@@ -31,7 +31,7 @@ type SourceDef struct {
 }
 
 var sourceDefs = []SourceDef{
-	{"https://raw.githubusercontent.com/lm705/vair-proxy-client/refs/heads/main/vless_alive.txt", ""},
+	{"https://raw.githubusercontent.com/lm705/vair/refs/heads/main/vless_alive.txt", ""},
 }
 
 const (
@@ -518,12 +518,15 @@ func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interfa
 }
 
 func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map[string]interface{} {
-	// Hybrid TUN: sing-box only routes traffic, xray handles the protocol.
-	// strict_route=true, stack=gvisor, mtu=9000 for maximum compatibility.
+	// Hybrid TUN: sing-box routes traffic, xray handles VLESS protocol.
 	//
-	// DNS: "local" type = Go's OS resolver = calls Windows GetAddrInfoW API.
-	// This bypasses TUN (it's a system call, not a UDP packet), so it works
-	// even with strict_route=true. No external DNS servers needed.
+	// DNS: "local" = OS system resolver. With strict_route=false, the OS resolver's
+	// UDP packets reach the router naturally through the physical NIC (not TUN).
+	// This works on both Ethernet and WiFi without knowing the router IP.
+	//
+	// strict_route=false: auto_route still captures most traffic through TUN,
+	// but system-level DNS and some edge cases can escape through the physical NIC.
+	// This avoids the chicken-and-egg DNS problem on WiFi.
 	dns := map[string]interface{}{
 		"servers": []interface{}{
 			map[string]interface{}{"tag": "dns-local", "type": "local"},
@@ -539,7 +542,7 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		"address":        []string{"172.19.0.1/30"},
 		"mtu":            9000,
 		"auto_route":     true,
-		"strict_route":   true,
+		"strict_route":   false,
 		"stack":          "gvisor",
 	}
 
@@ -557,9 +560,9 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		"rules": []interface{}{
 			map[string]interface{}{"action": "sniff"},
 			map[string]interface{}{"protocol": "dns", "action": "hijack-dns"},
-			// CRITICAL: exclude xray process from TUN routing to prevent loop.
-			// Without this, xray's connection to the VPN server gets captured
-			// by TUN → routed back to xray → infinite loop → timeout.
+			// Exclude xray process from TUN to prevent routing loop.
+			// xray connects to the VPN server directly — those connections
+			// must go through the physical NIC, not back through TUN.
 			map[string]interface{}{
 				"process_name": []string{"xray.exe", "xray"},
 				"outbound":     "direct",
@@ -899,7 +902,12 @@ func startTUNConnection(entry *ConfigEntry) {
 		return
 	}
 	xrayCfg := buildXrayConfig(p, xrayHTTPPort, xraySocksPort)
-	// For hybrid TUN, simplify routing: everything goes to proxy.
+	// For hybrid TUN: xray resolves the VPN server hostname via the OS resolver.
+	// sing-box's route rule `ip_is_private → direct` catches the resulting DNS
+	// packets (OS resolver hits the router at 192.168.x.1 which is private IP)
+	// and routes them out through the physical interface (direct outbound),
+	// not TUN. So we don't need to override xray's DNS — the default works.
+	// Simplify routing: everything goes to proxy.
 	// sing-box handles private IP routing, xray doesn't need geoip.
 	xrayCfg["routing"] = map[string]interface{}{
 		"domainStrategy": "AsIs",
@@ -978,15 +986,26 @@ func startTUNConnection(entry *ConfigEntry) {
 	go func() { exitCh <- cmd.Wait() }()
 	var stderrLines []string
 	var stderrMu sync.Mutex
+	// Write all sing-box stderr to a log file for debugging
+	logPath := filepath.Join(tabsDir(), "last-singbox.log")
+	os.MkdirAll(tabsDir(), 0755)
+	logFile, _ := os.Create(logPath)
 	go func() {
 		if stderrPipe == nil {
 			return
 		}
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
+			line := scanner.Text()
 			stderrMu.Lock()
-			stderrLines = append(stderrLines, scanner.Text())
+			stderrLines = append(stderrLines, line)
 			stderrMu.Unlock()
+			if logFile != nil {
+				fmt.Fprintln(logFile, line)
+			}
+		}
+		if logFile != nil {
+			logFile.Close()
 		}
 	}()
 
@@ -1083,24 +1102,35 @@ func stopConnectionLocked(cm *connManager) {
 		xrayCancel()
 	}
 
-	// Kill sing-box (TUN) first, then xray (proxy backend)
-	killProc := func(cmd *exec.Cmd) {
+	// Kill sing-box and xray in parallel. Go's Process.Kill() on Windows is
+	// soft — it sends WM_CLOSE-like signal and process may try to drain pending
+	// operations before exit (DNS queries with long timeouts, etc).
+	// taskkill /F forces immediate termination.
+	killProc := func(cmd *exec.Cmd, done chan<- struct{}) {
+		defer close(done)
 		if cmd == nil || cmd.Process == nil {
 			return
 		}
-		cmd.Process.Kill() //nolint:errcheck
-		done := make(chan struct{})
-		go func() { cmd.Wait(); close(done) }() //nolint:errcheck
+		pid := cmd.Process.Pid
+		// Force-kill immediately in parallel with Go's kill (whoever wins).
+		go runHidden("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run() //nolint:errcheck
+		cmd.Process.Kill()                                                    //nolint:errcheck
+		waitDone := make(chan struct{})
+		go func() { cmd.Wait(); close(waitDone) }() //nolint:errcheck
 		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			runHidden("taskkill", "/F", "/T", "/PID",
-				strconv.Itoa(cmd.Process.Pid)).Run() //nolint:errcheck
+		case <-waitDone:
+		case <-time.After(1500 * time.Millisecond):
+			// Still running — one more taskkill attempt
+			runHidden("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run() //nolint:errcheck
 		}
 	}
 
-	killProc(mainCmd)
-	killProc(xrayCmd)
+	mainDone := make(chan struct{})
+	xrayDone := make(chan struct{})
+	go killProc(mainCmd, mainDone)
+	go killProc(xrayCmd, xrayDone)
+	<-mainDone
+	<-xrayDone
 
 	// Cleanup temp files
 	if mainTmpCfg != "" {
@@ -2471,6 +2501,10 @@ tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px
 
 .tw{flex:1;overflow-y:auto}
 table{width:100%;border-collapse:collapse;table-layout:fixed}
+/* virtual scroll spacer rows — no borders, no hover */
+tbody tr.vspacer{background:transparent!important;border:0!important;pointer-events:none}
+tbody tr.vspacer:hover{background:transparent!important}
+tbody tr.vspacer td{border:0!important;padding:0!important}
 thead{position:sticky;top:0;z-index:10;background:var(--bg2)}
 thead th{
   padding:6px 10px;text-align:left;font-size:9px;text-transform:uppercase;
@@ -2865,6 +2899,14 @@ function matches(e){
 }
 
 // ── table ──────────────────────────────────────────────────────────
+// Virtual scroll: only renders visible rows + buffer. Works for 10,000+ configs.
+// Keeps the full sorted list in sortedList, renders only the window.
+// Top/bottom padding rows maintain correct scroll height.
+let sortedList = [];
+let rowHeight = 30; // measured on first render
+let visibleWindow = { start: 0, end: 0 }; // inclusive start, exclusive end
+const VBUFFER = 10; // rows rendered above/below viewport
+
 function rebuildTable(){
   let list=Object.values(entries).filter(matches);
   if(sortMode==='ping'){
@@ -2889,23 +2931,119 @@ function rebuildTable(){
       return a.index-b.index;
     });
   }else{list.sort((a,b)=>a.index-b.index);}
-  const tb=document.getElementById('tb'); tb.innerHTML='';
-  list.forEach((e,i)=>tb.appendChild(buildRow(e,i+1)));
+  sortedList = list;
   document.getElementById('fc').textContent=filterText?(list.length+'/'+Object.keys(entries).length+' shown'):'';
-  // restore highlights
+  visibleWindow = { start: 0, end: 0 }; // force full redraw
+  renderVisibleRows();
+}
+
+function renderVisibleRows(){
+  const tw = document.querySelector('.tw');
+  const tb = document.getElementById('tb');
+  if(!tw || !tb) return;
+  const total = sortedList.length;
+
+  // Small list: render everything (no virtualization overhead)
+  if(total <= 100){
+    if(visibleWindow.start === 0 && visibleWindow.end === total && tb.children.length === total){
+      return; // already rendered
+    }
+    tb.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    for(let i=0;i<total;i++) frag.appendChild(buildRow(sortedList[i], i+1));
+    tb.appendChild(frag);
+    visibleWindow = { start: 0, end: total };
+    restoreConnHighlight();
+    return;
+  }
+
+  const scrollTop = tw.scrollTop;
+  const viewH = tw.clientHeight;
+  const firstVisible = Math.max(0, Math.floor(scrollTop / rowHeight) - VBUFFER);
+  const lastVisible = Math.min(total, Math.ceil((scrollTop + viewH) / rowHeight) + VBUFFER);
+
+  // Skip re-render if window hasn't changed meaningfully
+  if(Math.abs(firstVisible - visibleWindow.start) < 3 &&
+     Math.abs(lastVisible - visibleWindow.end) < 3 &&
+     tb.children.length > 0){
+    return;
+  }
+
+  tb.innerHTML = '';
+  const frag = document.createDocumentFragment();
+
+  // Top spacer
+  if(firstVisible > 0){
+    const sp = document.createElement('tr');
+    sp.style.height = (firstVisible * rowHeight) + 'px';
+    sp.className = 'vspacer';
+    frag.appendChild(sp);
+  }
+  // Visible rows
+  for(let i=firstVisible; i<lastVisible; i++){
+    frag.appendChild(buildRow(sortedList[i], i+1));
+  }
+  // Bottom spacer
+  if(lastVisible < total){
+    const sp = document.createElement('tr');
+    sp.style.height = ((total - lastVisible) * rowHeight) + 'px';
+    sp.className = 'vspacer';
+    frag.appendChild(sp);
+  }
+  tb.appendChild(frag);
+  visibleWindow = { start: firstVisible, end: lastVisible };
+
+  // Measure actual row height on first render for accuracy
+  if(total > 0 && lastVisible > firstVisible){
+    const firstRow = tb.querySelector('tr:not(.vspacer)');
+    if(firstRow){
+      const h = firstRow.offsetHeight;
+      if(h > 0 && Math.abs(h - rowHeight) > 2){
+        rowHeight = h;
+      }
+    }
+  }
+  restoreConnHighlight();
+}
+
+function restoreConnHighlight(){
   if((connState.status==='connected'||connState.status==='connecting')&&connState.entry_index>=0&&(!connState.conn_tab||connState.conn_tab===activeTabId)){
     const row=document.getElementById('r'+connState.entry_index);
     if(row)row.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
   }
 }
 
+// Scroll listener for virtual window updates
+(function attachVScroll(){
+  const tw = document.querySelector('.tw');
+  if(!tw) { setTimeout(attachVScroll, 100); return; }
+  let scrollTimer = null;
+  tw.addEventListener('scroll', ()=>{
+    if(scrollTimer) return;
+    scrollTimer = requestAnimationFrame(()=>{
+      scrollTimer = null;
+      renderVisibleRows();
+    });
+  }, {passive: true});
+  window.addEventListener('resize', ()=>{
+    renderVisibleRows();
+  });
+})();
+
 function updateRow(idx){
+  // If only a few items changed visually, targeted update is faster than full rebuild.
+  // But for sorted views, position may change — rebuild.
   if(sortMode!=='idx'){ rebuildTable(); return; }
   const e=entries[idx]; if(!e)return;
   const old=document.getElementById('r'+idx);
-  const pos=old?parseInt(old.cells[0].textContent)||idx+1:idx+1;
+  if(!old){
+    // Row is outside virtual window, update underlying data only.
+    // Next scroll/rebuild will render it correctly.
+    return;
+  }
+  const pos=parseInt(old.cells[0].textContent)||idx+1;
   const nr=buildRow(e,pos);
-  if(old)old.replaceWith(nr); else document.getElementById('tb').appendChild(nr);
+  old.replaceWith(nr);
   if((connState.status==='connected'||connState.status==='connecting')&&connState.entry_index===idx)
     nr.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
 }
