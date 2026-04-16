@@ -572,6 +572,7 @@ func standaloneMain() {
 	}
 	registerRoutes()
 	loadTabs()
+	loadSettings()
 	go func() {
 		if err := httpListenAndServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
