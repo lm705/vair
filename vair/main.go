@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -75,7 +76,74 @@ const (
 	webPort = 19876
 )
 
-var skipTokens = []string{}
+// ─────────────────────────── proxy auth ──────────────────────────
+// Random credentials generated once per program launch.
+// Protects SOCKS5 inbound from abuse by malicious apps on the same machine.
+// See: https://habr.com/ru/articles/1020080/
+var (
+	proxyAuthUser string
+	proxyAuthPass string
+)
+
+func init() {
+	proxyAuthUser = randomHex(16)
+	proxyAuthPass = randomHex(32)
+}
+
+func randomHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
+
+// ─────────────────────────── settings ──────────────────────────────
+
+type AppSettings struct {
+	SourcesEnabled   bool     `json:"sources_enabled"`
+	ExcludeCountries []string `json:"exclude_countries"`
+	RuSitesDirect    bool     `json:"ru_sites_direct"`
+}
+
+var appSettings = AppSettings{SourcesEnabled: true}
+var settingsMu sync.RWMutex
+
+func settingsFilePath() string {
+	return filepath.Join(tabsDir(), "settings.json")
+}
+
+func loadSettings() {
+	data, err := os.ReadFile(settingsFilePath())
+	if err != nil {
+		return
+	}
+	settingsMu.Lock()
+	defer settingsMu.Unlock()
+	json.Unmarshal(data, &appSettings)
+}
+
+func saveSettings() {
+	settingsMu.RLock()
+	data, _ := json.MarshalIndent(appSettings, "", "  ")
+	settingsMu.RUnlock()
+	os.MkdirAll(tabsDir(), 0755)
+	os.WriteFile(settingsFilePath(), data, 0644)
+}
+
+func shouldSkip(name string) bool {
+	settingsMu.RLock()
+	countries := appSettings.ExcludeCountries
+	settingsMu.RUnlock()
+	if len(countries) == 0 {
+		return false
+	}
+	low := strings.ToLower(name)
+	for _, c := range countries {
+		if strings.Contains(low, strings.ToLower(c)) {
+			return true
+		}
+	}
+	return false
+}
 
 // ─────────────────────────── types ───────────────────────────────
 
@@ -403,16 +471,6 @@ func parseVless(raw string) (*VlessParams, error) {
 	return p, nil
 }
 
-func shouldSkip(name string) bool {
-	low := strings.ToLower(name)
-	for _, tok := range skipTokens {
-		if strings.Contains(low, tok) {
-			return true
-		}
-	}
-	return false
-}
-
 // ─────────────────────────── xray config (test + System Proxy) ───
 
 func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interface{} {
@@ -488,7 +546,13 @@ func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interfa
 		inbounds = append(inbounds, map[string]interface{}{
 			"tag": "socks", "listen": "127.0.0.1", "port": socksPort,
 			"protocol": "socks",
-			"settings": map[string]interface{}{"auth": "noauth", "udp": true},
+			"settings": map[string]interface{}{
+				"auth": "password",
+				"accounts": []interface{}{
+					map[string]interface{}{"user": proxyAuthUser, "pass": proxyAuthPass},
+				},
+				"udp": true,
+			},
 			"sniffing": sniffing,
 		})
 	}
@@ -506,12 +570,25 @@ func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interfa
 		},
 	}
 	if persistent {
+		rules := []interface{}{
+			map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
+		}
+		// Russian sites bypass VPN in proxy mode (uses xray's built-in geodata)
+		settingsMu.RLock()
+		ruDirect := appSettings.RuSitesDirect
+		settingsMu.RUnlock()
+		if ruDirect {
+			rules = append(rules,
+				map[string]interface{}{"type": "field", "domain": []string{"geosite:category-ru"}, "outboundTag": "direct"},
+				map[string]interface{}{"type": "field", "ip": []string{"geoip:ru"}, "outboundTag": "direct"},
+			)
+		}
+		rules = append(rules,
+			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
+		)
 		cfg["routing"] = map[string]interface{}{
 			"domainStrategy": "IPIfNonMatch",
-			"rules": []interface{}{
-				map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
-				map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
-			},
+			"rules":          rules,
 		}
 	}
 	return cfg
@@ -551,25 +628,64 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		"tag":         "proxy",
 		"server":      "127.0.0.1",
 		"server_port": xraySocksPort,
+		"username":    proxyAuthUser,
+		"password":    proxyAuthPass,
+	}
+
+	// Read routing settings
+	settingsMu.RLock()
+	ruSitesDirect := appSettings.RuSitesDirect
+	settingsMu.RUnlock()
+
+	rules := []interface{}{
+		map[string]interface{}{"action": "sniff"},
+		map[string]interface{}{"protocol": "dns", "action": "hijack-dns"},
+		// Exclude xray process from TUN to prevent routing loop.
+		// xray connects to the VPN server directly — those connections
+		// must go through the physical NIC, not back through TUN.
+		map[string]interface{}{
+			"process_name": []string{"xray.exe", "xray"},
+			"outbound":     "direct",
+		},
+		map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
+	}
+
+	// Russian sites bypass VPN — route directly through physical NIC.
+	// Uses remote rule-sets from SagerNet project (sing-box downloads on first use).
+	if ruSitesDirect {
+		rules = append(rules,
+			map[string]interface{}{"rule_set": "geosite-ru", "outbound": "direct"},
+			map[string]interface{}{"rule_set": "geoip-ru", "outbound": "direct"},
+		)
 	}
 
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
 		"default_domain_resolver": "dns-local",
 		"find_process":            true,
-		"rules": []interface{}{
-			map[string]interface{}{"action": "sniff"},
-			map[string]interface{}{"protocol": "dns", "action": "hijack-dns"},
-			// Exclude xray process from TUN to prevent routing loop.
-			// xray connects to the VPN server directly — those connections
-			// must go through the physical NIC, not back through TUN.
+		"rules":                   rules,
+		"final":                   "proxy",
+	}
+
+	if ruSitesDirect {
+		route["rule_set"] = []interface{}{
 			map[string]interface{}{
-				"process_name": []string{"xray.exe", "xray"},
-				"outbound":     "direct",
+				"type":            "remote",
+				"tag":             "geosite-ru",
+				"format":          "binary",
+				"url":             "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
+				"download_detour": "direct",
+				"update_interval": "24h",
 			},
-			map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
-		},
-		"final": "proxy",
+			map[string]interface{}{
+				"type":            "remote",
+				"tag":             "geoip-ru",
+				"format":          "binary",
+				"url":             "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+				"download_detour": "direct",
+				"update_interval": "24h",
+			},
+		}
 	}
 
 	return map[string]interface{}{
@@ -1540,6 +1656,25 @@ func runSpeedAll() {
 // ─────────────────────────── fetch ───────────────────────────────
 
 func fetchAndInit() {
+	// Check if Sources tab is enabled
+	settingsMu.RLock()
+	sourcesEnabled := appSettings.SourcesEnabled
+	settingsMu.RUnlock()
+
+	if !sourcesEnabled {
+		// Sources disabled — set empty entries for main tab
+		state.mu.Lock()
+		state.tabEntries["main"] = nil
+		if state.activeTab == "main" {
+			state.entries = nil
+		}
+		state.mu.Unlock()
+		if state.activeTab == "main" {
+			state.broadcast(SSEEvent{Type: "loaded", Payload: []ConfigEntry{}})
+		}
+		return
+	}
+
 	if state.activeTab == "main" {
 		state.broadcast(SSEEvent{Type: "loading", Payload: nil})
 	}
@@ -2477,6 +2612,22 @@ header{
 }
 .modal-input:focus{border-color:var(--accent)}
 .modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+.modal-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.modal-row-label{font-size:11px;color:var(--text)}
+.toggle{position:relative;width:36px;height:20px;cursor:pointer;flex-shrink:0}
+.toggle input{display:none}
+.toggle-track{position:absolute;inset:0;background:var(--dim2);border-radius:10px;transition:.2s}
+.toggle input:checked+.toggle-track{background:var(--accent)}
+.toggle-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s}
+.toggle input:checked~.toggle-thumb{left:18px}
+.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px}
+.chip{display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:700;
+  padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3)}
+.chip-x{cursor:pointer;opacity:.5;font-size:9px}.chip-x:hover{opacity:1;color:var(--red)}
+.chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:11px;outline:none;flex:1;min-width:80px}
+.modal-hint{font-size:9px;color:var(--dim);margin-top:-6px;margin-bottom:10px}
+.settings-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border2)}
+.settings-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
 
 /* row selection */
 tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px 0 0 var(--accent)}
@@ -2645,6 +2796,7 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
   </div>
   <div class="spacer"></div>
   <div class="ctrls">
+    <button class="btn ghost" id="btn-settings" onclick="openSettings()" title="Settings">&#9881;</button>
     <button class="btn ghost" id="btn-reload"    onclick="doReload()">reload</button>
     <button class="btn ghost" id="btn-ping-all"  onclick="doPingAll()">ping all</button>
     <button class="btn ghost"  id="btn-speed-all" onclick="doSpeedAll()">speed all</button>
@@ -2715,6 +2867,7 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
+let appSettingsJS={sources_enabled:true, exclude_countries:[], ru_sites_direct:false};
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -2738,6 +2891,7 @@ es.onmessage=e=>{
   else if(ev.type==='tabs_update')                   onTabsUpdate(ev.payload);
   else if(ev.type==='active_tab')                    onActiveTab(ev.payload);
 };
+loadAppSettings();
 
 // ── app info → update mode pills ──────────────────────────────────
 function onAppInfo(info){
@@ -2893,6 +3047,13 @@ function setSort(m){
 }
 function applyFilter(){ filterText=document.getElementById('fi').value.toLowerCase(); rebuildTable(); }
 function matches(e){
+  // On Sources tab, hide configs matching excluded countries
+  if(activeTabId==='main' && appSettingsJS.exclude_countries && appSettingsJS.exclude_countries.length>0){
+    var nm=(e.name||'').toLowerCase();
+    for(var i=0;i<appSettingsJS.exclude_countries.length;i++){
+      if(nm.indexOf(appSettingsJS.exclude_countries[i].toLowerCase())>=0) return false;
+    }
+  }
   if(!filterText)return true;
   return(e.name||'').toLowerCase().includes(filterText)||(e.host||'').toLowerCase().includes(filterText)
     ||(e.network||'').toLowerCase().includes(filterText)||(e.security||'').toLowerCase().includes(filterText);
@@ -3141,6 +3302,8 @@ function renderTabs(){
   const addBtn=bar.querySelector('.tab-add');
   bar.querySelectorAll('.tab-btn').forEach(b=>b.remove());
   tabsList.forEach(t=>{
+    // Hide Sources tab when disabled in settings
+    if(t.id==='main' && appSettingsJS.sources_enabled===false) return;
     const btn=document.createElement('button');
     btn.className='tab-btn'+(t.id===activeTabId?' active':'')+(t.closable?'':' no-close');
     btn.dataset.id=t.id;
@@ -3231,6 +3394,121 @@ function closeCtxMenu(){
 }
 
 // ── Tab settings modal ───────────────────────────────────────────────────────
+// ── settings ──────────────────────────────────────────────────────
+function loadAppSettings(){
+  fetch('/api/settings').then(r=>r.json()).then(s=>{
+    appSettingsJS=s;
+    rebuildTable();
+  }).catch(()=>{});
+}
+
+function saveAppSettings(cb){
+  fetch('/api/settings',{method:'POST',body:JSON.stringify(appSettingsJS)}).then(()=>{
+    if(cb)cb();
+  }).catch(console.error);
+}
+
+function openSettings(){
+  if(document.getElementById('settings-modal'))return;
+  var ov=document.createElement('div');
+  ov.className='modal-overlay';ov.id='settings-modal';
+  ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
+
+  var countries=appSettingsJS.exclude_countries||[];
+  var chipsHtml='';
+  for(var i=0;i<countries.length;i++){
+    chipsHtml+='<span class="chip" data-c="'+x(countries[i])+'">'+x(countries[i])+'<span class="chip-x" onclick="removeCountryChip(this)">x</span></span>';
+  }
+
+  ov.innerHTML='<div class="modal-box" style="min-width:400px">'+
+    '<div class="modal-title">Settings</div>'+
+    '<div class="settings-section">'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">Enable Sources tab</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-sources-on" '+(appSettingsJS.sources_enabled!==false?'checked':'')+' onchange="toggleSources(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-label">Exclude countries (Sources tab)</div>'+
+      '<div class="chips-wrap" id="country-chips">'+chipsHtml+
+        '<input class="chip-input" id="country-input" placeholder="Type country, press Enter" onkeydown="countryChipKey(event)">'+
+      '</div>'+
+      '<div class="modal-hint">Configs with matching name will be hidden. Applied on Reload.</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="modal-label" style="margin-bottom:8px">Routing</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">Russian sites without VPN</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-ru-direct" '+(appSettingsJS.ru_sites_direct?'checked':'')+' onchange="toggleRuSites(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.</div>'+
+    '</div>'+
+    '<div class="modal-btns">'+
+      '<button class="btn ghost" onclick="document.getElementById(\'settings-modal\').remove()">close</button>'+
+    '</div>'+
+  '</div>';
+  document.body.appendChild(ov);
+  document.getElementById('country-input').focus();
+}
+
+function toggleSources(on){
+  appSettingsJS.sources_enabled=on;
+  saveAppSettings(function(){
+    renderTabs();
+    if(!on && activeTabId==='main'){
+      // Switch to first available tab or create one
+      var other=tabsList.find(function(t){return t.id!=='main';});
+      if(other) switchTab(other.id);
+      else addTab();
+    }
+    if(on){
+      // Re-show Sources tab; if no other tab active, switch to it and reload
+      renderTabs();
+      if(activeTabId==='main') doReload();
+    }
+  });
+}
+
+function toggleRuSites(on){
+  appSettingsJS.ru_sites_direct=on;
+  saveAppSettings();
+}
+
+function countryChipKey(ev){
+  if(ev.key!=='Enter')return;
+  ev.preventDefault();
+  var val=ev.target.value.trim();
+  if(!val)return;
+  if(!appSettingsJS.exclude_countries)appSettingsJS.exclude_countries=[];
+  // Avoid duplicates
+  for(var i=0;i<appSettingsJS.exclude_countries.length;i++){
+    if(appSettingsJS.exclude_countries[i].toLowerCase()===val.toLowerCase())return;
+  }
+  appSettingsJS.exclude_countries.push(val);
+  ev.target.value='';
+  saveAppSettings(function(){
+    // Re-render chips
+    var wrap=document.getElementById('country-chips');
+    var inp=document.getElementById('country-input');
+    var chips=wrap.querySelectorAll('.chip');
+    chips.forEach(function(c){c.remove();});
+    for(var i=0;i<appSettingsJS.exclude_countries.length;i++){
+      var sp=document.createElement('span');
+      sp.className='chip';sp.setAttribute('data-c',appSettingsJS.exclude_countries[i]);
+      sp.innerHTML=x(appSettingsJS.exclude_countries[i])+'<span class="chip-x" onclick="removeCountryChip(this)">x</span>';
+      wrap.insertBefore(sp,inp);
+    }
+    rebuildTable();
+  });
+}
+
+function removeCountryChip(el){
+  var chip=el.parentElement;
+  var c=chip.getAttribute('data-c');
+  chip.remove();
+  if(!appSettingsJS.exclude_countries)return;
+  appSettingsJS.exclude_countries=appSettingsJS.exclude_countries.filter(function(v){return v.toLowerCase()!==c.toLowerCase();});
+  saveAppSettings(function(){ rebuildTable(); });
+}
+
 function openTabSettings(tabId){
   closeCtxMenu();
   const tab=tabsList.find(t=>t.id===tabId);
@@ -3413,6 +3691,34 @@ func killOrphanedXray() {
 
 // ─────────────────────────── route registration ──────────────────
 
+func handleSettings(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method == "GET" {
+		w.Header().Set("Content-Type", "application/json")
+		settingsMu.RLock()
+		json.NewEncoder(w).Encode(appSettings)
+		settingsMu.RUnlock()
+		return
+	}
+	// POST: update settings
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), 400)
+		return
+	}
+	var newSettings AppSettings
+	if err := json.Unmarshal(body, &newSettings); err != nil {
+		http.Error(w, "bad json: "+err.Error(), 400)
+		return
+	}
+	settingsMu.Lock()
+	appSettings = newSettings
+	settingsMu.Unlock()
+	saveSettings()
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
 func registerRoutes() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -3435,6 +3741,7 @@ func registerRoutes() {
 	http.HandleFunc("/api/tab/set-url", handleTabSetURL)
 	http.HandleFunc("/api/tab/delete-entries", handleTabDeleteEntries)
 	http.HandleFunc("/api/tab/reorder", handleTabReorder)
+	http.HandleFunc("/api/settings", handleSettings)
 }
 
 func httpListenAndServe() error {
@@ -3509,6 +3816,7 @@ func main() {
 
 	registerRoutes()
 	loadTabs()
+	loadSettings()
 	go fetchAndInit()
 	if err := httpListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
