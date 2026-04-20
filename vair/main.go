@@ -102,6 +102,7 @@ type AppSettings struct {
 	SourcesEnabled   bool     `json:"sources_enabled"`
 	ExcludeCountries []string `json:"exclude_countries"`
 	RuSitesDirect    bool     `json:"ru_sites_direct"`
+	DirectDomains    []string `json:"direct_domains"`
 }
 
 var appSettings = AppSettings{SourcesEnabled: true}
@@ -382,10 +383,20 @@ func nextTabNumber() int {
 	defer state.mu.RUnlock()
 	used := make(map[int]bool)
 	for _, t := range state.tabs {
-		if strings.HasPrefix(t.ID, "custom-") {
-			if n, err := strconv.Atoi(strings.TrimPrefix(t.ID, "custom-")); err == nil {
-				used[n] = true
+		// Support both old "custom-N" and new "tab-N-timestamp" formats
+		name := t.ID
+		if strings.HasPrefix(name, "custom-") {
+			name = strings.TrimPrefix(name, "custom-")
+		} else if strings.HasPrefix(name, "tab-") {
+			name = strings.TrimPrefix(name, "tab-")
+			if idx := strings.Index(name, "-"); idx > 0 {
+				name = name[:idx] // "2-1713456789" → "2"
 			}
+		} else {
+			continue
+		}
+		if n, err := strconv.Atoi(name); err == nil {
+			used[n] = true
 		}
 	}
 	for i := 1; ; i++ {
@@ -576,12 +587,32 @@ func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interfa
 		// Russian sites bypass VPN in proxy mode (uses xray's built-in geodata)
 		settingsMu.RLock()
 		ruDirect := appSettings.RuSitesDirect
+		directDomains := make([]string, len(appSettings.DirectDomains))
+		copy(directDomains, appSettings.DirectDomains)
 		settingsMu.RUnlock()
 		if ruDirect {
 			rules = append(rules,
 				map[string]interface{}{"type": "field", "domain": []string{"geosite:category-ru"}, "outboundTag": "direct"},
 				map[string]interface{}{"type": "field", "ip": []string{"geoip:ru"}, "outboundTag": "direct"},
 			)
+		}
+		// Custom domains → direct (user-defined in Settings)
+		if len(directDomains) > 0 {
+			// xray uses "domain" field with domain suffixes
+			var suffixes []string
+			for _, d := range directDomains {
+				d = strings.TrimSpace(d)
+				if d == "" {
+					continue
+				}
+				// "domain:" prefix = suffix match (vk.com matches *.vk.com and vk.com)
+				suffixes = append(suffixes, "domain:"+d)
+			}
+			if len(suffixes) > 0 {
+				rules = append(rules,
+					map[string]interface{}{"type": "field", "domain": suffixes, "outboundTag": "direct"},
+				)
+			}
 		}
 		rules = append(rules,
 			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
@@ -635,14 +666,14 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 	// Read routing settings
 	settingsMu.RLock()
 	ruSitesDirect := appSettings.RuSitesDirect
+	directDomains := make([]string, len(appSettings.DirectDomains))
+	copy(directDomains, appSettings.DirectDomains)
 	settingsMu.RUnlock()
 
 	rules := []interface{}{
 		map[string]interface{}{"action": "sniff"},
 		map[string]interface{}{"protocol": "dns", "action": "hijack-dns"},
 		// Exclude xray process from TUN to prevent routing loop.
-		// xray connects to the VPN server directly — those connections
-		// must go through the physical NIC, not back through TUN.
 		map[string]interface{}{
 			"process_name": []string{"xray.exe", "xray"},
 			"outbound":     "direct",
@@ -650,13 +681,28 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
 	}
 
-	// Russian sites bypass VPN — route directly through physical NIC.
-	// Uses remote rule-sets from SagerNet project (sing-box downloads on first use).
+	// Russian sites bypass VPN
 	if ruSitesDirect {
 		rules = append(rules,
 			map[string]interface{}{"rule_set": "geosite-ru", "outbound": "direct"},
 			map[string]interface{}{"rule_set": "geoip-ru", "outbound": "direct"},
 		)
+	}
+
+	// Custom domains → direct (user-defined in Settings)
+	if len(directDomains) > 0 {
+		var suffixes []string
+		for _, d := range directDomains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				suffixes = append(suffixes, d)
+			}
+		}
+		if len(suffixes) > 0 {
+			rules = append(rules,
+				map[string]interface{}{"domain_suffix": suffixes, "outbound": "direct"},
+			)
+		}
 	}
 
 	route := map[string]interface{}{
@@ -1594,6 +1640,14 @@ func runPingAll() {
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			// Re-check after semaphore wait (tab might be deleted while queued)
+			state.mu.RLock()
+			cancelled2 := state.cancelledTabs[tabID]
+			state.mu.RUnlock()
+			if cancelled2 {
+				atomic.AddInt64(&done, 1)
+				return
+			}
 			ent.mu.Lock()
 			ent.PingStatus = StatusTestingPing
 			ent.mu.Unlock()
@@ -1635,6 +1689,13 @@ func runSpeedAll() {
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			state.mu.RLock()
+			cancelled2 := state.cancelledTabs[tabID]
+			state.mu.RUnlock()
+			if cancelled2 {
+				atomic.AddInt64(&done, 1)
+				return
+			}
 			ent.mu.Lock()
 			ent.PingStatus = StatusTestingPing
 			ent.SpeedStatus = StatusPending
@@ -2168,8 +2229,10 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 func handleTabCreate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	n := nextTabNumber()
+	// Use timestamp in ID to prevent reuse of cancelled tab IDs.
+	// Display name uses the sequential number for readability.
 	tab := Tab{
-		ID:       fmt.Sprintf("custom-%d", n),
+		ID:       fmt.Sprintf("tab-%d-%d", n, time.Now().UnixMilli()),
 		Name:     fmt.Sprintf("Tab %d", n),
 		IsMain:   false,
 		Closable: true,
@@ -2177,6 +2240,7 @@ func handleTabCreate(w http.ResponseWriter, r *http.Request) {
 	state.mu.Lock()
 	state.tabs = append(state.tabs, tab)
 	state.tabEntries[tab.ID] = nil
+	delete(state.cancelledTabs, tab.ID) // clear stale cancellation from deleted tab with same ID
 	state.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
@@ -2867,7 +2931,7 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, exclude_countries:[], ru_sites_direct:false};
+let appSettingsJS={sources_enabled:true, exclude_countries:[], ru_sites_direct:false, direct_domains:[]};
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -3009,7 +3073,15 @@ function onLoaded(list){
   rebuildTable(); recalcStats();
   document.getElementById('s-tot').textContent=list.length;
 }
-function onUpdate(e){ entries[e.index]=e; updateRow(e.index); recalcStats(); }
+function onUpdate(e){
+  entries[e.index]=e;
+  // Keep sortedList in sync so virtual scroll renders fresh data when scrolling back
+  for(var i=0;i<sortedList.length;i++){
+    if(sortedList[i].index===e.index){ sortedList[i]=e; break; }
+  }
+  updateRow(e.index);
+  recalcStats();
+}
 
 function recalcStats(){
   const all=Object.values(entries);
@@ -3420,6 +3492,12 @@ function openSettings(){
     chipsHtml+='<span class="chip" data-c="'+x(countries[i])+'">'+x(countries[i])+'<span class="chip-x" onclick="removeCountryChip(this)">x</span></span>';
   }
 
+  var domains=appSettingsJS.direct_domains||[];
+  var domainChipsHtml='';
+  for(var i=0;i<domains.length;i++){
+    domainChipsHtml+='<span class="chip" data-d="'+x(domains[i])+'">'+x(domains[i])+'<span class="chip-x" onclick="removeDomainChip(this)">x</span></span>';
+  }
+
   ov.innerHTML='<div class="modal-box" style="min-width:400px">'+
     '<div class="modal-title">Settings</div>'+
     '<div class="settings-section">'+
@@ -3440,6 +3518,11 @@ function openSettings(){
         '<label class="toggle"><input type="checkbox" id="set-ru-direct" '+(appSettingsJS.ru_sites_direct?'checked':'')+' onchange="toggleRuSites(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
       '<div class="modal-hint">Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.</div>'+
+      '<div class="modal-label" style="margin-top:10px">Custom domains without VPN</div>'+
+      '<div class="chips-wrap" id="domain-chips">'+domainChipsHtml+
+        '<input class="chip-input" id="domain-input" placeholder="e.g. vk.com, press Enter" onkeydown="domainChipKey(event)">'+
+      '</div>'+
+      '<div class="modal-hint">Enter a domain — all its subdomains are included automatically. Takes effect on next connection.</div>'+
     '</div>'+
     '<div class="modal-btns">'+
       '<button class="btn ghost" onclick="document.getElementById(\'settings-modal\').remove()">close</button>'+
@@ -3507,6 +3590,40 @@ function removeCountryChip(el){
   if(!appSettingsJS.exclude_countries)return;
   appSettingsJS.exclude_countries=appSettingsJS.exclude_countries.filter(function(v){return v.toLowerCase()!==c.toLowerCase();});
   saveAppSettings(function(){ rebuildTable(); });
+}
+
+function domainChipKey(ev){
+  if(ev.key!=='Enter')return;
+  ev.preventDefault();
+  var val=ev.target.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+  if(!val)return;
+  if(!appSettingsJS.direct_domains)appSettingsJS.direct_domains=[];
+  for(var i=0;i<appSettingsJS.direct_domains.length;i++){
+    if(appSettingsJS.direct_domains[i].toLowerCase()===val)return;
+  }
+  appSettingsJS.direct_domains.push(val);
+  ev.target.value='';
+  saveAppSettings(function(){
+    var wrap=document.getElementById('domain-chips');
+    var inp=document.getElementById('domain-input');
+    var chips=wrap.querySelectorAll('.chip');
+    chips.forEach(function(c){c.remove();});
+    for(var i=0;i<appSettingsJS.direct_domains.length;i++){
+      var sp=document.createElement('span');
+      sp.className='chip';sp.setAttribute('data-d',appSettingsJS.direct_domains[i]);
+      sp.innerHTML=x(appSettingsJS.direct_domains[i])+'<span class="chip-x" onclick="removeDomainChip(this)">x</span>';
+      wrap.insertBefore(sp,inp);
+    }
+  });
+}
+
+function removeDomainChip(el){
+  var chip=el.parentElement;
+  var d=chip.getAttribute('data-d');
+  chip.remove();
+  if(!appSettingsJS.direct_domains)return;
+  appSettingsJS.direct_domains=appSettingsJS.direct_domains.filter(function(v){return v.toLowerCase()!==d.toLowerCase();});
+  saveAppSettings();
 }
 
 function openTabSettings(tabId){
