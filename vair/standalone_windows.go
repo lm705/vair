@@ -145,8 +145,17 @@ var (
 	procDwmExtendFrameIntoClientArea = dwmapi.NewProc("DwmExtendFrameIntoClientArea")
 	procSetForegroundWindow          = user32.NewProc("SetForegroundWindow")
 	procBringWindowToTop             = user32.NewProc("BringWindowToTop")
+	procIsWindowVisible              = user32.NewProc("IsWindowVisible")
 	procDwmSetWindowAttribute       = dwmapi.NewProc("DwmSetWindowAttribute")
 	procEnumChildWindows            = user32.NewProc("EnumChildWindows")
+	procCreatePopupMenu             = user32.NewProc("CreatePopupMenu")
+	procInsertMenuW                 = user32.NewProc("InsertMenuW")
+	procTrackPopupMenu              = user32.NewProc("TrackPopupMenu")
+	procDestroyMenu                 = user32.NewProc("DestroyMenu")
+	procGetCursorPos                = user32.NewProc("GetCursorPos")
+
+	shell32                        = windows.NewLazySystemDLL("shell32.dll")
+	procShellNotifyIconW           = shell32.NewProc("Shell_NotifyIconW")
 )
 
 type dwmMargins struct{ Left, Right, Top, Bottom int32 }
@@ -182,6 +191,8 @@ const (
 	swMinimize = 6
 	swMaximize = 3
 	swRestore  = 9
+	swHide     = 0
+	swShow     = 5
 
 	swpFrameChanged = 0x0020
 	swpNomove       = 0x0002
@@ -193,6 +204,9 @@ const (
 	wmSeticon       = 0x0080
 	wmClose         = 0x0010
 	scMinimize      = 0xF020
+	wmApp           = 0x8000 // WM_APP — used for tray icon callback
+	wmLbuttonup     = 0x0202
+	wmRbuttonup     = 0x0205
 
 	htCaption     = 2
 	wmNccalcsize    = 0x0083
@@ -364,6 +378,24 @@ func init() {
 				return 0
 			}
 
+		case wmApp:
+			// Tray icon callback — lParam contains the mouse message
+			switch lParam {
+			case wmLbuttonup:
+				// Toggle window visibility on left-click
+				visible, _, _ := procIsWindowVisible.Call(hwnd)
+				if visible != 0 {
+					procShowWindow.Call(hwnd, swHide)
+				} else {
+					procShowWindow.Call(hwnd, swShow)
+					procSetForegroundWindow.Call(hwnd)
+				}
+			case wmRbuttonup:
+				// Show context menu
+				showTrayMenu(hwnd)
+			}
+			return 0
+
 		}
 		ret, _, _ := procCallWindowProcW.Call(origWndProc, hwnd, msg, wParam, lParam)
 		return ret
@@ -503,9 +535,35 @@ func openNativeWindow(addr string) {
 	procSetForegroundWindow.Call(hwnd)
 	procBringWindowToTop.Call(hwnd)
 
+	// Show tray icon if enabled
+	settingsMu.RLock()
+	trayOn := appSettings.TrayEnabled
+	settingsMu.RUnlock()
+	if trayOn {
+		addTrayIcon(hwnd, filepath.Join(binDir, "icon.ico"))
+	}
+
 	// ── JS bindings ───────────────────────────────────────────────────────────
+	icoFullPath := filepath.Join(binDir, "icon.ico")
+
 	w.Bind("_goWinClose", func() {
-		procPostMessageW.Call(hwnd, wmClose, 0, 0)
+		settingsMu.RLock()
+		trayOn := appSettings.TrayEnabled
+		settingsMu.RUnlock()
+		if trayOn {
+			// Ensure tray icon exists before hiding window
+			addTrayIcon(hwnd, icoFullPath)
+			procShowWindow.Call(hwnd, swHide)
+		} else {
+			procPostMessageW.Call(hwnd, wmClose, 0, 0)
+		}
+	})
+	w.Bind("_goToggleTray", func(on bool) {
+		if on {
+			addTrayIcon(hwnd, icoFullPath)
+		} else {
+			removeTrayIcon(hwnd)
+		}
 	})
 	w.Bind("_goWinMinimize", func() {
 		// SW_MINIMIZE = 6 animates correctly on Windows 10/11 for frameless windows.
@@ -557,6 +615,104 @@ func openNativeWindow(addr string) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+// ── System Tray (notify icon) ─────────────────────────────────────────────────
+
+const (
+	nimAdd    = 0x00000000
+	nimDelete = 0x00000002
+	nifMessage = 0x01
+	nifIcon    = 0x02
+	nifTip     = 0x04
+)
+
+// NOTIFYICONDATAW (simplified, 64-bit layout)
+type notifyIconData struct {
+	CbSize           uint32
+	HWnd             uintptr
+	UID              uint32
+	UFlags           uint32
+	UCallbackMessage uint32
+	_                uint32 // padding
+	HIcon            uintptr
+	SzTip            [128]uint16
+}
+
+func addTrayIcon(hwnd uintptr, icoPath string) {
+	var nid notifyIconData
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = hwnd
+	nid.UID = 1
+	nid.UFlags = nifMessage | nifIcon | nifTip
+	nid.UCallbackMessage = wmApp
+
+	// Load icon from file
+	icoPathW, _ := syscall.UTF16PtrFromString(icoPath)
+	icon, _, _ := procLoadImageW.Call(
+		0, uintptr(unsafe.Pointer(icoPathW)),
+		1, // IMAGE_ICON
+		16, 16,
+		0x00000010, // LR_LOADFROMFILE
+	)
+	nid.HIcon = icon
+
+	// Set tooltip
+	tip, _ := syscall.UTF16FromString("Vair")
+	copy(nid.SzTip[:], tip)
+
+	procShellNotifyIconW.Call(nimAdd, uintptr(unsafe.Pointer(&nid)))
+}
+
+func removeTrayIcon(hwnd uintptr) {
+	var nid notifyIconData
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = hwnd
+	nid.UID = 1
+	procShellNotifyIconW.Call(nimDelete, uintptr(unsafe.Pointer(&nid)))
+}
+
+type point struct{ X, Y int32 }
+
+const (
+	mfString    = 0x00000000
+	mfSeparator = 0x00000800
+	tpmRightAlign = 0x0008
+)
+
+var trayMainHwnd uintptr // stored so showTrayMenu can post WM_CLOSE
+
+func showTrayMenu(hwnd uintptr) {
+	trayMainHwnd = hwnd
+	hMenu, _, _ := procCreatePopupMenu.Call()
+	if hMenu == 0 {
+		return
+	}
+	showW, _ := syscall.UTF16PtrFromString("Show")
+	disconnectW, _ := syscall.UTF16PtrFromString("Disconnect")
+	exitW, _ := syscall.UTF16PtrFromString("Exit")
+
+	procInsertMenuW.Call(hMenu, 0, mfString, 1001, uintptr(unsafe.Pointer(showW)))
+	procInsertMenuW.Call(hMenu, 1, mfString, 1002, uintptr(unsafe.Pointer(disconnectW)))
+	procInsertMenuW.Call(hMenu, 2, mfSeparator, 0, 0)
+	procInsertMenuW.Call(hMenu, 3, mfString, 1003, uintptr(unsafe.Pointer(exitW)))
+
+	var pt point
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procSetForegroundWindow.Call(hwnd)
+	cmd, _, _ := procTrackPopupMenu.Call(hMenu, 0x0100, uintptr(pt.X), uintptr(pt.Y), 0, hwnd, 0) // TPM_RETURNCMD=0x100
+	procDestroyMenu.Call(hMenu)
+
+	switch cmd {
+	case 1001: // Show
+		procShowWindow.Call(hwnd, swShow)
+		procSetForegroundWindow.Call(hwnd)
+	case 1002: // Disconnect
+		go stopConnection()
+	case 1003: // Exit
+		removeTrayIcon(hwnd)
+		procPostMessageW.Call(hwnd, wmClose, 0, 0)
+	}
+}
+
 func standaloneMain() {
 	fresh, err := extractBinaries()
 	if err != nil {
@@ -579,6 +735,7 @@ func standaloneMain() {
 			os.Exit(1)
 		}
 	}()
+	go startAutoRefresh()
 	go fetchAndInit()
 	openNativeWindow(fmt.Sprintf("http://localhost:%d", webPort))
 }

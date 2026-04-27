@@ -99,10 +99,12 @@ func randomHex(n int) string {
 // ─────────────────────────── settings ──────────────────────────────
 
 type AppSettings struct {
-	SourcesEnabled   bool     `json:"sources_enabled"`
-	ExcludeCountries []string `json:"exclude_countries"`
-	RuSitesDirect    bool     `json:"ru_sites_direct"`
-	DirectDomains    []string `json:"direct_domains"`
+	SourcesEnabled     bool     `json:"sources_enabled"`
+	SourcesRefreshMin  int      `json:"sources_refresh_min"`
+	ExcludeCountries   []string `json:"exclude_countries"`
+	RuSitesDirect      bool     `json:"ru_sites_direct"`
+	DirectDomains      []string `json:"direct_domains"`
+	TrayEnabled        bool     `json:"tray_enabled"`
 }
 
 var appSettings = AppSettings{SourcesEnabled: true}
@@ -227,6 +229,7 @@ type ConnState struct {
 	EntryIndex int        `json:"entry_index"`
 	EntryName  string     `json:"entry_name"`
 	ConnTab    string     `json:"conn_tab"`
+	ConnRaw    string     `json:"conn_raw,omitempty"` // raw vless:// URL for matching after reload
 	HTTPPort   int        `json:"http_port,omitempty"`
 	SOCKSPort  int        `json:"socks_port,omitempty"`
 	TUNIface   string     `json:"tun_iface,omitempty"`
@@ -236,13 +239,13 @@ type ConnState struct {
 }
 
 type connManager struct {
-	mu         sync.Mutex
-	state      ConnState
-	cmd        *exec.Cmd // main process (xray for proxy, sing-box for TUN)
-	xrayCmd    *exec.Cmd // secondary xray process (hybrid TUN mode only)
-	cancel     context.CancelFunc
+	mu      sync.Mutex
+	state   ConnState
+	cmd     *exec.Cmd    // main process (xray for proxy, sing-box for TUN)
+	xrayCmd *exec.Cmd    // secondary xray process (hybrid TUN mode only)
+	cancel  context.CancelFunc
 	xrayCancel context.CancelFunc
-	tmpCfg     string
+	tmpCfg  string
 	xrayTmpCfg string
 }
 
@@ -263,19 +266,23 @@ func (cm *connManager) snap() ConnState {
 // ─────────────────────────── tabs ───────────────────────────────
 
 type Tab struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	IsMain    bool   `json:"is_main"`
-	Closable  bool   `json:"closable"`
-	SourceURL string `json:"source_url,omitempty"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	IsMain     bool     `json:"is_main"`
+	Closable   bool     `json:"closable"`
+	SourceURL  string   `json:"source_url,omitempty"`  // legacy single URL (backward compat)
+	SourceURLs []string `json:"source_urls,omitempty"` // multiple source URLs
+	RefreshMin int      `json:"refresh_min,omitempty"` // auto-refresh interval in minutes (0=disabled)
 }
 
 // persistedTab is the JSON structure saved to disk
 type persistedTab struct {
-	ID        string   `json:"id"`
-	Name      string   `json:"name"`
-	SourceURL string   `json:"source_url,omitempty"`
-	Configs   []string `json:"configs,omitempty"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	SourceURL  string   `json:"source_url,omitempty"`
+	SourceURLs []string `json:"source_urls,omitempty"`
+	RefreshMin int      `json:"refresh_min,omitempty"`
+	Configs    []string `json:"configs,omitempty"`
 }
 type persistedData struct {
 	Tabs []persistedTab `json:"tabs"`
@@ -310,8 +317,8 @@ var state = &AppState{
 	conn:          newConnManager(),
 	tabEntries:    make(map[string][]*ConfigEntry),
 	cancelledTabs: make(map[string]bool),
-	activeTab:     "main",
-	tabs:          []Tab{{ID: "main", Name: "Sources", IsMain: true, Closable: false}},
+	activeTab:  "main",
+	tabs:       []Tab{{ID: "main", Name: "Sources", IsMain: true, Closable: false}},
 }
 
 // ─────────────────────────── tab persistence ────────────────────
@@ -337,7 +344,14 @@ func saveTabs() {
 		if t.IsMain {
 			continue
 		}
-		pt := persistedTab{ID: t.ID, Name: t.Name, SourceURL: t.SourceURL}
+		pt := persistedTab{
+			ID: t.ID, Name: t.Name,
+			SourceURLs: t.SourceURLs, RefreshMin: t.RefreshMin,
+		}
+		// Legacy compat: save single URL too if only one
+		if len(t.SourceURLs) == 1 {
+			pt.SourceURL = t.SourceURLs[0]
+		}
 		if entries, ok := state.tabEntries[t.ID]; ok {
 			for _, e := range entries {
 				pt.Configs = append(pt.Configs, e.Raw)
@@ -371,7 +385,15 @@ func loadTabs() {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	for _, pt := range pd.Tabs {
-		tab := Tab{ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true, SourceURL: pt.SourceURL}
+		// Migrate legacy single URL to SourceURLs
+		urls := pt.SourceURLs
+		if len(urls) == 0 && pt.SourceURL != "" {
+			urls = []string{pt.SourceURL}
+		}
+		tab := Tab{
+			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
+			SourceURLs: urls, RefreshMin: pt.RefreshMin,
+		}
 		state.tabs = append(state.tabs, tab)
 		entries := parseConfigLines(strings.Join(pt.Configs, "\n"))
 		state.tabEntries[tab.ID] = entries
@@ -481,6 +503,7 @@ func parseVless(raw string) (*VlessParams, error) {
 	p.PublicKey, p.ShortID, p.SpiderX = get("pbk"), get("sid"), get("spx")
 	return p, nil
 }
+
 
 // ─────────────────────────── xray config (test + System Proxy) ───
 
@@ -625,6 +648,8 @@ func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interfa
 	return cfg
 }
 
+
+
 func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map[string]interface{} {
 	// Hybrid TUN: sing-box routes traffic, xray handles VLESS protocol.
 	//
@@ -716,20 +741,20 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 	if ruSitesDirect {
 		route["rule_set"] = []interface{}{
 			map[string]interface{}{
-				"type":            "remote",
-				"tag":             "geosite-ru",
-				"format":          "binary",
-				"url":             "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
-				"download_detour": "direct",
-				"update_interval": "24h",
+				"type":             "remote",
+				"tag":              "geosite-ru",
+				"format":           "binary",
+				"url":              "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
+				"download_detour":  "direct",
+				"update_interval":  "24h",
 			},
 			map[string]interface{}{
-				"type":            "remote",
-				"tag":             "geoip-ru",
-				"format":          "binary",
-				"url":             "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
-				"download_detour": "direct",
-				"update_interval": "24h",
+				"type":             "remote",
+				"tag":              "geoip-ru",
+				"format":           "binary",
+				"url":              "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
+				"download_detour":  "direct",
+				"update_interval":  "24h",
 			},
 		}
 	}
@@ -861,15 +886,9 @@ func withXray(p *VlessParams, ttl time.Duration, fn func(httpPort int, tr *http.
 	case exitErr := <-exitCh:
 		errMsg := strings.TrimSpace(stderrBuf.String())
 		if errMsg == "" {
-			if exitErr != nil {
-				errMsg = exitErr.Error()
-			} else {
-				errMsg = "exited unexpectedly"
-			}
+			if exitErr != nil { errMsg = exitErr.Error() } else { errMsg = "exited unexpectedly" }
 		}
-		if len(errMsg) > 160 {
-			errMsg = "..." + errMsg[len(errMsg)-160:]
-		}
+		if len(errMsg) > 160 { errMsg = "..." + errMsg[len(errMsg)-160:] }
 		return fmt.Errorf("xray: %s", errMsg)
 	case ready := <-portResult:
 		if !ready {
@@ -920,7 +939,7 @@ func startProxyConnection(entry *ConfigEntry) {
 	}
 
 	cm.mu.Lock()
-	cm.state = ConnState{Status: ConnConnecting, Mode: ModeProxy, EntryIndex: entry.Index, EntryName: p.Name, ConnTab: connTab}
+	cm.state = ConnState{Status: ConnConnecting, Mode: ModeProxy, EntryIndex: entry.Index, EntryName: p.Name, ConnTab: connTab, ConnRaw: entry.Raw}
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 
@@ -1004,7 +1023,7 @@ func startProxyConnection(entry *ConfigEntry) {
 	cm.cancel = cancel
 	cm.tmpCfg = tmpPath
 	cm.state = ConnState{
-		Status: ConnConnected, Mode: ModeProxy, ConnTab: connTab,
+		Status: ConnConnected, Mode: ModeProxy, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: p.Name,
 		HTTPPort: httpPort, SOCKSPort: socksPort,
 		StartedAt: time.Now(),
@@ -1043,7 +1062,7 @@ func startTUNConnection(entry *ConfigEntry) {
 	}
 
 	cm.mu.Lock()
-	cm.state = ConnState{Status: ConnConnecting, Mode: ModeTUN, EntryIndex: entry.Index, EntryName: p.Name, ConnTab: connTab}
+	cm.state = ConnState{Status: ConnConnecting, Mode: ModeTUN, EntryIndex: entry.Index, EntryName: p.Name, ConnTab: connTab, ConnRaw: entry.Raw}
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 
@@ -1153,9 +1172,7 @@ func startTUNConnection(entry *ConfigEntry) {
 	os.MkdirAll(tabsDir(), 0755)
 	logFile, _ := os.Create(logPath)
 	go func() {
-		if stderrPipe == nil {
-			return
-		}
+		if stderrPipe == nil { return }
 		scanner := bufio.NewScanner(stderrPipe)
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -1166,9 +1183,7 @@ func startTUNConnection(entry *ConfigEntry) {
 				fmt.Fprintln(logFile, line)
 			}
 		}
-		if logFile != nil {
-			logFile.Close()
-		}
+		if logFile != nil { logFile.Close() }
 	}()
 
 	select {
@@ -1183,14 +1198,9 @@ func startTUNConnection(entry *ConfigEntry) {
 		stderrMu.Unlock()
 		errMsg := "sing-box crashed at startup"
 		for i := len(lines) - 1; i >= 0 && i >= len(lines)-3; i-- {
-			if lines[i] != "" {
-				errMsg = lines[i]
-				break
-			}
+			if lines[i] != "" { errMsg = lines[i]; break }
 		}
-		if len(errMsg) > 180 {
-			errMsg = "..." + errMsg[len(errMsg)-180:]
-		}
+		if len(errMsg) > 180 { errMsg = "..." + errMsg[len(errMsg)-180:] }
 		setConnError(cm, entry, errMsg)
 		return
 	case <-time.After(tunStartupTimeout):
@@ -1204,7 +1214,7 @@ func startTUNConnection(entry *ConfigEntry) {
 	cm.xrayCancel = xrayCancel
 	cm.xrayTmpCfg = xrayTmpPath
 	cm.state = ConnState{
-		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab,
+		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: p.Name,
 		TUNIface: tunIfaceName, StartedAt: time.Now(),
 	}
@@ -1225,6 +1235,7 @@ func removeTUNAdapter() {
 		`Get-NetAdapter -Name 'xc-tun-*' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:$false`,
 	).Run() //nolint:errcheck
 }
+
 
 func stopConnectionLocked(cm *connManager) {
 	cm.mu.Lock()
@@ -1276,7 +1287,7 @@ func stopConnectionLocked(cm *connManager) {
 		pid := cmd.Process.Pid
 		// Force-kill immediately in parallel with Go's kill (whoever wins).
 		go runHidden("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run() //nolint:errcheck
-		cmd.Process.Kill()                                                    //nolint:errcheck
+		cmd.Process.Kill()                                                      //nolint:errcheck
 		waitDone := make(chan struct{})
 		go func() { cmd.Wait(); close(waitDone) }() //nolint:errcheck
 		select {
@@ -1334,7 +1345,7 @@ func setConnError(cm *connManager, entry *ConfigEntry, msg string, tab ...string
 		connTab = tab[0]
 	}
 	cm.mu.Lock()
-	cm.state = ConnState{Status: ConnError, EntryIndex: entry.Index, EntryName: name, ErrMsg: msg, ConnTab: connTab}
+	cm.state = ConnState{Status: ConnError, EntryIndex: entry.Index, EntryName: name, ErrMsg: msg, ConnTab: connTab, ConnRaw: entry.Raw}
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 }
@@ -1699,9 +1710,9 @@ func runSpeedAll() {
 			ent.mu.Lock()
 			ent.PingStatus = StatusTestingPing
 			ent.SpeedStatus = StatusPending
-			ent.SpeedMBps = 0 // reset so sort doesn't use stale value
-			ent.SpeedLive = 0
-			ent.Delay = -1 // reset ping too
+			ent.SpeedMBps   = 0  // reset so sort doesn't use stale value
+			ent.SpeedLive   = 0
+			ent.Delay       = -1 // reset ping too
 			ent.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
 			runPingAndSpeedForEntry(ent, tabID)
@@ -1859,6 +1870,9 @@ func fetchURL(u string) ([]string, error) {
 }
 
 func fetchGitHubPAT() ([]string, error) {
+	if githubPAT == "" || githubOwner == "" {
+		return nil, nil
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	req, err := http.NewRequest("GET", githubAPIURL, nil)
 	if err != nil {
@@ -1897,11 +1911,28 @@ func fetchGitHubPAT() ([]string, error) {
 
 func parseConfigLines(text string) []*ConfigEntry {
 	var entries []*ConfigEntry
+	seen := make(map[string]bool)
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "vless://") {
+		// Extract vless:// URL from anywhere in the line
+		idx := strings.Index(line, "vless://")
+		if idx < 0 {
 			continue
 		}
+		line = line[idx:]
+		// Trim trailing garbage (spaces, markdown links etc)
+		if sp := strings.IndexAny(line, " \t\r"); sp > 0 {
+			line = line[:sp]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Dedup
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
 		e := &ConfigEntry{Raw: line, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
 		p, parseErr := parseVless(line)
 		if parseErr != nil {
@@ -2089,8 +2120,8 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 	go func() {
 		entry.mu.Lock()
 		entry.SpeedStatus = StatusTestingSpeed
-		entry.SpeedMBps = 0
-		entry.SpeedLive = 0
+		entry.SpeedMBps   = 0
+		entry.SpeedLive   = 0
 		entry.mu.Unlock()
 		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
 
@@ -2151,10 +2182,10 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	state.mu.RLock()
 	tabID := state.activeTab
-	var sourceURL string
+	var sourceURLs []string
 	for _, t := range state.tabs {
 		if t.ID == tabID {
-			sourceURL = t.SourceURL
+			sourceURLs = t.SourceURLs
 			break
 		}
 	}
@@ -2162,37 +2193,10 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 
 	if tabID == "main" {
 		go fetchAndInit()
-	} else if sourceURL != "" {
-		// Re-fetch from the tab's source URL
+	} else if len(sourceURLs) > 0 {
 		go func() {
 			state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: tabID})
-			lines, err := fetchURL(sourceURL)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "⚠ reload tab %s: %v\n", tabID, err)
-				// Restore current entries
-				state.mu.RLock()
-				cur := state.tabEntries[tabID]
-				snaps := make([]ConfigEntry, len(cur))
-				for i, e := range cur {
-					snaps[i] = e.snap()
-				}
-				state.mu.RUnlock()
-				state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
-				return
-			}
-			newEntries := parseConfigLines(strings.Join(lines, "\n"))
-			state.mu.Lock()
-			state.tabEntries[tabID] = newEntries
-			if state.activeTab == tabID {
-				state.entries = newEntries
-			}
-			state.mu.Unlock()
-			snaps := make([]ConfigEntry, len(newEntries))
-			for i, e := range newEntries {
-				snaps[i] = e.snap()
-			}
-			state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
-			saveTabs()
+			fetchTabURLs(tabID, sourceURLs)
 		}()
 	} else {
 		// No URL: reset all test results for this tab
@@ -2377,52 +2381,88 @@ func handleTabRename(w http.ResponseWriter, r *http.Request) {
 func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	id := r.URL.Query().Get("id")
-	sourceURL := r.URL.Query().Get("url")
 	if id == "main" {
 		http.Error(w, "cannot set URL on main tab", 400)
 		return
 	}
-	// Check if URL actually changed
-	var oldURL string
+	// Accept JSON body: {urls: [...], refresh_min: N} or legacy query param
+	type tabSettingsReq struct {
+		URLs       []string `json:"urls"`
+		RefreshMin int      `json:"refresh_min"`
+	}
+	var req tabSettingsReq
+	if r.Body != nil {
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+		json.Unmarshal(body, &req)
+	}
+	// Legacy fallback: single URL from query param
+	if len(req.URLs) == 0 {
+		if u := r.URL.Query().Get("url"); u != "" {
+			req.URLs = []string{u}
+		}
+	}
+	// Clean empty URLs
+	var cleanURLs []string
+	for _, u := range req.URLs {
+		u = strings.TrimSpace(u)
+		if u != "" {
+			cleanURLs = append(cleanURLs, u)
+		}
+	}
+
+	var urlsChanged bool
 	state.mu.Lock()
 	for i, t := range state.tabs {
 		if t.ID == id {
-			oldURL = t.SourceURL
-			state.tabs[i].SourceURL = sourceURL
+			oldURLs := strings.Join(t.SourceURLs, "|")
+			newURLs := strings.Join(cleanURLs, "|")
+			urlsChanged = oldURLs != newURLs
+			state.tabs[i].SourceURLs = cleanURLs
+			state.tabs[i].RefreshMin = req.RefreshMin
 			break
 		}
 	}
 	state.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
-	// Only fetch if URL changed AND is not empty
-	if sourceURL != "" && sourceURL != oldURL {
-		go func() {
-			lines, err := fetchURL(sourceURL)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "⚠ tab %s fetch URL: %v\n", id, err)
-				return
-			}
-			newEntries := parseConfigLines(strings.Join(lines, "\n"))
-			state.mu.Lock()
-			// Replace all entries — URL is the source of truth
-			state.tabEntries[id] = newEntries
-			if state.activeTab == id {
-				state.entries = newEntries
-			}
-			state.mu.Unlock()
-			if state.activeTab == id {
-				snaps := make([]ConfigEntry, len(newEntries))
-				for i, e := range newEntries {
-					snaps[i] = e.snap()
-				}
-				state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
-			}
-			saveTabs()
-		}()
+	// Fetch if URLs changed and not empty
+	if urlsChanged && len(cleanURLs) > 0 {
+		go fetchTabURLs(id, cleanURLs)
 	}
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
+}
+
+// fetchTabURLs fetches configs from multiple URLs and replaces tab entries
+func fetchTabURLs(tabID string, urls []string) {
+	var allEntries []*ConfigEntry
+	for _, u := range urls {
+		lines, err := fetchURL(u)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ tab %s fetch %s: %v\n", tabID, u, err)
+			continue
+		}
+		entries := parseConfigLines(strings.Join(lines, "\n"))
+		allEntries = append(allEntries, entries...)
+	}
+	// Re-index
+	for i, e := range allEntries {
+		e.Index = i
+	}
+	state.mu.Lock()
+	state.tabEntries[tabID] = allEntries
+	if state.activeTab == tabID {
+		state.entries = allEntries
+	}
+	state.mu.Unlock()
+	if state.activeTab == tabID {
+		snaps := make([]ConfigEntry, len(allEntries))
+		for i, e := range allEntries {
+			snaps[i] = e.snap()
+		}
+		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
+	}
+	saveTabs()
 }
 
 func handleTabDeleteEntries(w http.ResponseWriter, r *http.Request) {
@@ -2620,20 +2660,12 @@ header{
 .tab-bar{display:flex;gap:2px;align-items:center;flex-shrink:0;overflow-x:auto;max-width:55%}
 .tab-btn{
   all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
-  padding:3px 4px 3px 7px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
+  padding:3px 7px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
   transition:all .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em;
   display:inline-flex;align-items:center;gap:3px;
 }
-.tab-btn.no-close{padding:3px 7px}
 .tab-btn:hover{color:var(--text);border-color:var(--dim)}
 .tab-btn.active{color:var(--accent);border-color:var(--accent)}
-.tab-btn .tab-x{
-  font-size:8px;color:var(--dim);cursor:pointer;opacity:.4;
-  transition:color .12s;flex-shrink:0;
-  display:inline-flex;align-items:center;justify-content:center;
-  width:10px;height:10px;
-}
-.tab-btn .tab-x:hover{opacity:1;color:var(--red)}
 .tab-add{
   all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
   padding:3px 0;min-width:20px;display:flex;align-items:center;justify-content:center;
@@ -2692,6 +2724,11 @@ header{
 .modal-hint{font-size:9px;color:var(--dim);margin-top:-6px;margin-bottom:10px}
 .settings-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border2)}
 .settings-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
+.section-header{font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+.url-row{display:flex;gap:4px;margin-bottom:4px;align-items:center}
+.url-row .modal-input{flex:1;margin-bottom:0}
+.url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:12px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px}
+.url-rm:hover{color:var(--red);background:rgba(248,113,113,.1)}
 
 /* row selection */
 tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px 0 0 var(--accent)}
@@ -2931,7 +2968,7 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, exclude_countries:[], ru_sites_direct:false, direct_domains:[]};
+let appSettingsJS={sources_enabled:true, sources_refresh_min:0, exclude_countries:[], ru_sites_direct:false, direct_domains:[], tray_enabled:false};
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -3042,9 +3079,12 @@ function onConnUpdate(cs){
 
   // highlight row
   document.querySelectorAll('tbody tr.row-cp,tbody tr.row-ct').forEach(r=>{r.classList.remove('row-cp','row-ct')});
-  if((cs.status==='connected'||cs.status==='connecting')&&cs.entry_index>=0&&(!cs.conn_tab||cs.conn_tab===activeTabId)){
-    const row=document.getElementById('r'+cs.entry_index);
-    if(row)row.classList.add(cs.mode==='tun'?'row-ct':'row-cp');
+  if((cs.status==='connected'||cs.status==='connecting')&&(!cs.conn_tab||cs.conn_tab===activeTabId)){
+    var cidx=findConnIdx();
+    if(cidx>=0){
+      const row=document.getElementById('r'+cidx);
+      if(row)row.classList.add(cs.mode==='tun'?'row-ct':'row-cp');
+    }
   }
   rebuildTable();
 }
@@ -3239,10 +3279,23 @@ function renderVisibleRows(){
   restoreConnHighlight();
 }
 
+function findConnIdx(){
+  // Find entry index matching the connected config's raw URL (survives reload)
+  if(!connState.conn_raw) return connState.entry_index;
+  var vals=Object.values(entries);
+  for(var i=0;i<vals.length;i++){
+    if(vals[i].raw===connState.conn_raw) return vals[i].index;
+  }
+  return -1; // not found in current tab
+}
+
 function restoreConnHighlight(){
-  if((connState.status==='connected'||connState.status==='connecting')&&connState.entry_index>=0&&(!connState.conn_tab||connState.conn_tab===activeTabId)){
-    const row=document.getElementById('r'+connState.entry_index);
-    if(row)row.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
+  if((connState.status==='connected'||connState.status==='connecting')&&(!connState.conn_tab||connState.conn_tab===activeTabId)){
+    var idx=findConnIdx();
+    if(idx>=0){
+      var row=document.getElementById('r'+idx);
+      if(row)row.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
+    }
   }
 }
 
@@ -3277,7 +3330,7 @@ function updateRow(idx){
   const pos=parseInt(old.cells[0].textContent)||idx+1;
   const nr=buildRow(e,pos);
   old.replaceWith(nr);
-  if((connState.status==='connected'||connState.status==='connecting')&&connState.entry_index===idx)
+  if((connState.status==='connected'||connState.status==='connecting')&&findConnIdx()===idx)
     nr.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
 }
 
@@ -3285,8 +3338,17 @@ function buildRow(e,pos){
   const tr=document.createElement('tr'); tr.id='r'+e.index;
   if(selectedRows.has(e.index)) tr.classList.add('selected');
   tr.onclick=(ev)=>{
-    if(ev.target.closest('.act-cell'))return; // don't select when clicking action buttons
+    if(ev.target.closest('.act-cell'))return;
     toggleRowSelect(e.index,ev);
+  };
+  tr.oncontextmenu=(ev)=>{
+    ev.preventDefault();
+    if(!selectedRows.has(e.index)){
+      selectedRows.clear();
+      selectedRows.add(e.index);
+      rebuildTable();
+    }
+    showRowMenu(ev,e.index);
   };
 
   let pp='pill pending',pt='—';
@@ -3304,7 +3366,7 @@ function buildRow(e,pos){
   else if(e.speed_status==='skipped'){sp='pill skipped';st='—';}
 
   const nc=(e.network||'tcp').toLowerCase().replace(/[^a-z]/g,'');
-  const isConn=connState&&connState.status==='connected'&&connState.entry_index===e.index&&(!connState.conn_tab||connState.conn_tab===activeTabId);
+  const isConn=connState&&connState.status==='connected'&&(!connState.conn_tab||connState.conn_tab===activeTabId)&&(connState.conn_raw?connState.conn_raw===e.raw:connState.entry_index===e.index);
 
   let connectBtn;
   if(isConn){
@@ -3377,14 +3439,13 @@ function renderTabs(){
     // Hide Sources tab when disabled in settings
     if(t.id==='main' && appSettingsJS.sources_enabled===false) return;
     const btn=document.createElement('button');
-    btn.className='tab-btn'+(t.id===activeTabId?' active':'')+(t.closable?'':' no-close');
+    btn.className='tab-btn'+(t.id===activeTabId?' active':'');
     btn.dataset.id=t.id;
     let html='<span class="tab-label">'+x(t.name)+'</span>';
-    if(t.closable) html+='<span class="tab-x" onclick="event.stopPropagation();deleteTab(\''+t.id+'\')">✕</span>';
     btn.innerHTML=html;
     btn.onclick=()=>switchTab(t.id);
     btn.oncontextmenu=(e)=>{e.preventDefault();showTabMenu(e,t);};
-    btn.onmousedown=(e)=>{if(e.button===0&&!e.target.closest('.tab-x'))startTabDrag(e,t.id);};
+    btn.onmousedown=(e)=>{if(e.button===0)startTabDrag(e,t.id);};
     bar.insertBefore(btn,addBtn);
   });
 }
@@ -3444,6 +3505,61 @@ function deleteTab(id){
 }
 
 // ── Context menu ─────────────────────────────────────────────────────────────
+function showRowMenu(ev,idx){
+  closeCtxMenu();
+  var m=document.createElement('div');
+  m.className='ctx-menu';m.id='ctx-menu';
+  var selCount=selectedRows.size;
+  var label=selCount>1?selCount+' configs':'config';
+  m.innerHTML='<div class="ctx-menu-item" onclick="copySelected();closeCtxMenu()">Copy '+label+'</div>';
+  if(activeTabId!=='main'){
+    m.innerHTML+='<div class="ctx-menu-item danger" onclick="deleteSelectedRows();closeCtxMenu()">Delete '+label+'</div>';
+  }
+  m.style.left=ev.clientX+'px';m.style.top=ev.clientY+'px';
+  document.body.appendChild(m);
+  var rect=m.getBoundingClientRect();
+  if(rect.right>window.innerWidth) m.style.left=(window.innerWidth-rect.width-4)+'px';
+  if(rect.bottom>window.innerHeight) m.style.top=(window.innerHeight-rect.height-4)+'px';
+  setTimeout(()=>document.addEventListener('click',closeCtxMenu,{once:true}),10);
+}
+
+// Right-click on empty table area — paste option
+document.querySelector('.tw').addEventListener('contextmenu',function(ev){
+  if(ev.target.closest('tr'))return; // handled by row menu
+  if(activeTabId==='main')return;
+  ev.preventDefault();
+  closeCtxMenu();
+  var m=document.createElement('div');
+  m.className='ctx-menu';m.id='ctx-menu';
+  m.innerHTML='<div class="ctx-menu-item" onclick="pasteFromClipboard();closeCtxMenu()">Paste configs</div>';
+  m.style.left=ev.clientX+'px';m.style.top=ev.clientY+'px';
+  document.body.appendChild(m);
+  setTimeout(()=>document.addEventListener('click',closeCtxMenu,{once:true}),10);
+});
+
+function pasteFromClipboard(){
+  navigator.clipboard.readText().then(function(text){
+    if(!text||!text.includes('vless://'))return;
+    fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:text}).catch(console.error);
+  }).catch(()=>{});
+}
+
+function copySelected(){
+  var lines=[];
+  [...selectedRows].forEach(function(idx){
+    var e=entries[idx];
+    if(e&&e.raw) lines.push(e.raw);
+  });
+  if(lines.length>0) navigator.clipboard.writeText(lines.join('\n')).catch(()=>{});
+}
+
+function deleteSelectedRows(){
+  if(selectedRows.size===0||activeTabId==='main')return;
+  var indices=[...selectedRows];
+  selectedRows.clear();
+  fetch('/api/tab/delete-entries?id='+activeTabId,{method:'POST',body:JSON.stringify(indices)}).catch(console.error);
+}
+
 function showTabMenu(e,tab){
   closeCtxMenu();
   const m=document.createElement('div');
@@ -3453,7 +3569,7 @@ function showTabMenu(e,tab){
     m.innerHTML+='<div class="ctx-sep"></div>';
     m.innerHTML+='<div class="ctx-menu-item danger" onclick="deleteTab(\''+tab.id+'\');closeCtxMenu()">Delete tab</div>';
   } else {
-    m.innerHTML+='<div class="ctx-menu-item" style="color:var(--dim);cursor:default">Main tab (read-only)</div>';
+    m.innerHTML+='<div class="ctx-menu-item" onclick="openSourcesSettings()">Settings</div>';
   }
   m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px';
   m.style.top=Math.min(e.clientY,window.innerHeight-120)+'px';
@@ -3501,28 +3617,40 @@ function openSettings(){
   ov.innerHTML='<div class="modal-box" style="min-width:400px">'+
     '<div class="modal-title">Settings</div>'+
     '<div class="settings-section">'+
+      '<div class="section-header">Sources</div>'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">Enable Sources tab</span>'+
         '<label class="toggle"><input type="checkbox" id="set-sources-on" '+(appSettingsJS.sources_enabled!==false?'checked':'')+' onchange="toggleSources(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
-      '<div class="modal-label">Exclude countries (Sources tab)</div>'+
+      '<div class="modal-row" style="margin-bottom:4px">'+
+        '<span class="modal-row-label">Exclude countries</span>'+
+      '</div>'+
       '<div class="chips-wrap" id="country-chips">'+chipsHtml+
         '<input class="chip-input" id="country-input" placeholder="Type country, press Enter" onkeydown="countryChipKey(event)">'+
       '</div>'+
       '<div class="modal-hint">Configs with matching name will be hidden. Applied on Reload.</div>'+
     '</div>'+
     '<div class="settings-section">'+
-      '<div class="modal-label" style="margin-bottom:8px">Routing</div>'+
+      '<div class="section-header">Routing</div>'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">Russian sites without VPN</span>'+
         '<label class="toggle"><input type="checkbox" id="set-ru-direct" '+(appSettingsJS.ru_sites_direct?'checked':'')+' onchange="toggleRuSites(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
       '<div class="modal-hint">Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.</div>'+
-      '<div class="modal-label" style="margin-top:10px">Custom domains without VPN</div>'+
+      '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
+        '<span class="modal-row-label">Custom domains without VPN</span>'+
+      '</div>'+
       '<div class="chips-wrap" id="domain-chips">'+domainChipsHtml+
         '<input class="chip-input" id="domain-input" placeholder="e.g. vk.com, press Enter" onkeydown="domainChipKey(event)">'+
       '</div>'+
       '<div class="modal-hint">Enter a domain — all its subdomains are included automatically. Takes effect on next connection.</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">System</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">Minimize to tray on close</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-tray" '+(appSettingsJS.tray_enabled?'checked':'')+' onchange="toggleTray(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
     '</div>'+
     '<div class="modal-btns">'+
       '<button class="btn ghost" onclick="document.getElementById(\'settings-modal\').remove()">close</button>'+
@@ -3554,6 +3682,13 @@ function toggleRuSites(on){
   appSettingsJS.ru_sites_direct=on;
   saveAppSettings();
 }
+
+function toggleTray(on){
+  appSettingsJS.tray_enabled=on;
+  saveAppSettings();
+  if(typeof _goToggleTray==='function') _goToggleTray(on);
+}
+
 
 function countryChipKey(ev){
   if(ev.key!=='Enter')return;
@@ -3626,20 +3761,56 @@ function removeDomainChip(el){
   saveAppSettings();
 }
 
+function openSourcesSettings(){
+  closeCtxMenu();
+  if(document.getElementById('tab-modal'))return;
+  var ov=document.createElement('div');
+  ov.className='modal-overlay';ov.id='tab-modal';
+  ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
+  ov.innerHTML=
+    '<div class="modal-box">'+
+      '<div class="modal-title">Sources Settings</div>'+
+      '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
+      '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(appSettingsJS.sources_refresh_min||0)+'" style="width:80px">'+
+      '<div class="modal-btns">'+
+        '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">cancel</button>'+
+        '<button class="btn ghost" onclick="saveSourcesSettings()">save</button>'+
+      '</div>'+
+    '</div>';
+  document.body.appendChild(ov);
+}
+function saveSourcesSettings(){
+  appSettingsJS.sources_refresh_min=parseInt(document.getElementById('ms-src-refresh').value)||0;
+  saveAppSettings();
+  document.getElementById('tab-modal').remove();
+}
+
 function openTabSettings(tabId){
   closeCtxMenu();
   const tab=tabsList.find(t=>t.id===tabId);
   if(!tab)return;
+  // Get URLs: prefer source_urls array, fall back to legacy source_url
+  var urls=tab.source_urls||[];
+  if(urls.length===0&&tab.source_url) urls=[tab.source_url];
+  var urlsHtml='';
+  for(var i=0;i<urls.length;i++){
+    urlsHtml+='<div class="url-row"><input class="modal-input ms-url" value="'+x(urls[i])+'" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button></div>';
+  }
+  if(urls.length===0) urlsHtml='<div class="url-row"><input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button></div>';
+
   const ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='tab-modal';
   ov.onclick=(e)=>{if(e.target===ov)ov.remove();};
   ov.innerHTML=
-    '<div class="modal-box">'+
+    '<div class="modal-box" style="min-width:440px">'+
       '<div class="modal-title">Tab Settings</div>'+
       '<div class="modal-label">Name</div>'+
       '<input class="modal-input" id="ms-name" value="'+x(tab.name)+'" maxlength="40">'+
-      '<div class="modal-label">Source URL (raw GitHub link)</div>'+
-      '<input class="modal-input" id="ms-url" value="'+x(tab.source_url||'')+'" placeholder="https://raw.githubusercontent.com/...">'+
+      '<div class="modal-label">Source URLs (raw links, base64 subscriptions)</div>'+
+      '<div id="ms-urls">'+urlsHtml+'</div>'+
+      '<button class="btn ghost" style="font-size:9px;margin:4px 0 8px" onclick="addURLRow()">+ add URL</button>'+
+      '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
+      '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px">'+
       '<div class="modal-btns">'+
         '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">cancel</button>'+
         '<button class="btn ghost" onclick="saveTabSettings(\''+tabId+'\')">save</button>'+
@@ -3649,14 +3820,32 @@ function openTabSettings(tabId){
   document.getElementById('ms-name').focus();
   document.getElementById('ms-name').select();
 }
+function addURLRow(){
+  var wrap=document.getElementById('ms-urls');
+  if(!wrap)return;
+  var div=document.createElement('div');
+  div.className='url-row';
+  div.innerHTML='<input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button>';
+  wrap.appendChild(div);
+  div.querySelector('input').focus();
+}
 function saveTabSettings(tabId){
-  const name=document.getElementById('ms-name').value.trim();
-  const url=document.getElementById('ms-url').value.trim();
+  var name=document.getElementById('ms-name').value.trim();
+  var refreshMin=parseInt(document.getElementById('ms-refresh').value)||0;
+  var urlInputs=document.querySelectorAll('#ms-urls .ms-url');
+  var urls=[];
+  urlInputs.forEach(function(inp){
+    var v=inp.value.trim();
+    if(v) urls.push(v);
+  });
   document.getElementById('tab-modal').remove();
   if(name){
     fetch('/api/tab/rename?id='+encodeURIComponent(tabId)+'&name='+encodeURIComponent(name),{method:'POST'}).catch(console.error);
   }
-  fetch('/api/tab/set-url?id='+encodeURIComponent(tabId)+'&url='+encodeURIComponent(url),{method:'POST'}).catch(console.error);
+  fetch('/api/tab/set-url?id='+encodeURIComponent(tabId),{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({urls:urls,refresh_min:refreshMin})
+  }).catch(console.error);
 }
 
 // ── Row selection + delete ───────────────────────────────────────────────────
@@ -3666,11 +3855,9 @@ document.addEventListener('keydown',function(e){
     if(document.activeElement&&(document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA'))return;
     e.preventDefault();
     e.stopPropagation();
-    if(activeTabId!=='main'){
-      selectedRows.clear();
-      Object.values(entries).forEach(en=>selectedRows.add(en.index));
-      rebuildTable();
-    }
+    selectedRows.clear();
+    Object.values(entries).forEach(en=>selectedRows.add(en.index));
+    rebuildTable();
     return;
   }
   if((e.key==='Delete'||e.key==='Backspace')&&selectedRows.size>0&&activeTabId!=='main'){
@@ -3685,7 +3872,6 @@ document.addEventListener('keydown',function(e){
 },true);
 
 function toggleRowSelect(idx,e){
-  if(activeTabId==='main')return;
   if(e&&e.shiftKey&&selectedRows.size>0){
     // Range select
     const all=Object.values(entries).filter(matches).sort((a,b)=>a.index-b.index);
@@ -3705,11 +3891,6 @@ function toggleRowSelect(idx,e){
   rebuildTable();
 }
 
-function deleteSelectedRows(){
-  const indices=[...selectedRows];
-  selectedRows.clear();
-  fetch('/api/tab/delete-entries?id='+activeTabId,{method:'POST',body:JSON.stringify(indices)}).catch(console.error);
-}
 
 // ── Ctrl+V paste handler ─────────────────────────────────────────────────────
 document.addEventListener('paste', function(e){
@@ -3836,6 +4017,41 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// startAutoRefresh periodically checks all tabs and refreshes those with RefreshMin > 0.
+// For Sources tab, it uses the same interval logic.
+func startAutoRefresh() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	lastRefresh := make(map[string]time.Time)
+	for range ticker.C {
+		// Check Sources tab
+		settingsMu.RLock()
+		srcMin := appSettings.SourcesRefreshMin
+		srcEnabled := appSettings.SourcesEnabled
+		settingsMu.RUnlock()
+		if srcEnabled && srcMin > 0 {
+			if time.Since(lastRefresh["main"]) >= time.Duration(srcMin)*time.Minute {
+				lastRefresh["main"] = time.Now()
+				go fetchAndInit()
+			}
+		}
+		// Check custom tabs
+		state.mu.RLock()
+		tabs := make([]Tab, len(state.tabs))
+		copy(tabs, state.tabs)
+		state.mu.RUnlock()
+		for _, t := range tabs {
+			if t.IsMain || t.RefreshMin <= 0 || len(t.SourceURLs) == 0 {
+				continue
+			}
+			if time.Since(lastRefresh[t.ID]) >= time.Duration(t.RefreshMin)*time.Minute {
+				lastRefresh[t.ID] = time.Now()
+				go fetchTabURLs(t.ID, t.SourceURLs)
+			}
+		}
+	}
+}
+
 func registerRoutes() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -3934,6 +4150,7 @@ func main() {
 	registerRoutes()
 	loadTabs()
 	loadSettings()
+	go startAutoRefresh()
 	go fetchAndInit()
 	if err := httpListenAndServe(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

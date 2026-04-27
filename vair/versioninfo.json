@@ -1,7 +1,7 @@
 {
   "FixedFileInfo": {
-    "FileVersion": {"Major": 1, "Minor": 0, "Patch": 0, "Build": 0},
-    "ProductVersion": {"Major": 1, "Minor": 0, "Patch": 0, "Build": 0},
+    "FileVersion": {"Major": 1, "Minor": 2, "Patch": 0, "Build": 0},
+    "ProductVersion": {"Major": 1, "Minor": 2, "Patch": 0, "Build": 0},
     "FileFlagsMask": "3f",
     "FileFlags ": "00",
     "FileOS": "040004",
@@ -12,14 +12,14 @@
     "Comments": "",
     "CompanyName": "",
     "FileDescription": "Vair",
-    "FileVersion": "1.1.1.0",
+    "FileVersion": "1.2.0.0",
     "InternalName": "Vair",
     "LegalCopyright": "",
     "LegalTrademarks": "",
     "OriginalFilename": "Vair.exe",
     "PrivateBuild": "",
     "ProductName": "Vair",
-    "ProductVersion": "1.1.1",
+    "ProductVersion": "1.2.0.0",
     "SpecialBuild": ""
   },
   "VarFileInfo": {
