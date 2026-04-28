@@ -2620,11 +2620,14 @@ input,textarea{user-select:text;-webkit-user-select:text}
 .mpill:hover{color:var(--text);border-color:var(--dim)}
 .mpill.sel-proxy{color:var(--green);border-color:var(--green);background:rgba(74,222,128,.08)}
 .mpill.sel-tun  {color:var(--blue); border-color:var(--blue); background:rgba(96,165,250,.08)}
-.mpill.off{opacity:.28;pointer-events:none;cursor:default}
+.mpill.off{opacity:1;cursor:pointer;color:var(--dim);border-color:var(--border2)}
+.mpill.off:hover{color:var(--text);border-color:var(--dim)}
 .mode-wrap .mtip{
-  font-size:10px;color:var(--dim);border:1px solid var(--border2);border-radius:3px;
-  padding:2px 7px;background:var(--bg3);white-space:nowrap;
+  font-size:10px;color:var(--accent);border:1px solid rgba(232,197,71,.3);border-radius:3px;
+  padding:2px 7px;background:rgba(232,197,71,.06);white-space:nowrap;cursor:pointer;
+  transition:all .15s;
 }
+.mode-wrap .mtip:hover{background:rgba(232,197,71,.12);border-color:rgba(232,197,71,.5)}
 
 /* header */
 header{
@@ -3003,7 +3006,15 @@ function onAppInfo(info){
   if(!tunOk){
     tunBtn.classList.add('off');
     tip.style.display='';
-    tip.textContent=!info.singbox_available?'sing-box not found':'requires admin/root';
+    if(!info.singbox_available){
+      tip.textContent='sing-box not found';
+      tip.onclick=null;
+      tip.style.cursor='default';
+    } else {
+      tip.textContent='requires admin ↗';
+      tip.onclick=function(){ fetch('/api/restart-admin',{method:'POST'}); };
+      tip.title='Restart Vair as Administrator';
+    }
   } else {
     tunBtn.classList.remove('off');
     tip.style.display='none';
@@ -3012,7 +3023,12 @@ function onAppInfo(info){
 }
 
 function setMode(m){
-  if(m==='tun'&&(!appInfo.singbox_available||!appInfo.is_admin))return;
+  if(m==='tun'&&(!appInfo.singbox_available||!appInfo.is_admin)){
+    if(appInfo.singbox_available&&!appInfo.is_admin){
+      fetch('/api/restart-admin',{method:'POST'});
+    }
+    return;
+  }
   selectedMode=m;
   document.getElementById('mp-proxy').className='mpill'+(m==='proxy'?' sel-proxy':'');
   document.getElementById('mp-tun').className  ='mpill'+(m==='tun'?' sel-tun':'')
@@ -3873,9 +3889,8 @@ document.addEventListener('keydown',function(e){
 
 function toggleRowSelect(idx,e){
   if(e&&e.shiftKey&&selectedRows.size>0){
-    // Range select
-    const all=Object.values(entries).filter(matches).sort((a,b)=>a.index-b.index);
-    const idxs=all.map(en=>en.index);
+    // Range select using current visual order (sortedList)
+    const idxs=sortedList.map(en=>en.index);
     const lastSel=[...selectedRows].pop();
     const from=idxs.indexOf(lastSel),to=idxs.indexOf(idx);
     if(from>=0&&to>=0){
@@ -4052,6 +4067,18 @@ func startAutoRefresh() {
 	}
 }
 
+func handleRestartAdmin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(200)
+	w.Write([]byte("restarting"))
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		stopConnection()
+		killOrphanedXray()
+		restartAsAdmin()
+	}()
+}
+
 func registerRoutes() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -4075,6 +4102,7 @@ func registerRoutes() {
 	http.HandleFunc("/api/tab/delete-entries", handleTabDeleteEntries)
 	http.HandleFunc("/api/tab/reorder", handleTabReorder)
 	http.HandleFunc("/api/settings", handleSettings)
+	http.HandleFunc("/api/restart-admin", handleRestartAdmin)
 }
 
 func httpListenAndServe() error {

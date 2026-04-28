@@ -125,7 +125,7 @@ func prewarmBinary(binPath string) {
 // ── Win32 ─────────────────────────────────────────────────────────────────────
 
 var (
-	user32 = windows.NewLazySystemDLL("user32.dll")
+	user32  = windows.NewLazySystemDLL("user32.dll")
 	dwmapi = windows.NewLazySystemDLL("dwmapi.dll")
 
 	procGetWindowLongW              = user32.NewProc("GetWindowLongW")
@@ -387,7 +387,7 @@ func init() {
 				if visible != 0 {
 					procShowWindow.Call(hwnd, swHide)
 				} else {
-					procShowWindow.Call(hwnd, swShow)
+					procShowWindow.Call(hwnd, swRestore)
 					procSetForegroundWindow.Call(hwnd)
 				}
 			case wmRbuttonup:
@@ -543,6 +543,33 @@ func openNativeWindow(addr string) {
 		addTrayIcon(hwnd, filepath.Join(binDir, "icon.ico"))
 	}
 
+	// Periodically update tray tooltip with connection info
+	go func() {
+		lastTip := ""
+		for {
+			time.Sleep(2 * time.Second)
+			settingsMu.RLock()
+			on := appSettings.TrayEnabled
+			settingsMu.RUnlock()
+			if !on {
+				continue
+			}
+			cs := state.conn.snap()
+			tip := "Vair"
+			if cs.Status == ConnConnected {
+				mode := "Proxy"
+				if cs.Mode == ModeTUN {
+					mode = "TUN"
+				}
+				tip = fmt.Sprintf("Vair — %s [%s]", cs.EntryName, mode)
+			}
+			if tip != lastTip {
+				updateTrayTooltip(hwnd, tip)
+				lastTip = tip
+			}
+		}
+	}()
+
 	// ── JS bindings ───────────────────────────────────────────────────────────
 	icoFullPath := filepath.Join(binDir, "icon.ico")
 
@@ -675,10 +702,10 @@ type point struct{ X, Y int32 }
 const (
 	mfString    = 0x00000000
 	mfSeparator = 0x00000800
-	tpmRightAlign = 0x0008
+	mfGreyed    = 0x00000001
 )
 
-var trayMainHwnd uintptr // stored so showTrayMenu can post WM_CLOSE
+var trayMainHwnd uintptr
 
 func showTrayMenu(hwnd uintptr) {
 	trayMainHwnd = hwnd
@@ -686,37 +713,98 @@ func showTrayMenu(hwnd uintptr) {
 	if hMenu == 0 {
 		return
 	}
-	showW, _ := syscall.UTF16PtrFromString("Show")
-	disconnectW, _ := syscall.UTF16PtrFromString("Disconnect")
-	exitW, _ := syscall.UTF16PtrFromString("Exit")
 
-	procInsertMenuW.Call(hMenu, 0, mfString, 1001, uintptr(unsafe.Pointer(showW)))
-	procInsertMenuW.Call(hMenu, 1, mfString, 1002, uintptr(unsafe.Pointer(disconnectW)))
-	procInsertMenuW.Call(hMenu, 2, mfSeparator, 0, 0)
-	procInsertMenuW.Call(hMenu, 3, mfString, 1003, uintptr(unsafe.Pointer(exitW)))
+	// Check connection state
+	cs := state.conn.snap()
+	isConnected := cs.Status == ConnConnected
+
+	menuIdx := uint32(0)
+
+	if isConnected {
+		// Show connected config name (greyed, informational)
+		mode := "Proxy"
+		if cs.Mode == ModeTUN {
+			mode = "TUN"
+		}
+		label := fmt.Sprintf("● %s [%s]", cs.EntryName, mode)
+		labelW, _ := syscall.UTF16PtrFromString(label)
+		procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString|mfGreyed, 0, uintptr(unsafe.Pointer(labelW)))
+		menuIdx++
+		procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfSeparator, 0, 0)
+		menuIdx++
+	}
+
+	showW, _ := syscall.UTF16PtrFromString("Show")
+	procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString, 1001, uintptr(unsafe.Pointer(showW)))
+	menuIdx++
+
+	if isConnected {
+		disconnectW, _ := syscall.UTF16PtrFromString("Disconnect")
+		procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString, 1002, uintptr(unsafe.Pointer(disconnectW)))
+		menuIdx++
+	}
+
+	procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfSeparator, 0, 0)
+	menuIdx++
+	exitW, _ := syscall.UTF16PtrFromString("Exit")
+	procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString, 1003, uintptr(unsafe.Pointer(exitW)))
 
 	var pt point
 	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
 	procSetForegroundWindow.Call(hwnd)
-	cmd, _, _ := procTrackPopupMenu.Call(hMenu, 0x0100, uintptr(pt.X), uintptr(pt.Y), 0, hwnd, 0) // TPM_RETURNCMD=0x100
+	cmd, _, _ := procTrackPopupMenu.Call(hMenu, 0x0100, uintptr(pt.X), uintptr(pt.Y), 0, hwnd, 0)
 	procDestroyMenu.Call(hMenu)
 
 	switch cmd {
-	case 1001: // Show
-		procShowWindow.Call(hwnd, swShow)
+	case 1001:
+		procShowWindow.Call(hwnd, swRestore)
 		procSetForegroundWindow.Call(hwnd)
-	case 1002: // Disconnect
-		go stopConnection()
-	case 1003: // Exit
+	case 1002:
+		go func() {
+			stopConnection()
+			// Update tray tooltip
+			updateTrayTooltip(hwnd, "Vair")
+		}()
+	case 1003:
 		removeTrayIcon(hwnd)
 		procPostMessageW.Call(hwnd, wmClose, 0, 0)
 	}
 }
 
-func standaloneMain() {
-	fresh, err := extractBinaries()
+// updateTrayTooltip updates the tray icon tooltip text
+func updateTrayTooltip(hwnd uintptr, text string) {
+	var nid notifyIconData
+	nid.CbSize = uint32(unsafe.Sizeof(nid))
+	nid.HWnd = hwnd
+	nid.UID = 1
+	nid.UFlags = nifTip
+	tip, _ := syscall.UTF16FromString(text)
+	copy(nid.SzTip[:], tip)
+	procShellNotifyIconW.Call(0x00000001, uintptr(unsafe.Pointer(&nid))) // NIM_MODIFY
+}
+
+// restartAsAdmin relaunches the current exe with admin privileges via UAC prompt
+func restartAsAdmin() {
+	exe, err := os.Executable()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Startup error: %v\n", err)
+		return
+	}
+	verbW, _ := syscall.UTF16PtrFromString("runas")
+	exeW, _ := syscall.UTF16PtrFromString(exe)
+	dirW, _ := syscall.UTF16PtrFromString(filepath.Dir(exe))
+	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(verbW)),
+		uintptr(unsafe.Pointer(exeW)), 0, uintptr(unsafe.Pointer(dirW)), 1) // SW_SHOWNORMAL=1
+	os.Exit(0)
+}
+
+var (
+	procShellExecuteW = shell32.NewProc("ShellExecuteW")
+)
+
+func standaloneMain() {
+	fresh, extractErr := extractBinaries()
+	if extractErr != nil {
+		fmt.Fprintf(os.Stderr, "Startup error: %v\n", extractErr)
 		os.Exit(1)
 	}
 	if fresh {
