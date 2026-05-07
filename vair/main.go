@@ -33,6 +33,7 @@ type SourceDef struct {
 
 var sourceDefs = []SourceDef{
 	{"https://raw.githubusercontent.com/lm705/vair/refs/heads/main/vless_alive.txt", ""},
+	{"https://raw.githack.com/lm705/vair/main/vless_alive.txt", ""}, // fallback
 }
 
 const (
@@ -100,8 +101,6 @@ func randomHex(n int) string {
 
 type AppSettings struct {
 	SourcesEnabled     bool     `json:"sources_enabled"`
-	SourcesRefreshMin  int      `json:"sources_refresh_min"`
-	ExcludeCountries   []string `json:"exclude_countries"`
 	RuSitesDirect      bool     `json:"ru_sites_direct"`
 	DirectDomains      []string `json:"direct_domains"`
 	TrayEnabled        bool     `json:"tray_enabled"`
@@ -132,10 +131,7 @@ func saveSettings() {
 	os.WriteFile(settingsFilePath(), data, 0644)
 }
 
-func shouldSkip(name string) bool {
-	settingsMu.RLock()
-	countries := appSettings.ExcludeCountries
-	settingsMu.RUnlock()
+func shouldSkip(name string, countries []string) bool {
 	if len(countries) == 0 {
 		return false
 	}
@@ -266,23 +262,24 @@ func (cm *connManager) snap() ConnState {
 // ─────────────────────────── tabs ───────────────────────────────
 
 type Tab struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	IsMain     bool     `json:"is_main"`
-	Closable   bool     `json:"closable"`
-	SourceURL  string   `json:"source_url,omitempty"`  // legacy single URL (backward compat)
-	SourceURLs []string `json:"source_urls,omitempty"` // multiple source URLs
-	RefreshMin int      `json:"refresh_min,omitempty"` // auto-refresh interval in minutes (0=disabled)
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	IsMain         bool     `json:"is_main"`
+	Closable       bool     `json:"closable"`
+	SourceURL      string   `json:"source_url,omitempty"`
+	SourceURLs     []string `json:"source_urls,omitempty"`
+	RefreshMin     int      `json:"refresh_min,omitempty"`
+	ExcludeFilter  []string `json:"exclude_filter,omitempty"`
 }
 
-// persistedTab is the JSON structure saved to disk
 type persistedTab struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	SourceURL  string   `json:"source_url,omitempty"`
-	SourceURLs []string `json:"source_urls,omitempty"`
-	RefreshMin int      `json:"refresh_min,omitempty"`
-	Configs    []string `json:"configs,omitempty"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	SourceURL      string   `json:"source_url,omitempty"`
+	SourceURLs     []string `json:"source_urls,omitempty"`
+	RefreshMin     int      `json:"refresh_min,omitempty"`
+	ExcludeFilter  []string `json:"exclude_filter,omitempty"`
+	Configs        []string `json:"configs,omitempty"`
 }
 type persistedData struct {
 	Tabs []persistedTab `json:"tabs"`
@@ -341,20 +338,20 @@ func saveTabs() {
 	state.mu.RLock()
 	var pd persistedData
 	for _, t := range state.tabs {
-		if t.IsMain {
-			continue
-		}
 		pt := persistedTab{
 			ID: t.ID, Name: t.Name,
 			SourceURLs: t.SourceURLs, RefreshMin: t.RefreshMin,
+			ExcludeFilter: t.ExcludeFilter,
 		}
-		// Legacy compat: save single URL too if only one
 		if len(t.SourceURLs) == 1 {
 			pt.SourceURL = t.SourceURLs[0]
 		}
-		if entries, ok := state.tabEntries[t.ID]; ok {
-			for _, e := range entries {
-				pt.Configs = append(pt.Configs, e.Raw)
+		// Don't persist configs for main tab (fetched on startup)
+		if !t.IsMain {
+			if entries, ok := state.tabEntries[t.ID]; ok {
+				for _, e := range entries {
+					pt.Configs = append(pt.Configs, e.Raw)
+				}
 			}
 		}
 		pd.Tabs = append(pd.Tabs, pt)
@@ -375,7 +372,7 @@ func saveTabs() {
 func loadTabs() {
 	data, err := os.ReadFile(tabsFilePath())
 	if err != nil {
-		return // no saved data
+		return
 	}
 	var pd persistedData
 	if err := json.Unmarshal(data, &pd); err != nil {
@@ -385,14 +382,24 @@ func loadTabs() {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	for _, pt := range pd.Tabs {
-		// Migrate legacy single URL to SourceURLs
+		// Main tab: update settings only (ExcludeFilter, RefreshMin)
+		if pt.ID == "main" {
+			for i, t := range state.tabs {
+				if t.ID == "main" {
+					state.tabs[i].ExcludeFilter = pt.ExcludeFilter
+					state.tabs[i].RefreshMin = pt.RefreshMin
+					break
+				}
+			}
+			continue
+		}
 		urls := pt.SourceURLs
 		if len(urls) == 0 && pt.SourceURL != "" {
 			urls = []string{pt.SourceURL}
 		}
 		tab := Tab{
 			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
-			SourceURLs: urls, RefreshMin: pt.RefreshMin,
+			SourceURLs: urls, RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter,
 		}
 		state.tabs = append(state.tabs, tab)
 		entries := parseConfigLines(strings.Join(pt.Configs, "\n"))
@@ -1623,39 +1630,92 @@ func cleanPingErr(e error) string {
 
 // ─────────────────────────── bulk runners ────────────────────────
 
+var (
+	pingCancelCh  chan struct{}
+	speedCancelCh chan struct{}
+	testMu        sync.Mutex
+	testingTab    string // which tab is being tested
+)
+
+func cancelPingAll() {
+	testMu.Lock()
+	if pingCancelCh != nil {
+		select {
+		case <-pingCancelCh:
+		default:
+			close(pingCancelCh)
+		}
+	}
+	testMu.Unlock()
+}
+
+func cancelSpeedAll() {
+	testMu.Lock()
+	if speedCancelCh != nil {
+		select {
+		case <-speedCancelCh:
+		default:
+			close(speedCancelCh)
+		}
+	}
+	testMu.Unlock()
+}
+
+func isTestCancelled(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 func runPingAll() {
+	// If speed is running, cancel it only (don't start ping)
+	if atomic.LoadInt32(&state.speedRunning) == 1 {
+		cancelSpeedAll()
+		return
+	}
+	// If ping is running, cancel it
+	if atomic.LoadInt32(&state.pingRunning) == 1 {
+		cancelPingAll()
+		return
+	}
 	if !atomic.CompareAndSwapInt32(&state.pingRunning, 0, 1) {
 		return
 	}
+	testMu.Lock()
+	pingCancelCh = make(chan struct{})
+	cancelCh := pingCancelCh
+	testMu.Unlock()
 	defer atomic.StoreInt32(&state.pingRunning, 0)
 	state.mu.RLock()
 	entries := make([]*ConfigEntry, len(state.entries))
 	copy(entries, state.entries)
 	tabID := state.activeTab
 	state.mu.RUnlock()
+	testMu.Lock()
+	testingTab = tabID
+	testMu.Unlock()
 	state.broadcast(SSEEvent{Type: "bulk_ping_start", Payload: len(entries), Tab: tabID})
 	sem := make(chan struct{}, pingConcurrency)
 	var wg sync.WaitGroup
 	var done int64
 	for _, e := range entries {
+		if isTestCancelled(cancelCh) { break }
 		wg.Add(1)
 		go func(ent *ConfigEntry) {
 			defer wg.Done()
-			// Skip if tab was deleted during test
 			state.mu.RLock()
 			cancelled := state.cancelledTabs[tabID]
 			state.mu.RUnlock()
-			if cancelled {
+			if cancelled || isTestCancelled(cancelCh) {
 				atomic.AddInt64(&done, 1)
 				return
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			// Re-check after semaphore wait (tab might be deleted while queued)
-			state.mu.RLock()
-			cancelled2 := state.cancelledTabs[tabID]
-			state.mu.RUnlock()
-			if cancelled2 {
+			if isTestCancelled(cancelCh) {
 				atomic.AddInt64(&done, 1)
 				return
 			}
@@ -1670,71 +1730,79 @@ func runPingAll() {
 		}(e)
 	}
 	wg.Wait()
-	state.broadcast(SSEEvent{Type: "bulk_ping_done", Payload: nil, Tab: tabID})
+	state.broadcast(SSEEvent{Type: "bulk_ping_done", Tab: tabID})
 }
 
 func runSpeedAll() {
+	// If ping is running, cancel it only (don't start speed)
+	if atomic.LoadInt32(&state.pingRunning) == 1 {
+		cancelPingAll()
+		return
+	}
+	// If speed is running, cancel it
+	if atomic.LoadInt32(&state.speedRunning) == 1 {
+		cancelSpeedAll()
+		return
+	}
 	if !atomic.CompareAndSwapInt32(&state.speedRunning, 0, 1) {
 		return
 	}
+	testMu.Lock()
+	speedCancelCh = make(chan struct{})
+	cancelCh := speedCancelCh
+	testMu.Unlock()
 	defer atomic.StoreInt32(&state.speedRunning, 0)
 	state.mu.RLock()
 	entries := make([]*ConfigEntry, len(state.entries))
 	copy(entries, state.entries)
 	tabID := state.activeTab
 	state.mu.RUnlock()
+	testMu.Lock()
+	testingTab = tabID
+	testMu.Unlock()
 	state.broadcast(SSEEvent{Type: "bulk_speed_start", Payload: len(entries), Tab: tabID})
 	sem := make(chan struct{}, pingSpeedConcurrency)
 	var wg sync.WaitGroup
 	var done int64
 	for _, e := range entries {
+		if isTestCancelled(cancelCh) { break }
 		wg.Add(1)
 		go func(ent *ConfigEntry) {
 			defer wg.Done()
 			state.mu.RLock()
 			cancelled := state.cancelledTabs[tabID]
 			state.mu.RUnlock()
-			if cancelled {
+			if cancelled || isTestCancelled(cancelCh) {
 				atomic.AddInt64(&done, 1)
 				return
 			}
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			state.mu.RLock()
-			cancelled2 := state.cancelledTabs[tabID]
-			state.mu.RUnlock()
-			if cancelled2 {
+			if isTestCancelled(cancelCh) {
 				atomic.AddInt64(&done, 1)
 				return
 			}
 			ent.mu.Lock()
 			ent.PingStatus = StatusTestingPing
-			ent.SpeedStatus = StatusPending
-			ent.SpeedMBps   = 0  // reset so sort doesn't use stale value
-			ent.SpeedLive   = 0
-			ent.Delay       = -1 // reset ping too
 			ent.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
-			runPingAndSpeedForEntry(ent, tabID)
+			runSpeedForEntry(ent, tabID)
 			n := atomic.AddInt64(&done, 1)
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
 			state.broadcast(SSEEvent{Type: "bulk_speed_progress", Payload: map[string]interface{}{"done": n, "total": int64(len(entries))}, Tab: tabID})
 		}(e)
 	}
 	wg.Wait()
-	state.broadcast(SSEEvent{Type: "bulk_speed_done", Payload: nil, Tab: tabID})
+	state.broadcast(SSEEvent{Type: "bulk_speed_done", Tab: tabID})
 }
 
-// ─────────────────────────── fetch ───────────────────────────────
 
 func fetchAndInit() {
-	// Check if Sources tab is enabled
 	settingsMu.RLock()
 	sourcesEnabled := appSettings.SourcesEnabled
 	settingsMu.RUnlock()
 
 	if !sourcesEnabled {
-		// Sources disabled — set empty entries for main tab
 		state.mu.Lock()
 		state.tabEntries["main"] = nil
 		if state.activeTab == "main" {
@@ -1752,7 +1820,7 @@ func fetchAndInit() {
 	}
 	var raws []string
 
-	// 1. Fetch from public sources
+	// Fetch from sources (with fallback — if first succeeds, skip rest)
 	for _, src := range sourceDefs {
 		lines, err := fetchURL(src.URL)
 		if err != nil {
@@ -1761,18 +1829,48 @@ func fetchAndInit() {
 		}
 		raws = append(raws, lines...)
 		fmt.Printf("ℹ  fetched %d configs from %s\n", len(lines), src.URL)
+		break // success — don't try fallback
 	}
 
-	// 2. Fetch from private GitHub repo via PAT
+	// Fetch from private GitHub repo via PAT
 	ghLines, err := fetchGitHubPAT()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "⚠  GitHub PAT fetch: %v\n", err)
 	} else {
 		raws = append(raws, ghLines...)
-		fmt.Printf("ℹ  fetched %d configs from GitHub PAT\n", len(ghLines))
+		if len(ghLines) > 0 {
+			fmt.Printf("ℹ  fetched %d configs from GitHub PAT\n", len(ghLines))
+		}
 	}
 
-	// Deduplicate by raw URL
+	// If nothing fetched, keep existing entries
+	if len(raws) == 0 {
+		fmt.Fprintf(os.Stderr, "⚠  no configs fetched, keeping existing\n")
+		state.mu.RLock()
+		cur := state.tabEntries["main"]
+		state.mu.RUnlock()
+		if state.activeTab == "main" && cur != nil {
+			snaps := make([]ConfigEntry, len(cur))
+			for i, e := range cur {
+				snaps[i] = e.snap()
+			}
+			state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
+		}
+		return
+	}
+
+	// Get main tab's exclude filter
+	state.mu.RLock()
+	var excludeFilter []string
+	for _, t := range state.tabs {
+		if t.IsMain {
+			excludeFilter = t.ExcludeFilter
+			break
+		}
+	}
+	state.mu.RUnlock()
+
+	// Deduplicate
 	seen := make(map[string]bool, len(raws))
 	var deduped []string
 	for _, r := range raws {
@@ -1792,7 +1890,7 @@ func fetchAndInit() {
 			e.PingErr = parseErr.Error()
 			e.SpeedStatus = StatusFailed
 			e.SpeedErr = parseErr.Error()
-		} else if shouldSkip(p.Name) {
+		} else if shouldSkip(p.Name, excludeFilter) {
 			continue
 		} else {
 			e.Name = p.Name
@@ -2158,10 +2256,6 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 
 func handlePingAll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if atomic.LoadInt32(&state.pingRunning) == 1 {
-		http.Error(w, "already running", 409)
-		return
-	}
 	go runPingAll()
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
@@ -2169,11 +2263,35 @@ func handlePingAll(w http.ResponseWriter, r *http.Request) {
 
 func handleSpeedAll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	if atomic.LoadInt32(&state.speedRunning) == 1 {
-		http.Error(w, "already running", 409)
+	go runSpeedAll()
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
+func handleTestsCancel(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	tabID := r.URL.Query().Get("tab")
+	testMu.Lock()
+	onThisTab := tabID == "" || testingTab == "" || testingTab == tabID
+	testMu.Unlock()
+	if !onThisTab {
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
 		return
 	}
-	go runSpeedAll()
+	if atomic.LoadInt32(&state.pingRunning) == 1 {
+		cancelPingAll()
+	}
+	if atomic.LoadInt32(&state.speedRunning) == 1 {
+		cancelSpeedAll()
+	}
+	// Wait for tests to actually finish before returning
+	for i := 0; i < 70; i++ {
+		if atomic.LoadInt32(&state.pingRunning) == 0 && atomic.LoadInt32(&state.speedRunning) == 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
 }
@@ -2381,27 +2499,17 @@ func handleTabRename(w http.ResponseWriter, r *http.Request) {
 func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	id := r.URL.Query().Get("id")
-	if id == "main" {
-		http.Error(w, "cannot set URL on main tab", 400)
-		return
-	}
-	// Accept JSON body: {urls: [...], refresh_min: N} or legacy query param
 	type tabSettingsReq struct {
-		URLs       []string `json:"urls"`
-		RefreshMin int      `json:"refresh_min"`
+		URLs          []string `json:"urls"`
+		RefreshMin    int      `json:"refresh_min"`
+		ExcludeFilter []string `json:"exclude_filter"`
 	}
 	var req tabSettingsReq
 	if r.Body != nil {
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 64*1024))
 		json.Unmarshal(body, &req)
 	}
-	// Legacy fallback: single URL from query param
-	if len(req.URLs) == 0 {
-		if u := r.URL.Query().Get("url"); u != "" {
-			req.URLs = []string{u}
-		}
-	}
-	// Clean empty URLs
+	// Clean URLs
 	var cleanURLs []string
 	for _, u := range req.URLs {
 		u = strings.TrimSpace(u)
@@ -2414,20 +2522,49 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	state.mu.Lock()
 	for i, t := range state.tabs {
 		if t.ID == id {
-			oldURLs := strings.Join(t.SourceURLs, "|")
-			newURLs := strings.Join(cleanURLs, "|")
-			urlsChanged = oldURLs != newURLs
-			state.tabs[i].SourceURLs = cleanURLs
+			if !t.IsMain {
+				oldURLs := strings.Join(t.SourceURLs, "|")
+				newURLs := strings.Join(cleanURLs, "|")
+				urlsChanged = oldURLs != newURLs
+				state.tabs[i].SourceURLs = cleanURLs
+			}
 			state.tabs[i].RefreshMin = req.RefreshMin
+			state.tabs[i].ExcludeFilter = req.ExcludeFilter
 			break
 		}
 	}
 	state.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
-	// Fetch if URLs changed and not empty
-	if urlsChanged && len(cleanURLs) > 0 {
+	if !urlsChanged || id == "main" {
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+		return
+	}
+	if len(cleanURLs) > 0 {
+		// Clear old entries before fetching new ones (prevents stale data from removed URLs)
+		state.mu.Lock()
+		state.tabEntries[id] = nil
+		if state.activeTab == id {
+			state.entries = nil
+		}
+		state.mu.Unlock()
+		if state.activeTab == id {
+			state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
+		}
 		go fetchTabURLs(id, cleanURLs)
+	} else {
+		// All URLs removed — clear entries
+		state.mu.Lock()
+		state.tabEntries[id] = nil
+		if state.activeTab == id {
+			state.entries = nil
+		}
+		state.mu.Unlock()
+		if state.activeTab == id {
+			state.broadcast(SSEEvent{Type: "loaded", Payload: []ConfigEntry{}, Tab: id})
+		}
+		saveTabs()
 	}
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
@@ -2445,6 +2582,44 @@ func fetchTabURLs(tabID string, urls []string) {
 		entries := parseConfigLines(strings.Join(lines, "\n"))
 		allEntries = append(allEntries, entries...)
 	}
+
+	// If nothing fetched, keep existing entries
+	if len(allEntries) == 0 {
+		fmt.Fprintf(os.Stderr, "⚠ tab %s: no configs fetched, keeping existing\n", tabID)
+		state.mu.RLock()
+		cur := state.tabEntries[tabID]
+		state.mu.RUnlock()
+		if state.activeTab == tabID && cur != nil {
+			snaps := make([]ConfigEntry, len(cur))
+			for i, e := range cur {
+				snaps[i] = e.snap()
+			}
+			state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
+		}
+		return
+	}
+
+	// Apply per-tab exclude filter
+	state.mu.RLock()
+	var excludeFilter []string
+	for _, t := range state.tabs {
+		if t.ID == tabID {
+			excludeFilter = t.ExcludeFilter
+			break
+		}
+	}
+	state.mu.RUnlock()
+
+	if len(excludeFilter) > 0 {
+		var filtered []*ConfigEntry
+		for _, e := range allEntries {
+			if !shouldSkip(e.Name, excludeFilter) {
+				filtered = append(filtered, e)
+			}
+		}
+		allEntries = filtered
+	}
+
 	// Re-index
 	for i, e := range allEntries {
 		e.Index = i
@@ -2460,7 +2635,7 @@ func fetchTabURLs(tabID string, urls []string) {
 		for i, e := range allEntries {
 			snaps[i] = e.snap()
 		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
+		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
 	}
 	saveTabs()
 }
@@ -2653,6 +2828,8 @@ header{
 .btn.sm     {padding:3px 8px;font-size:10px;letter-spacing:.05em}
 .btn.sm-disc{padding:3px 9px;font-size:10px;background:rgba(248,113,113,.1);color:var(--red);border-color:rgba(248,113,113,.3)}
 .btn:disabled{opacity:.22;pointer-events:none}
+.btn.dim-btn{opacity:.4;color:var(--dim)}
+.btn.dim-btn:hover{opacity:.6}
 
 .prog-area{flex-shrink:0}
 .pbar-row{height:2px;background:var(--dim2);position:relative}
@@ -2971,7 +3148,7 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, sources_refresh_min:0, exclude_countries:[], ru_sites_direct:false, direct_domains:[], tray_enabled:false};
+let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], tray_enabled:false};
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -3152,7 +3329,11 @@ function recalcStats(){
 function startBulk(id,total,evTab){
   bulkProgressTab=evTab||activeTabId;
   if(bulkProgressTab===activeTabId) setBar(0);
-  setBtn('btn-'+(id==='ping'?'ping':'speed')+'-all',true,id==='ping'?'pinging…':'ping→speed…');
+  // Grey out both buttons but keep them clickable for cancel
+  var bp=document.getElementById('btn-ping-all');
+  var bs=document.getElementById('btn-speed-all');
+  bp.className='btn ghost dim-btn';
+  bs.className='btn ghost dim-btn';
 }
 function progBulk(id,p){
   if(bulkProgressTab===activeTabId) setBar(p.done/p.total*100);
@@ -3161,9 +3342,11 @@ function doneBulk(id,label,btnId,cls,evTab){
   var dt=evTab||bulkProgressTab;
   if(dt===activeTabId){ setBar(100); setTimeout(()=>{setBar(0);},1200); }
   bulkProgressTab='';
-  const b=document.getElementById(btnId);
-  b.disabled=false; b.textContent=label;
-  b.className='btn ghost';
+  // Restore both buttons
+  var bp=document.getElementById('btn-ping-all');
+  var bs=document.getElementById('btn-speed-all');
+  bp.className='btn ghost'; bp.textContent='ping all';
+  bs.className='btn ghost'; bs.textContent='speed all';
 }
 function setBar(pct){ document.getElementById('pb-main').style.width=pct+'%'; }
 function setBtn(id,dis,txt){ const b=document.getElementById(id); b.disabled=dis; b.textContent=txt; }
@@ -3175,11 +3358,13 @@ function setSort(m){
 }
 function applyFilter(){ filterText=document.getElementById('fi').value.toLowerCase(); rebuildTable(); }
 function matches(e){
-  // On Sources tab, hide configs matching excluded countries
-  if(activeTabId==='main' && appSettingsJS.exclude_countries && appSettingsJS.exclude_countries.length>0){
+  // Per-tab exclude filter
+  var tab=tabsList.find(function(t){return t.id===activeTabId;});
+  var ef=tab&&tab.exclude_filter?tab.exclude_filter:[];
+  if(ef.length>0){
     var nm=(e.name||'').toLowerCase();
-    for(var i=0;i<appSettingsJS.exclude_countries.length;i++){
-      if(nm.indexOf(appSettingsJS.exclude_countries[i].toLowerCase())>=0) return false;
+    for(var i=0;i<ef.length;i++){
+      if(nm.indexOf(ef[i].toLowerCase())>=0) return false;
     }
   }
   if(!filterText)return true;
@@ -3234,9 +3419,6 @@ function renderVisibleRows(){
 
   // Small list: render everything (no virtualization overhead)
   if(total <= 100){
-    if(visibleWindow.start === 0 && visibleWindow.end === total && tb.children.length === total){
-      return; // already rendered
-    }
     tb.innerHTML = '';
     const frag = document.createDocumentFragment();
     for(let i=0;i<total;i++) frag.appendChild(buildRow(sortedList[i], i+1));
@@ -3250,13 +3432,6 @@ function renderVisibleRows(){
   const viewH = tw.clientHeight;
   const firstVisible = Math.max(0, Math.floor(scrollTop / rowHeight) - VBUFFER);
   const lastVisible = Math.min(total, Math.ceil((scrollTop + viewH) / rowHeight) + VBUFFER);
-
-  // Skip re-render if window hasn't changed meaningfully
-  if(Math.abs(firstVisible - visibleWindow.start) < 3 &&
-     Math.abs(lastVisible - visibleWindow.end) < 3 &&
-     tb.children.length > 0){
-    return;
-  }
 
   tb.innerHTML = '';
   const frag = document.createDocumentFragment();
@@ -3427,7 +3602,13 @@ function pingOne(idx)   { fetch('/api/ping/one?idx='+idx,{method:'POST'}).catch(
 function speedOne(idx)  { fetch('/api/speed/one?idx='+idx,{method:'POST'}).catch(console.error); }
 function doPingAll()    { fetch('/api/ping/all',{method:'POST'}).catch(console.error); }
 function doSpeedAll()   { fetch('/api/speed/all',{method:'POST'}).catch(console.error); }
-function doReload()     { fetch('/api/reload',{method:'POST'}).catch(console.error); }
+function doReload(){
+  fetch('/api/tests/cancel?tab='+encodeURIComponent(activeTabId),{method:'POST'}).then(function(){
+    fetch('/api/reload',{method:'POST'}).catch(console.error);
+  }).catch(function(){
+    fetch('/api/reload',{method:'POST'}).catch(console.error);
+  });
+}
 
 // ── Tab management ───────────────────────────────────────────────────────────
 let activeTabId='main';
@@ -3618,12 +3799,6 @@ function openSettings(){
   ov.className='modal-overlay';ov.id='settings-modal';
   ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
 
-  var countries=appSettingsJS.exclude_countries||[];
-  var chipsHtml='';
-  for(var i=0;i<countries.length;i++){
-    chipsHtml+='<span class="chip" data-c="'+x(countries[i])+'">'+x(countries[i])+'<span class="chip-x" onclick="removeCountryChip(this)">x</span></span>';
-  }
-
   var domains=appSettingsJS.direct_domains||[];
   var domainChipsHtml='';
   for(var i=0;i<domains.length;i++){
@@ -3638,13 +3813,6 @@ function openSettings(){
         '<span class="modal-row-label">Enable Sources tab</span>'+
         '<label class="toggle"><input type="checkbox" id="set-sources-on" '+(appSettingsJS.sources_enabled!==false?'checked':'')+' onchange="toggleSources(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
-      '<div class="modal-row" style="margin-bottom:4px">'+
-        '<span class="modal-row-label">Exclude countries</span>'+
-      '</div>'+
-      '<div class="chips-wrap" id="country-chips">'+chipsHtml+
-        '<input class="chip-input" id="country-input" placeholder="Type country, press Enter" onkeydown="countryChipKey(event)">'+
-      '</div>'+
-      '<div class="modal-hint">Configs with matching name will be hidden. Applied on Reload.</div>'+
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">Routing</div>'+
@@ -3706,42 +3874,6 @@ function toggleTray(on){
 }
 
 
-function countryChipKey(ev){
-  if(ev.key!=='Enter')return;
-  ev.preventDefault();
-  var val=ev.target.value.trim();
-  if(!val)return;
-  if(!appSettingsJS.exclude_countries)appSettingsJS.exclude_countries=[];
-  // Avoid duplicates
-  for(var i=0;i<appSettingsJS.exclude_countries.length;i++){
-    if(appSettingsJS.exclude_countries[i].toLowerCase()===val.toLowerCase())return;
-  }
-  appSettingsJS.exclude_countries.push(val);
-  ev.target.value='';
-  saveAppSettings(function(){
-    // Re-render chips
-    var wrap=document.getElementById('country-chips');
-    var inp=document.getElementById('country-input');
-    var chips=wrap.querySelectorAll('.chip');
-    chips.forEach(function(c){c.remove();});
-    for(var i=0;i<appSettingsJS.exclude_countries.length;i++){
-      var sp=document.createElement('span');
-      sp.className='chip';sp.setAttribute('data-c',appSettingsJS.exclude_countries[i]);
-      sp.innerHTML=x(appSettingsJS.exclude_countries[i])+'<span class="chip-x" onclick="removeCountryChip(this)">x</span>';
-      wrap.insertBefore(sp,inp);
-    }
-    rebuildTable();
-  });
-}
-
-function removeCountryChip(el){
-  var chip=el.parentElement;
-  var c=chip.getAttribute('data-c');
-  chip.remove();
-  if(!appSettingsJS.exclude_countries)return;
-  appSettingsJS.exclude_countries=appSettingsJS.exclude_countries.filter(function(v){return v.toLowerCase()!==c.toLowerCase();});
-  saveAppSettings(function(){ rebuildTable(); });
-}
 
 function domainChipKey(ev){
   if(ev.key!=='Enter')return;
@@ -3780,14 +3912,25 @@ function removeDomainChip(el){
 function openSourcesSettings(){
   closeCtxMenu();
   if(document.getElementById('tab-modal'))return;
+  var tab=tabsList.find(function(t){return t.id==='main';});
+  var ef=tab&&tab.exclude_filter?tab.exclude_filter:[];
+  var chipsHtml='';
+  for(var i=0;i<ef.length;i++){
+    chipsHtml+='<span class="chip" data-c="'+x(ef[i])+'">'+x(ef[i])+'<span class="chip-x" onclick="this.parentElement.remove()">x</span></span>';
+  }
   var ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='tab-modal';
   ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
   ov.innerHTML=
-    '<div class="modal-box">'+
+    '<div class="modal-box" style="min-width:400px">'+
       '<div class="modal-title">Sources Settings</div>'+
       '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
-      '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(appSettingsJS.sources_refresh_min||0)+'" style="width:80px">'+
+      '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(tab&&tab.refresh_min||0)+'" style="width:80px;margin-bottom:10px">'+
+      '<div class="modal-label">Exclude filter</div>'+
+      '<div class="chips-wrap" id="src-filter-chips">'+chipsHtml+
+        '<input class="chip-input" id="src-filter-input" placeholder="e.g. Russia, press Enter" onkeydown="srcFilterKey(event)">'+
+      '</div>'+
+      '<div class="modal-hint">Configs with matching name will be hidden.</div>'+
       '<div class="modal-btns">'+
         '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">cancel</button>'+
         '<button class="btn ghost" onclick="saveSourcesSettings()">save</button>'+
@@ -3795,17 +3938,35 @@ function openSourcesSettings(){
     '</div>';
   document.body.appendChild(ov);
 }
+function srcFilterKey(ev){
+  if(ev.key!=='Enter')return;
+  ev.preventDefault();
+  var val=ev.target.value.trim();
+  if(!val)return;
+  ev.target.value='';
+  var wrap=document.getElementById('src-filter-chips');
+  var inp=document.getElementById('src-filter-input');
+  var sp=document.createElement('span');
+  sp.className='chip';sp.setAttribute('data-c',val);
+  sp.innerHTML=x(val)+'<span class="chip-x" onclick="this.parentElement.remove()">x</span>';
+  wrap.insertBefore(sp,inp);
+}
 function saveSourcesSettings(){
-  appSettingsJS.sources_refresh_min=parseInt(document.getElementById('ms-src-refresh').value)||0;
-  saveAppSettings();
+  var refreshMin=parseInt(document.getElementById('ms-src-refresh').value)||0;
+  var chips=document.querySelectorAll('#src-filter-chips .chip');
+  var ef=[];
+  chips.forEach(function(c){ef.push(c.getAttribute('data-c'));});
   document.getElementById('tab-modal').remove();
+  fetch('/api/tab/set-url?id=main',{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({refresh_min:refreshMin,exclude_filter:ef})
+  }).then(function(){rebuildTable();}).catch(console.error);
 }
 
 function openTabSettings(tabId){
   closeCtxMenu();
   const tab=tabsList.find(t=>t.id===tabId);
   if(!tab)return;
-  // Get URLs: prefer source_urls array, fall back to legacy source_url
   var urls=tab.source_urls||[];
   if(urls.length===0&&tab.source_url) urls=[tab.source_url];
   var urlsHtml='';
@@ -3813,6 +3974,12 @@ function openTabSettings(tabId){
     urlsHtml+='<div class="url-row"><input class="modal-input ms-url" value="'+x(urls[i])+'" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button></div>';
   }
   if(urls.length===0) urlsHtml='<div class="url-row"><input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button></div>';
+
+  var ef=tab.exclude_filter||[];
+  var efHtml='';
+  for(var i=0;i<ef.length;i++){
+    efHtml+='<span class="chip" data-c="'+x(ef[i])+'">'+x(ef[i])+'<span class="chip-x" onclick="this.parentElement.remove()">x</span></span>';
+  }
 
   const ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='tab-modal';
@@ -3826,7 +3993,12 @@ function openTabSettings(tabId){
       '<div id="ms-urls">'+urlsHtml+'</div>'+
       '<button class="btn ghost" style="font-size:9px;margin:4px 0 8px" onclick="addURLRow()">+ add URL</button>'+
       '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
-      '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px">'+
+      '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px;margin-bottom:10px">'+
+      '<div class="modal-label">Exclude filter</div>'+
+      '<div class="chips-wrap" id="tab-filter-chips">'+efHtml+
+        '<input class="chip-input" id="tab-filter-input" placeholder="e.g. Russia, press Enter" onkeydown="tabFilterKey(event)">'+
+      '</div>'+
+      '<div class="modal-hint">Configs with matching name will be hidden.</div>'+
       '<div class="modal-btns">'+
         '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">cancel</button>'+
         '<button class="btn ghost" onclick="saveTabSettings(\''+tabId+'\')">save</button>'+
@@ -3835,6 +4007,19 @@ function openTabSettings(tabId){
   document.body.appendChild(ov);
   document.getElementById('ms-name').focus();
   document.getElementById('ms-name').select();
+}
+function tabFilterKey(ev){
+  if(ev.key!=='Enter')return;
+  ev.preventDefault();
+  var val=ev.target.value.trim();
+  if(!val)return;
+  ev.target.value='';
+  var wrap=document.getElementById('tab-filter-chips');
+  var inp=document.getElementById('tab-filter-input');
+  var sp=document.createElement('span');
+  sp.className='chip';sp.setAttribute('data-c',val);
+  sp.innerHTML=x(val)+'<span class="chip-x" onclick="this.parentElement.remove()">x</span>';
+  wrap.insertBefore(sp,inp);
 }
 function addURLRow(){
   var wrap=document.getElementById('ms-urls');
@@ -3854,14 +4039,17 @@ function saveTabSettings(tabId){
     var v=inp.value.trim();
     if(v) urls.push(v);
   });
+  var chips=document.querySelectorAll('#tab-filter-chips .chip');
+  var ef=[];
+  chips.forEach(function(c){ef.push(c.getAttribute('data-c'));});
   document.getElementById('tab-modal').remove();
   if(name){
     fetch('/api/tab/rename?id='+encodeURIComponent(tabId)+'&name='+encodeURIComponent(name),{method:'POST'}).catch(console.error);
   }
   fetch('/api/tab/set-url?id='+encodeURIComponent(tabId),{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({urls:urls,refresh_min:refreshMin})
-  }).catch(console.error);
+    body:JSON.stringify({urls:urls,refresh_min:refreshMin,exclude_filter:ef})
+  }).then(function(){rebuildTable();}).catch(console.error);
 }
 
 // ── Row selection + delete ───────────────────────────────────────────────────
@@ -4039,28 +4227,29 @@ func startAutoRefresh() {
 	defer ticker.Stop()
 	lastRefresh := make(map[string]time.Time)
 	for range ticker.C {
-		// Check Sources tab
-		settingsMu.RLock()
-		srcMin := appSettings.SourcesRefreshMin
-		srcEnabled := appSettings.SourcesEnabled
-		settingsMu.RUnlock()
-		if srcEnabled && srcMin > 0 {
-			if time.Since(lastRefresh["main"]) >= time.Duration(srcMin)*time.Minute {
-				lastRefresh["main"] = time.Now()
-				go fetchAndInit()
-			}
-		}
-		// Check custom tabs
 		state.mu.RLock()
 		tabs := make([]Tab, len(state.tabs))
 		copy(tabs, state.tabs)
 		state.mu.RUnlock()
+
+		settingsMu.RLock()
+		srcEnabled := appSettings.SourcesEnabled
+		settingsMu.RUnlock()
+
 		for _, t := range tabs {
-			if t.IsMain || t.RefreshMin <= 0 || len(t.SourceURLs) == 0 {
+			if t.RefreshMin <= 0 {
 				continue
 			}
-			if time.Since(lastRefresh[t.ID]) >= time.Duration(t.RefreshMin)*time.Minute {
-				lastRefresh[t.ID] = time.Now()
+			if t.IsMain && !srcEnabled {
+				continue
+			}
+			if time.Since(lastRefresh[t.ID]) < time.Duration(t.RefreshMin)*time.Minute {
+				continue
+			}
+			lastRefresh[t.ID] = time.Now()
+			if t.IsMain {
+				go fetchAndInit()
+			} else if len(t.SourceURLs) > 0 {
 				go fetchTabURLs(t.ID, t.SourceURLs)
 			}
 		}
@@ -4092,6 +4281,7 @@ func registerRoutes() {
 	http.HandleFunc("/api/ping/all", handlePingAll)
 	http.HandleFunc("/api/speed/one", handleSpeedOne)
 	http.HandleFunc("/api/speed/all", handleSpeedAll)
+	http.HandleFunc("/api/tests/cancel", handleTestsCancel)
 	http.HandleFunc("/api/reload", handleReload)
 	http.HandleFunc("/api/tab/create", handleTabCreate)
 	http.HandleFunc("/api/tab/delete", handleTabDelete)
