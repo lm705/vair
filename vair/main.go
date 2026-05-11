@@ -103,6 +103,7 @@ type AppSettings struct {
 	SourcesEnabled     bool     `json:"sources_enabled"`
 	RuSitesDirect      bool     `json:"ru_sites_direct"`
 	DirectDomains      []string `json:"direct_domains"`
+	DirectApps         []string `json:"direct_apps"`
 	TrayEnabled        bool     `json:"tray_enabled"`
 }
 
@@ -261,25 +262,42 @@ func (cm *connManager) snap() ConnState {
 
 // ─────────────────────────── tabs ───────────────────────────────
 
+type TabFile struct {
+	Name string `json:"name"`
+	// Path is the on-disk location of the file. We store only the path —
+	// the content is read fresh on every fetch, so there's no in-memory
+	// duplication and the file size becomes a non-issue. The trade-off:
+	// if the file is moved or deleted between sessions, its entries are
+	// dropped from the tab until the file returns (same behaviour URLs
+	// already have when fetch fails).
+	Path  string `json:"path"`
+	Size  int64  `json:"size,omitempty"`  // last-known size in bytes, informational
+	Mtime int64  `json:"mtime,omitempty"` // last-known mtime (unix seconds), informational
+}
+
 type Tab struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	IsMain         bool     `json:"is_main"`
-	Closable       bool     `json:"closable"`
-	SourceURL      string   `json:"source_url,omitempty"`
-	SourceURLs     []string `json:"source_urls,omitempty"`
-	RefreshMin     int      `json:"refresh_min,omitempty"`
-	ExcludeFilter  []string `json:"exclude_filter,omitempty"`
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	IsMain         bool      `json:"is_main"`
+	Closable       bool      `json:"closable"`
+	SourceURL      string    `json:"source_url,omitempty"`
+	SourceURLs     []string  `json:"source_urls,omitempty"`
+	SourceFiles    []TabFile `json:"source_files,omitempty"`
+	RefreshMin     int       `json:"refresh_min,omitempty"`
+	ExcludeFilter  []string  `json:"exclude_filter,omitempty"`
+	Dedup          bool      `json:"dedup,omitempty"`
 }
 
 type persistedTab struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	SourceURL      string   `json:"source_url,omitempty"`
-	SourceURLs     []string `json:"source_urls,omitempty"`
-	RefreshMin     int      `json:"refresh_min,omitempty"`
-	ExcludeFilter  []string `json:"exclude_filter,omitempty"`
-	Configs        []string `json:"configs,omitempty"`
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	SourceURL      string    `json:"source_url,omitempty"`
+	SourceURLs     []string  `json:"source_urls,omitempty"`
+	SourceFiles    []TabFile `json:"source_files,omitempty"`
+	RefreshMin     int       `json:"refresh_min,omitempty"`
+	ExcludeFilter  []string  `json:"exclude_filter,omitempty"`
+	Dedup          bool      `json:"dedup,omitempty"`
+	Configs        []string  `json:"configs,omitempty"`
 }
 type persistedData struct {
 	Tabs []persistedTab `json:"tabs"`
@@ -340,8 +358,8 @@ func saveTabs() {
 	for _, t := range state.tabs {
 		pt := persistedTab{
 			ID: t.ID, Name: t.Name,
-			SourceURLs: t.SourceURLs, RefreshMin: t.RefreshMin,
-			ExcludeFilter: t.ExcludeFilter,
+			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles, RefreshMin: t.RefreshMin,
+			ExcludeFilter: t.ExcludeFilter, Dedup: t.Dedup,
 		}
 		if len(t.SourceURLs) == 1 {
 			pt.SourceURL = t.SourceURLs[0]
@@ -399,7 +417,8 @@ func loadTabs() {
 		}
 		tab := Tab{
 			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
-			SourceURLs: urls, RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter,
+			SourceURLs: urls, SourceFiles: pt.SourceFiles,
+			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter, Dedup: pt.Dedup,
 		}
 		state.tabs = append(state.tabs, tab)
 		entries := parseConfigLines(strings.Join(pt.Configs, "\n"))
@@ -700,6 +719,8 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 	ruSitesDirect := appSettings.RuSitesDirect
 	directDomains := make([]string, len(appSettings.DirectDomains))
 	copy(directDomains, appSettings.DirectDomains)
+	directApps := make([]string, len(appSettings.DirectApps))
+	copy(directApps, appSettings.DirectApps)
 	settingsMu.RUnlock()
 
 	rules := []interface{}{
@@ -711,6 +732,23 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 			"outbound":     "direct",
 		},
 		map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
+	}
+
+	// User-configured apps that bypass VPN (direct connection).
+	if len(directApps) > 0 {
+		var appNames []string
+		for _, a := range directApps {
+			a = strings.TrimSpace(a)
+			if a != "" {
+				appNames = append(appNames, a)
+			}
+		}
+		if len(appNames) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"process_name": appNames,
+				"outbound":     "direct",
+			})
+		}
 	}
 
 	// Russian sites bypass VPN
@@ -1670,7 +1708,10 @@ func isTestCancelled(ch chan struct{}) bool {
 	}
 }
 
-func runPingAll() {
+// runPingAll runs ping tests against entries. If `onlyIndices` is non-nil,
+// only entries whose Index is in that set are tested (used for FILTER on UI:
+// only visible configs are tested). Pass nil to test every entry.
+func runPingAll(onlyIndices map[int]bool) {
 	// If speed is running, cancel it only (don't start ping)
 	if atomic.LoadInt32(&state.speedRunning) == 1 {
 		cancelSpeedAll()
@@ -1690,10 +1731,23 @@ func runPingAll() {
 	testMu.Unlock()
 	defer atomic.StoreInt32(&state.pingRunning, 0)
 	state.mu.RLock()
-	entries := make([]*ConfigEntry, len(state.entries))
-	copy(entries, state.entries)
+	allEntries := make([]*ConfigEntry, len(state.entries))
+	copy(allEntries, state.entries)
 	tabID := state.activeTab
 	state.mu.RUnlock()
+
+	// Restrict to onlyIndices if provided.
+	var entries []*ConfigEntry
+	if onlyIndices != nil {
+		for _, e := range allEntries {
+			if onlyIndices[e.Index] {
+				entries = append(entries, e)
+			}
+		}
+	} else {
+		entries = allEntries
+	}
+
 	testMu.Lock()
 	testingTab = tabID
 	testMu.Unlock()
@@ -1733,7 +1787,9 @@ func runPingAll() {
 	state.broadcast(SSEEvent{Type: "bulk_ping_done", Tab: tabID})
 }
 
-func runSpeedAll() {
+// runSpeedAll mirrors runPingAll: when onlyIndices is non-nil, only those
+// entries are tested (for FILTER-aware testing).
+func runSpeedAll(onlyIndices map[int]bool) {
 	// If ping is running, cancel it only (don't start speed)
 	if atomic.LoadInt32(&state.pingRunning) == 1 {
 		cancelPingAll()
@@ -1753,10 +1809,22 @@ func runSpeedAll() {
 	testMu.Unlock()
 	defer atomic.StoreInt32(&state.speedRunning, 0)
 	state.mu.RLock()
-	entries := make([]*ConfigEntry, len(state.entries))
-	copy(entries, state.entries)
+	allEntries := make([]*ConfigEntry, len(state.entries))
+	copy(allEntries, state.entries)
 	tabID := state.activeTab
 	state.mu.RUnlock()
+
+	var entries []*ConfigEntry
+	if onlyIndices != nil {
+		for _, e := range allEntries {
+			if onlyIndices[e.Index] {
+				entries = append(entries, e)
+			}
+		}
+	} else {
+		entries = allEntries
+	}
+
 	testMu.Lock()
 	testingTab = tabID
 	testMu.Unlock()
@@ -1820,16 +1888,28 @@ func fetchAndInit() {
 	}
 	var raws []string
 
-	// Fetch from sources (with fallback — if first succeeds, skip rest)
+	// Fetch from sources (with fallback — only skip rest if vless configs were received)
 	for _, src := range sourceDefs {
 		lines, err := fetchURL(src.URL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "⚠  fetch %s: %v\n", src.URL, err)
 			continue
 		}
+		// Check if any line actually contains vless://
+		hasVless := false
+		for _, l := range lines {
+			if strings.Contains(l, "vless://") {
+				hasVless = true
+				break
+			}
+		}
+		if !hasVless {
+			fmt.Fprintf(os.Stderr, "⚠  fetch %s: no vless configs in response (%d lines)\n", src.URL, len(lines))
+			continue
+		}
 		raws = append(raws, lines...)
-		fmt.Printf("ℹ  fetched %d configs from %s\n", len(lines), src.URL)
-		break // success — don't try fallback
+		fmt.Printf("ℹ  fetched %d lines from %s\n", len(lines), src.URL)
+		break
 	}
 
 	// Fetch from private GitHub repo via PAT
@@ -1870,14 +1950,21 @@ func fetchAndInit() {
 	}
 	state.mu.RUnlock()
 
-	// Deduplicate
+	// Deduplicate by body. Two configs that connect to the same server
+	// (same uuid@host:port?params) are functionally identical regardless
+	// of the name fragment, so we collapse them. Sources doesn't expose a
+	// toggle for this — it's always on. Non-Sources tabs handle dedup as
+	// a client-side view filter (see matches() in the JS) which the user
+	// can toggle without losing data.
 	seen := make(map[string]bool, len(raws))
 	var deduped []string
 	for _, r := range raws {
-		if !seen[r] {
-			seen[r] = true
-			deduped = append(deduped, r)
+		body := vlessBody(strings.TrimSpace(r))
+		if body == "" || seen[body] {
+			continue
 		}
+		seen[body] = true
+		deduped = append(deduped, r)
 	}
 
 	entries := make([]*ConfigEntry, 0, len(deduped))
@@ -1901,6 +1988,9 @@ func fetchAndInit() {
 		}
 		entries = append(entries, e)
 	}
+	// Rename duplicate display names so each config is uniquely addressable
+	// in the UI (applies to every tab, including Sources).
+	disambiguateNames(entries)
 	for i, e := range entries {
 		e.Index = i
 	}
@@ -1929,6 +2019,9 @@ func fetchURL(u string) ([]string, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
 		return nil, err
@@ -2052,6 +2145,70 @@ func parseConfigLines(text string) []*ConfigEntry {
 		e.Index = i
 	}
 	return entries
+}
+
+// vlessBody returns the part of a vless URL before the `#` fragment — i.e.
+// the connection details (uuid@host:port?params) without the human name.
+// Two configs with identical bodies but different names are functionally
+// the same server/configuration, which is what dedup should compare on.
+func vlessBody(raw string) string {
+	// Use the LAST `#` since query strings can technically contain a `#`
+	// when malformed, and we want everything up to the fragment marker.
+	if i := strings.LastIndex(raw, "#"); i >= 0 {
+		return raw[:i]
+	}
+	return raw
+}
+
+// setVlessName replaces the URL fragment of a vless URL with the given
+// (decoded) name, percent-encoding it as needed. Used by disambiguateNames
+// so that copying a row puts the disambiguated name on the clipboard
+// (otherwise "anycast - 3" reverts to plain "anycast" on paste).
+func setVlessName(raw, name string) string {
+	encoded := url.PathEscape(name)
+	if i := strings.LastIndex(raw, "#"); i >= 0 {
+		return raw[:i+1] + encoded
+	}
+	return raw + "#" + encoded
+}
+
+// disambiguateNames walks the entries in the given order. The first
+// occurrence of any name is kept verbatim; for every subsequent occurrence
+// the name gets a " - N" suffix where N starts at 1 and increments. If a
+// candidate suffix collides with another entry already taken, we skip
+// further to find a free one — handles inputs like ["USA","USA - 1","USA"]
+// where naive numbering would collide.
+//
+// Applied globally to every tab: this is what makes long source dumps with
+// many "🇺🇸 USA" entries individually addressable in the UI. We also
+// rewrite e.Raw's fragment so the disambiguated name is what ends up on
+// the clipboard when the row is copied.
+func disambiguateNames(entries []*ConfigEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	taken := make(map[string]int, len(entries))
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		base := e.Name
+		if taken[base] == 0 {
+			taken[base] = 1
+			continue
+		}
+		// Find first free "base - N".
+		for n := taken[base]; ; n++ {
+			cand := fmt.Sprintf("%s - %d", base, n)
+			if taken[cand] == 0 {
+				e.Name = cand
+				e.Raw = setVlessName(e.Raw, cand)
+				taken[cand] = 1
+				taken[base] = n + 1
+				break
+			}
+		}
+	}
 }
 
 // ─────────────────────────── HTTP handlers ───────────────────────
@@ -2254,16 +2411,46 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// parseFilterIndices reads an optional JSON body of the form
+// {"indices":[0,3,5,...]} and returns it as a map for fast membership checks.
+// Returns nil if no body or the body is empty/invalid — caller treats nil as
+// "test everything" for backwards compatibility.
+func parseFilterIndices(r *http.Request) map[int]bool {
+	if r.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
+	if err != nil || len(body) == 0 {
+		return nil
+	}
+	var req struct {
+		Indices []int `json:"indices"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil
+	}
+	if req.Indices == nil {
+		return nil
+	}
+	m := make(map[int]bool, len(req.Indices))
+	for _, idx := range req.Indices {
+		m[idx] = true
+	}
+	return m
+}
+
 func handlePingAll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	go runPingAll()
+	indices := parseFilterIndices(r)
+	go runPingAll(indices)
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
 }
 
 func handleSpeedAll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	go runSpeedAll()
+	indices := parseFilterIndices(r)
+	go runSpeedAll(indices)
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
 }
@@ -2301,9 +2488,11 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 	state.mu.RLock()
 	tabID := state.activeTab
 	var sourceURLs []string
+	var sourceFiles []TabFile
 	for _, t := range state.tabs {
 		if t.ID == tabID {
 			sourceURLs = t.SourceURLs
+			sourceFiles = t.SourceFiles
 			break
 		}
 	}
@@ -2311,10 +2500,10 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 
 	if tabID == "main" {
 		go fetchAndInit()
-	} else if len(sourceURLs) > 0 {
+	} else if len(sourceURLs) > 0 || len(sourceFiles) > 0 {
 		go func() {
 			state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: tabID})
-			fetchTabURLs(tabID, sourceURLs)
+			fetchTabURLs(tabID, sourceURLs, sourceFiles)
 		}()
 	} else {
 		// No URL: reset all test results for this tab
@@ -2500,13 +2689,18 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	id := r.URL.Query().Get("id")
 	type tabSettingsReq struct {
-		URLs          []string `json:"urls"`
-		RefreshMin    int      `json:"refresh_min"`
-		ExcludeFilter []string `json:"exclude_filter"`
+		URLs          []string  `json:"urls"`
+		Files         []TabFile `json:"files"`
+		RefreshMin    int       `json:"refresh_min"`
+		ExcludeFilter []string  `json:"exclude_filter"`
+		Dedup         bool      `json:"dedup"`
 	}
 	var req tabSettingsReq
 	if r.Body != nil {
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+		// Files can be a few MB each - allow reasonable upload size
+		// Body contains URLs, file metadata, and config arrays. Content
+		// is read directly from disk, never sent over this endpoint.
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
 		json.Unmarshal(body, &req)
 	}
 	// Clean URLs
@@ -2517,16 +2711,41 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 			cleanURLs = append(cleanURLs, u)
 		}
 	}
+	// Clean files: every file now needs a Path. Drag-drop is gone, so the
+	// only way files enter the system is the native picker which always
+	// provides a path. We stat each path here to refresh size/mtime for
+	// display purposes; content is read lazily by fetchTabURLs.
+	var cleanFiles []TabFile
+	for _, f := range req.Files {
+		f.Name = strings.TrimSpace(f.Name)
+		f.Path = strings.TrimSpace(f.Path)
+		if f.Path == "" {
+			continue
+		}
+		if f.Name == "" {
+			f.Name = filepath.Base(f.Path)
+		}
+		if info, err := os.Stat(f.Path); err == nil {
+			f.Size = info.Size()
+			f.Mtime = info.ModTime().Unix()
+		}
+		cleanFiles = append(cleanFiles, f)
+	}
 
-	var urlsChanged bool
+	var sourcesChanged, dedupChanged bool
 	state.mu.Lock()
 	for i, t := range state.tabs {
 		if t.ID == id {
 			if !t.IsMain {
 				oldURLs := strings.Join(t.SourceURLs, "|")
 				newURLs := strings.Join(cleanURLs, "|")
-				urlsChanged = oldURLs != newURLs
+				oldFilesKey := tabFilesKey(t.SourceFiles)
+				newFilesKey := tabFilesKey(cleanFiles)
+				sourcesChanged = (oldURLs != newURLs) || (oldFilesKey != newFilesKey)
+				dedupChanged = t.Dedup != req.Dedup
 				state.tabs[i].SourceURLs = cleanURLs
+				state.tabs[i].SourceFiles = cleanFiles
+				state.tabs[i].Dedup = req.Dedup
 			}
 			state.tabs[i].RefreshMin = req.RefreshMin
 			state.tabs[i].ExcludeFilter = req.ExcludeFilter
@@ -2536,13 +2755,13 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
-	if !urlsChanged || id == "main" {
+	if (!sourcesChanged && !dedupChanged) || id == "main" {
 		w.WriteHeader(200)
 		w.Write([]byte("ok"))
 		return
 	}
-	if len(cleanURLs) > 0 {
-		// Clear old entries before fetching new ones (prevents stale data from removed URLs)
+	if len(cleanURLs) > 0 || len(cleanFiles) > 0 {
+		// Clear old entries before fetching new ones (prevents stale data from removed sources)
 		state.mu.Lock()
 		state.tabEntries[id] = nil
 		if state.activeTab == id {
@@ -2552,9 +2771,9 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		if state.activeTab == id {
 			state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
 		}
-		go fetchTabURLs(id, cleanURLs)
+		go fetchTabURLs(id, cleanURLs, cleanFiles)
 	} else {
-		// All URLs removed — clear entries
+		// All sources removed — clear entries
 		state.mu.Lock()
 		state.tabEntries[id] = nil
 		if state.activeTab == id {
@@ -2570,8 +2789,29 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
-// fetchTabURLs fetches configs from multiple URLs and replaces tab entries
-func fetchTabURLs(tabID string, urls []string) {
+// tabFilesKey produces a deterministic string for change-detection on a list
+// of files. Two file lists are "the same set of sources" if their (name,path)
+// pairs match in order. Size/mtime are intentionally NOT part of the key —
+// content changes on disk are picked up by RELOAD, not by save.
+func tabFilesKey(files []TabFile) string {
+	var sb strings.Builder
+	for _, f := range files {
+		sb.WriteString(f.Name)
+		sb.WriteByte('|')
+		sb.WriteString(f.Path)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+// fetchTabURLs fetches configs from multiple URLs and replaces tab entries.
+// Files (already loaded content) are appended after URL contents in order.
+//
+// For each file with a Path, we re-read the file from disk before parsing
+// so RELOAD picks up edits the user made outside of Vair. The freshly read
+// content (and updated mtime) is written back into state.tabs so it gets
+// persisted and the next reload starts from the same baseline.
+func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	var allEntries []*ConfigEntry
 	for _, u := range urls {
 		lines, err := fetchURL(u)
@@ -2581,6 +2821,34 @@ func fetchTabURLs(tabID string, urls []string) {
 		}
 		entries := parseConfigLines(strings.Join(lines, "\n"))
 		allEntries = append(allEntries, entries...)
+	}
+	// Read each file fresh from its on-disk path. Content lives in memory
+	// only for the moment it takes parseConfigLines to walk through it —
+	// after that it's eligible for GC. We refresh size/mtime on the way so
+	// the UI can display current file metadata. A missing or unreadable
+	// file just contributes zero entries this cycle (same behaviour URLs
+	// have on fetch failure); the user can RELOAD again later.
+	updatedFiles := make([]TabFile, len(files))
+	copy(updatedFiles, files)
+	for i := range updatedFiles {
+		f := &updatedFiles[i]
+		if f.Path == "" {
+			fmt.Fprintf(os.Stderr, "⚠ tab %s: file %q has no path, skipping\n", tabID, f.Name)
+			continue
+		}
+		data, err := os.ReadFile(f.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ tab %s re-read %s: %v\n", tabID, f.Path, err)
+			continue
+		}
+		if info, statErr := os.Stat(f.Path); statErr == nil {
+			f.Size = info.Size()
+			f.Mtime = info.ModTime().Unix()
+		}
+		entries := parseConfigLines(string(data))
+		allEntries = append(allEntries, entries...)
+		// Don't hold a reference to `data` past this point — the slice is
+		// scoped to the loop iteration so Go's GC can reclaim it.
 	}
 
 	// If nothing fetched, keep existing entries
@@ -2599,12 +2867,14 @@ func fetchTabURLs(tabID string, urls []string) {
 		return
 	}
 
-	// Apply per-tab exclude filter
+	// Apply per-tab exclude filter and read dedup flag
 	state.mu.RLock()
 	var excludeFilter []string
+	var dedup bool
 	for _, t := range state.tabs {
 		if t.ID == tabID {
 			excludeFilter = t.ExcludeFilter
+			dedup = t.Dedup
 			break
 		}
 	}
@@ -2620,12 +2890,32 @@ func fetchTabURLs(tabID string, urls []string) {
 		allEntries = filtered
 	}
 
+	// NB: per-tab dedup used to delete entries here. That broke the user's
+	// expectation that toggling dedup off should bring rows back. Dedup is
+	// now a pure client-side view filter (see matches() in the JS), so the
+	// server keeps every entry and the toggle just hides/shows them. The
+	// `dedup` variable is read above only to log/inspect; we don't act on it.
+	_ = dedup
+
+	// Always: rename duplicate display names so each entry is uniquely
+	// identifiable in the table — applied to every tab globally.
+	disambiguateNames(allEntries)
+
 	// Re-index
 	for i, e := range allEntries {
 		e.Index = i
 	}
 	state.mu.Lock()
 	state.tabEntries[tabID] = allEntries
+	// Persist any updated file content/mtime back to the tab so it survives
+	// restart and the next RELOAD doesn't have to detect changes from
+	// scratch.
+	for i := range state.tabs {
+		if state.tabs[i].ID == tabID {
+			state.tabs[i].SourceFiles = updatedFiles
+			break
+		}
+	}
 	if state.activeTab == tabID {
 		state.entries = allEntries
 	}
@@ -2637,6 +2927,7 @@ func fetchTabURLs(tabID string, urls []string) {
 		}
 		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
 	}
+	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
 }
 
@@ -2910,6 +3201,17 @@ header{
 .url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:12px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px}
 .url-rm:hover{color:var(--red);background:rgba(248,113,113,.1)}
 
+/* file rows in tab settings */
+.file-row{
+  display:flex;gap:6px;margin-bottom:4px;align-items:center;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  padding:5px 10px;font-size:11px;color:var(--text);
+}
+.file-row .file-ico{color:var(--dim);flex-shrink:0;font-size:12px}
+.file-row .file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-row .file-size{color:var(--dim);font-size:10px;flex-shrink:0;margin-right:2px}
+.file-row.new{border-color:rgba(74,222,128,.35);background:rgba(74,222,128,.05)}
+
 /* row selection */
 tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px 0 0 var(--accent)}
 
@@ -3148,7 +3450,7 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], tray_enabled:false};
+let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false};
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -3301,10 +3603,10 @@ function onLoaded(list){
   document.getElementById('msg-area').style.display='none';
   document.getElementById('tbl').style.display='';
   selectedRows.clear();
+  recomputeDupIndices();
   // Reset progress bar if we switched to a different tab than the one being tested
   if(bulkProgressTab&&bulkProgressTab!==activeTabId) setBar(0);
-  rebuildTable(); recalcStats();
-  document.getElementById('s-tot').textContent=list.length;
+  rebuildTable();
 }
 function onUpdate(e){
   entries[e.index]=e;
@@ -3316,14 +3618,47 @@ function onUpdate(e){
   recalcStats();
 }
 
+// dupBodyIndices is the set of entry indices whose vless "body" (everything
+// before the '#' fragment) was already seen at a smaller index. This is the
+// view filter the per-tab dedup toggle drives — toggling it on hides these
+// rows; toggling it off shows them again. Server keeps every entry.
+let dupBodyIndices=new Set();
+
+function vlessBodyJS(raw){
+  if(!raw) return '';
+  var i=raw.lastIndexOf('#');
+  return i>=0 ? raw.substring(0,i) : raw;
+}
+
+function recomputeDupIndices(){
+  dupBodyIndices=new Set();
+  // Walk in entry-index order so "first occurrence" is stable: it doesn't
+  // shift with the user's sort choice, so toggling dedup with different
+  // sort modes hides the same rows.
+  var ordered=Object.values(entries).slice().sort(function(a,b){return a.index-b.index;});
+  var seen=new Set();
+  for(var i=0;i<ordered.length;i++){
+    var body=vlessBodyJS(ordered[i].raw);
+    if(seen.has(body)) dupBodyIndices.add(ordered[i].index);
+    else seen.add(body);
+  }
+}
+
+// recalcStats updates the five header counters from sortedList, which is
+// the list of rows currently visible on screen (after FILTER, exclude
+// filter, and dedup view filter are applied). The previous version walked
+// every entry — that surprised users when enabling dedup or filtering: the
+// "configs" counter would stay at the total instead of matching what they
+// could see. rebuildTable() populates sortedList and then calls this.
 function recalcStats(){
-  const all=Object.values(entries);
-  document.getElementById('s-ok').textContent=all.filter(e=>e.ping_status==='ok').length;
-  document.getElementById('s-er').textContent=all.filter(e=>e.ping_status==='failed').length;
-  const dl=all.filter(e=>e.delay>0).map(e=>e.delay);
-  const sp=all.filter(e=>e.speed_mbps>0).map(e=>e.speed_mbps);
-  document.getElementById('s-ms').textContent=dl.length?Math.min(...dl)+'ms':'—';
-  document.getElementById('s-sp').textContent=sp.length?(Math.max(...sp).toFixed(1)+' MB/s'):'—';
+  const vis = sortedList || [];
+  document.getElementById('s-tot').textContent = vis.length;
+  document.getElementById('s-ok').textContent  = vis.filter(e=>e.ping_status==='ok').length;
+  document.getElementById('s-er').textContent  = vis.filter(e=>e.ping_status==='failed').length;
+  const dl = vis.filter(e=>e.delay>0).map(e=>e.delay);
+  const sp = vis.filter(e=>e.speed_mbps>0).map(e=>e.speed_mbps);
+  document.getElementById('s-ms').textContent = dl.length?Math.min(...dl)+'ms':'—';
+  document.getElementById('s-sp').textContent = sp.length?(Math.max(...sp).toFixed(1)+' MB/s'):'—';
 }
 
 function startBulk(id,total,evTab){
@@ -3358,8 +3693,12 @@ function setSort(m){
 }
 function applyFilter(){ filterText=document.getElementById('fi').value.toLowerCase(); rebuildTable(); }
 function matches(e){
-  // Per-tab exclude filter
+  // Per-tab dedup view filter — hide rows whose vless body has appeared at
+  // an earlier index. Toggling dedup off in tab settings makes these
+  // visible again with no fetch needed.
   var tab=tabsList.find(function(t){return t.id===activeTabId;});
+  if(tab && tab.dedup && dupBodyIndices.has(e.index)) return false;
+  // Per-tab exclude filter
   var ef=tab&&tab.exclude_filter?tab.exclude_filter:[];
   if(ef.length>0){
     var nm=(e.name||'').toLowerCase();
@@ -3407,6 +3746,9 @@ function rebuildTable(){
   }else{list.sort((a,b)=>a.index-b.index);}
   sortedList = list;
   document.getElementById('fc').textContent=filterText?(list.length+'/'+Object.keys(entries).length+' shown'):'';
+  // Counters are derived from sortedList so any change in visibility — sort,
+  // filter, dedup toggle, exclude filter, etc — keeps them in sync.
+  recalcStats();
   visibleWindow = { start: 0, end: 0 }; // force full redraw
   renderVisibleRows();
 }
@@ -3600,8 +3942,26 @@ function doConnect(idx){
 function doDisconnect(){ fetch('/api/disconnect',{method:'POST'}).catch(console.error); }
 function pingOne(idx)   { fetch('/api/ping/one?idx='+idx,{method:'POST'}).catch(console.error); }
 function speedOne(idx)  { fetch('/api/speed/one?idx='+idx,{method:'POST'}).catch(console.error); }
-function doPingAll()    { fetch('/api/ping/all',{method:'POST'}).catch(console.error); }
-function doSpeedAll()   { fetch('/api/speed/all',{method:'POST'}).catch(console.error); }
+// Collect indices of currently visible (filter+exclude) entries.
+// matches() already accounts for both the filter input and the per-tab exclude.
+function visibleIndices(){
+  var out=[];
+  Object.values(entries).forEach(function(e){ if(matches(e)) out.push(e.index); });
+  return out;
+}
+// When sending bulk-test requests, restrict to currently visible entries so
+// that running ping/speed all while a filter is active only tests the
+// configs the user can see. Sending the indices is harmless when nothing is
+// hidden — it just lists every entry.
+function bulkTestBody(){
+  return JSON.stringify({indices: visibleIndices()});
+}
+function doPingAll() {
+  fetch('/api/ping/all',{method:'POST',headers:{'Content-Type':'application/json'},body:bulkTestBody()}).catch(console.error);
+}
+function doSpeedAll(){
+  fetch('/api/speed/all',{method:'POST',headers:{'Content-Type':'application/json'},body:bulkTestBody()}).catch(console.error);
+}
 function doReload(){
   fetch('/api/tests/cancel?tab='+encodeURIComponent(activeTabId),{method:'POST'}).then(function(){
     fetch('/api/reload',{method:'POST'}).catch(console.error);
@@ -3617,8 +3977,19 @@ let selectedRows=new Set(); // selected config indices for deletion
 let bulkProgressTab=''; // which tab the current bulk operation belongs to
 
 function onTabsUpdate(tabs){
+  // Detect a change to the active tab's dedup flag so we can refresh the
+  // visible rows without waiting for a manual sort/filter event. Toggling
+  // dedup is intended to be instantaneous from the user's perspective.
+  var prev=tabsList.find(function(t){return t.id===activeTabId;});
+  var next=tabs.find(function(t){return t.id===activeTabId;});
+  var dedupFlipped=prev && next && (!!prev.dedup !== !!next.dedup);
   tabsList=tabs;
   renderTabs();
+  if(dedupFlipped){
+    // matches() consults tabsList[…].dedup which is now the new value,
+    // and dupBodyIndices was computed at load time so it's still valid.
+    rebuildTable();
+  }
 }
 function onActiveTab(id){
   activeTabId=id;
@@ -3741,14 +4112,78 @@ function pasteFromClipboard(){
   }).catch(()=>{});
 }
 
-function copySelected(){
-  var lines=[];
-  [...selectedRows].forEach(function(idx){
+// gatherSelectedLines collects raw vless URLs for every currently selected
+// row, in on-screen (sortedList) order so the clipboard order matches what
+// the user sees. selectedRows stores entry.index values, which are stable
+// across sorts — clicking the visually-first row in speed sort stores that
+// entry's index, then we look it up here. Anything still in selectedRows
+// but missing from sortedList (shouldn't happen, but guard anyway) is
+// appended at the end via the entries map.
+function gatherSelectedLines(){
+  if(selectedRows.size===0) return [];
+  var lines=[],seen=new Set();
+  for(var i=0;i<sortedList.length;i++){
+    var e=sortedList[i];
+    if(e && selectedRows.has(e.index) && e.raw){ lines.push(e.raw); seen.add(e.index); }
+  }
+  selectedRows.forEach(function(idx){
+    if(seen.has(idx)) return;
     var e=entries[idx];
-    if(e&&e.raw) lines.push(e.raw);
+    if(e && e.raw) lines.push(e.raw);
   });
-  if(lines.length>0) navigator.clipboard.writeText(lines.join('\n')).catch(()=>{});
+  return lines;
 }
+
+// flashCopySelected briefly turns every selected row's ⎘ button into a ✓.
+// Rows outside the virtualized window won't have a button rendered — those
+// are silently skipped, the user sees the feedback on whatever's visible.
+function flashCopySelected(){
+  selectedRows.forEach(function(idx){
+    var row=document.getElementById('r'+idx);
+    if(!row) return;
+    var btn=row.querySelector('.cpb');
+    if(!btn) return;
+    btn.classList.add('done');
+    btn.textContent='✓';
+    setTimeout(function(){
+      // Only revert if no newer flash overwrote it (cheap check via class).
+      if(btn.classList.contains('done')){
+        btn.classList.remove('done');
+        btn.textContent='⎘';
+      }
+    },1400);
+  });
+}
+
+// copySelected is the JS-driven copy path: right-click menu and any other
+// callers that don't go through the browser's copy event. It uses the async
+// Clipboard API which is what's available outside of a user-gesture copy
+// event. Returns true on success so callers can chain UI feedback.
+function copySelected(){
+  if(selectedRows.size===0) return false;
+  var lines=gatherSelectedLines();
+  if(lines.length===0) return false;
+  navigator.clipboard.writeText(lines.join('\n')).then(flashCopySelected).catch(function(){});
+  return true;
+}
+
+// Browser copy event — fires for Ctrl+C and the Edge/WebView2 Copy menu.
+// Handling it here (vs intercepting keydown + calling writeText) is more
+// reliable: clipboardData.setData is synchronous, doesn't depend on
+// permissions or focus state, and avoids races with the native copy
+// pipeline that were causing stale clipboard contents on Ctrl+C.
+document.addEventListener('copy',function(e){
+  // Inputs and textareas have their own selection — let the native copy
+  // handle them so users can still copy text out of the URL/filter fields.
+  var ae=document.activeElement;
+  if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA')) return;
+  if(selectedRows.size===0) return; // no rows selected — fall through to native
+  var lines=gatherSelectedLines();
+  if(lines.length===0) return;
+  e.preventDefault();
+  if(e.clipboardData) e.clipboardData.setData('text/plain', lines.join('\n'));
+  flashCopySelected();
+});
 
 function deleteSelectedRows(){
   if(selectedRows.size===0||activeTabId==='main')return;
@@ -3805,6 +4240,12 @@ function openSettings(){
     domainChipsHtml+='<span class="chip" data-d="'+x(domains[i])+'">'+x(domains[i])+'<span class="chip-x" onclick="removeDomainChip(this)">x</span></span>';
   }
 
+  var apps=appSettingsJS.direct_apps||[];
+  var appChipsHtml='';
+  for(var i=0;i<apps.length;i++){
+    appChipsHtml+='<span class="chip" data-a="'+x(apps[i])+'">'+x(apps[i])+'<span class="chip-x" onclick="removeAppChip(this)">x</span></span>';
+  }
+
   ov.innerHTML='<div class="modal-box" style="min-width:400px">'+
     '<div class="modal-title">Settings</div>'+
     '<div class="settings-section">'+
@@ -3828,6 +4269,13 @@ function openSettings(){
         '<input class="chip-input" id="domain-input" placeholder="e.g. vk.com, press Enter" onkeydown="domainChipKey(event)">'+
       '</div>'+
       '<div class="modal-hint">Enter a domain — all its subdomains are included automatically. Takes effect on next connection.</div>'+
+      '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
+        '<span class="modal-row-label">Apps without VPN (TUN mode only)</span>'+
+      '</div>'+
+      '<div class="chips-wrap" id="app-chips">'+appChipsHtml+
+        '<input class="chip-input" id="app-input" placeholder="e.g. chrome.exe, press Enter" onkeydown="appChipKey(event)">'+
+      '</div>'+
+      '<div class="modal-hint">Process names that bypass VPN. Only works in TUN mode (system proxy can\'t be excluded per-app at the OS level). <a href="#" onclick="openProcessPicker(event)" style="color:var(--accent);text-decoration:underline">Browse running processes</a>. Takes effect on next connection.</div>'+
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">System</div>'+
@@ -3841,7 +4289,110 @@ function openSettings(){
     '</div>'+
   '</div>';
   document.body.appendChild(ov);
-  document.getElementById('country-input').focus();
+  // Focus the first usable input — the previous build referenced a
+  // 'country-input' that no longer exists, which threw a TypeError.
+  var firstInput=document.getElementById('domain-input');
+  if(firstInput) firstInput.focus();
+  // Pre-warm the running-process cache asynchronously so the Browse modal
+  // opens instantly when the user clicks the link below.
+  refreshProcessCache();
+}
+
+// processNamesCache stores the most recent process snapshot so the browse
+// modal can render instantly. It's refreshed whenever Settings opens or
+// the user clicks "refresh" inside the picker.
+var processNamesCache=[];
+
+function refreshProcessCache(){
+  if(typeof window._goListProcesses!=='function') return;
+  Promise.resolve(window._goListProcesses()).then(function(list){
+    processNamesCache=Array.isArray(list)?list:[];
+  }).catch(function(){});
+}
+
+// openProcessPicker opens a small modal listing currently running
+// processes. Clicking a name adds it as an "Apps without VPN" chip.
+function openProcessPicker(ev){
+  if(ev){ ev.preventDefault(); ev.stopPropagation(); }
+  if(document.getElementById('proc-modal')) return;
+  // Refresh in case processes started/stopped since Settings opened.
+  refreshProcessCache();
+  var ov=document.createElement('div');
+  ov.className='modal-overlay';ov.id='proc-modal';
+  ov.onclick=function(e){ if(e.target===ov) ov.remove(); };
+  ov.innerHTML='<div class="modal-box" style="min-width:380px;max-width:420px">'+
+    '<div class="modal-title">Running processes</div>'+
+    '<input class="modal-input" id="proc-filter" placeholder="filter…" autofocus>'+
+    '<div class="modal-hint" style="margin-top:0">Click a process to add it to the Apps without VPN list.</div>'+
+    '<div id="proc-list-box" style="max-height:300px;overflow-y:auto;border:1px solid var(--border2);border-radius:3px;background:var(--bg2);padding:4px"></div>'+
+    '<div class="modal-btns">'+
+      '<button class="btn ghost" onclick="refreshProcessCache();renderProcessList(document.getElementById(\'proc-filter\').value)">refresh</button>'+
+      '<button class="btn ghost" onclick="document.getElementById(\'proc-modal\').remove()">close</button>'+
+    '</div>'+
+  '</div>';
+  document.body.appendChild(ov);
+  document.getElementById('proc-filter').addEventListener('input',function(e){
+    renderProcessList(e.target.value);
+  });
+  renderProcessList('');
+}
+
+function renderProcessList(filter){
+  var box=document.getElementById('proc-list-box');
+  if(!box) return;
+  filter=(filter||'').trim().toLowerCase();
+  var existing=new Set((appSettingsJS.direct_apps||[]).map(function(s){return s.toLowerCase();}));
+  var names=processNamesCache;
+  var html='';
+  var shown=0;
+  for(var i=0;i<names.length;i++){
+    var n=names[i];
+    if(filter && n.indexOf(filter)<0) continue;
+    var already=existing.has(n);
+    html+='<div class="proc-item'+(already?' added':'')+'" onclick="addProcessFromPicker(\''+
+      x(n).replace(/\\/g,'\\\\').replace(/\x27/g,'\\\x27')+'\')" '+
+      'style="padding:5px 8px;cursor:pointer;font-size:11px;border-radius:2px;'+
+      (already?'opacity:.5;':'')+'" '+
+      'onmouseover="this.style.background=\'rgba(232,197,71,.12)\'" '+
+      'onmouseout="this.style.background=\'\'">'+
+      x(n)+(already?'  (already added)':'')+
+      '</div>';
+    shown++;
+    if(shown>500){ html+='<div style="padding:4px 8px;color:var(--dim);font-size:10px">… '+(names.length-shown)+' more, refine filter</div>'; break; }
+  }
+  if(shown===0){
+    html='<div style="padding:8px;color:var(--dim);font-size:11px;text-align:center">'+
+      (names.length===0?'No process list available — only works in the desktop build.':'No matches')+
+      '</div>';
+  }
+  box.innerHTML=html;
+}
+
+function addProcessFromPicker(name){
+  if(!name) return;
+  if(!appSettingsJS.direct_apps) appSettingsJS.direct_apps=[];
+  var lower=name.toLowerCase();
+  for(var i=0;i<appSettingsJS.direct_apps.length;i++){
+    if(appSettingsJS.direct_apps[i].toLowerCase()===lower) return; // already there
+  }
+  appSettingsJS.direct_apps.push(lower);
+  saveAppSettings(function(){
+    // Re-render the chip strip in the underlying Settings modal.
+    var wrap=document.getElementById('app-chips');
+    var inp=document.getElementById('app-input');
+    if(wrap && inp){
+      wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
+      for(var i=0;i<appSettingsJS.direct_apps.length;i++){
+        var sp=document.createElement('span');
+        sp.className='chip';sp.setAttribute('data-a',appSettingsJS.direct_apps[i]);
+        sp.innerHTML=x(appSettingsJS.direct_apps[i])+'<span class="chip-x" onclick="removeAppChip(this)">x</span>';
+        wrap.insertBefore(sp,inp);
+      }
+    }
+    // Refresh the picker list so the just-added entry shows as "already added".
+    var f=document.getElementById('proc-filter');
+    if(f) renderProcessList(f.value);
+  });
 }
 
 function toggleSources(on){
@@ -3909,6 +4460,48 @@ function removeDomainChip(el){
   saveAppSettings();
 }
 
+// Apps without VPN — process names matched by sing-box (TUN mode only).
+function appChipKey(ev){
+  if(ev.key!=='Enter')return;
+  ev.preventDefault();
+  // Strip whitespace + path; keep just the executable name. Case-insensitive.
+  var raw=ev.target.value.trim();
+  if(!raw)return;
+  // If user pastes a full path like C:\Program Files\Foo\foo.exe, take the leaf.
+  var leaf=raw.replace(/[\/\\]+$/,'');
+  var sep=Math.max(leaf.lastIndexOf('\\'), leaf.lastIndexOf('/'));
+  if(sep>=0) leaf=leaf.substring(sep+1);
+  leaf=leaf.toLowerCase();
+  if(!leaf)return;
+  if(!appSettingsJS.direct_apps)appSettingsJS.direct_apps=[];
+  for(var i=0;i<appSettingsJS.direct_apps.length;i++){
+    if(appSettingsJS.direct_apps[i].toLowerCase()===leaf)return;
+  }
+  appSettingsJS.direct_apps.push(leaf);
+  ev.target.value='';
+  saveAppSettings(function(){
+    var wrap=document.getElementById('app-chips');
+    var inp=document.getElementById('app-input');
+    if(!wrap||!inp)return;
+    wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
+    for(var i=0;i<appSettingsJS.direct_apps.length;i++){
+      var sp=document.createElement('span');
+      sp.className='chip';sp.setAttribute('data-a',appSettingsJS.direct_apps[i]);
+      sp.innerHTML=x(appSettingsJS.direct_apps[i])+'<span class="chip-x" onclick="removeAppChip(this)">x</span>';
+      wrap.insertBefore(sp,inp);
+    }
+  });
+}
+
+function removeAppChip(el){
+  var chip=el.parentElement;
+  var a=chip.getAttribute('data-a');
+  chip.remove();
+  if(!appSettingsJS.direct_apps)return;
+  appSettingsJS.direct_apps=appSettingsJS.direct_apps.filter(function(v){return v.toLowerCase()!==a.toLowerCase();});
+  saveAppSettings();
+}
+
 function openSourcesSettings(){
   closeCtxMenu();
   if(document.getElementById('tab-modal'))return;
@@ -3963,6 +4556,77 @@ function saveSourcesSettings(){
   }).then(function(){rebuildTable();}).catch(console.error);
 }
 
+// modalFiles holds the set of files (existing + newly added) for the
+// currently open tab settings modal. Each item has {name, content, isNew}.
+// We populate it from tab.source_files on open, mutate as the user adds /
+// removes, then send it back on save.
+var modalFiles=[];
+
+function fmtBytes(n){
+  if(n<1024) return n+' B';
+  if(n<1024*1024) return (n/1024).toFixed(1)+' KB';
+  return (n/(1024*1024)).toFixed(1)+' MB';
+}
+
+function renderFileList(){
+  var wrap=document.getElementById('ms-files');
+  if(!wrap) return;
+  if(modalFiles.length===0){
+    wrap.innerHTML='<div class="modal-hint" style="margin:0 0 6px">No files added. Use the + add file button below.</div>';
+    return;
+  }
+  var html='';
+  for(var i=0;i<modalFiles.length;i++){
+    var f=modalFiles[i];
+    var pathTitle=f.path||f.name;
+    var sz=typeof f.size==='number'?f.size:0;
+    html+='<div class="file-row'+(f.isNew?' new':'')+'" title="'+x(pathTitle)+'">'+
+      '<span class="file-ico">📄</span>'+
+      '<span class="file-name">'+x(f.name)+'</span>'+
+      '<span class="file-size">'+fmtBytes(sz)+'</span>'+
+      '<button class="url-rm" onclick="removeModalFile('+i+')" title="Remove">x</button>'+
+      '</div>';
+  }
+  wrap.innerHTML=html;
+}
+
+function removeModalFile(i){
+  if(i<0||i>=modalFiles.length) return;
+  modalFiles.splice(i,1);
+  renderFileList();
+}
+
+// pickModalFiles opens the native Windows file dialog through the Go-side
+// binding. Files come back with their full disk paths so the server can
+// re-read them on RELOAD when their content changes.
+//
+// Drag-and-drop was supported earlier but was removed — without access to
+// the original file path (which the web platform doesn't expose for dropped
+// files) RELOAD couldn't pick up edits, which made the feature confusing.
+function pickModalFiles(){
+  if(typeof window._goPickFiles!=='function'){
+    console.warn('Native file picker is unavailable — pickModalFiles is a no-op outside the desktop shell.');
+    return;
+  }
+  Promise.resolve(window._goPickFiles()).then(function(picked){
+    if(!picked||picked.length===0) return;
+    for(var i=0;i<picked.length;i++){
+      var f=picked[i];
+      if(!f || !f.path) continue;
+      modalFiles.push({
+        name: f.name||'file.txt',
+        path: f.path,
+        size: typeof f.size==='number'?f.size:0,
+        mtime: typeof f.mtime==='number'?f.mtime:0,
+        isNew: true
+      });
+    }
+    renderFileList();
+  }).catch(function(err){
+    console.error('native picker failed:', err);
+  });
+}
+
 function openTabSettings(tabId){
   closeCtxMenu();
   const tab=tabsList.find(t=>t.id===tabId);
@@ -3981,19 +4645,43 @@ function openTabSettings(tabId){
     efHtml+='<span class="chip" data-c="'+x(ef[i])+'">'+x(ef[i])+'<span class="chip-x" onclick="this.parentElement.remove()">x</span></span>';
   }
 
+  // Seed modalFiles with what's already saved on the tab. We only carry
+  // file metadata (name, path, size, mtime) — actual content is read from
+  // disk on every fetch by the server, so the renderer never holds it.
+  modalFiles=[];
+  var existing=tab.source_files||[];
+  for(var i=0;i<existing.length;i++){
+    modalFiles.push({
+      name: existing[i].name||'file.txt',
+      path: existing[i].path||'',
+      size: typeof existing[i].size==='number'?existing[i].size:0,
+      mtime: typeof existing[i].mtime==='number'?existing[i].mtime:0,
+      isNew: false
+    });
+  }
+
   const ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='tab-modal';
   ov.onclick=(e)=>{if(e.target===ov)ov.remove();};
   ov.innerHTML=
-    '<div class="modal-box" style="min-width:440px">'+
+    '<div class="modal-box" id="tab-modal-box" style="min-width:440px">'+
       '<div class="modal-title">Tab Settings</div>'+
       '<div class="modal-label">Name</div>'+
       '<input class="modal-input" id="ms-name" value="'+x(tab.name)+'" maxlength="40">'+
       '<div class="modal-label">Source URLs (raw links, base64 subscriptions)</div>'+
       '<div id="ms-urls">'+urlsHtml+'</div>'+
       '<button class="btn ghost" style="font-size:9px;margin:4px 0 8px" onclick="addURLRow()">+ add URL</button>'+
+      '<div class="modal-label">Files (loaded in addition order, after URLs)</div>'+
+      '<div id="ms-files"></div>'+
+      '<button class="btn ghost" style="font-size:9px;margin:4px 0 8px" onclick="pickModalFiles()">+ add file</button>'+
+      '<div class="modal-hint">Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.</div>'+
       '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
       '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px;margin-bottom:10px">'+
+      '<div class="modal-row" style="margin-top:6px;margin-bottom:4px">'+
+        '<span class="modal-row-label">Deduplicate configs across sources</span>'+
+        '<label class="toggle"><input type="checkbox" id="ms-dedup" '+(tab.dedup?'checked':'')+'><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">Removes duplicate vless URLs that appear in more than one source within this tab.</div>'+
       '<div class="modal-label">Exclude filter</div>'+
       '<div class="chips-wrap" id="tab-filter-chips">'+efHtml+
         '<input class="chip-input" id="tab-filter-input" placeholder="e.g. Russia, press Enter" onkeydown="tabFilterKey(event)">'+
@@ -4005,6 +4693,7 @@ function openTabSettings(tabId){
       '</div>'+
     '</div>';
   document.body.appendChild(ov);
+  renderFileList();
   document.getElementById('ms-name').focus();
   document.getElementById('ms-name').select();
 }
@@ -4033,6 +4722,7 @@ function addURLRow(){
 function saveTabSettings(tabId){
   var name=document.getElementById('ms-name').value.trim();
   var refreshMin=parseInt(document.getElementById('ms-refresh').value)||0;
+  var dedup=!!document.getElementById('ms-dedup').checked;
   var urlInputs=document.querySelectorAll('#ms-urls .ms-url');
   var urls=[];
   urlInputs.forEach(function(inp){
@@ -4042,13 +4732,21 @@ function saveTabSettings(tabId){
   var chips=document.querySelectorAll('#tab-filter-chips .chip');
   var ef=[];
   chips.forEach(function(c){ef.push(c.getAttribute('data-c'));});
+  // Send only the file metadata the server needs to find and read each
+  // file. Strip isNew (client-only) and size/mtime (server re-stats on
+  // save anyway, so what we'd send is stale). Content is never on the
+  // wire — the server reads from disk on every fetch.
+  var files=modalFiles
+    .filter(function(f){ return !!f.path; })
+    .map(function(f){ return {name:f.name, path:f.path}; });
   document.getElementById('tab-modal').remove();
+  modalFiles=[];
   if(name){
     fetch('/api/tab/rename?id='+encodeURIComponent(tabId)+'&name='+encodeURIComponent(name),{method:'POST'}).catch(console.error);
   }
   fetch('/api/tab/set-url?id='+encodeURIComponent(tabId),{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({urls:urls,refresh_min:refreshMin,exclude_filter:ef})
+    body:JSON.stringify({urls:urls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup:dedup})
   }).then(function(){rebuildTable();}).catch(console.error);
 }
 
@@ -4064,6 +4762,12 @@ document.addEventListener('keydown',function(e){
     rebuildTable();
     return;
   }
+  // Ctrl+C is handled by the 'copy' event listener — see above.
+  // That path is more reliable than intercepting keydown + calling
+  // navigator.clipboard.writeText(), which is async, permission-gated,
+  // and races with the native copy pipeline (the symptoms of which were
+  // "копируется не та конфигурация" — the OS clipboard kept the
+  // previous value when writeText silently failed).
   if((e.key==='Delete'||e.key==='Backspace')&&selectedRows.size>0&&activeTabId!=='main'){
     if(document.activeElement&&(document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA'))return;
     e.preventDefault();
@@ -4110,6 +4814,28 @@ document.addEventListener('paste', function(e){
   }
   fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:text}).catch(console.error);
 });
+
+// Drag-and-drop file ingestion has been removed.
+// Without the original disk path (which the web platform doesn't expose
+// for dropped files) RELOAD couldn't pick up later edits, which made the
+// feature confusing. Use the "+ add file" button in tab settings instead —
+// it goes through the native Windows file dialog and yields full paths.
+//
+// We still need to swallow drag/drop on the document, otherwise dropping a
+// file would navigate the WebView away from the app to that file.
+(function(){
+  document.addEventListener('dragover', function(e){
+    if(e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types,'Files')>=0){
+      e.preventDefault();
+      e.dataTransfer.dropEffect='none';
+    }
+  });
+  document.addEventListener('drop', function(e){
+    if(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length>0){
+      e.preventDefault();
+    }
+  });
+})();
 
 // ── Custom title bar (standalone frameless mode) ─────────────────────────────
 (function(){
@@ -4249,8 +4975,8 @@ func startAutoRefresh() {
 			lastRefresh[t.ID] = time.Now()
 			if t.IsMain {
 				go fetchAndInit()
-			} else if len(t.SourceURLs) > 0 {
-				go fetchTabURLs(t.ID, t.SourceURLs)
+			} else if len(t.SourceURLs) > 0 || len(t.SourceFiles) > 0 {
+				go fetchTabURLs(t.ID, t.SourceURLs, t.SourceFiles)
 			}
 		}
 	}

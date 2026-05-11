@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -156,6 +158,10 @@ var (
 
 	shell32                        = windows.NewLazySystemDLL("shell32.dll")
 	procShellNotifyIconW           = shell32.NewProc("Shell_NotifyIconW")
+
+	// File-open dialog (used by _goPickFiles).
+	comdlg32              = windows.NewLazySystemDLL("comdlg32.dll")
+	procGetOpenFileNameW  = comdlg32.NewProc("GetOpenFileNameW")
 )
 
 type dwmMargins struct{ Left, Right, Top, Bottom int32 }
@@ -616,6 +622,40 @@ func openNativeWindow(addr string) {
 	})
 	w.Bind("_goLogoBase64", func() string { return logoBase64 })
 
+	// File picker — opens the native Windows open-file dialog and returns
+	// metadata for each chosen file. Returns:
+	//   [{name, path, size, mtime}, …]
+	// We deliberately do NOT read file content here. The server reads
+	// content directly from disk when it needs to parse configs, so the
+	// renderer never has to hold a copy. This makes any file size work
+	// without memory pressure on the WebView2 process.
+	w.Bind("_goPickFiles", func() []map[string]interface{} {
+		paths := pickConfigFiles(hwnd)
+		out := make([]map[string]interface{}, 0, len(paths))
+		for _, p := range paths {
+			info, statErr := os.Stat(p)
+			if statErr != nil {
+				fmt.Fprintf(os.Stderr, "⚠ pick %s: %v\n", p, statErr)
+				continue
+			}
+			out = append(out, map[string]interface{}{
+				"name":  filepath.Base(p),
+				"path":  p,
+				"size":  info.Size(),
+				"mtime": info.ModTime().Unix(),
+			})
+		}
+		return out
+	})
+
+	// Lists running processes (executable names) for the "Apps without
+	// VPN" chip input. Returns a deduplicated, sorted, lowercased slice.
+	// Result is small (typically a few hundred entries) so we just send
+	// the whole list each call.
+	w.Bind("_goListProcesses", func() []string {
+		return listRunningProcessNames()
+	})
+
 	w.Navigate(addr)
 
 	// ── Resize fix: subclass WebView2 child windows ───────────────────────────
@@ -800,6 +840,196 @@ func restartAsAdmin() {
 var (
 	procShellExecuteW = shell32.NewProc("ShellExecuteW")
 )
+
+// ── Native file picker (used by JS `_goPickFiles`) ───────────────────────────
+//
+// Uses the classic GetOpenFileNameW dialog (comdlg32) with multi-select.
+// We pick the classic dialog over the modern IFileOpenDialog to keep the
+// implementation in plain syscalls without COM plumbing — multi-select works
+// fine for our purposes (text/config files).
+//
+// Multi-select result formatting: the buffer is zero-separated with the
+// directory first, then each file name, ending with a double-NUL. If only
+// one file is chosen, the buffer holds the single full path. We parse both
+// shapes below.
+
+const (
+	ofnAllowMultiSelect = 0x00000200
+	ofnExplorer         = 0x00080000
+	ofnPathMustExist    = 0x00000800
+	ofnFileMustExist    = 0x00001000
+	ofnHideReadOnly     = 0x00000004
+	ofnNoChangeDir      = 0x00000008
+)
+
+type openFileNameW struct {
+	StructSize     uint32
+	Owner          uintptr
+	Instance       uintptr
+	Filter         *uint16
+	CustomFilter   *uint16
+	MaxCustFilter  uint32
+	FilterIndex    uint32
+	File           *uint16
+	MaxFile        uint32
+	FileTitle      *uint16
+	MaxFileTitle   uint32
+	InitialDir     *uint16
+	Title          *uint16
+	Flags          uint32
+	FileOffset     uint16
+	FileExtension  uint16
+	DefExt         *uint16
+	CustData       uintptr
+	FnHook         uintptr
+	TemplateName   *uint16
+	PvReserved     uintptr
+	DwReserved     uint32
+	FlagsEx        uint32
+}
+
+// pickConfigFiles shows the file picker and returns the selected paths.
+// Returns an empty slice if the user cancels or anything goes wrong.
+func pickConfigFiles(ownerHwnd uintptr) []string {
+	// 64 KiB buffer — enough for ~1000 selected files even with long paths.
+	const bufLen = 64 * 1024
+	buf := make([]uint16, bufLen)
+
+	filter := utf16Z("Config files\x00*.txt;*.conf;*.list;*.json;*.yaml;*.yml\x00All files\x00*.*\x00")
+	title := utf16Z("Select config file(s)")
+
+	ofn := openFileNameW{
+		Owner:    ownerHwnd,
+		Filter:   &filter[0],
+		File:     &buf[0],
+		MaxFile:  bufLen,
+		Title:    &title[0],
+		Flags:    ofnAllowMultiSelect | ofnExplorer | ofnPathMustExist | ofnFileMustExist | ofnHideReadOnly | ofnNoChangeDir,
+	}
+	ofn.StructSize = uint32(unsafe.Sizeof(ofn))
+
+	ret, _, _ := procGetOpenFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
+	if ret == 0 {
+		return nil // user cancelled, or error
+	}
+
+	// Parse: walk null-separated UTF-16 strings until we hit a double-NUL.
+	var parts []string
+	i := 0
+	for i < bufLen {
+		// Find the next NUL.
+		j := i
+		for j < bufLen && buf[j] != 0 {
+			j++
+		}
+		if j == i {
+			// Empty string => terminator (double-NUL).
+			break
+		}
+		parts = append(parts, syscall.UTF16ToString(buf[i:j]))
+		i = j + 1
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	if len(parts) == 1 {
+		// Single-select form: the only entry is the full path.
+		return parts
+	}
+	// Multi-select form: parts[0] is the directory, parts[1:] are file names.
+	dir := parts[0]
+	out := make([]string, 0, len(parts)-1)
+	for _, name := range parts[1:] {
+		out = append(out, filepath.Join(dir, name))
+	}
+	return out
+}
+
+// utf16Z converts a Go string with embedded NULs into a NUL-terminated
+// UTF-16 buffer suitable for the filter field (which uses NULs as
+// internal separators).
+func utf16Z(s string) []uint16 {
+	out := make([]uint16, 0, len(s)+1)
+	for _, r := range s {
+		if r < 0x10000 {
+			out = append(out, uint16(r))
+		} else {
+			r -= 0x10000
+			out = append(out, 0xD800|uint16(r>>10))
+			out = append(out, 0xDC00|uint16(r&0x3FF))
+		}
+	}
+	out = append(out, 0)
+	return out
+}
+
+// ── Process enumeration (used by JS `_goListProcesses`) ─────────────────────
+
+const (
+	th32csSnapProcess = 0x00000002
+	maxPath           = 260
+)
+
+type processEntry32W struct {
+	Size            uint32
+	Usage           uint32
+	ProcessID       uint32
+	DefaultHeapID   uintptr
+	ModuleID        uint32
+	Threads         uint32
+	ParentProcessID uint32
+	PriClassBase    int32
+	Flags           uint32
+	ExeFile         [maxPath]uint16
+}
+
+var (
+	kernel32                  = windows.NewLazySystemDLL("kernel32.dll")
+	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
+	procProcess32FirstW          = kernel32.NewProc("Process32FirstW")
+	procProcess32NextW           = kernel32.NewProc("Process32NextW")
+	procCloseHandle              = kernel32.NewProc("CloseHandle")
+)
+
+// listRunningProcessNames returns a sorted, deduplicated list of executable
+// names of currently running processes (e.g. "chrome.exe"). Names are
+// lowercased so the chip-input's case-insensitive matching stays consistent.
+func listRunningProcessNames() []string {
+	hSnap, _, _ := procCreateToolhelp32Snapshot.Call(th32csSnapProcess, 0)
+	// INVALID_HANDLE_VALUE is -1 on x64; on a uintptr that's all-bits-set.
+	if hSnap == 0 || hSnap == ^uintptr(0) {
+		return nil
+	}
+	defer procCloseHandle.Call(hSnap)
+
+	var entry processEntry32W
+	entry.Size = uint32(unsafe.Sizeof(entry))
+
+	ret, _, _ := procProcess32FirstW.Call(hSnap, uintptr(unsafe.Pointer(&entry)))
+	if ret == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool, 256)
+	for {
+		name := syscall.UTF16ToString(entry.ExeFile[:])
+		if name != "" {
+			lower := strings.ToLower(name)
+			seen[lower] = true
+		}
+		ret, _, _ := procProcess32NextW.Call(hSnap, uintptr(unsafe.Pointer(&entry)))
+		if ret == 0 {
+			break
+		}
+	}
+
+	out := make([]string, 0, len(seen))
+	for n := range seen {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
 
 func standaloneMain() {
 	fresh, extractErr := extractBinaries()
