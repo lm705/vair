@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,9 +68,6 @@ const (
 	// tunStartupTimeout: time to wait for sing-box TUN adapter to come up.
 	tunStartupTimeout = 3 * time.Second
 
-	pingConcurrency      = 10
-	pingSpeedConcurrency = 5
-
 	// Default ports for persistent proxy connection
 	connHTTPPort  = 10819
 	connSOCKSPort = 10818
@@ -105,6 +103,50 @@ type AppSettings struct {
 	DirectDomains      []string `json:"direct_domains"`
 	DirectApps         []string `json:"direct_apps"`
 	TrayEnabled        bool     `json:"tray_enabled"`
+	// Per-user concurrency overrides for bulk tests. Zero / unset falls back
+	// to the defaults below. Capped at sane upper bounds inside the
+	// accessors so a fat-fingered "9999" doesn't melt the local network.
+	PingConcurrency    int `json:"ping_concurrency,omitempty"`
+	SpeedConcurrency   int `json:"speed_concurrency,omitempty"`
+}
+
+const (
+	defaultPingConcurrency  = 10
+	defaultSpeedConcurrency = 5
+	maxPingConcurrency      = 200
+	maxSpeedConcurrency     = 100
+)
+
+// currentPingConcurrency returns the user's chosen ping concurrency, clamped
+// to [1, maxPingConcurrency]. Used by runPingAll instead of a const so the
+// setting is honored without a restart.
+func currentPingConcurrency() int {
+	settingsMu.RLock()
+	n := appSettings.PingConcurrency
+	settingsMu.RUnlock()
+	if n <= 0 {
+		return defaultPingConcurrency
+	}
+	if n > maxPingConcurrency {
+		return maxPingConcurrency
+	}
+	return n
+}
+
+// currentSpeedConcurrency mirrors currentPingConcurrency for speed tests.
+// The default is lower (5) because each speed test holds a full data
+// transfer for several seconds — running 200 in parallel saturates anything.
+func currentSpeedConcurrency() int {
+	settingsMu.RLock()
+	n := appSettings.SpeedConcurrency
+	settingsMu.RUnlock()
+	if n <= 0 {
+		return defaultSpeedConcurrency
+	}
+	if n > maxSpeedConcurrency {
+		return maxSpeedConcurrency
+	}
+	return n
 }
 
 var appSettings = AppSettings{SourcesEnabled: true}
@@ -285,7 +327,10 @@ type Tab struct {
 	SourceFiles    []TabFile `json:"source_files,omitempty"`
 	RefreshMin     int       `json:"refresh_min,omitempty"`
 	ExcludeFilter  []string  `json:"exclude_filter,omitempty"`
-	Dedup          bool      `json:"dedup,omitempty"`
+	// DedupMode is "" (off), "hide" (client-side view filter, reversible),
+	// or "delete" (server-side removal, not reversible). The Tab.Dedup
+	// boolean from earlier dev builds is auto-migrated to "hide" on load.
+	DedupMode      string    `json:"dedup_mode,omitempty"`
 }
 
 type persistedTab struct {
@@ -296,7 +341,11 @@ type persistedTab struct {
 	SourceFiles    []TabFile `json:"source_files,omitempty"`
 	RefreshMin     int       `json:"refresh_min,omitempty"`
 	ExcludeFilter  []string  `json:"exclude_filter,omitempty"`
+	// Two fields cover the migration: old builds wrote `dedup: true` for
+	// what's now `dedup_mode: "hide"`. loadTabs picks DedupMode if set,
+	// otherwise upgrades the legacy bool.
 	Dedup          bool      `json:"dedup,omitempty"`
+	DedupMode      string    `json:"dedup_mode,omitempty"`
 	Configs        []string  `json:"configs,omitempty"`
 }
 type persistedData struct {
@@ -359,7 +408,7 @@ func saveTabs() {
 		pt := persistedTab{
 			ID: t.ID, Name: t.Name,
 			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles, RefreshMin: t.RefreshMin,
-			ExcludeFilter: t.ExcludeFilter, Dedup: t.Dedup,
+			ExcludeFilter: t.ExcludeFilter, DedupMode: t.DedupMode,
 		}
 		if len(t.SourceURLs) == 1 {
 			pt.SourceURL = t.SourceURLs[0]
@@ -415,10 +464,16 @@ func loadTabs() {
 		if len(urls) == 0 && pt.SourceURL != "" {
 			urls = []string{pt.SourceURL}
 		}
+		// Upgrade pre-3-state dev builds: `dedup: true` → DedupMode "hide".
+		// The new explicit DedupMode wins if present.
+		mode := pt.DedupMode
+		if mode == "" && pt.Dedup {
+			mode = "hide"
+		}
 		tab := Tab{
 			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
 			SourceURLs: urls, SourceFiles: pt.SourceFiles,
-			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter, Dedup: pt.Dedup,
+			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter, DedupMode: mode,
 		}
 		state.tabs = append(state.tabs, tab)
 		entries := parseConfigLines(strings.Join(pt.Configs, "\n"))
@@ -1752,7 +1807,7 @@ func runPingAll(onlyIndices map[int]bool) {
 	testingTab = tabID
 	testMu.Unlock()
 	state.broadcast(SSEEvent{Type: "bulk_ping_start", Payload: len(entries), Tab: tabID})
-	sem := make(chan struct{}, pingConcurrency)
+	sem := make(chan struct{}, currentPingConcurrency())
 	var wg sync.WaitGroup
 	var done int64
 	for _, e := range entries {
@@ -1829,7 +1884,7 @@ func runSpeedAll(onlyIndices map[int]bool) {
 	testingTab = tabID
 	testMu.Unlock()
 	state.broadcast(SSEEvent{Type: "bulk_speed_start", Payload: len(entries), Tab: tabID})
-	sem := make(chan struct{}, pingSpeedConcurrency)
+	sem := make(chan struct{}, currentSpeedConcurrency())
 	var wg sync.WaitGroup
 	var done int64
 	for _, e := range entries {
@@ -2010,6 +2065,10 @@ func fetchAndInit() {
 		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
 	}
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
+	// Big subscription parses leave Go's heap allocated — nudge the runtime
+	// to release it back to the OS so memory usage doesn't appear to grow
+	// after every reload. See the matching call in fetchTabURLs.
+	debug.FreeOSMemory()
 }
 
 func fetchURL(u string) ([]string, error) {
@@ -2100,11 +2159,39 @@ func fetchGitHubPAT() ([]string, error) {
 	return lines, nil
 }
 
+// parseConfigLines parses vless URLs from a single in-memory text blob.
+// Used for URL responses and pasted text — kept around as a convenience
+// wrapper over parseConfigReader.
 func parseConfigLines(text string) []*ConfigEntry {
+	return parseConfigReader(strings.NewReader(text))
+}
+
+// parseConfigFile streams a file from disk a line at a time. This is the
+// path that matters for big files: a 980 MB subscription dump is processed
+// without ever holding more than one line in memory. The returned entries
+// each own a fresh Raw string (no substring-sharing with the file content),
+// so they don't pin the file's bytes alive after parsing.
+func parseConfigFile(path string) ([]*ConfigEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return parseConfigReader(f), nil
+}
+
+// parseConfigReader does the actual scanning. bufio.Scanner.Text() allocates
+// a fresh string per line, so e.Raw doesn't share storage with anything
+// upstream — that's the key fix for the "RAM doubles on every RELOAD"
+// leak. The buffer cap is 4 MiB which comfortably handles the longest
+// vless URLs (real ones are typically < 4 KiB).
+func parseConfigReader(r io.Reader) []*ConfigEntry {
 	var entries []*ConfigEntry
 	seen := make(map[string]bool)
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSpace(line)
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		// Extract vless:// URL from anywhere in the line
 		idx := strings.Index(line, "vless://")
 		if idx < 0 {
@@ -2141,6 +2228,9 @@ func parseConfigLines(text string) []*ConfigEntry {
 		}
 		entries = append(entries, e)
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠ parseConfigReader: %v\n", err)
+	}
 	for i, e := range entries {
 		e.Index = i
 	}
@@ -2158,6 +2248,70 @@ func vlessBody(raw string) string {
 		return raw[:i]
 	}
 	return raw
+}
+
+// dedupByBody removes entries whose vless body (everything before the
+// `#` fragment) already appeared at a smaller index. The first occurrence
+// in input order is kept. Used by tabs in DedupMode "delete" — the
+// reversible "hide" mode achieves the same visual result via a JS view
+// filter in matches(), without touching the underlying entries.
+func dedupByBody(entries []*ConfigEntry) []*ConfigEntry {
+	if len(entries) <= 1 {
+		return entries
+	}
+	seen := make(map[string]bool, len(entries))
+	out := make([]*ConfigEntry, 0, len(entries))
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		body := vlessBody(e.Raw)
+		if body == "" || seen[body] {
+			continue
+		}
+		seen[body] = true
+		out = append(out, e)
+	}
+	return out
+}
+
+// applyDeleteDedupInPlace removes body-duplicates from the named tab's
+// current entries and rebroadcasts the table. Used when the user flips
+// DedupMode to "delete" without changing sources — there's nothing to
+// re-fetch, but we still want the deletion to happen immediately. Indices
+// are recomputed; names are *not* re-disambiguated because the existing
+// names were already computed against the pre-dedup index order and
+// re-running would produce double-suffix names like "USA - 1 - 1".
+func applyDeleteDedupInPlace(tabID string) {
+	state.mu.Lock()
+	entries := state.tabEntries[tabID]
+	if len(entries) == 0 {
+		state.mu.Unlock()
+		saveTabs()
+		return
+	}
+	deduped := dedupByBody(entries)
+	if len(deduped) == len(entries) {
+		state.mu.Unlock()
+		saveTabs()
+		return
+	}
+	for i, e := range deduped {
+		e.Index = i
+	}
+	state.tabEntries[tabID] = deduped
+	if state.activeTab == tabID {
+		state.entries = deduped
+	}
+	state.mu.Unlock()
+	if state.activeTab == tabID {
+		snaps := make([]ConfigEntry, len(deduped))
+		for i, e := range deduped {
+			snaps[i] = e.snap()
+		}
+		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
+	}
+	saveTabs()
 }
 
 // setVlessName replaces the URL fragment of a vless URL with the given
@@ -2693,16 +2847,33 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		Files         []TabFile `json:"files"`
 		RefreshMin    int       `json:"refresh_min"`
 		ExcludeFilter []string  `json:"exclude_filter"`
+		// New 3-state field. Legacy "dedup":true is accepted below for
+		// older clients during the migration window.
+		DedupMode     string    `json:"dedup_mode"`
 		Dedup         bool      `json:"dedup"`
 	}
 	var req tabSettingsReq
 	if r.Body != nil {
-		// Files can be a few MB each - allow reasonable upload size
 		// Body contains URLs, file metadata, and config arrays. Content
 		// is read directly from disk, never sent over this endpoint.
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 4*1024*1024))
 		json.Unmarshal(body, &req)
 	}
+	// Normalize the mode. Empty or unrecognized → "" (off). Old `dedup: true`
+	// payloads from any in-flight client get treated as "hide".
+	newMode := req.DedupMode
+	switch newMode {
+	case "off":
+		newMode = ""
+	case "hide", "delete", "":
+		// recognized
+	default:
+		newMode = ""
+	}
+	if newMode == "" && req.Dedup {
+		newMode = "hide"
+	}
+
 	// Clean URLs
 	var cleanURLs []string
 	for _, u := range req.URLs {
@@ -2732,7 +2903,8 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		cleanFiles = append(cleanFiles, f)
 	}
 
-	var sourcesChanged, dedupChanged bool
+	var sourcesChanged bool
+	var oldMode string
 	state.mu.Lock()
 	for i, t := range state.tabs {
 		if t.ID == id {
@@ -2742,10 +2914,10 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 				oldFilesKey := tabFilesKey(t.SourceFiles)
 				newFilesKey := tabFilesKey(cleanFiles)
 				sourcesChanged = (oldURLs != newURLs) || (oldFilesKey != newFilesKey)
-				dedupChanged = t.Dedup != req.Dedup
+				oldMode = t.DedupMode
 				state.tabs[i].SourceURLs = cleanURLs
 				state.tabs[i].SourceFiles = cleanFiles
-				state.tabs[i].Dedup = req.Dedup
+				state.tabs[i].DedupMode = newMode
 			}
 			state.tabs[i].RefreshMin = req.RefreshMin
 			state.tabs[i].ExcludeFilter = req.ExcludeFilter
@@ -2755,7 +2927,24 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	state.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
-	if (!sourcesChanged && !dedupChanged) || id == "main" {
+
+	// "delete" mode requested AND mode has actually transitioned into delete
+	// AND sources didn't change → apply server-side dedup to the current
+	// entries in place. (When sources changed we re-fetch below, and that
+	// path applies delete-dedup via fetchTabURLs.)
+	if !sourcesChanged && id != "main" && newMode == "delete" && oldMode != "delete" {
+		applyDeleteDedupInPlace(id)
+		w.WriteHeader(200)
+		w.Write([]byte("ok"))
+		return
+	}
+
+	// Otherwise: dedup is purely a view-filter concern — toggling it must
+	// not touch server entries, otherwise paste-only tabs (no URLs, no
+	// files) lose every config the moment dedup is flipped. The client
+	// already picked up the new dedup_mode via the tabs_update broadcast
+	// above and re-rendered.
+	if !sourcesChanged || id == "main" {
 		w.WriteHeader(200)
 		w.Write([]byte("ok"))
 		return
@@ -2773,7 +2962,9 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		}
 		go fetchTabURLs(id, cleanURLs, cleanFiles)
 	} else {
-		// All sources removed — clear entries
+		// All sources removed — clear entries. We only reach here when
+		// sourcesChanged is true AND there are no remaining sources;
+		// paste-only tabs have sourcesChanged=false and exit above.
 		state.mu.Lock()
 		state.tabEntries[id] = nil
 		if state.activeTab == id {
@@ -2836,19 +3027,22 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 			fmt.Fprintf(os.Stderr, "⚠ tab %s: file %q has no path, skipping\n", tabID, f.Name)
 			continue
 		}
-		data, err := os.ReadFile(f.Path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "⚠ tab %s re-read %s: %v\n", tabID, f.Path, err)
-			continue
-		}
+		// Refresh stat info for the UI/persistence (size, mtime).
 		if info, statErr := os.Stat(f.Path); statErr == nil {
 			f.Size = info.Size()
 			f.Mtime = info.ModTime().Unix()
 		}
-		entries := parseConfigLines(string(data))
+		// Stream the file line by line. parseConfigFile uses bufio.Scanner
+		// internally so peak memory is one line, not the whole file —
+		// essential for the multi-hundred-MB subscription dumps some
+		// users have. Each entry's Raw owns its own bytes, so the file
+		// contents become eligible for GC the moment scanning finishes.
+		entries, err := parseConfigFile(f.Path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ tab %s read %s: %v\n", tabID, f.Path, err)
+			continue
+		}
 		allEntries = append(allEntries, entries...)
-		// Don't hold a reference to `data` past this point — the slice is
-		// scoped to the loop iteration so Go's GC can reclaim it.
 	}
 
 	// If nothing fetched, keep existing entries
@@ -2867,14 +3061,14 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		return
 	}
 
-	// Apply per-tab exclude filter and read dedup flag
+	// Apply per-tab exclude filter and read dedup mode
 	state.mu.RLock()
 	var excludeFilter []string
-	var dedup bool
+	var dedupMode string
 	for _, t := range state.tabs {
 		if t.ID == tabID {
 			excludeFilter = t.ExcludeFilter
-			dedup = t.Dedup
+			dedupMode = t.DedupMode
 			break
 		}
 	}
@@ -2890,12 +3084,13 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		allEntries = filtered
 	}
 
-	// NB: per-tab dedup used to delete entries here. That broke the user's
-	// expectation that toggling dedup off should bring rows back. Dedup is
-	// now a pure client-side view filter (see matches() in the JS), so the
-	// server keeps every entry and the toggle just hides/shows them. The
-	// `dedup` variable is read above only to log/inspect; we don't act on it.
-	_ = dedup
+	// "delete" mode removes body-duplicates on the server side. "hide" is a
+	// client-side view filter handled by matches() in the JS — server keeps
+	// every entry in that case so toggling back to "off" / "hide" → "off"
+	// restores everything instantly. "" / unset means no dedup at all.
+	if dedupMode == "delete" {
+		allEntries = dedupByBody(allEntries)
+	}
 
 	// Always: rename duplicate display names so each entry is uniquely
 	// identifiable in the table — applied to every tab globally.
@@ -2929,6 +3124,13 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	}
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
+	// Multi-hundred-MB subscription files can leave Go's heap several GB
+	// large after parsing — the previous entries are unreferenced but the
+	// runtime would normally hold that memory for future allocations. Hint
+	// at returning it to the OS so Task Manager actually reflects the
+	// drop. Doing this here (rather than on a timer) means we release
+	// right after the big spike, when there's nothing else to allocate.
+	debug.FreeOSMemory()
 }
 
 func handleTabDeleteEntries(w http.ResponseWriter, r *http.Request) {
@@ -3196,6 +3398,34 @@ header{
 .settings-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border2)}
 .settings-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
 .section-header{font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+
+/* Compact numeric input used in Settings (concurrency, refresh interval) */
+.num-input{
+  width:70px;margin-bottom:0;padding:4px 8px;font-size:11px;text-align:right;
+}
+/* hide spinners on Firefox / WebView2 - they look out of place in this UI */
+.num-input::-webkit-inner-spin-button,.num-input::-webkit-outer-spin-button{
+  -webkit-appearance:none;margin:0;
+}
+.num-input{-moz-appearance:textfield}
+
+/* Segmented selector (Off / Hide / Delete for dedup mode). Each button is
+ * a standalone ghost-style chip — same border/typography as the add-url /
+ * add-file buttons in the same modal. The active option lights up amber
+ * (text + border), mirroring the active-tab treatment in .tab-btn.active.
+ * A small left margin keeps the group from crowding the row label. */
+.seg-group{
+  display:inline-flex;gap:4px;margin-left:12px;
+}
+.seg-btn{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
+  padding:3px 7px;border-radius:3px;
+  color:var(--dim);border:1px solid var(--border2);
+  text-transform:uppercase;letter-spacing:.05em;
+  transition:color .15s, border-color .15s;
+}
+.seg-btn:hover:not(.active){color:var(--text);border-color:var(--dim)}
+.seg-btn.active{color:var(--accent);border-color:var(--accent)}
 .url-row{display:flex;gap:4px;margin-bottom:4px;align-items:center}
 .url-row .modal-input{flex:1;margin-bottom:0}
 .url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:12px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px}
@@ -3450,7 +3680,7 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false};
+let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false, ping_concurrency:10, speed_concurrency:5};
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -3693,11 +3923,11 @@ function setSort(m){
 }
 function applyFilter(){ filterText=document.getElementById('fi').value.toLowerCase(); rebuildTable(); }
 function matches(e){
-  // Per-tab dedup view filter — hide rows whose vless body has appeared at
-  // an earlier index. Toggling dedup off in tab settings makes these
-  // visible again with no fetch needed.
+  // Per-tab dedup view filter — hide rows whose vless body appeared at an
+  // earlier index. Only applies in "hide" mode; "delete" mode has already
+  // removed those entries server-side, so they're not in the entries map.
   var tab=tabsList.find(function(t){return t.id===activeTabId;});
-  if(tab && tab.dedup && dupBodyIndices.has(e.index)) return false;
+  if(tab && tab.dedup_mode==='hide' && dupBodyIndices.has(e.index)) return false;
   // Per-tab exclude filter
   var ef=tab&&tab.exclude_filter?tab.exclude_filter:[];
   if(ef.length>0){
@@ -3977,17 +4207,19 @@ let selectedRows=new Set(); // selected config indices for deletion
 let bulkProgressTab=''; // which tab the current bulk operation belongs to
 
 function onTabsUpdate(tabs){
-  // Detect a change to the active tab's dedup flag so we can refresh the
+  // Detect a change to the active tab's dedup mode so we can refresh the
   // visible rows without waiting for a manual sort/filter event. Toggling
   // dedup is intended to be instantaneous from the user's perspective.
+  // Note: "delete" mode causes a "loaded" event with a smaller entries
+  // list, which itself triggers a rebuild via onLoaded — but we still
+  // rebuild here to cover the "off"⇄"hide" transition where the entries
+  // map doesn't change but the view filter does.
   var prev=tabsList.find(function(t){return t.id===activeTabId;});
   var next=tabs.find(function(t){return t.id===activeTabId;});
-  var dedupFlipped=prev && next && (!!prev.dedup !== !!next.dedup);
+  var dedupFlipped=prev && next && ((prev.dedup_mode||'')!==(next.dedup_mode||''));
   tabsList=tabs;
   renderTabs();
   if(dedupFlipped){
-    // matches() consults tabsList[…].dedup which is now the new value,
-    // and dupBodyIndices was computed at load time so it's still valid.
     rebuildTable();
   }
 }
@@ -4278,6 +4510,18 @@ function openSettings(){
       '<div class="modal-hint">Process names that bypass VPN. Only works in TUN mode (system proxy can\'t be excluded per-app at the OS level). <a href="#" onclick="openProcessPicker(event)" style="color:var(--accent);text-decoration:underline">Browse running processes</a>. Takes effect on next connection.</div>'+
     '</div>'+
     '<div class="settings-section">'+
+      '<div class="section-header">Testing</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">Ping concurrency</span>'+
+        '<input class="modal-input num-input" id="set-ping-conc" type="number" min="1" max="200" value="'+(appSettingsJS.ping_concurrency||10)+'" onchange="updateConcurrency(\'ping\',this.value)">'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">Speed concurrency</span>'+
+        '<input class="modal-input num-input" id="set-speed-conc" type="number" min="1" max="100" value="'+(appSettingsJS.speed_concurrency||5)+'" onchange="updateConcurrency(\'speed\',this.value)">'+
+      '</div>'+
+      '<div class="modal-hint">How many configs are pinged or speed-tested in parallel. Defaults: ping 10, speed 5. Takes effect on the next bulk test run.</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
       '<div class="section-header">System</div>'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">Minimize to tray on close</span>'+
@@ -4422,6 +4666,24 @@ function toggleTray(on){
   appSettingsJS.tray_enabled=on;
   saveAppSettings();
   if(typeof _goToggleTray==='function') _goToggleTray(on);
+}
+
+// updateConcurrency stores a clamped concurrency choice in app settings.
+// Server clamps again on receive (defensive), but we mirror the bounds here
+// so the visible input value stays sensible if the user types past them.
+function updateConcurrency(kind, raw){
+  var v=parseInt(raw,10);
+  if(isNaN(v) || v<1) v=1;
+  if(kind==='ping'){
+    if(v>200) v=200;
+    appSettingsJS.ping_concurrency=v;
+    var inp=document.getElementById('set-ping-conc'); if(inp) inp.value=v;
+  } else {
+    if(v>100) v=100;
+    appSettingsJS.speed_concurrency=v;
+    var inp=document.getElementById('set-speed-conc'); if(inp) inp.value=v;
+  }
+  saveAppSettings();
 }
 
 
@@ -4677,11 +4939,11 @@ function openTabSettings(tabId){
       '<div class="modal-hint">Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.</div>'+
       '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
       '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px;margin-bottom:10px">'+
-      '<div class="modal-row" style="margin-top:6px;margin-bottom:4px">'+
-        '<span class="modal-row-label">Deduplicate configs across sources</span>'+
-        '<label class="toggle"><input type="checkbox" id="ms-dedup" '+(tab.dedup?'checked':'')+'><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '<div class="modal-row" style="margin-top:6px;margin-bottom:12px;align-items:flex-end">'+
+        '<span class="modal-row-label">Deduplicate duplicate configs</span>'+
+        renderDedupSeg(tab.dedup_mode||(tab.dedup?'hide':''))+
       '</div>'+
-      '<div class="modal-hint">Removes duplicate vless URLs that appear in more than one source within this tab.</div>'+
+      '<div class="modal-hint"><strong>Off</strong>: show everything. <strong>Hide</strong>: filter from view, reversible. <strong>Delete</strong>: permanently remove duplicate entries. Matching is by vless body (ignores the name).</div>'+
       '<div class="modal-label">Exclude filter</div>'+
       '<div class="chips-wrap" id="tab-filter-chips">'+efHtml+
         '<input class="chip-input" id="tab-filter-input" placeholder="e.g. Russia, press Enter" onkeydown="tabFilterKey(event)">'+
@@ -4719,10 +4981,44 @@ function addURLRow(){
   wrap.appendChild(div);
   div.querySelector('input').focus();
 }
+
+// renderDedupSeg returns HTML for the 3-state dedup selector shown in
+// tab settings. The currently-selected mode gets the .active class; the
+// underlying value is stored as data-mode on each button so saveTabSettings
+// can read it back without consulting state.
+function renderDedupSeg(currentMode){
+  if(!currentMode) currentMode='';
+  if(currentMode==='off') currentMode=''; // be lenient about legacy values
+  var modes=[
+    {v:'',       l:'Off'},
+    {v:'hide',   l:'Hide'},
+    {v:'delete', l:'Delete'}
+  ];
+  var html='<div class="seg-group" id="ms-dedup-seg" role="radiogroup" aria-label="Deduplicate configs">';
+  for(var i=0;i<modes.length;i++){
+    var m=modes[i];
+    var active=(currentMode===m.v)?' active':'';
+    html+='<button type="button" class="seg-btn'+active+'" data-mode="'+m.v+'" '+
+      'onclick="selectDedupMode(this)" '+
+      'title="'+(m.v===''?'No deduplication':m.v==='hide'?'Hide duplicates from view (reversible)':'Permanently delete duplicates')+'">'+
+      m.l+'</button>';
+  }
+  return html+'</div>';
+}
+
+function selectDedupMode(btn){
+  var group=btn.parentElement;
+  group.querySelectorAll('.seg-btn').forEach(function(b){ b.classList.remove('active'); });
+  btn.classList.add('active');
+}
+
 function saveTabSettings(tabId){
   var name=document.getElementById('ms-name').value.trim();
   var refreshMin=parseInt(document.getElementById('ms-refresh').value)||0;
-  var dedup=!!document.getElementById('ms-dedup').checked;
+  // Read the active segmented-control choice. Empty data-mode means "off".
+  var dedupMode='';
+  var activeSeg=document.querySelector('#ms-dedup-seg .seg-btn.active');
+  if(activeSeg) dedupMode=activeSeg.getAttribute('data-mode')||'';
   var urlInputs=document.querySelectorAll('#ms-urls .ms-url');
   var urls=[];
   urlInputs.forEach(function(inp){
@@ -4746,7 +5042,7 @@ function saveTabSettings(tabId){
   }
   fetch('/api/tab/set-url?id='+encodeURIComponent(tabId),{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({urls:urls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup:dedup})
+    body:JSON.stringify({urls:urls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup_mode:dedupMode})
   }).then(function(){rebuildTable();}).catch(console.error);
 }
 
