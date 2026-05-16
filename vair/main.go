@@ -46,12 +46,12 @@ const (
 )
 
 const (
-	pingTestURL   = "https://www.gstatic.com/generate_204"
+	pingTestURLDefault   = "https://www.gstatic.com/generate_204"
 	pingTimeout   = 1500 * time.Millisecond
 	warmupTimeout = 2 * time.Second
 	pingRounds    = 3
 
-	speedTestURL   = "https://speed.cloudflare.com/__down?bytes=10000000"
+	speedTestURLDefault   = "https://speed.cloudflare.com/__down?bytes=10000000"
 	speedDuration  = 4 * time.Second
 	speedUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -108,6 +108,21 @@ type AppSettings struct {
 	// accessors so a fat-fingered "9999" doesn't melt the local network.
 	PingConcurrency    int `json:"ping_concurrency,omitempty"`
 	SpeedConcurrency   int `json:"speed_concurrency,omitempty"`
+	// Customisable test endpoints. Empty → use built-in defaults
+	// (pingTestURLDefault / speedTestURLDefault). The dropdown in
+	// Settings → Testing lets the user pick a preset or "Custom URL".
+	PingTestURL        string `json:"ping_test_url,omitempty"`
+	SpeedTestURL       string `json:"speed_test_url,omitempty"`
+	// TUN adapter MTU. Zero / unset / out-of-range → 9000 (current default).
+	// Recommended values: 9000 (default, jumbo) or 1500 / 1408 if a slow
+	// network can't handle big frames.
+	TUNMTU             int    `json:"tun_mtu,omitempty"`
+	// Traffic statistics. Inverted bool so the JSON zero value (omitted /
+	// false) means "enabled" — matches the default-on UI.
+	StatsDisabled      bool   `json:"stats_disabled,omitempty"`
+	// Lifetime traffic counters, persisted between sessions. Bytes.
+	StatsTotalUp       int64  `json:"stats_total_up,omitempty"`
+	StatsTotalDown     int64  `json:"stats_total_down,omitempty"`
 }
 
 const (
@@ -147,6 +162,52 @@ func currentSpeedConcurrency() int {
 		return maxSpeedConcurrency
 	}
 	return n
+}
+
+// currentPingURL returns the URL used by the ping test. Falls back to the
+// built-in default if the user hasn't picked one. Read at every call so
+// changes apply without a restart.
+func currentPingURL() string {
+	settingsMu.RLock()
+	u := strings.TrimSpace(appSettings.PingTestURL)
+	settingsMu.RUnlock()
+	if u == "" {
+		return pingTestURLDefault
+	}
+	return u
+}
+
+// currentSpeedURL returns the URL used by the speed test.
+func currentSpeedURL() string {
+	settingsMu.RLock()
+	u := strings.TrimSpace(appSettings.SpeedTestURL)
+	settingsMu.RUnlock()
+	if u == "" {
+		return speedTestURLDefault
+	}
+	return u
+}
+
+// currentMTU returns the TUN-adapter MTU. Out-of-range or unset → 9000
+// (the historical default the codebase shipped with). 576 is the smallest
+// MTU IPv4 hosts must support; above 9000 isn't useful for any LAN we'll see.
+func currentMTU() int {
+	settingsMu.RLock()
+	m := appSettings.TUNMTU
+	settingsMu.RUnlock()
+	if m < 576 || m > 9000 {
+		return 9000
+	}
+	return m
+}
+
+// statsEnabled reports whether traffic statistics collection is on.
+// We store the negation (StatsDisabled) so the JSON zero-value/omitted
+// case means "enabled", matching the default-on UI.
+func statsEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return !appSettings.StatsDisabled
 }
 
 var appSettings = AppSettings{SourcesEnabled: true}
@@ -286,6 +347,13 @@ type connManager struct {
 	xrayCancel context.CancelFunc
 	tmpCfg  string
 	xrayTmpCfg string
+	// Per-session traffic counter. Allocated fresh on every connect so
+	// the byte tallies don't bleed across sessions. nil while idle.
+	counter   *trafficCounter
+	// Cancels the byte-counting forwarders (1 in TUN mode, 2 in proxy
+	// mode for the HTTP + SOCKS inbounds). Set during connect, called
+	// during disconnect to close the listeners.
+	fwdCancel context.CancelFunc
 }
 
 func newConnManager() *connManager {
@@ -754,7 +822,7 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		"tag":            "tun-in",
 		"interface_name": ifaceName,
 		"address":        []string{"172.19.0.1/30"},
-		"mtu":            9000,
+		"mtu":            currentMTU(),
 		"auto_route":     true,
 		"strict_route":   false,
 		"stack":          "gvisor",
@@ -1055,7 +1123,22 @@ func startProxyConnection(entry *ConfigEntry) {
 		}
 	}
 
-	tmpPath, err := writeTempJSON(buildXrayConfig(p, httpPort, socksPort), "xray-conn")
+	// The user-visible ports above are what apps connect to (system proxy
+	// points at httpPort). xray itself listens on internal ports — bytes
+	// flow ext → counter → int → xray. The forwarder is a transparent
+	// localhost TCP relay that tallies bytes per direction.
+	intHTTPPort, e1 := findFreePort()
+	if e1 != nil {
+		setConnError(cm, entry, "no free port for xray http")
+		return
+	}
+	intSOCKSPort, e2 := findFreePort()
+	if e2 != nil {
+		setConnError(cm, entry, "no free port for xray socks")
+		return
+	}
+
+	tmpPath, err := writeTempJSON(buildXrayConfig(p, intHTTPPort, intSOCKSPort), "xray-conn")
 	if err != nil {
 		setConnError(cm, entry, err.Error())
 		return
@@ -1084,7 +1167,7 @@ func startProxyConnection(entry *ConfigEntry) {
 	// Wait for xray HTTP port OR an immediate crash, whichever comes first.
 	portResult := make(chan bool, 1)
 	go func() {
-		portResult <- waitForPort(httpPort, time.Now().Add(xrayConnTimeout))
+		portResult <- waitForPort(intHTTPPort, time.Now().Add(xrayConnTimeout))
 	}()
 
 	select {
@@ -1114,6 +1197,26 @@ func startProxyConnection(entry *ConfigEntry) {
 		}
 	}
 
+	// xray is now listening on the internal ports. Bring up the byte
+	// counters in front of them on the externally visible ports. Apps
+	// (and the system proxy below) see the same ports they always did.
+	counter := &trafficCounter{}
+	fwdCtx, fwdCancel := context.WithCancel(context.Background())
+	if _, err := startCountingForwarder(fwdCtx, httpPort, intHTTPPort, counter, "proxy-http"); err != nil {
+		fwdCancel()
+		cancel()
+		os.Remove(tmpPath)
+		setConnError(cm, entry, "proxy http counter: "+err.Error())
+		return
+	}
+	if _, err := startCountingForwarder(fwdCtx, socksPort, intSOCKSPort, counter, "proxy-socks"); err != nil {
+		fwdCancel()
+		cancel()
+		os.Remove(tmpPath)
+		setConnError(cm, entry, "proxy socks counter: "+err.Error())
+		return
+	}
+
 	if err = setSystemProxy(httpPort); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠  setSystemProxy: %v\n", err)
 	}
@@ -1122,6 +1225,8 @@ func startProxyConnection(entry *ConfigEntry) {
 	cm.cmd = cmd
 	cm.cancel = cancel
 	cm.tmpCfg = tmpPath
+	cm.counter = counter
+	cm.fwdCancel = fwdCancel
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeProxy, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: p.Name,
@@ -1131,6 +1236,7 @@ func startProxyConnection(entry *ConfigEntry) {
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
+	startStatsTicker(cm)
 }
 
 func startTUNConnection(entry *ConfigEntry) {
@@ -1229,10 +1335,28 @@ func startTUNConnection(entry *ConfigEntry) {
 		return
 	}
 	fmt.Printf("ℹ  hybrid TUN: xray proxy on :%d/%d for %s\n", xrayHTTPPort, xraySocksPort, p.Network)
-	// 2. Build sing-box TUN config routing through xray proxy
-	cfg := buildHybridTUNConfig(tunIfaceName, xrayHTTPPort, xraySocksPort)
+
+	// Insert a byte-counting forwarder between sing-box and xray's SOCKS
+	// inbound. sing-box's `proxy` outbound dials this forwarder; the
+	// forwarder relays into xray. xray remains unmodified. This is the
+	// same trick used in proxy mode and gives us per-session traffic
+	// stats with no protocol-specific code.
+	counter := &trafficCounter{}
+	fwdCtx, fwdCancel := context.WithCancel(context.Background())
+	counterSocksPort, err := startCountingForwarder(fwdCtx, 0, xraySocksPort, counter, "tun-socks")
+	if err != nil {
+		fwdCancel()
+		xrayCmd.Process.Kill() //nolint:errcheck
+		xrayCancel()
+		os.Remove(xrayTmpPath)
+		setConnError(cm, entry, "tun counter: "+err.Error())
+		return
+	}
+	// 2. Build sing-box TUN config routing through xray proxy (via counter)
+	cfg := buildHybridTUNConfig(tunIfaceName, xrayHTTPPort, counterSocksPort)
 	tmpPath, err := writeTempJSON(cfg, "singbox-tun")
 	if err != nil {
+		fwdCancel()
 		xrayCmd.Process.Kill() //nolint:errcheck
 		xrayCancel()
 		os.Remove(xrayTmpPath)
@@ -1256,6 +1380,7 @@ func startTUNConnection(entry *ConfigEntry) {
 	if err = cmd.Start(); err != nil {
 		cancel()
 		os.Remove(tmpPath)
+		fwdCancel()
 		xrayCmd.Process.Kill() //nolint:errcheck
 		xrayCancel()
 		os.Remove(xrayTmpPath)
@@ -1290,6 +1415,7 @@ func startTUNConnection(entry *ConfigEntry) {
 	case <-exitCh:
 		cancel()
 		os.Remove(tmpPath)
+		fwdCancel()
 		xrayCmd.Process.Kill() //nolint:errcheck
 		xrayCancel()
 		os.Remove(xrayTmpPath)
@@ -1313,6 +1439,8 @@ func startTUNConnection(entry *ConfigEntry) {
 	cm.xrayCmd = xrayCmd
 	cm.xrayCancel = xrayCancel
 	cm.xrayTmpCfg = xrayTmpPath
+	cm.counter = counter
+	cm.fwdCancel = fwdCancel
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: p.Name,
@@ -1321,6 +1449,7 @@ func startTUNConnection(entry *ConfigEntry) {
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
+	startStatsTicker(cm)
 }
 
 func stopConnection() {
@@ -1355,6 +1484,8 @@ func stopConnectionLocked(cm *connManager) {
 	xrayCmd := cm.xrayCmd
 	xrayCancel := cm.xrayCancel
 	xrayTmpCfg := cm.xrayTmpCfg
+	fwdCancel := cm.fwdCancel
+	counter := cm.counter
 
 	// Clear references immediately so a concurrent call sees them as nil
 	cm.cmd = nil
@@ -1363,7 +1494,32 @@ func stopConnectionLocked(cm *connManager) {
 	cm.xrayCmd = nil
 	cm.xrayCancel = nil
 	cm.xrayTmpCfg = ""
+	cm.fwdCancel = nil
+	cm.counter = nil
 	cm.mu.Unlock()
+
+	// Stop accepting new proxied connections immediately. In-flight relays
+	// drain naturally (their source/dest closes propagate); we don't wait
+	// because the xray kill below will close the destinations for them.
+	if fwdCancel != nil {
+		fwdCancel()
+	}
+
+	// Roll any unpersisted bytes from this session into the lifetime
+	// total before xray dies. The counter is in-process so its values
+	// are available regardless of what xray does. The 30-second ticker
+	// has already persisted most of it; this picks up the tail.
+	//
+	// We skip the fold-in when the user has stats disabled — the toggle
+	// semantics are "don't grow the lifetime counter while I'm not
+	// watching", and folding in here would silently bump it on every
+	// disconnect even with stats off. The session bytes themselves stay
+	// in the in-memory counter (which is about to be discarded), so the
+	// next session starts from a clean slate either way.
+	if counter != nil && statsEnabled() {
+		persistCounterDelta(counter)
+		state.broadcast(SSEEvent{Type: "stats_update", Payload: statsSnapshot(nil)})
+	}
 
 	// === Kill processes WITHOUT holding the lock ===
 
@@ -1466,12 +1622,103 @@ func startUptimeTicker(cm *connManager) {
 	}()
 }
 
+// statsSnapshot returns a JSON-friendly view of current traffic
+// counters. session_* fields are zero when the counter is nil (idle).
+// total_* always reflects the value the lifetime total would take if
+// we persisted right now — i.e. the value on disk plus whatever the
+// live counter has accumulated since the last 30-second checkpoint.
+// Without this fold-in, the displayed total would only tick once
+// every 30 s (and on disconnect), confusing users who watch it.
+func statsSnapshot(counter *trafficCounter) map[string]interface{} {
+	settingsMu.RLock()
+	totalUp := appSettings.StatsTotalUp
+	totalDown := appSettings.StatsTotalDown
+	enabled := !appSettings.StatsDisabled
+	settingsMu.RUnlock()
+	var sessUp, sessDown int64
+	if counter != nil {
+		sessUp = counter.Up.Load()
+		sessDown = counter.Down.Load()
+		// Fold in the not-yet-persisted portion of this session so the
+		// displayed total grows in lockstep with session bytes. The
+		// next persist run will move these bytes into appSettings and
+		// bump LastPersisted — at which point the same display value
+		// comes from the disk side and the delta drops to zero, so the
+		// total never jumps.
+		totalUp += sessUp - counter.LastPersistedUp.Load()
+		totalDown += sessDown - counter.LastPersistedDown.Load()
+	}
+	return map[string]interface{}{
+		"session_up":   sessUp,
+		"session_down": sessDown,
+		"total_up":     totalUp,
+		"total_down":   totalDown,
+		"enabled":      enabled,
+	}
+}
+
+// startStatsTicker broadcasts the current traffic counters once per
+// second while the session is alive. It also folds session deltas into
+// the lifetime total every 30 seconds so a crash never loses more than
+// half a minute of data. Final fold-in happens in stopConnectionLocked.
+func startStatsTicker(cm *connManager) {
+	go func() {
+		t := time.NewTicker(1 * time.Second)
+		defer t.Stop()
+		var ticksSincePersist int
+		for range t.C {
+			cm.mu.Lock()
+			ok := cm.state.Status == ConnConnected
+			counter := cm.counter
+			cm.mu.Unlock()
+			if !ok || counter == nil {
+				return
+			}
+			if !statsEnabled() {
+				continue
+			}
+			state.broadcast(SSEEvent{Type: "stats_update", Payload: statsSnapshot(counter)})
+			ticksSincePersist++
+			if ticksSincePersist >= 30 {
+				ticksSincePersist = 0
+				persistCounterDelta(counter)
+			}
+		}
+	}()
+}
+
+// persistCounterDelta folds the unpersisted portion of the session
+// counter into the lifetime total and updates the LastPersisted markers
+// so the same bytes aren't counted again. Safe to call from anywhere;
+// no-op when there's nothing new.
+func persistCounterDelta(counter *trafficCounter) {
+	curUp := counter.Up.Load()
+	curDown := counter.Down.Load()
+	deltaUp := curUp - counter.LastPersistedUp.Load()
+	deltaDown := curDown - counter.LastPersistedDown.Load()
+	if deltaUp <= 0 && deltaDown <= 0 {
+		return
+	}
+	settingsMu.Lock()
+	if deltaUp > 0 {
+		appSettings.StatsTotalUp += deltaUp
+	}
+	if deltaDown > 0 {
+		appSettings.StatsTotalDown += deltaDown
+	}
+	settingsMu.Unlock()
+	counter.LastPersistedUp.Store(curUp)
+	counter.LastPersistedDown.Store(curDown)
+	saveSettings()
+}
+
 // ─────────────────────────── ping / speed ────────────────────────
 
 func measurePing(tr *http.Transport) (int64, error) {
+	url := currentPingURL()
 	wc := &http.Client{Transport: tr, Timeout: warmupTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	w, err := wc.Get(pingTestURL)
+	w, err := wc.Get(url)
 	if err != nil {
 		return -1, fmt.Errorf("warmup: %w", err)
 	}
@@ -1483,7 +1730,7 @@ func measurePing(tr *http.Transport) (int64, error) {
 	var lastErr error
 	for i := 0; i < pingRounds; i++ {
 		start := time.Now()
-		resp, e := mc.Get(pingTestURL)
+		resp, e := mc.Get(url)
 		if e != nil {
 			lastErr = e
 			if best > 0 {
@@ -1509,7 +1756,7 @@ func measurePing(tr *http.Transport) (int64, error) {
 
 func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error) {
 	sc := &http.Client{Transport: tr, Timeout: speedDuration + 5*time.Second}
-	req, err := http.NewRequest("GET", speedTestURL, nil)
+	req, err := http.NewRequest("GET", currentSpeedURL(), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -2394,6 +2641,13 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 	send(SSEEvent{Type: "conn_update", Payload: state.conn.snap()})
 	send(SSEEvent{Type: "tabs_update", Payload: state.tabs})
+	// Send initial stats so the freshly-loaded UI shows lifetime totals
+	// without waiting for the first ticker pulse (which only fires while
+	// connected). We pass the live counter if a session is in progress.
+	state.conn.mu.Lock()
+	initialCounter := state.conn.counter
+	state.conn.mu.Unlock()
+	send(SSEEvent{Type: "stats_update", Payload: statsSnapshot(initialCounter)})
 	send(SSEEvent{Type: "app_info", Payload: map[string]interface{}{
 		"singbox_available": state.singboxBin != "",
 		"is_admin":          checkAdmin(),
@@ -3307,6 +3561,9 @@ header{
 .sv{font-size:16px;font-weight:700;line-height:1}
 .sl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
 .sv.ok{color:var(--green)}.sv.err{color:var(--red)}.sv.ms{color:var(--accent)}.sv.sp{color:var(--teal)}
+.sv.tx{color:var(--teal);font-variant-numeric:tabular-nums;font-size:12px;line-height:1.1}
+.stat.traf{margin-left:8px;padding-left:14px;border-left:1px solid var(--border2)}
+.stat.traf .sv{white-space:nowrap}
 .spacer{flex:1}
 .ctrls{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
 .btn{
@@ -3371,6 +3628,10 @@ header{
 .modal-box{
   background:var(--bg2);border:1px solid var(--border2);border-radius:6px;
   padding:18px 22px;min-width:360px;max-width:90vw;
+  /* Cap to viewport so long settings don't push the close button off-screen.
+     Falling back to scroll keeps the close button reachable on any window
+     size — including small mobile-style aspect ratios. */
+  max-height:85vh;overflow-y:auto;
 }
 .modal-title{font-size:13px;font-weight:700;color:var(--accent);margin-bottom:14px;text-transform:uppercase;letter-spacing:.06em}
 .modal-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
@@ -3606,6 +3867,8 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
     <div class="stat"><span class="sv err" id="s-er">0</span><span class="sl">failed</span></div>
     <div class="stat"><span class="sv ms" id="s-ms">—</span><span class="sl">best ping</span></div>
     <div class="stat"><span class="sv sp" id="s-sp">—</span><span class="sl">best speed</span></div>
+    <div class="stat traf" id="stat-session" style="display:none"><span class="sv tx" id="s-sess">↑0 ↓0</span><span class="sl">session</span></div>
+    <div class="stat traf" id="stat-total"><span class="sv tx" id="s-totl">↑0 ↓0</span><span class="sl">total</span></div>
   </div>
   <div class="spacer"></div>
   <div class="ctrls">
@@ -3680,7 +3943,7 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false, ping_concurrency:10, speed_concurrency:5};
+let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false, ping_concurrency:10, speed_concurrency:5, ping_test_url:'', speed_test_url:'', tun_mtu:0, stats_disabled:false, stats_total_up:0, stats_total_down:0};
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -3694,6 +3957,7 @@ es.onmessage=e=>{
   else if(ev.type==='loaded'&&tabMatch)              onLoaded(ev.payload);
   else if(ev.type==='entry_update'&&tabMatch)        onUpdate(ev.payload);
   else if(ev.type==='conn_update')                   onConnUpdate(ev.payload);
+  else if(ev.type==='stats_update')                   onStatsUpdate(ev.payload);
   else if(ev.type==='app_info')                      onAppInfo(ev.payload);
   else if(ev.type==='bulk_ping_start')               startBulk('ping',ev.payload,evTab);
   else if(ev.type==='bulk_ping_progress'&&tabMatch)  progBulk('ping',ev.payload);
@@ -3811,6 +4075,10 @@ function onConnUpdate(cs){
       if(row)row.classList.add(cs.mode==='tun'?'row-ct':'row-cp');
     }
   }
+  // Session stat visibility is tied to "connected" — re-render with the
+  // last known counters so the panel hides/shows immediately rather than
+  // waiting for the next stats tick.
+  onStatsUpdate(lastStats);
   rebuildTable();
 }
 
@@ -3818,6 +4086,34 @@ function fmtUptime(s){
   if(!s||s<0)return '';
   const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),ss=s%60;
   return h>0?h+'h '+m+'m':(m>0?m+'m '+ss+'s':ss+'s');
+}
+
+// onStatsUpdate is fired by the server every ~1s while connected, and
+// once on (re-)load. session_* is the live counter (only shown when
+// connected); total_* is the persisted lifetime value (always shown).
+let lastStats={session_up:0, session_down:0, total_up:0, total_down:0, enabled:true};
+function onStatsUpdate(s){
+  if(!s) return;
+  lastStats=s;
+  const enabled = s.enabled !== false;
+  const statTot = document.getElementById('stat-total');
+  const statSess= document.getElementById('stat-session');
+  if(!enabled){
+    statTot.style.display='none';
+    statSess.style.display='none';
+    return;
+  }
+  statTot.style.display='';
+  document.getElementById('s-totl').textContent = '↑'+fmtBytes(s.total_up)+' ↓'+fmtBytes(s.total_down);
+  // Session visibility tracks connection: shown while connected, hidden
+  // otherwise. The actual show/hide happens in onConnUpdate but we also
+  // refresh the value here so it updates as bytes flow.
+  if(connState && connState.status==='connected'){
+    statSess.style.display='';
+    document.getElementById('s-sess').textContent = '↑'+fmtBytes(s.session_up)+' ↓'+fmtBytes(s.session_down);
+  } else {
+    statSess.style.display='none';
+  }
 }
 
 // ── data ───────────────────────────────────────────────────────────
@@ -4520,6 +4816,43 @@ function openSettings(){
         '<input class="modal-input num-input" id="set-speed-conc" type="number" min="1" max="100" value="'+(appSettingsJS.speed_concurrency||5)+'" onchange="updateConcurrency(\'speed\',this.value)">'+
       '</div>'+
       '<div class="modal-hint">How many configs are pinged or speed-tested in parallel. Defaults: ping 10, speed 5. Takes effect on the next bulk test run.</div>'+
+      '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Ping URL</span>'+
+        '<select class="modal-input" id="set-ping-url" style="margin-bottom:0" onchange="updateTestURL(\'ping\',this.value)">'+pingURLOptions()+'</select>'+
+      '</div>'+
+      '<div class="modal-row" id="ping-url-custom-row" style="display:'+(isCustomURL('ping')?'block':'none')+';margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Custom ping URL</span>'+
+        '<input class="modal-input" id="set-ping-url-custom" style="margin-bottom:0" placeholder="https://..." value="'+x(isCustomURL('ping')?(appSettingsJS.ping_test_url||''):'')+'" onchange="updateTestURLCustom(\'ping\',this.value)">'+
+      '</div>'+
+      '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Speed URL</span>'+
+        '<select class="modal-input" id="set-speed-url" style="margin-bottom:0" onchange="updateTestURL(\'speed\',this.value)">'+speedURLOptions()+'</select>'+
+      '</div>'+
+      '<div class="modal-row" id="speed-url-custom-row" style="display:'+(isCustomURL('speed')?'block':'none')+';margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Custom speed URL</span>'+
+        '<input class="modal-input" id="set-speed-url-custom" style="margin-bottom:0" placeholder="https://..." value="'+x(isCustomURL('speed')?(appSettingsJS.speed_test_url||''):'')+'" onchange="updateTestURLCustom(\'speed\',this.value)">'+
+      '</div>'+
+      '<div class="modal-hint">Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">Network</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">TUN MTU</span>'+
+        '<input class="modal-input num-input" id="set-mtu" type="number" min="576" max="9000" value="'+(appSettingsJS.tun_mtu||9000)+'" onchange="updateMTU(this.value)">'+
+      '</div>'+
+      '<div class="modal-hint">Default 9000 (jumbo frames). If you see download stalls or sites hanging, try 1500 or 1408. Takes effect on next connection.</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">Statistics</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">Enable traffic statistics</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-stats" '+(!appSettingsJS.stats_disabled?'checked':'')+' onchange="toggleStats(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label" id="stats-total-label">Lifetime total: ↑'+fmtBytes(appSettingsJS.stats_total_up||0)+' ↓'+fmtBytes(appSettingsJS.stats_total_down||0)+'</span>'+
+        '<button class="btn ghost sm" onclick="resetTotalStats()">reset total</button>'+
+      '</div>'+
+      '<div class="modal-hint">Tracks bytes through the VPN tunnel in both modes. The lifetime total persists across sessions; the live session counter resets on every connect.</div>'+
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">System</div>'+
@@ -4686,6 +5019,117 @@ function updateConcurrency(kind, raw){
   saveAppSettings();
 }
 
+// ── test URL pickers ───────────────────────────────────────────────
+// The dropdowns hold a fixed preset list (kept in sync with the Go
+// defaults). "Custom URL..." switches the dropdown to a sentinel value
+// and reveals a text input. The empty string maps to "default" — what
+// the program shipped with — so unsetting a custom URL is a one-click op.
+
+var PING_PRESETS=[
+  {url:'',                                                  label:'https://www.gstatic.com/generate_204 (default)'},
+  {url:'https://www.google.com/generate_204',               label:'https://www.google.com/generate_204'},
+  {url:'https://detectportal.firefox.com/success.txt',      label:'https://detectportal.firefox.com/success.txt'},
+  {url:'https://captive.apple.com/hotspot-detect.html',     label:'https://captive.apple.com/hotspot-detect.html'},
+  {url:'http://www.msftconnecttest.com/connecttest.txt',    label:'http://www.msftconnecttest.com/connecttest.txt'}
+];
+var SPEED_PRESETS=[
+  {url:'',                                                  label:'https://speed.cloudflare.com/__down?bytes=10000000 (default)'},
+  {url:'https://speed.cloudflare.com/__down?bytes=50000000',  label:'https://speed.cloudflare.com/__down?bytes=50000000'},
+  {url:'http://cachefly.cachefly.net/100mb.test',           label:'http://cachefly.cachefly.net/100mb.test'},
+  {url:'https://proof.ovh.net/files/100Mb.dat',             label:'https://proof.ovh.net/files/100Mb.dat'}
+];
+
+// isCustomURL: true when the user's current URL doesn't match any
+// preset. We treat the empty string as the default (preset 0), not a
+// custom URL — that's what the dropdown represents.
+function isCustomURL(kind){
+  var cur = kind==='ping' ? (appSettingsJS.ping_test_url||'') : (appSettingsJS.speed_test_url||'');
+  if(cur==='') return false;
+  var presets = kind==='ping' ? PING_PRESETS : SPEED_PRESETS;
+  for(var i=0;i<presets.length;i++){ if(presets[i].url===cur) return false; }
+  return true;
+}
+
+function urlOptionsHTML(presets, currentURL, customSelected){
+  var html='';
+  for(var i=0;i<presets.length;i++){
+    var sel = (!customSelected && presets[i].url===currentURL) ? ' selected' : '';
+    html += '<option value="'+x(presets[i].url)+'"'+sel+'>'+x(presets[i].label)+'</option>';
+  }
+  html += '<option value="__custom"'+(customSelected?' selected':'')+'>Custom URL…</option>';
+  return html;
+}
+function pingURLOptions(){
+  return urlOptionsHTML(PING_PRESETS, appSettingsJS.ping_test_url||'', isCustomURL('ping'));
+}
+function speedURLOptions(){
+  return urlOptionsHTML(SPEED_PRESETS, appSettingsJS.speed_test_url||'', isCustomURL('speed'));
+}
+
+// updateTestURL handles a dropdown change. Selecting a preset writes
+// its URL straight into settings (the empty string for the default is
+// fine — currentPingURL()/currentSpeedURL() on the Go side falls back
+// to the built-in default for empty). "__custom" reveals the text
+// input but doesn't change the saved URL until the user types and
+// blurs (updateTestURLCustom does the save).
+function updateTestURL(kind, val){
+  var customRow = document.getElementById(kind+'-url-custom-row');
+  if(val==='__custom'){
+    if(customRow) customRow.style.display='block';
+    // Don't save anything yet — wait for the user to actually type a URL.
+    // But seed the input with whatever they had (if it was already custom).
+    var inp=document.getElementById('set-'+kind+'-url-custom');
+    if(inp && !inp.value) inp.focus();
+    return;
+  }
+  if(customRow) customRow.style.display='none';
+  if(kind==='ping') appSettingsJS.ping_test_url = val;
+  else appSettingsJS.speed_test_url = val;
+  saveAppSettings();
+}
+function updateTestURLCustom(kind, raw){
+  var v = (raw||'').trim();
+  if(kind==='ping') appSettingsJS.ping_test_url = v;
+  else appSettingsJS.speed_test_url = v;
+  saveAppSettings();
+}
+
+// updateMTU clamps to [576, 9000] (the same clamp Go applies). Empty
+// or non-numeric resets to default 9000. Setting takes effect on next
+// connect — there's no point in trying to hot-swap the TUN MTU.
+function updateMTU(raw){
+  var v = parseInt(raw,10);
+  if(isNaN(v) || v<=0){ v = 9000; }
+  if(v < 576)  v = 576;
+  if(v > 9000) v = 9000;
+  appSettingsJS.tun_mtu = v;
+  var inp=document.getElementById('set-mtu'); if(inp) inp.value=v;
+  saveAppSettings();
+}
+
+// toggleStats turns the traffic counter UI on or off. Storage is
+// inverted (stats_disabled) so the JSON default state is "enabled".
+function toggleStats(on){
+  appSettingsJS.stats_disabled = !on;
+  saveAppSettings();
+  // Refresh the panel immediately so the change is visible without
+  // waiting for the next ticker pulse — when disabled, both stats hide.
+  onStatsUpdate(Object.assign({}, lastStats, {enabled: on}));
+}
+
+// resetTotalStats clears the lifetime traffic totals. Server zeros the
+// counters and broadcasts a stats_update; we also patch our local copy
+// so the Settings dialog row updates without a re-open.
+function resetTotalStats(){
+  if(!confirm('Reset the lifetime traffic counter to 0? The current session is not affected.')) return;
+  fetch('/api/stats/reset',{method:'POST'}).then(function(){
+    appSettingsJS.stats_total_up = 0;
+    appSettingsJS.stats_total_down = 0;
+    var lbl=document.getElementById('stats-total-label');
+    if(lbl) lbl.textContent='Lifetime total: ↑0 B ↓0 B';
+  }).catch(console.error);
+}
+
 
 
 function domainChipKey(ev){
@@ -4824,10 +5268,19 @@ function saveSourcesSettings(){
 // removes, then send it back on save.
 var modalFiles=[];
 
+// fmtBytes formats a byte count for both file sizes (used by the
+// per-tab file picker) and traffic totals (used by the header stats
+// panel and Settings). Lifetime totals routinely climb into GB/TB
+// territory, so the scale runs all the way up. Compact precision
+// (≤2 decimals) keeps the column width predictable as values grow.
 function fmtBytes(n){
+  if(!n||n<0) return '0 B';
   if(n<1024) return n+' B';
-  if(n<1024*1024) return (n/1024).toFixed(1)+' KB';
-  return (n/(1024*1024)).toFixed(1)+' MB';
+  const units=['KB','MB','GB','TB'];
+  let v=n/1024, i=0;
+  while(v >= 1024 && i < units.length-1){ v/=1024; i++; }
+  const s = v >= 100 ? v.toFixed(0) : (v >= 10 ? v.toFixed(1) : v.toFixed(2));
+  return s+' '+units[i];
 }
 
 function renderFileList(){
@@ -5235,9 +5688,52 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	settingsMu.Lock()
+	// Preserve server-authoritative counters. The Settings UI loads them
+	// at open time and POSTs them back unchanged, but the 30s ticker can
+	// update them while the dialog is open — using the client's snapshot
+	// would roll them back. Reset goes through a dedicated endpoint.
+	newSettings.StatsTotalUp = appSettings.StatsTotalUp
+	newSettings.StatsTotalDown = appSettings.StatsTotalDown
 	appSettings = newSettings
 	settingsMu.Unlock()
 	saveSettings()
+	state.broadcast(SSEEvent{Type: "stats_update", Payload: statsSnapshot(currentSessionCounter())})
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
+// currentSessionCounter returns the live traffic counter if a session is
+// active, or nil otherwise. Used by handlers that need a fresh stats
+// snapshot without poking at connManager internals from the outside.
+func currentSessionCounter() *trafficCounter {
+	state.conn.mu.Lock()
+	defer state.conn.mu.Unlock()
+	return state.conn.counter
+}
+
+// handleStatsReset clears the lifetime traffic totals. The live session
+// counter (if any) is left alone — the user is asking to reset
+// "lifetime", and the current session will fold in normally on
+// disconnect, starting accumulation fresh from zero.
+func handleStatsReset(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method != "POST" {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	settingsMu.Lock()
+	appSettings.StatsTotalUp = 0
+	appSettings.StatsTotalDown = 0
+	settingsMu.Unlock()
+	// Forget what was already folded in for the live session so its
+	// future deltas don't immediately re-inflate the just-cleared
+	// total. The visible session bytes (counter.Up/Down) stay intact.
+	if c := currentSessionCounter(); c != nil {
+		c.LastPersistedUp.Store(c.Up.Load())
+		c.LastPersistedDown.Store(c.Down.Load())
+	}
+	saveSettings()
+	state.broadcast(SSEEvent{Type: "stats_update", Payload: statsSnapshot(currentSessionCounter())})
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
 }
@@ -5314,6 +5810,7 @@ func registerRoutes() {
 	http.HandleFunc("/api/tab/delete-entries", handleTabDeleteEntries)
 	http.HandleFunc("/api/tab/reorder", handleTabReorder)
 	http.HandleFunc("/api/settings", handleSettings)
+	http.HandleFunc("/api/stats/reset", handleStatsReset)
 	http.HandleFunc("/api/restart-admin", handleRestartAdmin)
 }
 
