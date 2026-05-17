@@ -26,4 +26,24 @@
 
 کاربر مسئولیت کامل رعایت قوانین حوزه قضایی خود را در هنگام استفاده از این نرم‌افزار بر عهده دارد.
 
+>## حمایت مالی
+>
+>اطلاعات آدرس‌های «پرداخت» صرفاً جهت اطلاع‌رسانی ارائه شده است. آدرس‌های ذکرشده از منابع عمومی گردآوری شده‌اند و متعلق به نویسنده پروژه نمی‌باشند.
+>
+>ERC20:
+>
+>*0x37072eb42019a258a801df002e5c8d5542709165*
+>
+>TRC20:
+>
+>*TGz3wkGFL7PNjSoxpDnM5WgXEvod3qfz3k*
+>
+>SOL:
+>
+>*F7pVS8N74ARDJYmiTqFeViRVHZhXJ8toJsxyrmWstfmi*
+>
+>TON:
+>
+>*UQBxGaG0hBVKarg6TJVaqvCN0hOFAodQjnCZ9rdnUaWxcbDV*
+
 ![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
