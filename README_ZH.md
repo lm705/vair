@@ -26,4 +26,24 @@
 
 用户在使用本软件时，须自行承担遵守所在司法管辖区法律法规的全部责任。
 
+>## 支持
+>
+>相关"支付"地址信息仅供参考。所列地址均来源于公开渠道，不属于本项目作者所有。
+>
+>ERC20:
+>
+>*0x37072eb42019a258a801df002e5c8d5542709165*
+>
+>TRC20:
+>
+>*TGz3wkGFL7PNjSoxpDnM5WgXEvod3qfz3k*
+>
+>SOL:
+>
+>*F7pVS8N74ARDJYmiTqFeViRVHZhXJ8toJsxyrmWstfmi*
+>
+>TON:
+>
+>*UQBxGaG0hBVKarg6TJVaqvCN0hOFAodQjnCZ9rdnUaWxcbDV*
+
 ![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
