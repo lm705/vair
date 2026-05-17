@@ -113,6 +113,22 @@ type AppSettings struct {
 	// Settings → Testing lets the user pick a preset or "Custom URL".
 	PingTestURL        string `json:"ping_test_url,omitempty"`
 	SpeedTestURL       string `json:"speed_test_url,omitempty"`
+	// Per-round ping timeout (ms) and speed-test duration (seconds).
+	// Zero / unset → built-in defaults (pingTimeout / speedDuration consts).
+	// Clamped to sane bounds inside the accessors. Note that the speed test
+	// always runs a ping first to warm the tunnel and get a fresh delay —
+	// PingTimeoutMs applies to both standalone ping tests and that
+	// pre-speed warm-up.
+	PingTimeoutMs      int    `json:"ping_timeout_ms,omitempty"`
+	SpeedDurationSec   int    `json:"speed_duration_sec,omitempty"`
+	// UI scale and language for the Settings / Tab settings dialogs.
+	// Both apply to those modals only — the main window (tabs, table,
+	// connection bar, title bar) is intentionally not affected, since
+	// that's where pixel-precise typography matters most. ModalFontSize
+	// is the px value driving the --modal-fs-base CSS variable; default
+	// 11. Language uses BCP-47-ish short codes — "" / "en" / "ru".
+	ModalFontSize      int    `json:"modal_font_size,omitempty"`
+	Language           string `json:"language,omitempty"`
 	// TUN adapter MTU. Zero / unset / out-of-range → 9000 (current default).
 	// Recommended values: 9000 (default, jumbo) or 1500 / 1408 if a slow
 	// network can't handle big frames.
@@ -123,6 +139,44 @@ type AppSettings struct {
 	// Lifetime traffic counters, persisted between sessions. Bytes.
 	StatsTotalUp       int64  `json:"stats_total_up,omitempty"`
 	StatsTotalDown     int64  `json:"stats_total_down,omitempty"`
+
+	// ── DNS leak protection (1.5.0) ──────────────────────────────────
+	// All zero-valued → 1.4.0 behaviour. Opt-in for now; once we have
+	// field reports we'll consider flipping defaults in 1.6.0.
+	//
+	// DNSLeakProtection is the master switch. When ON we install a real
+	// DNS routing block in sing-box, hijack port 53, and turn on
+	// strict_route so the WFP filter (Windows) prevents anything from
+	// escaping. When OFF the program behaves like 1.4.0.
+	DNSLeakProtection  bool   `json:"dns_leak_protection,omitempty"`
+	// KillSwitch only takes effect when DNSLeakProtection is on. With
+	// strict_route=true, sing-box already drops traffic that can't go
+	// through the tunnel; the kill-switch wording in UI tells the user
+	// this is happening. (1.6.0 will add Windows Firewall rules as
+	// belt-and-braces.)
+	KillSwitch         bool   `json:"kill_switch,omitempty"`
+	// BlockLAN is inverted: zero/false = LAN traffic allowed direct.
+	// When true the ip_is_private→direct rule is removed and even
+	// 192.168.x.x goes through the tunnel.
+	BlockLAN           bool   `json:"block_lan,omitempty"`
+	// FakeIPDisabled is also inverted: zero/false = FakeIP enabled
+	// (when DNSLeakProtection is on). FakeIP returns 198.18.0.0/15
+	// pseudo-addresses for A/AAAA queries; real resolution happens
+	// once a connection is made through the proxy outbound. Turning
+	// it off falls back to real DNS via the proxy detour — slower
+	// but more compatible with picky apps (P2P, WebRTC, custom
+	// resolvers).
+	FakeIPDisabled     bool   `json:"fakeip_disabled,omitempty"`
+	// DNS server overrides. Empty falls back to the built-in default
+	// for the slot (see dnsServerOr* helpers).
+	BootstrapDNS       string `json:"bootstrap_dns,omitempty"` // plain UDP, IP-only
+	DirectDNS          string `json:"direct_dns,omitempty"`    // for bypass traffic
+	RemoteDNS          string `json:"remote_dns,omitempty"`    // through proxy
+	// StaticHosts is a Windows-hosts-file-style domain→IP map.
+	// Resolved before any DNS server is asked. Useful for hard-coded
+	// VPN-server resolution, custom CNAME-like redirects, or
+	// emergency bypass when DNS infrastructure is unreliable.
+	StaticHosts        map[string]string `json:"static_hosts,omitempty"`
 }
 
 const (
@@ -188,6 +242,43 @@ func currentSpeedURL() string {
 	return u
 }
 
+// Sane bounds for the two test-duration knobs. The lower bounds protect
+// the tests from being so short they always fail (one round-trip needs at
+// least a few hundred ms over a real proxy chain). The upper bounds keep
+// "ping all" / "speed all" from blocking forever on dead servers.
+const (
+	minPingTimeoutMs    = 200
+	maxPingTimeoutMs    = 10000
+	minSpeedDurationSec = 1
+	maxSpeedDurationSec = 60
+)
+
+// currentPingTimeout returns the per-round ping timeout. Zero / unset /
+// out-of-range falls back to the compile-time pingTimeout default. Same
+// value is used for the warm-up ping inside speed tests, so changing it
+// affects both ping-only and ping→speed flows.
+func currentPingTimeout() time.Duration {
+	settingsMu.RLock()
+	ms := appSettings.PingTimeoutMs
+	settingsMu.RUnlock()
+	if ms < minPingTimeoutMs || ms > maxPingTimeoutMs {
+		return pingTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// currentSpeedDuration returns the speed-test download window. Zero / unset
+// / out-of-range falls back to the compile-time speedDuration default.
+func currentSpeedDuration() time.Duration {
+	settingsMu.RLock()
+	s := appSettings.SpeedDurationSec
+	settingsMu.RUnlock()
+	if s < minSpeedDurationSec || s > maxSpeedDurationSec {
+		return speedDuration
+	}
+	return time.Duration(s) * time.Second
+}
+
 // currentMTU returns the TUN-adapter MTU. Out-of-range or unset → 9000
 // (the historical default the codebase shipped with). 576 is the smallest
 // MTU IPv4 hosts must support; above 9000 isn't useful for any LAN we'll see.
@@ -208,6 +299,165 @@ func statsEnabled() bool {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
 	return !appSettings.StatsDisabled
+}
+
+// ── DNS leak protection accessors ─────────────────────────────────
+//
+// Built-in defaults chosen for Russia 2026:
+//
+//   bootstrap = 9.9.9.9 (Quad9). Plain UDP/IP, used to resolve the VPN
+//     server hostname on startup before any tunnel exists. Quad9 is
+//     non-profit, Swiss, and historically unblocked in RU. Cloudflare
+//     was thrown off the list because of the 2025 throttling.
+//
+//   direct = 77.88.8.8 (Yandex). Used only for bypass traffic (RU
+//     sites, custom direct domains). Yandex always works inside RU
+//     and privacy doesn't matter for direct traffic — those queries
+//     would otherwise go to the user's ISP anyway.
+//
+//   remote = https://1.1.1.1/dns-query (Cloudflare DoH over IP).
+//     Used for VPN-tunnelled traffic, so RU-level throttling is
+//     irrelevant — the request goes through the proxy. We use the
+//     IP-only DoH URL to avoid the meta-DNS chicken-and-egg of
+//     "resolve dns.cloudflare.com first".
+const (
+	defaultBootstrapDNS = "9.9.9.9"
+	defaultDirectDNS    = "77.88.8.8"
+	defaultRemoteDNS    = "https://1.1.1.1/dns-query"
+)
+
+func dnsLeakProtectionEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.DNSLeakProtection
+}
+
+func killSwitchEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	// Kill-switch only makes sense with strict_route, which is only
+	// turned on when DNSLeakProtection is on. The UI greys this out
+	// in that case but we also defend in code.
+	return appSettings.DNSLeakProtection && appSettings.KillSwitch
+}
+
+func allowLANTraffic() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return !appSettings.BlockLAN
+}
+
+func fakeIPEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	// FakeIP is meaningful only when leak protection is on. When off,
+	// sing-box doesn't run its own DNS module at all.
+	return appSettings.DNSLeakProtection && !appSettings.FakeIPDisabled
+}
+
+func currentBootstrapDNS() string {
+	settingsMu.RLock()
+	v := strings.TrimSpace(appSettings.BootstrapDNS)
+	settingsMu.RUnlock()
+	if v == "" {
+		return defaultBootstrapDNS
+	}
+	return v
+}
+func currentDirectDNS() string {
+	settingsMu.RLock()
+	v := strings.TrimSpace(appSettings.DirectDNS)
+	settingsMu.RUnlock()
+	if v == "" {
+		return defaultDirectDNS
+	}
+	return v
+}
+func currentRemoteDNS() string {
+	settingsMu.RLock()
+	v := strings.TrimSpace(appSettings.RemoteDNS)
+	settingsMu.RUnlock()
+	if v == "" {
+		return defaultRemoteDNS
+	}
+	return v
+}
+
+// staticHostsSnapshot returns a defensive copy of the user-defined
+// hosts map. Empty when none are set. The map is small (rarely more
+// than a few entries) so the copy is cheap.
+func staticHostsSnapshot() map[string]string {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	if len(appSettings.StaticHosts) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(appSettings.StaticHosts))
+	for k, v := range appSettings.StaticHosts {
+		k = strings.TrimSpace(strings.ToLower(k))
+		v = strings.TrimSpace(v)
+		if k != "" && v != "" {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// preResolveVPNHost replaces p.Host (a domain) with a resolved IPv4
+// address using Go's default resolver. The original hostname is moved
+// to p.SNI so TLS still uses the right server name in its handshake
+// — without this, certificate validation against an IP would fail.
+//
+// Why we do this even when DNS leak protection is off:
+//   * Eliminates one DNS lookup that would happen inside xray, which
+//     is harder to control or surface errors from.
+//   * Makes the kill-switch / strict_route case actually startable —
+//     when strict_route is on, sing-box's WFP filter would block
+//     xray's UDP/53 probe to the OS resolver.
+//   * No behaviour change for IP-only servers — pre-resolve is a
+//     no-op.
+//   * No behaviour change for TLS — SNI keeps the original domain.
+//
+// Static hosts take precedence over DNS. They're checked first so the
+// user can pin a VPN server IP even when DNS resolution is broken.
+func preResolveVPNHost(p *VlessParams) error {
+	if p == nil || p.Host == "" {
+		return nil
+	}
+	if net.ParseIP(p.Host) != nil {
+		// Already an IP literal — nothing to resolve, SNI stays as-is.
+		return nil
+	}
+	host := strings.ToLower(p.Host)
+
+	// Static hosts: user override comes first.
+	if hosts := staticHostsSnapshot(); hosts != nil {
+		if ip, ok := hosts[host]; ok && net.ParseIP(ip) != nil {
+			if p.SNI == "" {
+				p.SNI = p.Host
+			}
+			p.Host = ip
+			return nil
+		}
+	}
+
+	// DNS resolve via Go's default resolver. This uses the OS resolver
+	// (and thus the OS DNS settings) and runs before sing-box brings
+	// up TUN, so it's always reachable.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", p.Host)
+	if err != nil {
+		return fmt.Errorf("resolve %s: %w", p.Host, err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("no IPs returned for %s", p.Host)
+	}
+	if p.SNI == "" {
+		p.SNI = p.Host
+	}
+	p.Host = ips[0].String()
+	return nil
 }
 
 var appSettings = AppSettings{SourcesEnabled: true}
@@ -802,20 +1052,25 @@ func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interfa
 func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map[string]interface{} {
 	// Hybrid TUN: sing-box routes traffic, xray handles VLESS protocol.
 	//
-	// DNS: "local" = OS system resolver. With strict_route=false, the OS resolver's
-	// UDP packets reach the router naturally through the physical NIC (not TUN).
-	// This works on both Ethernet and WiFi without knowing the router IP.
+	// Two operating modes, gated by AppSettings.DNSLeakProtection:
 	//
-	// strict_route=false: auto_route still captures most traffic through TUN,
-	// but system-level DNS and some edge cases can escape through the physical NIC.
-	// This avoids the chicken-and-egg DNS problem on WiFi.
-	dns := map[string]interface{}{
-		"servers": []interface{}{
-			map[string]interface{}{"tag": "dns-local", "type": "local"},
-		},
-		"final":             "dns-local",
-		"independent_cache": true,
-	}
+	// 1. Legacy mode (default, leak-prone): strict_route=false, DNS just
+	//    references the OS resolver. System DNS packets can escape
+	//    through the physical NIC. Matches 1.4.0 behaviour exactly so
+	//    upgrades don't break working setups.
+	//
+	// 2. Protected mode: strict_route=true (WFP filter on Windows blocks
+	//    port 53 outside TUN), proper DNS routing block with three
+	//    distinct servers (bootstrap, direct, remote), and either
+	//    FakeIP (default) or "real DNS via proxy detour" for the
+	//    actual tunnelled-traffic queries.
+	//
+	// All knobs come from settings — see currentBootstrapDNS / etc.
+	leakProtect := dnsLeakProtectionEnabled()
+	allowLAN := allowLANTraffic()
+	useFakeIP := fakeIPEnabled()
+
+	dns := buildDNSBlock(leakProtect, useFakeIP)
 
 	tun := map[string]interface{}{
 		"type":           "tun",
@@ -824,7 +1079,7 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		"address":        []string{"172.19.0.1/30"},
 		"mtu":            currentMTU(),
 		"auto_route":     true,
-		"strict_route":   false,
+		"strict_route":   leakProtect, // WFP-filter on Windows when true
 		"stack":          "gvisor",
 	}
 
@@ -854,7 +1109,15 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 			"process_name": []string{"xray.exe", "xray"},
 			"outbound":     "direct",
 		},
-		map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
+	}
+	// LAN handling: when allowed (default), private IPs bypass the
+	// tunnel so printers / NAS / router admin pages still work. With
+	// kill-switch + BlockLAN, even those go through proxy — usually
+	// breaks them, but it's a deliberate user choice.
+	if allowLAN {
+		rules = append(rules,
+			map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
+		)
 	}
 
 	// User-configured apps that bypass VPN (direct connection).
@@ -898,9 +1161,19 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		}
 	}
 
+	// default_domain_resolver picks the DNS server used when sing-box
+	// itself needs to resolve a name in a routing rule (e.g. the IP
+	// for a CIDR-matching geosite). In legacy mode → OS resolver. In
+	// protected mode → our bootstrap server (plain UDP, no detour),
+	// so name resolution for sing-box's own internal needs can never
+	// loop through the proxy.
+	defaultResolver := "dns-local"
+	if leakProtect {
+		defaultResolver = "dns-bootstrap"
+	}
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
-		"default_domain_resolver": "dns-local",
+		"default_domain_resolver": defaultResolver,
 		"find_process":            true,
 		"rules":                   rules,
 		"final":                   "proxy",
@@ -937,6 +1210,236 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		},
 		"route": route,
 	}
+}
+
+// buildDNSBlock returns the sing-box "dns" configuration block.
+//
+// legacy mode (leakProtect=false):
+//   One server, "dns-local" of type "local". sing-box defers to the
+//   OS resolver. DNS leaks are possible because port 53 packets the
+//   OS resolver sends out are not forced into TUN (strict_route is
+//   false in this mode). This is what 1.4.0 shipped with — kept for
+//   compatibility.
+//
+// protected mode (leakProtect=true): three real DNS servers plus an
+// optional FakeIP server used via rule (never as `final`).
+//
+//   * dns-bootstrap (plain UDP, no detour) — sing-box's internal
+//     fallback for routing-time resolutions. No `detour: direct`
+//     here: in sing-box 1.13+ that errors out as
+//     "detour to an empty direct outbound makes no sense". Without
+//     a detour, sing-box dials the IP through OS routing, with
+//     its own internal carve-out from the strict_route WFP filter
+//     that blocks UDP/53 for other processes.
+//   * dns-direct (plain UDP, no detour) — for bypass traffic
+//     (geosite-ru, custom direct domains). Same shape as bootstrap.
+//   * dns-remote (DoH over proxy) — for tunnelled traffic when
+//     FakeIP is disabled, AND always as the `final` server so any
+//     non-A/AAAA query (PTR, MX, SRV…) gets a real answer through
+//     the tunnel. FakeIP cannot be `final` — sing-box 1.13+ rejects
+//     that with "default server cannot be fakeip".
+//   * dns-fakeip (FakeIP, optional) — used only via a rule that
+//     matches `query_type` A/AAAA. Returns 198.18.0.0/15 pseudo-
+//     addresses immediately; real resolution happens once the
+//     connection is dialled through the proxy.
+//
+// Rule ordering (matters):
+//   1. Static hosts (predefined map) — highest priority.
+//   2. RU bypass + user-direct-domains → dns-direct.
+//   3. If FakeIP enabled: A/AAAA → dns-fakeip.
+//   4. Everything else falls through to `final = dns-remote`.
+func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
+	if !leakProtect {
+		return map[string]interface{}{
+			"servers": []interface{}{
+				map[string]interface{}{"tag": "dns-local", "type": "local"},
+			},
+			"final":             "dns-local",
+			"independent_cache": true,
+		}
+	}
+
+	servers := []interface{}{
+		// Bootstrap: plain UDP, no detour. sing-box uses its own
+		// kernel-level carve-out to escape strict_route's WFP filter
+		// for these internal queries.
+		map[string]interface{}{
+			"tag":    "dns-bootstrap",
+			"type":   "udp",
+			"server": bootstrapDNSIP(),
+		},
+		// Direct: same shape, used for bypass traffic queries.
+		map[string]interface{}{
+			"tag":    "dns-direct",
+			"type":   "udp",
+			"server": directDNSIP(),
+		},
+		// Remote: DoH through the proxy outbound. Always present
+		// (acts as `final`) regardless of FakeIP setting.
+		parseRemoteDNSServer(),
+	}
+
+	if useFakeIP {
+		servers = append(servers, map[string]interface{}{
+			"tag":         "dns-fakeip",
+			"type":        "fakeip",
+			"inet4_range": "198.18.0.0/15",
+			// IPv6 fake range left out for now — adding it requires
+			// also routing the range through TUN. v6 isn't always
+			// available anyway; v4 is sufficient for the common case.
+		})
+	}
+
+	rules := []interface{}{}
+
+	// 1. Static hosts: hard-coded answers, checked before everything via
+	// sing-box's "hosts" DNS server type. One server with a predefined
+	// map is more efficient than one server per host.
+	if hosts := staticHostsSnapshot(); len(hosts) > 0 {
+		predefined := make(map[string]interface{}, len(hosts))
+		var domainList []string
+		for domain, ip := range hosts {
+			predefined[domain] = []string{ip}
+			domainList = append(domainList, domain)
+		}
+		servers = append(servers, map[string]interface{}{
+			"tag":        "dns-hosts",
+			"type":       "hosts",
+			"predefined": predefined,
+		})
+		rules = append(rules, map[string]interface{}{
+			"domain": domainList,
+			"server": "dns-hosts",
+		})
+	}
+
+	// 2. Direct bypass: RU geosite + user-defined direct domains.
+	settingsMu.RLock()
+	ruSitesDirect := appSettings.RuSitesDirect
+	directDomains := make([]string, len(appSettings.DirectDomains))
+	copy(directDomains, appSettings.DirectDomains)
+	settingsMu.RUnlock()
+	if ruSitesDirect {
+		rules = append(rules, map[string]interface{}{
+			"rule_set": "geosite-ru",
+			"server":   "dns-direct",
+		})
+	}
+	if len(directDomains) > 0 {
+		var suffixes []string
+		for _, d := range directDomains {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				suffixes = append(suffixes, d)
+			}
+		}
+		if len(suffixes) > 0 {
+			rules = append(rules, map[string]interface{}{
+				"domain_suffix": suffixes,
+				"server":        "dns-direct",
+			})
+		}
+	}
+
+	// 3. FakeIP for the common case: A/AAAA queries for tunnelled
+	// hostnames. Must be a rule, not final — sing-box rejects fakeip
+	// in the final slot.
+	if useFakeIP {
+		rules = append(rules, map[string]interface{}{
+			"query_type": []string{"A", "AAAA"},
+			"server":     "dns-fakeip",
+		})
+	}
+
+	return map[string]interface{}{
+		"servers":           servers,
+		"rules":             rules,
+		"final":             "dns-remote",
+		"independent_cache": true,
+		"strategy":          "ipv4_only", // avoid AAAA round-trips
+	}
+}
+
+// bootstrapDNSIP returns just the IP component of the bootstrap DNS
+// setting. If the user wrote a full URL like "https://9.9.9.9/...",
+// strip it back to the host so sing-box's "udp" server type can use
+// it directly.
+func bootstrapDNSIP() string {
+	v := currentBootstrapDNS()
+	if ip := stripURLToHost(v); ip != "" {
+		return ip
+	}
+	return defaultBootstrapDNS
+}
+func directDNSIP() string {
+	v := currentDirectDNS()
+	if ip := stripURLToHost(v); ip != "" {
+		return ip
+	}
+	return defaultDirectDNS
+}
+
+// stripURLToHost extracts the host part of a URL or returns the input
+// unchanged if it's already a bare host. Used because the bootstrap
+// slot is plain UDP — even if the user enters "https://9.9.9.9/dns-
+// query" we want just "9.9.9.9".
+func stripURLToHost(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if !strings.Contains(v, "://") {
+		// Already bare. Strip any trailing path/port — we want only host.
+		if i := strings.IndexAny(v, ":/"); i >= 0 {
+			return v[:i]
+		}
+		return v
+	}
+	// Has scheme. Parse and take Host (which excludes port; that's fine
+	// for UDP DNS since we only support the standard :53).
+	u, err := url.Parse(v)
+	if err != nil {
+		return ""
+	}
+	h := u.Hostname()
+	return h
+}
+
+// parseRemoteDNSServer constructs the sing-box server-config map for
+// the remote DNS slot. Accepts plain IP, IP with scheme, or full DoH
+// URL — sing-box server types are picked accordingly.
+func parseRemoteDNSServer() map[string]interface{} {
+	v := strings.TrimSpace(currentRemoteDNS())
+	base := map[string]interface{}{
+		"tag":    "dns-remote",
+		"detour": "proxy",
+	}
+	if strings.HasPrefix(v, "https://") {
+		base["type"] = "https"
+		// sing-box's "https" type needs a server hostname/IP, not a
+		// full URL. Parse it apart.
+		if u, err := url.Parse(v); err == nil {
+			base["server"] = u.Hostname()
+			if u.Path != "" && u.Path != "/" {
+				base["path"] = u.Path
+			}
+		} else {
+			base["server"] = v
+		}
+		return base
+	}
+	if strings.HasPrefix(v, "tls://") {
+		base["type"] = "tls"
+		base["server"] = strings.TrimPrefix(v, "tls://")
+		return base
+	}
+	// Default: plain UDP.
+	base["type"] = "udp"
+	base["server"] = stripURLToHost(v)
+	if base["server"] == "" {
+		base["server"] = "1.1.1.1"
+	}
+	return base
 }
 
 // ─────────────────────────── helpers ─────────────────────────────
@@ -1106,6 +1609,16 @@ func startProxyConnection(entry *ConfigEntry) {
 		return
 	}
 
+	// Pre-resolve the VPN server hostname on the Go side so xray gets a
+	// numeric IP for its outbound. Cheap, idempotent (no-op if the host
+	// is already an IP literal), and lets the kill-switch path actually
+	// boot — when strict_route is on, xray can't reach the OS resolver
+	// on UDP/53 to do this resolution itself.
+	if err := preResolveVPNHost(p); err != nil {
+		setConnError(cm, entry, "resolve server: "+err.Error(), connTab)
+		return
+	}
+
 	cm.mu.Lock()
 	cm.state = ConnState{Status: ConnConnecting, Mode: ModeProxy, EntryIndex: entry.Index, EntryName: p.Name, ConnTab: connTab, ConnRaw: entry.Raw}
 	cm.mu.Unlock()
@@ -1264,6 +1777,16 @@ func startTUNConnection(entry *ConfigEntry) {
 	p, err := parseVless(entry.Raw)
 	if err != nil {
 		setConnError(cm, entry, err.Error())
+		return
+	}
+
+	// Pre-resolve the VPN server hostname so xray gets a numeric IP for
+	// its outbound. Critical in protected mode: strict_route + WFP
+	// filter would block xray's UDP/53 attempt to the OS resolver, and
+	// the tunnel would deadlock at startup waiting for DNS. Cheap
+	// no-op in all other cases.
+	if err := preResolveVPNHost(p); err != nil {
+		setConnError(cm, entry, "resolve server: "+err.Error())
 		return
 	}
 
@@ -1716,6 +2239,7 @@ func persistCounterDelta(counter *trafficCounter) {
 
 func measurePing(tr *http.Transport) (int64, error) {
 	url := currentPingURL()
+	pt := currentPingTimeout()
 	wc := &http.Client{Transport: tr, Timeout: warmupTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	w, err := wc.Get(url)
@@ -1724,7 +2248,7 @@ func measurePing(tr *http.Transport) (int64, error) {
 	}
 	io.Copy(io.Discard, w.Body)
 	w.Body.Close()
-	mc := &http.Client{Transport: tr, Timeout: pingTimeout,
+	mc := &http.Client{Transport: tr, Timeout: pt,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var best int64 = -1
 	var lastErr error
@@ -1755,7 +2279,8 @@ func measurePing(tr *http.Transport) (int64, error) {
 }
 
 func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error) {
-	sc := &http.Client{Transport: tr, Timeout: speedDuration + 5*time.Second}
+	sd := currentSpeedDuration()
+	sc := &http.Client{Transport: tr, Timeout: sd + 5*time.Second}
 	req, err := http.NewRequest("GET", currentSpeedURL(), nil)
 	if err != nil {
 		return 0, err
@@ -1773,7 +2298,7 @@ func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error)
 	buf := make([]byte, 64*1024)
 	var total int64
 	start := time.Now()
-	deadline := start.Add(speedDuration)
+	deadline := start.Add(sd)
 	lastReport := start
 	for time.Now().Before(deadline) {
 		n, rerr := resp.Body.Read(buf)
@@ -1807,7 +2332,7 @@ func runPingForEntry(entry *ConfigEntry) {
 		entry.mu.Unlock()
 		return
 	}
-	ttl := startupTimeout + warmupTimeout + pingTimeout*time.Duration(pingRounds) + 3*time.Second
+	ttl := startupTimeout + warmupTimeout + currentPingTimeout()*time.Duration(pingRounds) + 3*time.Second
 	if err = withXray(p, ttl, func(_ int, tr *http.Transport) error {
 		delay, e := measurePing(tr)
 		entry.mu.Lock()
@@ -1843,7 +2368,7 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string) {
 		entry.mu.Unlock()
 		return
 	}
-	ttl := startupTimeout + warmupTimeout + pingTimeout*time.Duration(pingRounds) + speedDuration + 10*time.Second
+	ttl := startupTimeout + warmupTimeout + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
 	if err = withXray(p, ttl, func(_ int, tr *http.Transport) error {
 		// Always re-ping — gives fresh delay AND warms the tunnel for speed test
 		delay, pingErr := measurePing(tr)
@@ -1906,7 +2431,7 @@ func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
 		entry.mu.Unlock()
 		return
 	}
-	ttl := startupTimeout + warmupTimeout + pingTimeout*time.Duration(pingRounds) + speedDuration + 10*time.Second
+	ttl := startupTimeout + warmupTimeout + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
 	if err = withXray(p, ttl, func(_ int, tr *http.Transport) error {
 		delay, pingErr := measurePing(tr)
 		entry.mu.Lock()
@@ -3054,6 +3579,27 @@ func handleTabPaste(w http.ResponseWriter, r *http.Request) {
 		e.Index = baseIdx + i
 	}
 	existing = append(existing, newEntries...)
+
+	// Apply server-side dedup in-place when the tab is in "delete" mode.
+	// Without this, dupes pasted into a delete-mode tab silently accumulated
+	// because "delete" was only ever applied during fetchTabURLs / explicit
+	// mode transition — paste went straight through. "hide" mode kept working
+	// because it's a JS view filter, evaluated on every render.
+	// Re-index so positions are contiguous after dedup.
+	var dedupMode string
+	for _, t := range state.tabs {
+		if t.ID == id {
+			dedupMode = t.DedupMode
+			break
+		}
+	}
+	if dedupMode == "delete" {
+		existing = dedupByBody(existing)
+		for i, e := range existing {
+			e.Index = i
+		}
+	}
+
 	state.tabEntries[id] = existing
 	if state.activeTab == id {
 		state.entries = existing
@@ -3625,25 +4171,44 @@ header{
   position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,.55);
   display:flex;align-items:center;justify-content:center;
 }
+/* Modal text scale.
+ * A single CSS variable on :root drives every font-size in the Settings
+ * and Tab settings modals. The user can grow or shrink modal typography
+ * from one input; the main window (table, header, conn bar, title bar)
+ * does NOT use these classes, so it stays at its original sizes
+ * regardless. Default 11px matches what the program shipped with. */
+:root{ --modal-fs-base: 11px; }
 .modal-box{
   background:var(--bg2);border:1px solid var(--border2);border-radius:6px;
-  padding:18px 22px;min-width:360px;max-width:90vw;
+  padding:18px 22px;
+  /* One consistent width for every modal in the app (Settings, Tab
+     Settings, Sources, Running Processes). 560px is comfortable for
+     long DNS URLs and the static hosts textarea without being absurd.
+     min(...) keeps the modal inside the program window when it's
+     dragged narrow — 92vw means ≤92% of the webview width, so a
+     500px-wide window still gets a 460px-wide modal. */
+  width:min(560px, 92vw);
   /* Cap to viewport so long settings don't push the close button off-screen.
      Falling back to scroll keeps the close button reachable on any window
      size — including small mobile-style aspect ratios. */
   max-height:85vh;overflow-y:auto;
 }
-.modal-title{font-size:13px;font-weight:700;color:var(--accent);margin-bottom:14px;text-transform:uppercase;letter-spacing:.06em}
-.modal-label{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
+.modal-title{font-size:calc(var(--modal-fs-base) + 2px);font-weight:700;color:var(--accent);margin-bottom:14px;text-transform:uppercase;letter-spacing:.06em}
+.modal-label{font-size:calc(var(--modal-fs-base) - 1px);color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
 .modal-input{
-  width:100%;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
-  color:var(--text);font-family:var(--font);font-size:12px;padding:6px 10px;outline:none;
+  width:100%;box-sizing:border-box;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  color:var(--text);font-family:var(--font);font-size:calc(var(--modal-fs-base) + 1px);padding:6px 10px;outline:none;
   margin-bottom:12px;
 }
+/* Textareas inherit modal-input width but the browser default min-width
+   would otherwise track the textarea's intrinsic content size. Force
+   100% with box-sizing, and only allow vertical resize so the user
+   can't drag the modal wider by accident. */
+textarea.modal-input{resize:vertical;min-width:0}
 .modal-input:focus{border-color:var(--accent)}
 .modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
 .modal-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
-.modal-row-label{font-size:11px;color:var(--text)}
+.modal-row-label{font-size:var(--modal-fs-base);color:var(--text)}
 .toggle{position:relative;width:36px;height:20px;cursor:pointer;flex-shrink:0}
 .toggle input{display:none}
 .toggle-track{position:absolute;inset:0;background:var(--dim2);border-radius:10px;transition:.2s}
@@ -3651,18 +4216,18 @@ header{
 .toggle-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s}
 .toggle input:checked~.toggle-thumb{left:18px}
 .chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px}
-.chip{display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:700;
+.chip{display:inline-flex;align-items:center;gap:3px;font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
   padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3)}
-.chip-x{cursor:pointer;opacity:.5;font-size:9px}.chip-x:hover{opacity:1;color:var(--red)}
-.chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:11px;outline:none;flex:1;min-width:80px}
-.modal-hint{font-size:9px;color:var(--dim);margin-top:-6px;margin-bottom:10px}
+.chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px)}.chip-x:hover{opacity:1;color:var(--red)}
+.chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:var(--modal-fs-base);outline:none;flex:1;min-width:80px}
+.modal-hint{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-top:-6px;margin-bottom:10px}
 .settings-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border2)}
 .settings-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
-.section-header{font-size:11px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+.section-header{font-size:var(--modal-fs-base);font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
 
 /* Compact numeric input used in Settings (concurrency, refresh interval) */
 .num-input{
-  width:70px;margin-bottom:0;padding:4px 8px;font-size:11px;text-align:right;
+  width:70px;margin-bottom:0;padding:4px 8px;font-size:var(--modal-fs-base);text-align:right;
 }
 /* hide spinners on Firefox / WebView2 - they look out of place in this UI */
 .num-input::-webkit-inner-spin-button,.num-input::-webkit-outer-spin-button{
@@ -3679,7 +4244,7 @@ header{
   display:inline-flex;gap:4px;margin-left:12px;
 }
 .seg-btn{
-  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
+  all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
   padding:3px 7px;border-radius:3px;
   color:var(--dim);border:1px solid var(--border2);
   text-transform:uppercase;letter-spacing:.05em;
@@ -3943,7 +4508,166 @@ const entries={};
 let sortMode='idx', filterText='';
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false, ping_concurrency:10, speed_concurrency:5, ping_test_url:'', speed_test_url:'', tun_mtu:0, stats_disabled:false, stats_total_up:0, stats_total_down:0};
+let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false, ping_concurrency:10, speed_concurrency:5, ping_test_url:'', speed_test_url:'', ping_timeout_ms:0, speed_duration_sec:0, tun_mtu:0, stats_disabled:false, stats_total_up:0, stats_total_down:0, dns_leak_protection:false, kill_switch:false, block_lan:false, fakeip_disabled:false, bootstrap_dns:'', direct_dns:'', remote_dns:'', static_hosts:{}, modal_font_size:0, language:''};
+
+// ── i18n / UI prefs ─────────────────────────────────────────────────
+// Modal-only translations. Main window stays English on purpose — table
+// headers, status pills, tab bar, and titlebar are untouched.
+// Keys ARE the English text. That doubles as the fallback when no
+// translation exists and keeps t() callsites self-documenting.
+const I18N = {
+  ru: {
+    // Section headers
+    "Settings": "Настройки",
+    // "Sources" is intentionally NOT translated — the user asked to keep
+    // the section header as-is so the tab name and the settings section
+    // stay visually consistent across languages.
+    "Routing": "Маршрутизация",
+    "Testing": "Тестирование",
+    "Network": "Сеть",
+    "Statistics": "Статистика",
+    "Security": "Безопасность",
+    "DNS": "DNS",
+    "System": "Система",
+    "Appearance": "Внешний вид",
+
+    // Settings — labels / buttons
+    "Enable Sources tab": "Включить вкладку «SOURCES»",
+    "Russian sites without VPN": "Российские сайты без VPN",
+    "Custom domains without VPN": "Свои домены без VPN",
+    "Apps without VPN (TUN mode only)": "Приложения без VPN (только TUN)",
+    "Browse running processes": "Просмотреть запущенные процессы",
+    "Ping concurrency": "Параллельных ping-тестов",
+    "Speed concurrency": "Параллельных speed-тестов",
+    "Ping timeout (ms)": "Таймаут ping (мс)",
+    "Speed test duration (s)": "Длительность speed-теста (с)",
+    "Ping URL": "URL для ping",
+    "Custom ping URL": "Свой URL для ping",
+    "Speed URL": "URL для speed",
+    "Custom speed URL": "Свой URL для speed",
+    "TUN MTU": "TUN MTU",
+    "Enable traffic statistics": "Считать трафик",
+    "Lifetime total": "Итого за всё время",
+    "reset total": "сбросить итог",
+    "TUN DNS leak protection": "TUN: защита от утечек DNS",
+    "TUN Kill-switch": "TUN: Kill-switch",
+    "TUN Block LAN traffic": "TUN: блокировать LAN-трафик",
+    "TUN FakeIP": "TUN FakeIP",
+    "TUN Bootstrap DNS": "TUN Bootstrap DNS",
+    "TUN Direct DNS": "TUN Direct DNS",
+    "TUN Remote DNS": "TUN Remote DNS",
+    "TUN Static hosts": "TUN: статические хосты",
+    "Minimize to tray on close": "Сворачивать в трей при закрытии",
+    "Settings font size (px)": "Размер текста в настройках (px)",
+    "Language": "Язык",
+    "close": "закрыть",
+
+    // Placeholders
+    "e.g. vk.com, press Enter": "напр. vk.com, нажмите Enter",
+    "e.g. chrome.exe, press Enter": "напр. chrome.exe, нажмите Enter",
+    "e.g. Russia, press Enter": "напр. Russia, нажмите Enter",
+
+    // Small annotations
+    "(resolves VPN server; plain UDP)": "(резолвит сервер VPN; обычный UDP)",
+    "(for RU bypass / direct domains)": "(для RU-обхода и direct-доменов)",
+    "(through proxy; DoH URL or IP)": "(через прокси; DoH URL или IP)",
+    "(domain → IP; one per line)": "(домен → IP; по одному на строку)",
+
+    // Hints (paragraphs)
+    "Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.":
+      "Трафик к российским доменам и IP идёт напрямую, минуя VPN. Применится при следующем подключении.",
+    "Enter a domain — all its subdomains are included automatically. Takes effect on next connection.":
+      "Введите домен — все его поддомены включаются автоматически. Применится при следующем подключении.",
+    "Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).":
+      "Имена процессов, которые идут мимо VPN. Работает только в TUN-режиме (системный прокси нельзя исключить пер-приложение).",
+    "Takes effect on next connection.": "Применится при следующем подключении.",
+    "How many configs are pinged or speed-tested in parallel. Defaults: ping 10, speed 5. Takes effect on the next bulk test run.":
+      "Сколько конфигов одновременно проверяется. По умолчанию: ping 10, speed 5. Действует при следующем массовом тесте.",
+    "Ping timeout is per round (3 rounds run, best is reported) and also applies to the warm-up ping inside speed tests. Speed duration is how long the test downloads before computing throughput. Defaults: 1500 ms, 4 s.":
+      "Таймаут ping применяется к одному раунду (всего 3 раунда, в результат идёт лучший) и к разогревочному ping внутри speed-теста. Длительность speed-теста — это время скачивания, после которого считается скорость. По умолчанию: 1500 мс, 4 с.",
+    "Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.":
+      "Speed-тест работает заданное время (по умолчанию 4 с) независимо от размера файла. Ping принимает любой HTTP-ответ — выберите эндпоинт, который ваш провайдер маршрутизирует лучше.",
+    "Default 9000 (jumbo frames). If you see download stalls or sites hanging, try 1500 or 1408. Takes effect on next connection.":
+      "По умолчанию 9000 (jumbo). Если скачивания зависают или сайты не открываются — попробуйте 1500 или 1408. Применится при следующем подключении.",
+    "Tracks bytes through the VPN tunnel in both modes. The lifetime total persists across sessions; the live session counter resets on every connect.":
+      "Считает байты через VPN-туннель в обоих режимах. Итоговая сумма сохраняется между запусками; сессионный счётчик сбрасывается при каждом подключении.",
+    "Forces all DNS queries through the tunnel using sing-box's built-in FakeIP. Without this, system DNS can escape through your ISP. Takes effect on next connection. Applies only to TUN mode.":
+      "Принудительно отправляет все DNS-запросы через туннель, используя встроенный FakeIP в sing-box. Без этого DNS может утекать к провайдеру. Применится при следующем подключении. Работает только в TUN-режиме.",
+    "Drops all traffic if the VPN goes down — no fallback to your physical network. Relies on the same strict-routing mechanism as DNS leak protection.":
+      "Сбрасывает весь трафик, если VPN упал — без возврата к физической сети. Использует тот же механизм strict-routing, что и защита от утечек DNS.",
+    "By default 192.168.x.x and similar private addresses bypass the VPN so printers, NAS, and router admin pages still work. Enable this to force LAN traffic through the tunnel too — usually breaks local services.":
+      "По умолчанию 192.168.x.x и подобные приватные адреса идут мимо VPN — это нужно, чтобы работали принтеры, NAS и админка роутера. Включите, чтобы LAN-трафик тоже шёл через туннель — обычно ломает локальные сервисы.",
+    "FakeIP returns pseudo-addresses instantly and resolves the real domain inside the tunnel — fastest, no leak. Turn off to use a real DoH server through the proxy (slower but more compatible with apps that do their own DNS).":
+      "FakeIP мгновенно отдаёт псевдо-адрес, а реальное имя резолвится уже внутри туннеля — быстро и без утечек. Отключите, чтобы использовать настоящий DoH через прокси (медленнее, но совместимо с приложениями, у которых свой DNS).",
+    "Leave blank for defaults: Quad9 / Yandex / Cloudflare-over-IP. Pick servers that work on your ISP for bootstrap and direct; remote goes through the tunnel so anything reachable from your VPN server works.":
+      "Оставьте пустым для значений по умолчанию: Quad9 / Yandex / Cloudflare-over-IP. Для bootstrap и direct выбирайте серверы, которые работают у вашего провайдера; remote идёт через туннель, поэтому подходит всё, что доступно с VPN-сервера.",
+    "Hard-coded answers checked before any DNS server. Useful for pinning the VPN server IP or working around broken DNS. Format: <code>domain ip</code> separated by spaces, one per line.":
+      "Жёсткие ответы, проверяются до любого DNS-сервера. Удобно для прибивания IP VPN-сервера или обхода сломанного DNS. Формат: <code>домен ip</code> через пробел, по одному на строку.",
+    "Increase or decrease the text size in the Settings and Tab settings modals only. The main window's typography is unchanged.":
+      "Меняет размер текста только в окнах настроек программы и вкладок. Шрифты основного окна не меняются.",
+    "Changes apply immediately when you reopen this dialog.":
+      "Изменения применяются после повторного открытия диалога.",
+    "Reset the lifetime traffic counter to 0? The current session is not affected.":
+      "Сбросить общий счётчик трафика? Текущая сессия не затрагивается.",
+
+    // openTabSettings
+    "Tab Settings": "Настройки вкладки",
+    "Name": "Имя",
+    "Source URLs (raw links, base64 subscriptions)": "URL источников (raw-ссылки, base64-подписки)",
+    "+ add URL": "+ добавить URL",
+    "Files (loaded in addition order, after URLs)": "Файлы (грузятся в порядке добавления, после URL)",
+    "+ add file": "+ добавить файл",
+    "Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.":
+      "Файлы читаются с диска при каждом RELOAD, так что правки подхватываются без повторного добавления. Без лимита на размер — хранится только путь.",
+    "Auto-refresh interval (minutes, 0 = off)": "Интервал автообновления (минуты, 0 = выкл.)",
+    "Deduplicate duplicate configs": "Удалять повторяющиеся конфиги",
+    "Off": "Выкл.",
+    "Hide": "Скрыть",
+    "Delete": "Удалить",
+    "No deduplication": "Без дедупликации",
+    "Hide duplicates from view (reversible)": "Скрыть дубликаты из вида (обратимо)",
+    "Permanently delete duplicates": "Безвозвратно удалить дубликаты",
+    "Exclude filter": "Фильтр исключений",
+    "Configs with matching name will be hidden.": "Конфиги с совпадающим именем будут скрыты.",
+    "Off: show everything. Hide: filter from view, reversible. Delete: permanently remove duplicate entries. Matching is by vless body (ignores the name).":
+      "Off: показывать всё. Hide: скрыть из вида (обратимо). Delete: безвозвратно удалить дубликаты. Сравнение по vless-телу (имя игнорируется).",
+
+    // Running processes picker
+    "Running processes": "Запущенные процессы",
+    "filter…": "фильтр…",
+    "Click a process to add it to the Apps without VPN list.": "Кликните по процессу, чтобы добавить его в список «Приложения без VPN».",
+    "refresh": "обновить",
+    "already added": "уже добавлен",
+    "more, refine filter": "ещё, уточните фильтр",
+    "No process list available — only works in the desktop build.": "Список процессов недоступен — работает только в desktop-сборке.",
+    "No matches": "Совпадений нет",
+
+    // Tab settings — empty file list placeholder
+    "No files added. Use the + add file button below.": "Файлы не добавлены. Используйте кнопку «+ добавить файл» ниже.",
+
+    "cancel": "отмена",
+    "save": "сохранить"
+  }
+};
+
+function t(en){
+  var lang = (appSettingsJS && appSettingsJS.language) || 'en';
+  if(lang === 'en' || !lang) return en;
+  var dict = I18N[lang];
+  return (dict && Object.prototype.hasOwnProperty.call(dict, en)) ? dict[en] : en;
+}
+
+// applyUIPrefs writes the modal-font-size CSS variable from the current
+// settings. Called from loadAppSettings on startup, and re-called when the
+// user changes the size in Settings so other open modals (and any later
+// opened ones) update without reopening. Default 11 matches the historical
+// modal typography; out-of-range values fall back to the default to keep
+// the UI legible if a saved value is corrupted.
+function applyUIPrefs(){
+  var fs = appSettingsJS && appSettingsJS.modal_font_size;
+  if(!fs || fs < 9 || fs > 20) fs = 11;
+  document.documentElement.style.setProperty('--modal-fs-base', fs+'px');
+}
 let selectedMode='proxy';
 
 // ── SSE ───────────────────────────────────────────────────────────
@@ -4010,6 +4734,14 @@ function setMode(m){
 }
 
 // ── connection bar ─────────────────────────────────────────────────
+// Tracks the previous conn state so we can skip the expensive rebuildTable()
+// call on the once-per-second uptime ticks. Without this, the table is
+// torn down and re-rendered every second while connected, which resets
+// the CSS :hover state on whatever row the cursor was on — visible as
+// a flicker on every tick. The table only really needs to redraw when
+// the connection status, mode, or which entry is connected actually
+// changes; uptime alone goes nowhere near the table rows.
+let prevConnSig = '';
 function onConnUpdate(cs){
   connState=cs;
   const bar  =document.getElementById('conn-bar');
@@ -4079,7 +4811,15 @@ function onConnUpdate(cs){
   // last known counters so the panel hides/shows immediately rather than
   // waiting for the next stats tick.
   onStatsUpdate(lastStats);
-  rebuildTable();
+  // Only rebuild the table when something that affects row rendering has
+  // actually changed (status, mode, which entry is current, active tab).
+  // uptime_sec ticks every second while connected and does not affect any
+  // row — rebuilding for it caused hover-flicker on every tick.
+  const sig = cs.status+'|'+cs.mode+'|'+cs.entry_index+'|'+(cs.conn_tab||'')+'|'+(cs.conn_raw||'');
+  if(sig !== prevConnSig){
+    prevConnSig = sig;
+    rebuildTable();
+  }
 }
 
 function fmtUptime(s){
@@ -4375,22 +5115,57 @@ function restoreConnHighlight(){
   });
 })();
 
+// pendingResort coalesces re-sort requests during bulk tests. While
+// running ping all / speed all with sort = ping or speed, every row
+// finishing its test would otherwise trigger a full rebuildTable — and
+// since rebuildTable wipes the tbody, the :hover on whatever row the
+// cursor was on flickered on each rebuild. Debouncing collapses N row
+// finishes into one rebuild ~250 ms after the first; rows themselves
+// have already been updated in-place by then, so the user sees fresh
+// numbers immediately and only the positions catch up shortly after.
+let pendingResort = null;
+function scheduleResort(){
+  if(pendingResort) return;
+  pendingResort = setTimeout(function(){
+    pendingResort = null;
+    rebuildTable();
+  }, 250);
+}
+
 function updateRow(idx){
-  // If only a few items changed visually, targeted update is faster than full rebuild.
-  // But for sorted views, position may change — rebuild.
-  if(sortMode!=='idx'){ rebuildTable(); return; }
   const e=entries[idx]; if(!e)return;
   const old=document.getElementById('r'+idx);
   if(!old){
-    // Row is outside virtual window, update underlying data only.
-    // Next scroll/rebuild will render it correctly.
+    // Row is outside the virtual window. In sorted mode a finishing row
+    // may need to be brought into view — schedule a debounced resort,
+    // but only when the row has reached a terminal status (same rule
+    // applied below for visible rows).
+    if(sortMode!=='idx'){
+      const stillTesting = e.ping_status==='testing_ping' || e.speed_status==='testing_speed';
+      if(!stillTesting) scheduleResort();
+    }
     return;
   }
+  // In-place update of the row's contents — never destroys the <tr>
+  // node itself, which is what kept :hover stable in idx mode (fix #3).
+  // We extend the same approach to sorted modes here so live-speed
+  // ticks and ping pill changes during a test stop flickering the
+  // cursor row.
   const pos=parseInt(old.cells[0].textContent)||idx+1;
   const nr=buildRow(e,pos);
-  old.replaceWith(nr);
+  old.className = nr.className;
+  old.replaceChildren(...nr.childNodes);
   if((connState.status==='connected'||connState.status==='connecting')&&findConnIdx()===idx)
-    nr.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
+    old.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
+  // In sorted modes the row's position may have to change, but only
+  // when its status is final — re-sorting on every live_speed progress
+  // tick (~400 ms cadence) was the cause of the hover flicker before.
+  // Debounced so a flurry of finishes during bulk tests collapses to
+  // one rebuild.
+  if(sortMode!=='idx'){
+    const stillTesting = e.ping_status==='testing_ping' || e.speed_status==='testing_speed';
+    if(!stillTesting) scheduleResort();
+  }
 }
 
 function buildRow(e,pos){
@@ -4746,6 +5521,7 @@ function closeCtxMenu(){
 function loadAppSettings(){
   fetch('/api/settings').then(r=>r.json()).then(s=>{
     appSettingsJS=s;
+    applyUIPrefs();
     rebuildTable();
   }).catch(()=>{});
 }
@@ -4774,95 +5550,165 @@ function openSettings(){
     appChipsHtml+='<span class="chip" data-a="'+x(apps[i])+'">'+x(apps[i])+'<span class="chip-x" onclick="removeAppChip(this)">x</span></span>';
   }
 
-  ov.innerHTML='<div class="modal-box" style="min-width:400px">'+
-    '<div class="modal-title">Settings</div>'+
+  ov.innerHTML='<div class="modal-box">'+
+    '<div class="modal-title">'+t('Settings')+'</div>'+
     '<div class="settings-section">'+
-      '<div class="section-header">Sources</div>'+
+      '<div class="section-header">'+t('Sources')+'</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">Enable Sources tab</span>'+
+        '<span class="modal-row-label">'+t('Enable Sources tab')+'</span>'+
         '<label class="toggle"><input type="checkbox" id="set-sources-on" '+(appSettingsJS.sources_enabled!==false?'checked':'')+' onchange="toggleSources(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
     '</div>'+
     '<div class="settings-section">'+
-      '<div class="section-header">Routing</div>'+
+      '<div class="section-header">'+t('Routing')+'</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">Russian sites without VPN</span>'+
+        '<span class="modal-row-label">'+t('Russian sites without VPN')+'</span>'+
         '<label class="toggle"><input type="checkbox" id="set-ru-direct" '+(appSettingsJS.ru_sites_direct?'checked':'')+' onchange="toggleRuSites(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
-      '<div class="modal-hint">Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.</div>'+
+      '<div class="modal-hint">'+t('Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.')+'</div>'+
       '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
-        '<span class="modal-row-label">Custom domains without VPN</span>'+
+        '<span class="modal-row-label">'+t('Custom domains without VPN')+'</span>'+
       '</div>'+
       '<div class="chips-wrap" id="domain-chips">'+domainChipsHtml+
-        '<input class="chip-input" id="domain-input" placeholder="e.g. vk.com, press Enter" onkeydown="domainChipKey(event)">'+
+        '<input class="chip-input" id="domain-input" placeholder="'+t('e.g. vk.com, press Enter')+'" onkeydown="domainChipKey(event)">'+
       '</div>'+
-      '<div class="modal-hint">Enter a domain — all its subdomains are included automatically. Takes effect on next connection.</div>'+
+      '<div class="modal-hint">'+t('Enter a domain — all its subdomains are included automatically. Takes effect on next connection.')+'</div>'+
       '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
-        '<span class="modal-row-label">Apps without VPN (TUN mode only)</span>'+
+        '<span class="modal-row-label">'+t('Apps without VPN (TUN mode only)')+'</span>'+
       '</div>'+
       '<div class="chips-wrap" id="app-chips">'+appChipsHtml+
-        '<input class="chip-input" id="app-input" placeholder="e.g. chrome.exe, press Enter" onkeydown="appChipKey(event)">'+
+        '<input class="chip-input" id="app-input" placeholder="'+t('e.g. chrome.exe, press Enter')+'" onkeydown="appChipKey(event)">'+
       '</div>'+
-      '<div class="modal-hint">Process names that bypass VPN. Only works in TUN mode (system proxy can\'t be excluded per-app at the OS level). <a href="#" onclick="openProcessPicker(event)" style="color:var(--accent);text-decoration:underline">Browse running processes</a>. Takes effect on next connection.</div>'+
+      '<div class="modal-hint">'+t("Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).")+' <a href="#" onclick="openProcessPicker(event)" style="color:var(--accent);text-decoration:underline">'+t('Browse running processes')+'</a>. '+t('Takes effect on next connection.')+'</div>'+
     '</div>'+
     '<div class="settings-section">'+
-      '<div class="section-header">Testing</div>'+
+      '<div class="section-header">'+t('Testing')+'</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">Ping concurrency</span>'+
+        '<span class="modal-row-label">'+t('Ping concurrency')+'</span>'+
         '<input class="modal-input num-input" id="set-ping-conc" type="number" min="1" max="200" value="'+(appSettingsJS.ping_concurrency||10)+'" onchange="updateConcurrency(\'ping\',this.value)">'+
       '</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">Speed concurrency</span>'+
+        '<span class="modal-row-label">'+t('Speed concurrency')+'</span>'+
         '<input class="modal-input num-input" id="set-speed-conc" type="number" min="1" max="100" value="'+(appSettingsJS.speed_concurrency||5)+'" onchange="updateConcurrency(\'speed\',this.value)">'+
       '</div>'+
-      '<div class="modal-hint">How many configs are pinged or speed-tested in parallel. Defaults: ping 10, speed 5. Takes effect on the next bulk test run.</div>'+
+      '<div class="modal-hint">'+t('How many configs are pinged or speed-tested in parallel. Defaults: ping 10, speed 5. Takes effect on the next bulk test run.')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Ping timeout (ms)')+'</span>'+
+        '<input class="modal-input num-input" id="set-ping-timeout" type="number" min="200" max="10000" step="100" value="'+(appSettingsJS.ping_timeout_ms||1500)+'" onchange="updatePingTimeout(this.value)">'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Speed test duration (s)')+'</span>'+
+        '<input class="modal-input num-input" id="set-speed-duration" type="number" min="1" max="60" value="'+(appSettingsJS.speed_duration_sec||4)+'" onchange="updateSpeedDuration(this.value)">'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Ping timeout is per round (3 rounds run, best is reported) and also applies to the warm-up ping inside speed tests. Speed duration is how long the test downloads before computing throughput. Defaults: 1500 ms, 4 s.')+'</div>'+
       '<div class="modal-row" style="display:block;margin-bottom:6px">'+
-        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Ping URL</span>'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Ping URL')+'</span>'+
         '<select class="modal-input" id="set-ping-url" style="margin-bottom:0" onchange="updateTestURL(\'ping\',this.value)">'+pingURLOptions()+'</select>'+
       '</div>'+
       '<div class="modal-row" id="ping-url-custom-row" style="display:'+(isCustomURL('ping')?'block':'none')+';margin-bottom:6px">'+
-        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Custom ping URL</span>'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Custom ping URL')+'</span>'+
         '<input class="modal-input" id="set-ping-url-custom" style="margin-bottom:0" placeholder="https://..." value="'+x(isCustomURL('ping')?(appSettingsJS.ping_test_url||''):'')+'" onchange="updateTestURLCustom(\'ping\',this.value)">'+
       '</div>'+
       '<div class="modal-row" style="display:block;margin-bottom:6px">'+
-        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Speed URL</span>'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Speed URL')+'</span>'+
         '<select class="modal-input" id="set-speed-url" style="margin-bottom:0" onchange="updateTestURL(\'speed\',this.value)">'+speedURLOptions()+'</select>'+
       '</div>'+
       '<div class="modal-row" id="speed-url-custom-row" style="display:'+(isCustomURL('speed')?'block':'none')+';margin-bottom:6px">'+
-        '<span class="modal-row-label" style="display:block;margin-bottom:4px">Custom speed URL</span>'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Custom speed URL')+'</span>'+
         '<input class="modal-input" id="set-speed-url-custom" style="margin-bottom:0" placeholder="https://..." value="'+x(isCustomURL('speed')?(appSettingsJS.speed_test_url||''):'')+'" onchange="updateTestURLCustom(\'speed\',this.value)">'+
       '</div>'+
-      '<div class="modal-hint">Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.</div>'+
+      '<div class="modal-hint">'+t('Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.')+'</div>'+
     '</div>'+
     '<div class="settings-section">'+
-      '<div class="section-header">Network</div>'+
+      '<div class="section-header">'+t('Network')+'</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">TUN MTU</span>'+
+        '<span class="modal-row-label">'+t('TUN MTU')+'</span>'+
         '<input class="modal-input num-input" id="set-mtu" type="number" min="576" max="9000" value="'+(appSettingsJS.tun_mtu||9000)+'" onchange="updateMTU(this.value)">'+
       '</div>'+
-      '<div class="modal-hint">Default 9000 (jumbo frames). If you see download stalls or sites hanging, try 1500 or 1408. Takes effect on next connection.</div>'+
+      '<div class="modal-hint">'+t('Default 9000 (jumbo frames). If you see download stalls or sites hanging, try 1500 or 1408. Takes effect on next connection.')+'</div>'+
     '</div>'+
     '<div class="settings-section">'+
-      '<div class="section-header">Statistics</div>'+
+      '<div class="section-header">'+t('Statistics')+'</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">Enable traffic statistics</span>'+
+        '<span class="modal-row-label">'+t('Enable traffic statistics')+'</span>'+
         '<label class="toggle"><input type="checkbox" id="set-stats" '+(!appSettingsJS.stats_disabled?'checked':'')+' onchange="toggleStats(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label" id="stats-total-label">Lifetime total: ↑'+fmtBytes(appSettingsJS.stats_total_up||0)+' ↓'+fmtBytes(appSettingsJS.stats_total_down||0)+'</span>'+
-        '<button class="btn ghost sm" onclick="resetTotalStats()">reset total</button>'+
+        '<span class="modal-row-label" id="stats-total-label">'+t('Lifetime total')+': ↑'+fmtBytes(appSettingsJS.stats_total_up||0)+' ↓'+fmtBytes(appSettingsJS.stats_total_down||0)+'</span>'+
+        '<button class="btn ghost sm" onclick="resetTotalStats()">'+t('reset total')+'</button>'+
       '</div>'+
-      '<div class="modal-hint">Tracks bytes through the VPN tunnel in both modes. The lifetime total persists across sessions; the live session counter resets on every connect.</div>'+
+      '<div class="modal-hint">'+t('Tracks bytes through the VPN tunnel in both modes. The lifetime total persists across sessions; the live session counter resets on every connect.')+'</div>'+
     '</div>'+
     '<div class="settings-section">'+
-      '<div class="section-header">System</div>'+
+      '<div class="section-header">'+t('Security')+'</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">Minimize to tray on close</span>'+
+        '<span class="modal-row-label">'+t('TUN DNS leak protection')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-dnslp" '+(appSettingsJS.dns_leak_protection?'checked':'')+' onchange="toggleDNSLeakProtection(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t("Forces all DNS queries through the tunnel using sing-box's built-in FakeIP. Without this, system DNS can escape through your ISP. Takes effect on next connection. Applies only to TUN mode.")+'</div>'+
+      '<div id="security-deps" style="'+(appSettingsJS.dns_leak_protection?'':'display:none')+'">'+
+        '<div class="modal-row">'+
+          '<span class="modal-row-label">'+t('TUN Kill-switch')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="set-ks" '+(appSettingsJS.kill_switch?'checked':'')+' onchange="toggleKillSwitch(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
+        '<div class="modal-hint">'+t('Drops all traffic if the VPN goes down — no fallback to your physical network. Relies on the same strict-routing mechanism as DNS leak protection.')+'</div>'+
+        '<div class="modal-row">'+
+          '<span class="modal-row-label">'+t('TUN Block LAN traffic')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="set-blan" '+(appSettingsJS.block_lan?'checked':'')+' onchange="toggleBlockLAN(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
+        '<div class="modal-hint">'+t('By default 192.168.x.x and similar private addresses bypass the VPN so printers, NAS, and router admin pages still work. Enable this to force LAN traffic through the tunnel too — usually breaks local services.')+'</div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="settings-section" id="dns-section" style="'+(appSettingsJS.dns_leak_protection?'':'display:none')+'">'+
+      '<div class="section-header">'+t('DNS')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('TUN FakeIP')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-fakeip" '+(!appSettingsJS.fakeip_disabled?'checked':'')+' onchange="toggleFakeIP(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('FakeIP returns pseudo-addresses instantly and resolves the real domain inside the tunnel — fastest, no leak. Turn off to use a real DoH server through the proxy (slower but more compatible with apps that do their own DNS).')+'</div>'+
+      '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('TUN Bootstrap DNS')+' <span style="color:var(--muted);font-weight:400">'+t('(resolves VPN server; plain UDP)')+'</span></span>'+
+        '<input class="modal-input" id="set-bootstrap-dns" style="margin-bottom:0" placeholder="9.9.9.9" value="'+x(appSettingsJS.bootstrap_dns||'')+'" onchange="updateDNSServer(\'bootstrap\',this.value)">'+
+      '</div>'+
+      '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('TUN Direct DNS')+' <span style="color:var(--muted);font-weight:400">'+t('(for RU bypass / direct domains)')+'</span></span>'+
+        '<input class="modal-input" id="set-direct-dns" style="margin-bottom:0" placeholder="77.88.8.8" value="'+x(appSettingsJS.direct_dns||'')+'" onchange="updateDNSServer(\'direct\',this.value)">'+
+      '</div>'+
+      '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('TUN Remote DNS')+' <span style="color:var(--muted);font-weight:400">'+t('(through proxy; DoH URL or IP)')+'</span></span>'+
+        '<input class="modal-input" id="set-remote-dns" style="margin-bottom:0" placeholder="https://1.1.1.1/dns-query" value="'+x(appSettingsJS.remote_dns||'')+'" onchange="updateDNSServer(\'remote\',this.value)">'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Leave blank for defaults: Quad9 / Yandex / Cloudflare-over-IP. Pick servers that work on your ISP for bootstrap and direct; remote goes through the tunnel so anything reachable from your VPN server works.')+'</div>'+
+      '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('TUN Static hosts')+' <span style="color:var(--muted);font-weight:400">'+t('(domain → IP; one per line)')+'</span></span>'+
+        '<textarea class="modal-input" id="set-static-hosts" style="margin-bottom:0;min-height:60px;font-family:var(--mono);font-size:11px" placeholder="vpn.example.com 1.2.3.4" onchange="updateStaticHosts(this.value)">'+x(staticHostsToText(appSettingsJS.static_hosts))+'</textarea>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Hard-coded answers checked before any DNS server. Useful for pinning the VPN server IP or working around broken DNS. Format: <code>domain ip</code> separated by spaces, one per line.')+'</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">'+t('Appearance')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Language')+'</span>'+
+        '<select class="modal-input num-input" style="width:120px;text-align:left" id="set-lang" onchange="updateLanguage(this.value)">'+
+          '<option value="en"'+(!appSettingsJS.language||appSettingsJS.language==="en"?" selected":"")+'>English</option>'+
+          '<option value="ru"'+(appSettingsJS.language==="ru"?" selected":"")+'>Русский</option>'+
+        '</select>'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Settings font size (px)')+'</span>'+
+        '<input class="modal-input num-input" id="set-modal-fs" type="number" min="9" max="20" value="'+(appSettingsJS.modal_font_size||11)+'" onchange="updateModalFontSize(this.value)">'+
+      '</div>'+
+      '<div class="modal-hint">'+t("Increase or decrease the text size in the Settings and Tab settings modals only. The main window's typography is unchanged.")+'</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">'+t('System')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Minimize to tray on close')+'</span>'+
         '<label class="toggle"><input type="checkbox" id="set-tray" '+(appSettingsJS.tray_enabled?'checked':'')+' onchange="toggleTray(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
     '</div>'+
     '<div class="modal-btns">'+
-      '<button class="btn ghost" onclick="document.getElementById(\'settings-modal\').remove()">close</button>'+
+      '<button class="btn ghost" onclick="document.getElementById(\'settings-modal\').remove()">'+t('close')+'</button>'+
     '</div>'+
   '</div>';
   document.body.appendChild(ov);
@@ -4897,14 +5743,14 @@ function openProcessPicker(ev){
   var ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='proc-modal';
   ov.onclick=function(e){ if(e.target===ov) ov.remove(); };
-  ov.innerHTML='<div class="modal-box" style="min-width:380px;max-width:420px">'+
-    '<div class="modal-title">Running processes</div>'+
-    '<input class="modal-input" id="proc-filter" placeholder="filter…" autofocus>'+
-    '<div class="modal-hint" style="margin-top:0">Click a process to add it to the Apps without VPN list.</div>'+
+  ov.innerHTML='<div class="modal-box">'+
+    '<div class="modal-title">'+t('Running processes')+'</div>'+
+    '<input class="modal-input" id="proc-filter" placeholder="'+t('filter…')+'" autofocus>'+
+    '<div class="modal-hint" style="margin-top:0">'+t('Click a process to add it to the Apps without VPN list.')+'</div>'+
     '<div id="proc-list-box" style="max-height:300px;overflow-y:auto;border:1px solid var(--border2);border-radius:3px;background:var(--bg2);padding:4px"></div>'+
     '<div class="modal-btns">'+
-      '<button class="btn ghost" onclick="refreshProcessCache();renderProcessList(document.getElementById(\'proc-filter\').value)">refresh</button>'+
-      '<button class="btn ghost" onclick="document.getElementById(\'proc-modal\').remove()">close</button>'+
+      '<button class="btn ghost" onclick="refreshProcessCache();renderProcessList(document.getElementById(\'proc-filter\').value)">'+t('refresh')+'</button>'+
+      '<button class="btn ghost" onclick="document.getElementById(\'proc-modal\').remove()">'+t('close')+'</button>'+
     '</div>'+
   '</div>';
   document.body.appendChild(ov);
@@ -4932,14 +5778,14 @@ function renderProcessList(filter){
       (already?'opacity:.5;':'')+'" '+
       'onmouseover="this.style.background=\'rgba(232,197,71,.12)\'" '+
       'onmouseout="this.style.background=\'\'">'+
-      x(n)+(already?'  (already added)':'')+
+      x(n)+(already?'  ('+t('already added')+')':'')+
       '</div>';
     shown++;
-    if(shown>500){ html+='<div style="padding:4px 8px;color:var(--dim);font-size:10px">… '+(names.length-shown)+' more, refine filter</div>'; break; }
+    if(shown>500){ html+='<div style="padding:4px 8px;color:var(--dim);font-size:10px">… '+(names.length-shown)+' '+t('more, refine filter')+'</div>'; break; }
   }
   if(shown===0){
     html='<div style="padding:8px;color:var(--dim);font-size:11px;text-align:center">'+
-      (names.length===0?'No process list available — only works in the desktop build.':'No matches')+
+      (names.length===0?t('No process list available — only works in the desktop build.'):t('No matches'))+
       '</div>';
   }
   box.innerHTML=html;
@@ -5017,6 +5863,56 @@ function updateConcurrency(kind, raw){
     var inp=document.getElementById('set-speed-conc'); if(inp) inp.value=v;
   }
   saveAppSettings();
+}
+
+// updatePingTimeout / updateSpeedDuration store the test-duration knobs.
+// Bounds mirror minPingTimeoutMs / maxPingTimeoutMs / minSpeedDurationSec /
+// maxSpeedDurationSec on the Go side; out-of-range values fall back to the
+// compile-time defaults (1500 ms ping, 4 s speed) at measurement time.
+function updatePingTimeout(raw){
+  var v=parseInt(raw,10);
+  if(isNaN(v) || v<200) v=200;
+  if(v>10000) v=10000;
+  appSettingsJS.ping_timeout_ms=v;
+  var inp=document.getElementById('set-ping-timeout'); if(inp) inp.value=v;
+  saveAppSettings();
+}
+function updateSpeedDuration(raw){
+  var v=parseInt(raw,10);
+  if(isNaN(v) || v<1) v=1;
+  if(v>60) v=60;
+  appSettingsJS.speed_duration_sec=v;
+  var inp=document.getElementById('set-speed-duration'); if(inp) inp.value=v;
+  saveAppSettings();
+}
+
+// updateModalFontSize / updateLanguage — Appearance controls. Both apply
+// only to .modal-* DOM (Settings + Tab settings); the main window keeps
+// its original typography and English labels by design. Bounds match
+// applyUIPrefs: 9–20 px, default 11. Out-of-range values fall back to
+// the default at apply time.
+function updateModalFontSize(raw){
+  var v=parseInt(raw,10);
+  if(isNaN(v) || v<9) v=9;
+  if(v>20) v=20;
+  appSettingsJS.modal_font_size=v;
+  var inp=document.getElementById('set-modal-fs'); if(inp) inp.value=v;
+  applyUIPrefs();
+  saveAppSettings();
+}
+function updateLanguage(code){
+  // Empty / unknown → English (the source language of every literal in
+  // openSettings / openTabSettings). The change takes effect when those
+  // modals are reopened — reopening Settings right after picking a new
+  // language is the path the user follows naturally to verify it.
+  if(code!=='ru' && code!=='en') code='en';
+  appSettingsJS.language=code;
+  saveAppSettings(function(){
+    // Reopen Settings so labels switch immediately. Tab settings re-render
+    // on its own next open.
+    var m=document.getElementById('settings-modal');
+    if(m){ m.remove(); openSettings(); }
+  });
 }
 
 // ── test URL pickers ───────────────────────────────────────────────
@@ -5130,6 +6026,89 @@ function resetTotalStats(){
   }).catch(console.error);
 }
 
+// ── DNS leak protection / security toggles ─────────────────────────
+// The DNS section is hidden when DNS leak protection is off, since the
+// per-slot DNS server fields and FakeIP toggle are meaningless without
+// the master switch. We toggle visibility instead of disabling so the
+// section's defaults aren't visually misleading when irrelevant.
+
+function toggleDNSLeakProtection(on){
+  appSettingsJS.dns_leak_protection = !!on;
+  // Kill-switch and Block LAN are TUN-only and depend on the same
+  // strict-routing mechanism — hide both completely (rather than just
+  // disable) when leak protection is off, so the UI doesn't show
+  // settings that can't actually do anything.
+  if(!on){
+    if(appSettingsJS.kill_switch){
+      appSettingsJS.kill_switch = false;
+      var ks = document.getElementById('set-ks');
+      if(ks) ks.checked = false;
+    }
+    if(appSettingsJS.block_lan){
+      appSettingsJS.block_lan = false;
+      var bl = document.getElementById('set-blan');
+      if(bl) bl.checked = false;
+    }
+  }
+  var deps = document.getElementById('security-deps');
+  if(deps) deps.style.display = on ? '' : 'none';
+  var dnsSec = document.getElementById('dns-section');
+  if(dnsSec) dnsSec.style.display = on ? '' : 'none';
+  saveAppSettings();
+}
+function toggleKillSwitch(on){
+  appSettingsJS.kill_switch = !!on;
+  saveAppSettings();
+}
+function toggleBlockLAN(on){
+  appSettingsJS.block_lan = !!on;
+  saveAppSettings();
+}
+function toggleFakeIP(on){
+  // Storage is inverted (fakeip_disabled) so the JSON default state
+  // (omitted/false) corresponds to FakeIP being ON when leak
+  // protection is on — matches the recommended setting.
+  appSettingsJS.fakeip_disabled = !on;
+  saveAppSettings();
+}
+function updateDNSServer(slot, raw){
+  var v = (raw||'').trim();
+  if(slot === 'bootstrap') appSettingsJS.bootstrap_dns = v;
+  else if(slot === 'direct') appSettingsJS.direct_dns = v;
+  else if(slot === 'remote') appSettingsJS.remote_dns = v;
+  saveAppSettings();
+}
+
+// Static hosts: stored as object {domain: ip}, edited in a textarea
+// as one-per-line "domain ip" pairs (mirrors /etc/hosts ordering).
+// Lines starting with # are comments. Whitespace around domain or
+// IP is tolerated. Invalid lines are dropped silently on save —
+// the parser is forgiving rather than yelling at the user.
+function staticHostsToText(obj){
+  if(!obj || typeof obj !== 'object') return '';
+  var lines = [];
+  Object.keys(obj).sort().forEach(function(k){
+    lines.push(k + ' ' + obj[k]);
+  });
+  return lines.join('\n');
+}
+function updateStaticHosts(raw){
+  var out = {};
+  (raw||'').split(/\r?\n/).forEach(function(line){
+    var t = line.trim();
+    if(!t || t[0] === '#') return;
+    var parts = t.split(/\s+/);
+    if(parts.length < 2) return;
+    var domain = parts[0].toLowerCase();
+    var ip = parts[1];
+    // Very loose validation — anything Go can parse counts as an IP
+    // there, so we just reject obviously empty/whitespace values.
+    if(domain && ip) out[domain] = ip;
+  });
+  appSettingsJS.static_hosts = out;
+  saveAppSettings();
+}
+
 
 
 function domainChipKey(ev){
@@ -5221,7 +6200,7 @@ function openSourcesSettings(){
   ov.className='modal-overlay';ov.id='tab-modal';
   ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
   ov.innerHTML=
-    '<div class="modal-box" style="min-width:400px">'+
+    '<div class="modal-box">'+
       '<div class="modal-title">Sources Settings</div>'+
       '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
       '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(tab&&tab.refresh_min||0)+'" style="width:80px;margin-bottom:10px">'+
@@ -5287,7 +6266,7 @@ function renderFileList(){
   var wrap=document.getElementById('ms-files');
   if(!wrap) return;
   if(modalFiles.length===0){
-    wrap.innerHTML='<div class="modal-hint" style="margin:0 0 6px">No files added. Use the + add file button below.</div>';
+    wrap.innerHTML='<div class="modal-hint" style="margin:0 0 6px">'+t('No files added. Use the + add file button below.')+'</div>';
     return;
   }
   var html='';
@@ -5379,32 +6358,40 @@ function openTabSettings(tabId){
   ov.className='modal-overlay';ov.id='tab-modal';
   ov.onclick=(e)=>{if(e.target===ov)ov.remove();};
   ov.innerHTML=
-    '<div class="modal-box" id="tab-modal-box" style="min-width:440px">'+
-      '<div class="modal-title">Tab Settings</div>'+
-      '<div class="modal-label">Name</div>'+
-      '<input class="modal-input" id="ms-name" value="'+x(tab.name)+'" maxlength="40">'+
-      '<div class="modal-label">Source URLs (raw links, base64 subscriptions)</div>'+
-      '<div id="ms-urls">'+urlsHtml+'</div>'+
-      '<button class="btn ghost" style="font-size:9px;margin:4px 0 8px" onclick="addURLRow()">+ add URL</button>'+
-      '<div class="modal-label">Files (loaded in addition order, after URLs)</div>'+
-      '<div id="ms-files"></div>'+
-      '<button class="btn ghost" style="font-size:9px;margin:4px 0 8px" onclick="pickModalFiles()">+ add file</button>'+
-      '<div class="modal-hint">Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.</div>'+
-      '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
-      '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px;margin-bottom:10px">'+
-      '<div class="modal-row" style="margin-top:6px;margin-bottom:12px;align-items:flex-end">'+
-        '<span class="modal-row-label">Deduplicate duplicate configs</span>'+
-        renderDedupSeg(tab.dedup_mode||(tab.dedup?'hide':''))+
+    '<div class="modal-box" id="tab-modal-box">'+
+      '<div class="modal-title">'+t('Tab Settings')+'</div>'+
+      '<div class="settings-section">'+
+        '<div class="modal-label">'+t('Name')+'</div>'+
+        '<input class="modal-input" id="ms-name" value="'+x(tab.name)+'" maxlength="40" style="margin-bottom:0">'+
       '</div>'+
-      '<div class="modal-hint"><strong>Off</strong>: show everything. <strong>Hide</strong>: filter from view, reversible. <strong>Delete</strong>: permanently remove duplicate entries. Matching is by vless body (ignores the name).</div>'+
-      '<div class="modal-label">Exclude filter</div>'+
-      '<div class="chips-wrap" id="tab-filter-chips">'+efHtml+
-        '<input class="chip-input" id="tab-filter-input" placeholder="e.g. Russia, press Enter" onkeydown="tabFilterKey(event)">'+
+      '<div class="settings-section">'+
+        '<div class="modal-label">'+t('Source URLs (raw links, base64 subscriptions)')+'</div>'+
+        '<div id="ms-urls">'+urlsHtml+'</div>'+
+        '<button class="btn ghost" style="font-size:9px;margin:4px 0 12px" onclick="addURLRow()">'+t('+ add URL')+'</button>'+
+        '<div class="modal-label">'+t('Files (loaded in addition order, after URLs)')+'</div>'+
+        '<div id="ms-files"></div>'+
+        '<button class="btn ghost" style="font-size:9px;margin:4px 0 8px" onclick="pickModalFiles()">'+t('+ add file')+'</button>'+
+        '<div class="modal-hint">'+t('Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.')+'</div>'+
+        '<div class="modal-label" style="margin-top:8px">'+t('Auto-refresh interval (minutes, 0 = off)')+'</div>'+
+        '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px;margin-bottom:0">'+
       '</div>'+
-      '<div class="modal-hint">Configs with matching name will be hidden.</div>'+
+      '<div class="settings-section">'+
+        '<div class="modal-row" style="margin-bottom:6px;align-items:flex-end">'+
+          '<span class="modal-row-label">'+t('Deduplicate duplicate configs')+'</span>'+
+          renderDedupSeg(tab.dedup_mode||(tab.dedup?'hide':''))+
+        '</div>'+
+        '<div class="modal-hint">'+t('Off: show everything. Hide: filter from view, reversible. Delete: permanently remove duplicate entries. Matching is by vless body (ignores the name).')+'</div>'+
+      '</div>'+
+      '<div class="settings-section">'+
+        '<div class="modal-label">'+t('Exclude filter')+'</div>'+
+        '<div class="chips-wrap" id="tab-filter-chips">'+efHtml+
+          '<input class="chip-input" id="tab-filter-input" placeholder="'+t('e.g. Russia, press Enter')+'" onkeydown="tabFilterKey(event)">'+
+        '</div>'+
+        '<div class="modal-hint">'+t('Configs with matching name will be hidden.')+'</div>'+
+      '</div>'+
       '<div class="modal-btns">'+
-        '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">cancel</button>'+
-        '<button class="btn ghost" onclick="saveTabSettings(\''+tabId+'\')">save</button>'+
+        '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">'+t('cancel')+'</button>'+
+        '<button class="btn ghost" onclick="saveTabSettings(\''+tabId+'\')">'+t('save')+'</button>'+
       '</div>'+
     '</div>';
   document.body.appendChild(ov);
@@ -5443,17 +6430,18 @@ function renderDedupSeg(currentMode){
   if(!currentMode) currentMode='';
   if(currentMode==='off') currentMode=''; // be lenient about legacy values
   var modes=[
-    {v:'',       l:'Off'},
-    {v:'hide',   l:'Hide'},
-    {v:'delete', l:'Delete'}
+    {v:'',       l:t('Off')},
+    {v:'hide',   l:t('Hide')},
+    {v:'delete', l:t('Delete')}
   ];
-  var html='<div class="seg-group" id="ms-dedup-seg" role="radiogroup" aria-label="Deduplicate configs">';
+  var html='<div class="seg-group" id="ms-dedup-seg" role="radiogroup" aria-label="'+t('Deduplicate duplicate configs')+'">';
   for(var i=0;i<modes.length;i++){
     var m=modes[i];
     var active=(currentMode===m.v)?' active':'';
+    var titleText=m.v===''?t('No deduplication'):m.v==='hide'?t('Hide duplicates from view (reversible)'):t('Permanently delete duplicates');
     html+='<button type="button" class="seg-btn'+active+'" data-mode="'+m.v+'" '+
       'onclick="selectDedupMode(this)" '+
-      'title="'+(m.v===''?'No deduplication':m.v==='hide'?'Hide duplicates from view (reversible)':'Permanently delete duplicates')+'">'+
+      'title="'+titleText+'">'+
       m.l+'</button>';
   }
   return html+'</div>';
