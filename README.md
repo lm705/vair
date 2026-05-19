@@ -4,6 +4,8 @@
 
 Поддерживается только протокол **VLESS**.
 
+[![Download](https://img.shields.io/badge/Download-blue?style=for-the-badge&logo=github)](https://github.com/lm705/vair/releases/tag/v1.4.0)
+
 ## vless_alive.txt
 
 Список бесплатных VLESS-конфигураций, работающих на территории России.
@@ -45,8 +47,6 @@
 >TON:
 >
 >*UQBxGaG0hBVKarg6TJVaqvCN0hOFAodQjnCZ9rdnUaWxcbDV*
-
-[![Download](https://img.shields.io/badge/Download-blue?style=for-the-badge&logo=github)](https://github.com/lm705/vair/releases/tag/v1.4.0)
 
 ## Статистика репозитория
 
