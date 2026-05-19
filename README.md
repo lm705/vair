@@ -50,4 +50,4 @@
 
 [![Download](https://img.shields.io/badge/Download-blue?style=for-the-badge&logo=github)](https://github.com/lm705/vair/releases/tag/v1.4.0)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=bytebase/star-history&type=Date)](https://star-history.com/#lm705/vair&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=lm705/vair&type=Date)](https://star-history.com/#lm705/vair&Date)
