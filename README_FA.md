@@ -1,8 +1,8 @@
 # Vair
 
-یک کلاینت برای بررسی و اتصال به پیکربندی‌های VPN با پروتکل VLESS. ساخته‌شده بر پایه [Xray-core](https://github.com/XTLS/Xray-core) و [sing-box](https://github.com/SagerNet/sing-box).
+کلاینتی برای آزمایش و اتصال به پیکربندی‌های VPN با پروتکل‌های **VLESS، VMess، Trojan، Shadowsocks (شامل SS2022)، Hysteria2، TUIC**. بر پایه [Xray-core](https://github.com/XTLS/Xray-core) و [sing-box](https://github.com/SagerNet/sing-box) ساخته شده است.
 
-تنها پروتکل **VLESS** پشتیبانی می‌شود.
+فقط برای **Windows**.
 
 ## vless_alive.txt
 
