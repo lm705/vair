@@ -1,10 +1,10 @@
 # Vair
 
-Клиент для проверки и подключения к VPN-конфигурациям протокола VLESS. Построен на базе [Xray-core](https://github.com/XTLS/Xray-core) и [sing-box](https://github.com/SagerNet/sing-box).
+Клиент для проверки и подключения к VPN-конфигурациям протоколов **VLESS, VMess, Trojan, Shadowsocks (включая SS2022), Hysteria2, TUIC**. Построен на базе [Xray-core](https://github.com/XTLS/Xray-core) и [sing-box](https://github.com/SagerNet/sing-box).
 
-Поддерживается только протокол **VLESS**.
+Только на **Windows**.
 
-[![Download](https://img.shields.io/badge/Download-blue?style=for-the-badge&logo=github)](https://github.com/lm705/vair/releases/tag/v1.4.0)
+[![Download](https://img.shields.io/badge/Download-blue?style=for-the-badge&logo=github)](https://github.com/lm705/vair/releases/tag/v1.5.0)
 
 ## vless_alive.txt
 
