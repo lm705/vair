@@ -5,8 +5,10 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -162,6 +164,7 @@ var (
 	// File-open dialog (used by _goPickFiles).
 	comdlg32              = windows.NewLazySystemDLL("comdlg32.dll")
 	procGetOpenFileNameW  = comdlg32.NewProc("GetOpenFileNameW")
+	procGetSaveFileNameW  = comdlg32.NewProc("GetSaveFileNameW")
 )
 
 type dwmMargins struct{ Left, Right, Top, Bottom int32 }
@@ -656,6 +659,13 @@ func openNativeWindow(addr string) {
 		return listRunningProcessNames()
 	})
 
+	// Settings export — show a native Save As dialog, write the supplied
+	// JSON to the chosen path. Returns the path on success, empty string on
+	// cancel. Errors propagate to the JS .catch.
+	w.Bind("_goSaveExport", func(suggestedName, content string) (string, error) {
+		return saveJSONFile(hwnd, suggestedName, []byte(content))
+	})
+
 	w.Navigate(addr)
 
 	// ── Resize fix: subclass WebView2 child windows ───────────────────────────
@@ -823,23 +833,96 @@ func updateTrayTooltip(hwnd uintptr, text string) {
 	procShellNotifyIconW.Call(0x00000001, uintptr(unsafe.Pointer(&nid))) // NIM_MODIFY
 }
 
-// restartAsAdmin relaunches the current exe with admin privileges via UAC prompt
+// CREATE_BREAKAWAY_FROM_JOB lets the spawned process escape our Job Object.
+// The job is created with JOB_OBJECT_LIMIT_BREAKAWAY_OK so this is honoured.
+const createBreakawayFromJob = 0x01000000
+
+// restartAsAdmin relaunches the current exe elevated, then exits this
+// (non-elevated) instance.
+//
+// The naive approach — ShellExecute "runas" then os.Exit(0) from inside this
+// process — does not work here, and ShellExecuteEx/NOASYNC did not fix it:
+// this process lives in a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+// so the instant we exit the kernel tears the whole group down. Anything the
+// dying process started for the elevation (and the elevation RPC itself) dies
+// with it, so the app just closed and nothing came back elevated.
+//
+// Fix: hand the relaunch to a detached PowerShell helper that has *broken
+// away* from our job (CREATE_BREAKAWAY_FROM_JOB). Because it is no longer in
+// the job, our os.Exit + KILL_ON_JOB_CLOSE cannot touch it. It waits for us
+// to fully exit (freeing the HTTP port), then performs the UAC elevation
+// itself via Start-Process -Verb RunAs. The prompt therefore comes from a
+// healthy standalone process, not a process being torn down.
 func restartAsAdmin() {
 	exe, err := os.Executable()
 	if err != nil {
 		return
 	}
-	verbW, _ := syscall.UTF16PtrFromString("runas")
-	exeW, _ := syscall.UTF16PtrFromString(exe)
-	dirW, _ := syscall.UTF16PtrFromString(filepath.Dir(exe))
-	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(verbW)),
-		uintptr(unsafe.Pointer(exeW)), 0, uintptr(unsafe.Pointer(dirW)), 1) // SW_SHOWNORMAL=1
+	dir := filepath.Dir(exe)
+
+	// Single-quote escaping for the PowerShell string literals.
+	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
+	script := "Start-Sleep -Milliseconds 900; " +
+		"Start-Process -FilePath '" + esc(exe) + "'" +
+		" -WorkingDirectory '" + esc(dir) + "' -Verb RunAs"
+
+	// PowerShell -EncodedCommand expects base64 of the UTF-16LE script. This
+	// sidesteps every quoting pitfall for exe paths with spaces/specials.
+	u16 := utf16LE(script)
+	enc := base64.StdEncoding.EncodeToString(u16)
+
+	cmd := exec.Command("powershell.exe",
+		"-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+		"-EncodedCommand", enc)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: createBreakawayFromJob | createNoWindow,
+	}
+	if err := cmd.Start(); err != nil {
+		// Helper could not be spawned — stay running rather than vanish.
+		return
+	}
 	os.Exit(0)
 }
 
-var (
-	procShellExecuteW = shell32.NewProc("ShellExecuteW")
-)
+// utf16LE encodes s as little-endian UTF-16 bytes (no BOM, no NUL
+// terminator) for PowerShell's -EncodedCommand.
+func utf16LE(s string) []byte {
+	u, _ := windows.UTF16FromString(s)
+	out := make([]byte, 0, len(u)*2)
+	for _, c := range u {
+		if c == 0 { // drop the terminating NUL UTF16FromString appends
+			break
+		}
+		out = append(out, byte(c), byte(c>>8))
+	}
+	return out
+}
+
+// openStorageLocation opens the given directory in Explorer (used by the
+// "Open storage location" button to reveal %LOCALAPPDATA%\vair). Explorer
+// inherits its own visible window — we deliberately do NOT use the
+// runHidden helper here, that would defeat the purpose. Errors are
+// returned to the HTTP layer so the UI can show a notification.
+func openStorageLocation(dir string) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("ensure %s: %w", dir, err)
+	}
+	cmd := exec.Command("explorer.exe", dir)
+	// Detach from our Job Object so closing the Explorer window does not
+	// take Vair down — and so Vair's KILL_ON_JOB_CLOSE does not snap
+	// Explorer shut when the user closes Vair.
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: createBreakawayFromJob,
+	}
+	// Explorer.exe returns exit code 1 even when it successfully opened the
+	// folder (long-standing Windows quirk). Run-and-forget; ignore the wait.
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start explorer: %w", err)
+	}
+	go cmd.Wait() //nolint:errcheck — exit code is meaningless here
+	return nil
+}
 
 // ── Native file picker (used by JS `_goPickFiles`) ───────────────────────────
 //
@@ -860,6 +943,7 @@ const (
 	ofnFileMustExist    = 0x00001000
 	ofnHideReadOnly     = 0x00000004
 	ofnNoChangeDir      = 0x00000008
+	ofnOverwritePrompt  = 0x00000002 // SaveAs: confirm before overwriting
 )
 
 type openFileNameW struct {
@@ -943,6 +1027,54 @@ func pickConfigFiles(ownerHwnd uintptr) []string {
 		out = append(out, filepath.Join(dir, name))
 	}
 	return out
+}
+
+// saveJSONFile shows the native Save As dialog seeded with suggestedName,
+// writes content to the chosen path on confirm, and returns that path. An
+// empty path with a nil error means the user cancelled. We pick GetSaveFile
+// to match pickConfigFiles' classic-dialog style and avoid COM plumbing.
+func saveJSONFile(ownerHwnd uintptr, suggestedName string, content []byte) (string, error) {
+	// 32 KiB buffer for the chosen path — way more than any real path needs.
+	const bufLen = 32 * 1024
+	buf := make([]uint16, bufLen)
+	if suggestedName == "" {
+		suggestedName = "vair_settings.json"
+	}
+	// Pre-fill the file name with the suggestion. UTF-16 copy + NUL.
+	for i, r := range suggestedName {
+		if i >= bufLen-1 {
+			break
+		}
+		buf[i] = uint16(r)
+	}
+
+	filter := utf16Z("JSON files\x00*.json\x00All files\x00*.*\x00")
+	title := utf16Z("Save settings as")
+	defExt := utf16Z("json")
+
+	ofn := openFileNameW{
+		Owner:   ownerHwnd,
+		Filter:  &filter[0],
+		File:    &buf[0],
+		MaxFile: bufLen,
+		Title:   &title[0],
+		DefExt:  &defExt[0],
+		Flags:   ofnExplorer | ofnOverwritePrompt | ofnHideReadOnly | ofnNoChangeDir,
+	}
+	ofn.StructSize = uint32(unsafe.Sizeof(ofn))
+
+	ret, _, _ := procGetSaveFileNameW.Call(uintptr(unsafe.Pointer(&ofn)))
+	if ret == 0 {
+		return "", nil // user cancelled (or GetSaveFile failed silently)
+	}
+	path := syscall.UTF16ToString(buf)
+	if path == "" {
+		return "", nil
+	}
+	if err := os.WriteFile(path, content, 0644); err != nil {
+		return "", fmt.Errorf("write %s: %w", path, err)
+	}
+	return path, nil
 }
 
 // utf16Z converts a Go string with embedded NULs into a NUL-terminated
@@ -1031,7 +1163,82 @@ func listRunningProcessNames() []string {
 	return out
 }
 
+// ── Process grouping (Job Object + AppUserModelID) ──────────────────────────
+//
+// Goal: everything Vair launches shows up *as part of Vair* in Task Manager
+// and dies with Vair — including the embedded WebView2 runtime, which used
+// to appear as a separate top-level "Microsoft Edge WebView2" entry.
+//
+// Two levers:
+//   1. A Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. Child processes
+//      inherit job membership by default, so once the current process is in
+//      the job every later child — xray.exe, sing-box.exe and WebView2's
+//      msedgewebview2.exe helper processes — is captured. Task Manager then
+//      shows them within Vair's process group, and when Vair exits (even via
+//      "End task") the job's last handle closes and the OS tears the whole
+//      group down. No orphaned WebView2/xray/sing-box left behind.
+//   2. An explicit AppUserModelID so the shell/Task Manager treats every
+//      Vair window and child under one stable app identity.
+
+var procSetCurrentProcessExplicitAppUserModelID = shell32.NewProc("SetCurrentProcessExplicitAppUserModelID")
+
+// jobHandle is intentionally kept open for the whole process lifetime.
+// KILL_ON_JOB_CLOSE fires when the last handle closes — we want that to
+// happen at (and only at) process exit, which the OS does for us.
+var jobHandle windows.Handle
+
+func bindChildrenToJob() {
+	h, err := windows.CreateJobObject(nil, nil)
+	if err != nil || h == 0 {
+		return
+	}
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	// KILL_ON_JOB_CLOSE: WebView2/xray/sing-box children (created without the
+	// breakaway flag) stay in the job and die with Vair — no orphans.
+	// BREAKAWAY_OK: but a child created with CREATE_BREAKAWAY_FROM_JOB (only
+	// the elevated-relaunch helper) may escape, so it survives our exit.
+	info.BasicLimitInformation.LimitFlags =
+		windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | windows.JOB_OBJECT_LIMIT_BREAKAWAY_OK
+	if _, err := windows.SetInformationJobObject(
+		h,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		windows.CloseHandle(h)
+		return
+	}
+	cur, err := windows.GetCurrentProcess()
+	if err != nil {
+		windows.CloseHandle(h)
+		return
+	}
+	// On Windows 8+ a process may belong to nested jobs, so this succeeds
+	// even when Vair was itself launched inside someone else's job. On
+	// legacy Windows it can fail with ACCESS_DENIED — we degrade silently
+	// (behaviour identical to before this change).
+	if err := windows.AssignProcessToJobObject(h, cur); err != nil {
+		windows.CloseHandle(h)
+		return
+	}
+	jobHandle = h // kept alive deliberately; do not close before exit
+}
+
+func setAppUserModelID() {
+	idW, err := windows.UTF16PtrFromString("Vair.App")
+	if err != nil {
+		return
+	}
+	procSetCurrentProcessExplicitAppUserModelID.Call(uintptr(unsafe.Pointer(idW))) //nolint:errcheck
+}
+
 func standaloneMain() {
+	// Must run before any child process is spawned (extractBinaries →
+	// prewarmBinary launches `xray version`), so every descendant lands
+	// inside the job and is grouped with / cleaned up alongside Vair.
+	bindChildrenToJob()
+	setAppUserModelID()
+
 	fresh, extractErr := extractBinaries()
 	if extractErr != nil {
 		fmt.Fprintf(os.Stderr, "Startup error: %v\n", extractErr)
@@ -1044,6 +1251,10 @@ func standaloneMain() {
 	if !checkAdmin() {
 		fmt.Println("!! Run as Administrator to enable TUN mode.")
 	}
+	// Recover from a dirty shutdown: if the last session left the Windows
+	// system proxy enabled (pointed at a now-dead localhost port), internet
+	// would be broken until cleared. Do this before anything else network.
+	clearStaleProxy()
 	registerRoutes()
 	loadTabs()
 	loadSettings()

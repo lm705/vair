@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -51,7 +54,13 @@ const (
 	warmupTimeout = 2 * time.Second
 	pingRounds    = 3
 
-	speedTestURLDefault   = "https://speed.cloudflare.com/__down?bytes=10000000"
+	// 50 MB: large enough to fill the measurement window (speedDuration) for
+	// any realistic proxy speed so the window isn't cut short by an early
+	// EOF (the old "response too fast" false positive), yet within
+	// Cloudflare's accepted __down range — bytes=100000000 is rejected by
+	// the endpoint, so we cap at 50 MB. We stop reading at the deadline
+	// anyway, so this size is an upper bound, not an actual 50 MB download.
+	speedTestURLDefault   = "https://speed.cloudflare.com/__down?bytes=50000000"
 	speedDuration  = 4 * time.Second
 	speedUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -64,6 +73,18 @@ const (
 
 	// xrayConnTimeout: time to wait for xray to start in persistent proxy connection mode.
 	xrayConnTimeout = 12 * time.Second
+
+	// singboxStartupTimeout: time to wait for the sing-box HTTP port to open
+	// during ping/speed test of a UDP-family node (Hysteria2/TUIC). The QUIC
+	// handshake is slower to come up than a TCP outbound, so this is a touch
+	// more generous than xrayStartupTimeout.
+	singboxStartupTimeout = 10 * time.Second
+
+	// singboxConnTimeout: time to wait for sing-box to start in a persistent
+	// proxy connection. sing-box binds the local HTTP inbound before it ever
+	// dials the QUIC outbound, so this only bounds local listener readiness;
+	// kept generous to cover first-run Defender scan of the extracted binary.
+	singboxConnTimeout = 15 * time.Second
 
 	// tunStartupTimeout: time to wait for sing-box TUN adapter to come up.
 	tunStartupTimeout = 3 * time.Second
@@ -113,6 +134,27 @@ type AppSettings struct {
 	// Settings → Testing lets the user pick a preset or "Custom URL".
 	PingTestURL        string `json:"ping_test_url,omitempty"`
 	SpeedTestURL       string `json:"speed_test_url,omitempty"`
+	// Fallback speed URL — used ONLY when the primary speed URL returns HTTP
+	// 429 (rate-limit). "" / unset → the CacheFly default (on by default);
+	// "__none" → fallback explicitly disabled; anything else → that URL. See
+	// currentSpeedFallbackURL. Each attempt has its own bounded
+	// http.Client.Timeout, so an unreachable fallback cannot extend the test
+	// indefinitely or leak goroutines.
+	SpeedTestURLFallback string `json:"speed_test_url_fallback,omitempty"`
+	// Raw URL of the most recently connected config. Drives the "last"
+	// badge in the table. Persisted so the badge survives restarts; only
+	// one config carries it at a time.
+	LastConnectedRaw   string `json:"last_connected_raw,omitempty"`
+	// Favorite configs, keyed by their raw URL (stable across reload/sort).
+	// Starred rows sort to the top in the default order.
+	Favorites          []string `json:"favorites,omitempty"`
+	// VerboseLogs raises the xray/sing-box log level from warning→info so the
+	// Logs panel shows the detailed per-connection lines (like v2rayN). Takes
+	// effect on the next connection.
+	VerboseLogs        bool     `json:"verbose_logs,omitempty"`
+	// LogTests, when on, emits a [test] line per ping/speed result into the
+	// Logs panel. Off by default — bulk tests are noisy.
+	LogTests           bool     `json:"log_tests,omitempty"`
 	// Per-round ping timeout (ms) and speed-test duration (seconds).
 	// Zero / unset → built-in defaults (pingTimeout / speedDuration consts).
 	// Clamped to sane bounds inside the accessors. Note that the speed test
@@ -148,7 +190,10 @@ type AppSettings struct {
 	// DNS routing block in sing-box, hijack port 53, and turn on
 	// strict_route so the WFP filter (Windows) prevents anything from
 	// escaping. When OFF the program behaves like 1.4.0.
-	DNSLeakProtection  bool   `json:"dns_leak_protection,omitempty"`
+	// On by default (see appSettings initialiser). No omitempty: an explicit
+	// "off" must round-trip to disk, otherwise it would silently revert to the
+	// default on next launch.
+	DNSLeakProtection  bool   `json:"dns_leak_protection"`
 	// KillSwitch only takes effect when DNSLeakProtection is on. With
 	// strict_route=true, sing-box already drops traffic that can't go
 	// through the tunnel; the kill-switch wording in UI tells the user
@@ -166,7 +211,10 @@ type AppSettings struct {
 	// it off falls back to real DNS via the proxy detour — slower
 	// but more compatible with picky apps (P2P, WebRTC, custom
 	// resolvers).
-	FakeIPDisabled     bool   `json:"fakeip_disabled,omitempty"`
+	// FakeIP is OFF by default → FakeIPDisabled defaults to true (see
+	// appSettings initialiser). No omitempty for the same round-trip reason as
+	// DNSLeakProtection.
+	FakeIPDisabled     bool   `json:"fakeip_disabled"`
 	// DNS server overrides. Empty falls back to the built-in default
 	// for the slot (see dnsServerOr* helpers).
 	BootstrapDNS       string `json:"bootstrap_dns,omitempty"` // plain UDP, IP-only
@@ -240,6 +288,81 @@ func currentSpeedURL() string {
 		return speedTestURLDefault
 	}
 	return u
+}
+
+// speedFallbackDefaultURL is the fallback speed-test endpoint used when the
+// user hasn't changed the setting (CacheFly). The fallback is on by default —
+// it kicks in only when the primary URL returns HTTP 429.
+const speedFallbackDefaultURL = "http://cachefly.cachefly.net/100mb.test"
+
+// currentSpeedFallbackURL returns the fallback speed-test URL. The stored
+// value distinguishes three cases: "__none" → fallback explicitly disabled
+// (returns ""), "" / unset → the CacheFly default (on by default), anything
+// else → that custom/preset URL.
+func currentSpeedFallbackURL() string {
+	settingsMu.RLock()
+	u := strings.TrimSpace(appSettings.SpeedTestURLFallback)
+	settingsMu.RUnlock()
+	switch u {
+	case "__none":
+		return ""
+	case "":
+		return speedFallbackDefaultURL
+	}
+	return u
+}
+
+// xrayLogLevel / singboxLogLevel return the log verbosity for generated
+// configs. Default is quiet (warning/warn); the "Verbose logs" setting bumps
+// both to info so the Logs panel shows per-connection detail. Read under
+// settingsMu like the other appSettings accessors.
+func xrayLogLevel() string {
+	settingsMu.RLock()
+	v := appSettings.VerboseLogs
+	settingsMu.RUnlock()
+	if v {
+		return "info"
+	}
+	return "warning"
+}
+
+func singboxLogLevel() string {
+	settingsMu.RLock()
+	v := appSettings.VerboseLogs
+	settingsMu.RUnlock()
+	if v {
+		return "info"
+	}
+	return "warn"
+}
+
+// xrayLogConfig builds the xray "log" stanza. We deliberately KEEP the access
+// log on in quiet (non-verbose) mode: its one-line-per-connection entries
+// ("accepted host:port [in -> out]") are a useful summary of what's routed
+// where (proxy vs direct), without the info-level transport spam. quiet =
+// warnings/errors + access; verbose (loglevel "info") adds the per-connection
+// internals ("creating connection", "taking detour", "sniffed domain", …).
+// The rate-limit gate keeps even a busy TUN session bounded, and the
+// server-IP route carve-out prevents the old connection-storm flood.
+func xrayLogConfig() map[string]interface{} {
+	return map[string]interface{}{"loglevel": xrayLogLevel()}
+}
+
+// recordLastConnected remembers the raw of the most recently connected
+// config so the UI can tag exactly one row with a "last" badge. Persisted
+// (saveSettings) so the badge survives a restart; a no-op when the raw is
+// already current to avoid needless disk writes on reconnect.
+func recordLastConnected(raw string) {
+	if raw == "" {
+		return
+	}
+	settingsMu.Lock()
+	changed := appSettings.LastConnectedRaw != raw
+	appSettings.LastConnectedRaw = raw
+	settingsMu.Unlock()
+	if changed {
+		saveSettings()
+	}
 }
 
 // Sane bounds for the two test-duration knobs. The lower bounds protect
@@ -403,64 +526,10 @@ func staticHostsSnapshot() map[string]string {
 	return out
 }
 
-// preResolveVPNHost replaces p.Host (a domain) with a resolved IPv4
-// address using Go's default resolver. The original hostname is moved
-// to p.SNI so TLS still uses the right server name in its handshake
-// — without this, certificate validation against an IP would fail.
-//
-// Why we do this even when DNS leak protection is off:
-//   * Eliminates one DNS lookup that would happen inside xray, which
-//     is harder to control or surface errors from.
-//   * Makes the kill-switch / strict_route case actually startable —
-//     when strict_route is on, sing-box's WFP filter would block
-//     xray's UDP/53 probe to the OS resolver.
-//   * No behaviour change for IP-only servers — pre-resolve is a
-//     no-op.
-//   * No behaviour change for TLS — SNI keeps the original domain.
-//
-// Static hosts take precedence over DNS. They're checked first so the
-// user can pin a VPN server IP even when DNS resolution is broken.
-func preResolveVPNHost(p *VlessParams) error {
-	if p == nil || p.Host == "" {
-		return nil
-	}
-	if net.ParseIP(p.Host) != nil {
-		// Already an IP literal — nothing to resolve, SNI stays as-is.
-		return nil
-	}
-	host := strings.ToLower(p.Host)
-
-	// Static hosts: user override comes first.
-	if hosts := staticHostsSnapshot(); hosts != nil {
-		if ip, ok := hosts[host]; ok && net.ParseIP(ip) != nil {
-			if p.SNI == "" {
-				p.SNI = p.Host
-			}
-			p.Host = ip
-			return nil
-		}
-	}
-
-	// DNS resolve via Go's default resolver. This uses the OS resolver
-	// (and thus the OS DNS settings) and runs before sing-box brings
-	// up TUN, so it's always reachable.
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", p.Host)
-	if err != nil {
-		return fmt.Errorf("resolve %s: %w", p.Host, err)
-	}
-	if len(ips) == 0 {
-		return fmt.Errorf("no IPs returned for %s", p.Host)
-	}
-	if p.SNI == "" {
-		p.SNI = p.Host
-	}
-	p.Host = ips[0].String()
-	return nil
-}
-
-var appSettings = AppSettings{SourcesEnabled: true}
+// Defaults: DNS leak protection ON, FakeIP OFF (FakeIPDisabled=true) — picked
+// for safer out-of-the-box TUN behaviour (DNS through the tunnel, real DoH
+// rather than FakeIP for app compatibility).
+var appSettings = AppSettings{SourcesEnabled: true, DNSLeakProtection: true, FakeIPDisabled: true}
 var settingsMu sync.RWMutex
 
 func settingsFilePath() string {
@@ -485,13 +554,87 @@ func saveSettings() {
 	os.WriteFile(settingsFilePath(), data, 0644)
 }
 
-func shouldSkip(name string, countries []string) bool {
-	if len(countries) == 0 {
+// excludeColumns is the canonical set of columns the exclude-filter UI can
+// target. Anything else in the column position of a "col:val" rule is
+// treated as legacy (name-only) data. Keep this in sync with the dropdown
+// options in the tab-settings modal.
+var excludeColumns = map[string]struct{}{
+	"name":      {},
+	"type":      {},
+	"host":      {},
+	"transport": {},
+	"security":  {},
+}
+
+// parseExcludeRule splits a stored exclude-filter entry into (column, value).
+//
+// Encoding:
+//   - New form:   "column:value"  where column is one of excludeColumns.
+//   - Legacy:     "value"         (no colon, or colon-prefix isn't a known
+//                                  column) — defaults to column="name" so
+//                                  pre-existing user data keeps working
+//                                  without a migration step.
+//
+// The colon split is on the FIRST ':' only — values can contain colons
+// without escaping ("name:foo:bar" filters names containing "foo:bar").
+func parseExcludeRule(s string) (column, value string) {
+	if i := strings.Index(s, ":"); i > 0 {
+		col := strings.ToLower(s[:i])
+		if _, ok := excludeColumns[col]; ok {
+			return col, s[i+1:]
+		}
+	}
+	return "name", s
+}
+
+// displayProtocol returns the protocol label as the user sees it in the UI:
+// "ss2022" is split out from the backend's unified "ss" Kind by inspecting
+// the cipher. Keep in sync with chipProto() in the JS layer.
+func displayProtocol(kind, security string) string {
+	if kind == "ss" && strings.HasPrefix(security, "2022-blake3-") {
+		return "ss2022"
+	}
+	return kind
+}
+
+// shouldSkip reports whether a config row should be hidden because it
+// matches any of the per-tab exclude rules. Each rule is "column:value"
+// (or bare "value" for legacy name-only rules — see parseExcludeRule).
+// A row is skipped if ANY rule's value is a (case-insensitive) substring
+// of the corresponding column's value on the row.
+//
+// The `kind` parameter is the backend protocol id ("vless", "ss", …); the
+// type-column match uses displayProtocol so a "ss2022" filter actually
+// targets only the SS2022 ciphers, not legacy SS.
+func shouldSkip(name, kind, host, network, security string, rules []string) bool {
+	if len(rules) == 0 {
 		return false
 	}
-	low := strings.ToLower(name)
-	for _, c := range countries {
-		if strings.Contains(low, strings.ToLower(c)) {
+	lowName := strings.ToLower(name)
+	lowType := strings.ToLower(displayProtocol(kind, security))
+	lowHost := strings.ToLower(host)
+	lowNet := strings.ToLower(network)
+	lowSec := strings.ToLower(security)
+	for _, r := range rules {
+		col, val := parseExcludeRule(r)
+		val = strings.ToLower(strings.TrimSpace(val))
+		if val == "" {
+			continue
+		}
+		var hay string
+		switch col {
+		case "type":
+			hay = lowType
+		case "host":
+			hay = lowHost
+		case "transport":
+			hay = lowNet
+		case "security":
+			hay = lowSec
+		default: // "name" + legacy
+			hay = lowName
+		}
+		if strings.Contains(hay, val) {
 			return true
 		}
 	}
@@ -499,27 +642,6 @@ func shouldSkip(name string, countries []string) bool {
 }
 
 // ─────────────────────────── types ───────────────────────────────
-
-type VlessParams struct {
-	Raw           string
-	UUID          string
-	Host          string
-	Port          int
-	Name          string
-	Network       string
-	Security      string
-	Path          string
-	Host2         string
-	ServiceName   string
-	SNI           string
-	ALPN          string
-	Fingerprint   string
-	AllowInsecure bool
-	Flow          string
-	PublicKey     string
-	ShortID       string
-	SpiderX       string
-}
 
 type Status string
 
@@ -541,6 +663,7 @@ type ConfigEntry struct {
 	Port        int     `json:"port"`
 	Network     string  `json:"network"`
 	Security    string  `json:"security"`
+	Protocol    string  `json:"protocol,omitempty"`
 	PingStatus  Status  `json:"ping_status"`
 	Delay       int64   `json:"delay"`
 	PingErr     string  `json:"ping_err,omitempty"`
@@ -586,6 +709,10 @@ type ConnState struct {
 	StartedAt  time.Time  `json:"started_at"`
 	ErrMsg     string     `json:"error,omitempty"`
 	UptimeSec  int64      `json:"uptime_sec"`
+	// StatsUnavailable is true for the pure-sing-box TUN path (Hysteria2/
+	// TUIC): there's no local SOCKS hop to instrument, so session/lifetime
+	// traffic counters don't move. The UI shows a small note instead.
+	StatsUnavailable bool `json:"stats_unavailable,omitempty"`
 }
 
 type connManager struct {
@@ -676,6 +803,15 @@ type SSEEvent struct {
 	Type    string      `json:"type"`
 	Payload interface{} `json:"payload"`
 	Tab     string      `json:"tab,omitempty"`
+	// Lossy marks an event as safe to drop if the receiver's channel is
+	// full. Use this for high-frequency intermediate events (live-progress
+	// callbacks, in-flight byte counters, bulk progress ticks) where the
+	// *next* event supersedes this one anyway. Terminal events (entry's
+	// final OK/Failed status, conn state transitions, bulk_*_done) leave
+	// this false so broadcast() blocks long enough to deliver them even
+	// under heavy event flow. Field is JSON-omitted — only the server
+	// inspects it. See broadcast() for the drop/block policy.
+	Lossy bool `json:"-"`
 }
 
 type AppState struct {
@@ -827,13 +963,54 @@ func nextTabNumber() int {
 	}
 }
 
+// broadcast fans an SSE event out to every connected client.
+//
+// Two delivery tiers — driven by ev.Lossy:
+//
+//   - Lossy (live-progress, in-flight stats, bulk-progress ticks): send
+//     non-blocking. If the receiver's 1024-slot buffer is full, drop this
+//     event. A later event will supersede it anyway, so loss is harmless.
+//
+//   - Reliable (terminal entry updates, conn state, bulk_*_done, tabs):
+//     block up to 2 seconds. These represent a state TRANSITION the client
+//     must observe — dropping them leaves rows stuck on stale status (the
+//     classic "connecting…" pill that only disappears after RELOAD).
+//
+// The client list is snapshotted under the lock and the actual sends happen
+// OUTSIDE the lock. Otherwise a single slow client would serialize every
+// broadcast through clientMu, and the 2-second reliable budget would
+// multiply by the client count for unrelated events on other clients.
 func (s *AppState) broadcast(ev SSEEvent) {
 	s.clientMu.Lock()
-	defer s.clientMu.Unlock()
+	clients := make([]chan SSEEvent, 0, len(s.clients))
 	for ch := range s.clients {
+		clients = append(clients, ch)
+	}
+	s.clientMu.Unlock()
+
+	if ev.Lossy {
+		for _, ch := range clients {
+			select {
+			case ch <- ev:
+			default:
+				// buffer full — drop. The next live-progress / counter /
+				// bulk-tick event will replace this one's stale value, so
+				// the client converges on the right state on its own.
+			}
+		}
+		return
+	}
+
+	for _, ch := range clients {
 		select {
 		case ch <- ev:
-		default:
+		case <-time.After(2 * time.Second):
+			// Two seconds is enough that a momentary GC/IO pause on the
+			// SSE writer can't drop a terminal event, and short enough
+			// that a truly dead client doesn't pin a sender forever.
+			// If we do drop here, the row may show "stale" until the
+			// next reload — but at this point the client is unreachable
+			// anyway and reload is the right recovery.
 		}
 	}
 }
@@ -848,6 +1025,307 @@ func (s *AppState) removeClient(ch chan SSEEvent) {
 	s.clientMu.Unlock()
 }
 
+// ─────────────────────────── log store ───────────────────────────
+//
+// In-memory ring buffer of recent log lines, shown in the UI's Logs panel.
+// Sources: xray/sing-box stderr from the active connection ("xray"/"singbox")
+// and Vair's own diagnostics ("vair", via vlog). Each new line is also pushed
+// to clients as a lossy SSE "log" event so the panel updates live without
+// blocking the broadcast path. The buffer is session-only (not persisted).
+
+type logLine struct {
+	T   int64  `json:"t"`   // unix millis
+	Lvl string `json:"lvl"` // error | warn | info | raw
+	Src string `json:"src"` // xray | singbox | vair
+	Msg string `json:"msg"`
+}
+
+type logStore struct {
+	mu      sync.Mutex
+	lines   []logLine // ring buffer for the /api/logs snapshot
+	pending []logLine // lines added since the last SSE flush
+	cap     int
+	// Token-bucket rate limit for high-volume core output (see gate). A
+	// verbose TUN connection can emit tens of thousands of "creating
+	// connection" lines per second; without a cap they pile up in the ring,
+	// the SSE batches, and the client's 1024-slot channel, spiking CPU and
+	// RAM into the gigabytes. error/warn lines bypass the limit so failures
+	// are never dropped.
+	rlStart   time.Time
+	rlCount   int
+	rlDropped int
+}
+
+const (
+	logRateInterval = 250 * time.Millisecond
+	logRateLimit    = 200 // info/raw lines per interval (~800/s) before dropping
+)
+
+var logs = &logStore{cap: 2000}
+
+// ansiRe matches ANSI SGR colour escapes (e.g. sing-box on Windows still
+// emits them even when stderr is piped). We strip them before storing so the
+// Logs panel shows clean text instead of "[31mERROR[0m".
+var ansiRe = regexp.MustCompile("\x1b\\[[0-9;]*[a-zA-Z]")
+
+func stripANSI(s string) string {
+	// Fast path: most lines (all of xray's) carry no escapes, so skip the
+	// regexp entirely unless an ESC byte is actually present. Matters under a
+	// verbose flood where this runs tens of thousands of times per second.
+	if strings.IndexByte(s, 0x1b) < 0 {
+		return s
+	}
+	return ansiRe.ReplaceAllString(s, "")
+}
+
+// add records a line. It does NOT broadcast directly: under verbose logging a
+// busy core (especially TUN, which routes all system traffic) can emit
+// thousands of lines per second, and one SSE event per line froze the UI
+// (every event = a JSON marshal on the server + a parse and DOM write on the
+// client). Instead lines accumulate in `pending` and a ticker flushes them as
+// a single batched event a few times per second — bounded work regardless of
+// log volume. See logFlushLoop.
+// push appends a line to both the ring buffer and the pending SSE batch.
+// Caller must hold l.mu.
+func (l *logStore) push(ln logLine) {
+	l.lines = append(l.lines, ln)
+	if len(l.lines) > 2*l.cap {
+		// Amortised trim: let the slice grow to 2× cap, then drop the oldest
+		// half in one copy. This keeps the per-add cost O(1) under a flood
+		// instead of copying `cap` elements on every single line.
+		l.lines = append(l.lines[:0], l.lines[len(l.lines)-l.cap:]...)
+	}
+	l.pending = append(l.pending, ln)
+	if len(l.pending) > l.cap {
+		// A flood between flushes: keep only the newest cap lines for the live
+		// stream (the panel re-fetches the full snapshot on open anyway).
+		l.pending = append(l.pending[:0], l.pending[len(l.pending)-l.cap:]...)
+	}
+}
+
+// add stores a pre-classified line (vlog/tlog and result summaries). Not
+// rate-limited — these are low-volume and always worth keeping.
+func (l *logStore) add(src, lvl, msg string) {
+	msg = stripANSI(strings.TrimRight(msg, "\r\n"))
+	if msg == "" {
+		return
+	}
+	ln := logLine{T: time.Now().UnixMilli(), Lvl: lvl, Src: src, Msg: msg}
+	l.mu.Lock()
+	l.push(ln)
+	l.mu.Unlock()
+}
+
+// gate advances the rate-limit window and reports whether a high-volume core
+// line should be kept. error/warn lines (isErrWarn) always pass; info/raw
+// lines are capped at logRateLimit per window. Callers MUST evaluate this on
+// the raw bytes BEFORE allocating a string (scanner.Text()), so each dropped
+// line under a verbose flood costs almost nothing — no string, no GC churn.
+// When a window rolls over with drops, one summary line is pushed so the user
+// knows output was suppressed.
+func (l *logStore) gate(isErrWarn bool) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if now.Sub(l.rlStart) >= logRateInterval {
+		if l.rlDropped > 0 {
+			l.push(logLine{T: now.UnixMilli(), Lvl: "warn", Src: "vair",
+				Msg: fmt.Sprintf("… %d log lines suppressed (too fast — lower verbosity to see all)", l.rlDropped)})
+		}
+		l.rlStart = now
+		l.rlCount = 0
+		l.rlDropped = 0
+	}
+	if isErrWarn {
+		return true
+	}
+	if l.rlCount >= logRateLimit {
+		l.rlDropped++
+		return false
+	}
+	l.rlCount++
+	return true
+}
+
+// flush emits the lines accumulated since the last flush as one batched,
+// lossy SSE "log" event (payload is an array). Returns quickly when idle.
+func (l *logStore) flush() {
+	l.mu.Lock()
+	if len(l.pending) == 0 {
+		l.mu.Unlock()
+		return
+	}
+	batch := make([]logLine, len(l.pending))
+	copy(batch, l.pending)
+	l.pending = l.pending[:0]
+	l.mu.Unlock()
+	state.broadcast(SSEEvent{Type: "log", Payload: batch, Lossy: true})
+}
+
+// logFlushLoop drives periodic batched delivery of buffered log lines.
+func logFlushLoop() {
+	tick := time.NewTicker(150 * time.Millisecond)
+	defer tick.Stop()
+	for range tick.C {
+		logs.flush()
+	}
+}
+
+func (l *logStore) snapshot() []logLine {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := len(l.lines)
+	if n > l.cap {
+		n = l.cap
+	}
+	out := make([]logLine, n)
+	copy(out, l.lines[len(l.lines)-n:])
+	return out
+}
+
+func (l *logStore) clear() {
+	l.mu.Lock()
+	// Drop the backing arrays (not just reslice) so a buffer that grew under a
+	// flood is actually reclaimed by the GC.
+	l.lines = nil
+	l.pending = nil
+	l.mu.Unlock()
+}
+
+// parseLevel classifies a raw stderr line by source so the UI can colour it.
+// xray uses bracketed tags ([Warning]/[Info]/[Error]); sing-box prints the
+// level word (WARN/INFO/ERROR/FATAL). Unrecognised lines are "raw".
+func parseLevel(src, line string) string {
+	// Match xray's capitalised tags ([Error]/[Warning]/[Info]) and sing-box's
+	// uppercase words (ERROR/WARN/INFO/FATAL) WITHOUT allocating an uppercased
+	// copy of every line — this runs per line under a verbose flood, so the
+	// old strings.ToUpper was a real GC/CPU cost.
+	switch {
+	case strings.Contains(line, "[Error]") || strings.Contains(line, "[Fatal]") || strings.Contains(line, "ERROR") || strings.Contains(line, "FATAL") || strings.Contains(line, "PANIC") || strings.Contains(line, "panic"):
+		return "error"
+	case strings.Contains(line, "[Warning]") || strings.Contains(line, "WARN"):
+		return "warn"
+	case strings.Contains(line, "[Info]") || strings.Contains(line, "INFO"):
+		return "info"
+	}
+	return "raw"
+}
+
+// errWarnTokens mirrors parseLevel's error/warn cases, pre-converted to bytes
+// so the rate-limit gate can classify scanner.Bytes() WITHOUT allocating a
+// string. Under a verbose flood the gate runs on every line; only the lines we
+// actually keep get a string (scanner.Text()) allocated.
+var errWarnTokens = [][]byte{
+	[]byte("[Error]"), []byte("[Fatal]"), []byte("ERROR"), []byte("FATAL"),
+	[]byte("PANIC"), []byte("panic"), []byte("[Warning]"), []byte("WARN"),
+}
+
+func levelErrWarnBytes(b []byte) bool {
+	for _, t := range errWarnTokens {
+		if bytes.Contains(b, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// vlog records a Vair diagnostic: still printed to stderr (for console /
+// LEGACY runs) and also pushed into the log store / SSE stream so it shows
+// in the UI Logs panel. level is "error" | "warn" | "info".
+func vlog(level, format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	fmt.Fprintln(os.Stderr, msg)
+	logs.add("vair", level, msg)
+}
+
+// logTestsEnabled reports whether the "Log speed/ping tests" setting is on.
+func logTestsEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.LogTests
+}
+
+// nodeLogLabel is a short human label for a node used to prefix its test-core
+// log lines, so interleaved output from concurrent probes stays attributable.
+func nodeLogLabel(n *Node) string {
+	if n == nil {
+		return "?"
+	}
+	if s := strings.TrimSpace(n.Name); s != "" {
+		return s
+	}
+	if n.Host != "" {
+		return fmt.Sprintf("%s:%d", n.Host, n.Port)
+	}
+	return string(n.Kind)
+}
+
+// tlog records a ping/speed test result into the Logs panel, but only when
+// the "Log speed/ping tests" setting is on (off by default — bulk tests can
+// produce hundreds of lines). Tagged with the "test" source so it can be
+// filtered separately from connection/core output.
+func tlog(format string, args ...interface{}) {
+	if !logTestsEnabled() {
+		return
+	}
+	logs.add("test", "info", fmt.Sprintf(format, args...))
+}
+
+// lineSink is an io.Writer that splits a test core's output stream into lines
+// and pushes each into the Logs panel under the "test" source, prefixed with
+// the config name (bulk tests run many cores concurrently, so the name keeps
+// interleaved lines attributable). engine is "xray"/"singbox" for level
+// classification. Used only while the LogTests setting is on.
+type lineSink struct {
+	engine, name string
+	buf          []byte
+}
+
+func (w *lineSink) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		raw := w.buf[:i]
+		keep := logs.gate(levelErrWarnBytes(raw))
+		var line string
+		if keep {
+			line = strings.TrimRight(string(raw), "\r")
+		}
+		w.buf = w.buf[i+1:]
+		if keep && strings.TrimSpace(line) != "" {
+			logs.add("test", parseLevel(w.engine, line), "["+w.name+"] "+line)
+		}
+	}
+	return len(p), nil
+}
+
+// pumpProcLog reads a child process's stderr pipe line-by-line into the log
+// store, tagged by source ("xray"/"singbox"). It also feeds each line to the
+// optional sink (used by the connection paths to keep a rolling tail for the
+// crash-error message). Returns when the pipe closes (process exit).
+func pumpProcLog(src string, pipe io.Reader, sink func(string)) {
+	if pipe == nil {
+		return
+	}
+	scanner := bufio.NewScanner(pipe)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		// Drop/keep decision on the raw bytes first — no string allocation for
+		// the lines we drop under a verbose flood (the bulk of them).
+		if !logs.gate(levelErrWarnBytes(scanner.Bytes())) {
+			continue
+		}
+		line := scanner.Text()
+		if sink != nil {
+			sink(line)
+		}
+		logs.add(src, parseLevel(src, line), line)
+	}
+}
+
 // ─────────────────────────── admin check ─────────────────────────
 
 func checkAdmin() bool {
@@ -859,197 +1337,16 @@ func checkAdmin() bool {
 	return false
 }
 
-// ─────────────────────────── VLESS parsing ───────────────────────
-
-func parseVless(raw string) (*VlessParams, error) {
-	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, "vless://") {
-		return nil, fmt.Errorf("not a vless URL")
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, fmt.Errorf("url.Parse: %w", err)
-	}
-	p := &VlessParams{Raw: raw}
-	p.UUID = u.User.Username()
-	p.Host = u.Hostname()
-	if p.Host == "" {
-		return nil, fmt.Errorf("empty host")
-	}
-	if port := u.Port(); port == "" {
-		p.Port = 443
-	} else if p.Port, err = strconv.Atoi(port); err != nil {
-		return nil, fmt.Errorf("bad port: %w", err)
-	}
-	p.Name = u.Fragment
-	if p.Name == "" {
-		p.Name = fmt.Sprintf("%s:%d", p.Host, p.Port)
-	}
-	q := u.Query()
-	get := func(k string) string { return q.Get(k) }
-	p.Network = get("type")
-	if p.Network == "" {
-		p.Network = "tcp"
-	}
-	p.Security = get("security")
-	if p.Security == "" {
-		p.Security = "none"
-	}
-	p.Path, p.Host2, p.ServiceName = get("path"), get("host"), get("serviceName")
-	p.SNI, p.ALPN, p.Fingerprint = get("sni"), get("alpn"), get("fp")
-	p.AllowInsecure = get("allowInsecure") == "1"
-	p.Flow = get("flow")
-	p.PublicKey, p.ShortID, p.SpiderX = get("pbk"), get("sid"), get("spx")
-	return p, nil
-}
-
-
 // ─────────────────────────── xray config (test + System Proxy) ───
-
-func buildXrayConfig(p *VlessParams, httpPort, socksPort int) map[string]interface{} {
-	user := map[string]interface{}{"id": p.UUID, "encryption": "none"}
-	if p.Flow != "" {
-		user["flow"] = p.Flow
-	}
-	outSettings := map[string]interface{}{
-		"vnext": []interface{}{map[string]interface{}{
-			"address": p.Host, "port": p.Port, "users": []interface{}{user},
-		}},
-	}
-	stream := map[string]interface{}{"network": p.Network, "security": p.Security}
-	switch p.Network {
-	case "ws":
-		ws := map[string]interface{}{"path": p.Path}
-		if p.Host2 != "" {
-			ws["headers"] = map[string]interface{}{"Host": p.Host2}
-		}
-		stream["wsSettings"] = ws
-	case "grpc":
-		stream["grpcSettings"] = map[string]interface{}{"serviceName": p.ServiceName, "multiMode": false}
-	case "h2", "http":
-		h2 := map[string]interface{}{"path": p.Path}
-		if p.Host2 != "" {
-			h2["host"] = []string{p.Host2}
-		}
-		stream["httpSettings"] = h2
-	case "httpupgrade":
-		hu := map[string]interface{}{"path": p.Path}
-		if p.Host2 != "" {
-			hu["host"] = p.Host2
-		}
-		stream["httpupgradeSettings"] = hu
-	case "splithttp", "xhttp":
-		// xhttp is the newer name for splithttp in xray-core 1.8+
-		sh := map[string]interface{}{"path": p.Path}
-		if p.Host2 != "" {
-			sh["host"] = p.Host2
-		}
-		stream["xhttpSettings"] = sh
-	}
-	switch p.Security {
-	case "tls":
-		tls := map[string]interface{}{"serverName": p.SNI, "allowInsecure": p.AllowInsecure}
-		if p.Fingerprint != "" {
-			tls["fingerprint"] = p.Fingerprint
-		}
-		if p.ALPN != "" {
-			tls["alpn"] = strings.Split(p.ALPN, ",")
-		}
-		stream["tlsSettings"] = tls
-	case "reality":
-		stream["realitySettings"] = map[string]interface{}{
-			"serverName": p.SNI, "fingerprint": p.Fingerprint,
-			"publicKey": p.PublicKey, "shortId": p.ShortID, "spiderX": p.SpiderX,
-		}
-	}
-	persistent := socksPort > 0
-	sniffing := map[string]interface{}{
-		"enabled":      persistent,
-		"destOverride": []string{"http", "tls", "quic"},
-	}
-	inbounds := []interface{}{
-		map[string]interface{}{
-			"tag": "http", "listen": "127.0.0.1", "port": httpPort,
-			"protocol": "http",
-			"settings": map[string]interface{}{"auth": "noauth"},
-			"sniffing": sniffing,
-		},
-	}
-	if persistent {
-		inbounds = append(inbounds, map[string]interface{}{
-			"tag": "socks", "listen": "127.0.0.1", "port": socksPort,
-			"protocol": "socks",
-			"settings": map[string]interface{}{
-				"auth": "password",
-				"accounts": []interface{}{
-					map[string]interface{}{"user": proxyAuthUser, "pass": proxyAuthPass},
-				},
-				"udp": true,
-			},
-			"sniffing": sniffing,
-		})
-	}
-	cfg := map[string]interface{}{
-		"log":      map[string]interface{}{"loglevel": "warning"},
-		"inbounds": inbounds,
-		"outbounds": []interface{}{
-			map[string]interface{}{
-				"tag": "proxy", "protocol": "vless",
-				"settings": outSettings, "streamSettings": stream,
-			},
-			map[string]interface{}{"tag": "direct", "protocol": "freedom",
-				"settings": map[string]interface{}{"domainStrategy": "UseIPv4"}},
-			map[string]interface{}{"tag": "block", "protocol": "blackhole", "settings": map[string]interface{}{}},
-		},
-	}
-	if persistent {
-		rules := []interface{}{
-			map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
-		}
-		// Russian sites bypass VPN in proxy mode (uses xray's built-in geodata)
-		settingsMu.RLock()
-		ruDirect := appSettings.RuSitesDirect
-		directDomains := make([]string, len(appSettings.DirectDomains))
-		copy(directDomains, appSettings.DirectDomains)
-		settingsMu.RUnlock()
-		if ruDirect {
-			rules = append(rules,
-				map[string]interface{}{"type": "field", "domain": []string{"geosite:category-ru"}, "outboundTag": "direct"},
-				map[string]interface{}{"type": "field", "ip": []string{"geoip:ru"}, "outboundTag": "direct"},
-			)
-		}
-		// Custom domains → direct (user-defined in Settings)
-		if len(directDomains) > 0 {
-			// xray uses "domain" field with domain suffixes
-			var suffixes []string
-			for _, d := range directDomains {
-				d = strings.TrimSpace(d)
-				if d == "" {
-					continue
-				}
-				// "domain:" prefix = suffix match (vk.com matches *.vk.com and vk.com)
-				suffixes = append(suffixes, "domain:"+d)
-			}
-			if len(suffixes) > 0 {
-				rules = append(rules,
-					map[string]interface{}{"type": "field", "domain": suffixes, "outboundTag": "direct"},
-				)
-			}
-		}
-		rules = append(rules,
-			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
-		)
-		cfg["routing"] = map[string]interface{}{
-			"domainStrategy": "IPIfNonMatch",
-			"rules":          rules,
-		}
-	}
-	return cfg
-}
+//
+// All xray config assembly lives in protocols.go now:
+//   buildXrayConfigForNode(n, httpPort, socksPort) dispatches on n.Kind and
+//   stitches together xrayShell / xrayStreamSettings / xrayRoutingForProxy
+//   plus the per-protocol xrayOutboundXxx builder.
 
 
 
-func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map[string]interface{} {
+func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPort int, blockQUIC bool) map[string]interface{} {
 	// Hybrid TUN: sing-box routes traffic, xray handles VLESS protocol.
 	//
 	// Two operating modes, gated by AppSettings.DNSLeakProtection:
@@ -1067,7 +1364,6 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 	//
 	// All knobs come from settings — see currentBootstrapDNS / etc.
 	leakProtect := dnsLeakProtectionEnabled()
-	allowLAN := allowLANTraffic()
 	useFakeIP := fakeIPEnabled()
 
 	dns := buildDNSBlock(leakProtect, useFakeIP)
@@ -1092,74 +1388,49 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 		"password":    proxyAuthPass,
 	}
 
-	// Read routing settings
+	// Routing rules are shared with the pure-sing-box path; build them via
+	// the common helper. true = include the xray-process carve-out (this is
+	// the hybrid path, an xray child is dialling the real server).
+	rules := singboxRoutingRules(true)
+
+	// Exclude the real VPN server IP from the tunnel. In hybrid mode sing-box
+	// can't auto-exclude it (its outbound is a local SOCKS to 127.0.0.1 — the
+	// real server is hidden inside the xray child), so without this the xray
+	// child's own connection to the server can be re-captured by the TUN and
+	// looped back through the proxy. That loop manifests as an endless storm
+	// of "creating connection to <server>" lines and 100% CPU even while idle.
+	// The process_name carve-out above is meant to prevent it, but Windows
+	// find_process is unreliable; pinning the server IP to direct is the
+	// bulletproof backstop. Prepended so it wins over `final: proxy`.
+	if ip := net.ParseIP(serverIP); ip != nil {
+		bits := "/32"
+		if ip.To4() == nil {
+			bits = "/128"
+		}
+		rules = append([]interface{}{
+			map[string]interface{}{"ip_cidr": []string{serverIP + bits}, "outbound": "direct"},
+		}, rules...)
+	}
+
+	// Block QUIC (UDP/443) when the node uses an XTLS flow (xtls-rprx-vision).
+	// XTLS-Vision rejects UDP/443 ("XTLS rejected UDP/443 traffic"), so in TUN
+	// mode a browser's HTTP/3 (QUIC) requests die and the site fails to load —
+	// even though it works in proxy mode (where the browser only speaks TCP to
+	// the HTTP proxy). Rejecting UDP/443 makes the browser fall back to TCP /
+	// HTTP-2, which the tunnel handles fine. This is what v2rayN does by
+	// default. Appended after the bypass rules so direct-routed QUIC (e.g. RU
+	// sites) is unaffected; only proxy-bound QUIC is rejected.
+	if blockQUIC {
+		rules = append(rules, map[string]interface{}{
+			"network": "udp", "port": 443, "action": "reject",
+		})
+	}
+
+	// ruSitesDirect is still needed below to decide whether the RU rule_set
+	// definitions get attached to the route.
 	settingsMu.RLock()
 	ruSitesDirect := appSettings.RuSitesDirect
-	directDomains := make([]string, len(appSettings.DirectDomains))
-	copy(directDomains, appSettings.DirectDomains)
-	directApps := make([]string, len(appSettings.DirectApps))
-	copy(directApps, appSettings.DirectApps)
 	settingsMu.RUnlock()
-
-	rules := []interface{}{
-		map[string]interface{}{"action": "sniff"},
-		map[string]interface{}{"protocol": "dns", "action": "hijack-dns"},
-		// Exclude xray process from TUN to prevent routing loop.
-		map[string]interface{}{
-			"process_name": []string{"xray.exe", "xray"},
-			"outbound":     "direct",
-		},
-	}
-	// LAN handling: when allowed (default), private IPs bypass the
-	// tunnel so printers / NAS / router admin pages still work. With
-	// kill-switch + BlockLAN, even those go through proxy — usually
-	// breaks them, but it's a deliberate user choice.
-	if allowLAN {
-		rules = append(rules,
-			map[string]interface{}{"ip_is_private": true, "outbound": "direct"},
-		)
-	}
-
-	// User-configured apps that bypass VPN (direct connection).
-	if len(directApps) > 0 {
-		var appNames []string
-		for _, a := range directApps {
-			a = strings.TrimSpace(a)
-			if a != "" {
-				appNames = append(appNames, a)
-			}
-		}
-		if len(appNames) > 0 {
-			rules = append(rules, map[string]interface{}{
-				"process_name": appNames,
-				"outbound":     "direct",
-			})
-		}
-	}
-
-	// Russian sites bypass VPN
-	if ruSitesDirect {
-		rules = append(rules,
-			map[string]interface{}{"rule_set": "geosite-ru", "outbound": "direct"},
-			map[string]interface{}{"rule_set": "geoip-ru", "outbound": "direct"},
-		)
-	}
-
-	// Custom domains → direct (user-defined in Settings)
-	if len(directDomains) > 0 {
-		var suffixes []string
-		for _, d := range directDomains {
-			d = strings.TrimSpace(d)
-			if d != "" {
-				suffixes = append(suffixes, d)
-			}
-		}
-		if len(suffixes) > 0 {
-			rules = append(rules,
-				map[string]interface{}{"domain_suffix": suffixes, "outbound": "direct"},
-			)
-		}
-	}
 
 	// default_domain_resolver picks the DNS server used when sing-box
 	// itself needs to resolve a name in a routing rule (e.g. the IP
@@ -1180,24 +1451,7 @@ func buildHybridTUNConfig(ifaceName string, xrayHTTPPort, xraySocksPort int) map
 	}
 
 	if ruSitesDirect {
-		route["rule_set"] = []interface{}{
-			map[string]interface{}{
-				"type":             "remote",
-				"tag":              "geosite-ru",
-				"format":           "binary",
-				"url":              "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
-				"download_detour":  "direct",
-				"update_interval":  "24h",
-			},
-			map[string]interface{}{
-				"type":             "remote",
-				"tag":              "geoip-ru",
-				"format":           "binary",
-				"url":              "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
-				"download_detour":  "direct",
-				"update_interval":  "24h",
-			},
-		}
+		route["rule_set"] = singboxRuRuleSet()
 	}
 
 	return map[string]interface{}{
@@ -1521,12 +1775,23 @@ func writeTempJSON(data interface{}, prefix string) (string, error) {
 
 // ─────────────────────────── xray lifecycle (testing) ────────────
 
-func withXray(p *VlessParams, ttl time.Duration, fn func(httpPort int, tr *http.Transport) error) error {
+func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transport) error) error {
 	httpPort, err := findFreePort()
 	if err != nil {
 		return fmt.Errorf("no free port")
 	}
-	tmpPath, err := writeTempJSON(buildXrayConfig(p, httpPort, -1), "xray-test")
+	cfg := buildXrayConfigForNode(n, httpPort, -1)
+	if cfg == nil {
+		return fmt.Errorf("xray: unsupported protocol %s", n.Kind)
+	}
+	traceTest := logTestsEnabled()
+	if traceTest {
+		// Full diagnostics for this probe: force info level and re-enable the
+		// access log so failure reasons (dial timeouts, TLS handshake errors,
+		// …) show in the panel regardless of the global Verbose setting.
+		cfg["log"] = map[string]interface{}{"loglevel": "info"}
+	}
+	tmpPath, err := writeTempJSON(cfg, "xray-test")
 	if err != nil {
 		return fmt.Errorf("config: %w", err)
 	}
@@ -1534,9 +1799,17 @@ func withXray(p *VlessParams, ttl time.Duration, fn func(httpPort int, tr *http.
 	ctx, cancel := context.WithTimeout(context.Background(), ttl)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, state.xrayBin, "run", "-c", tmpPath)
-	cmd.Stdout = io.Discard
 	var stderrBuf strings.Builder
-	cmd.Stderr = &stderrBuf
+	if traceTest {
+		// xray logs to stdout; also tee stderr into the panel while keeping a
+		// copy in stderrBuf for the crash-error message below.
+		label := nodeLogLabel(n)
+		cmd.Stdout = &lineSink{engine: "xray", name: label}
+		cmd.Stderr = io.MultiWriter(&stderrBuf, &lineSink{engine: "xray", name: label})
+	} else {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = &stderrBuf
+	}
 	hideProcess(cmd)
 	if err = cmd.Start(); err != nil {
 		return fmt.Errorf("xray start: %w", err)
@@ -1569,7 +1842,104 @@ func withXray(p *VlessParams, ttl time.Duration, fn func(httpPort int, tr *http.
 	return fn(httpPort, makeSharedTransport(httpPort))
 }
 
+// withSingbox is the sing-box mirror of withXray: it spins up a throwaway
+// sing-box process exposing a local HTTP proxy on a free port, waits for the
+// port to open, then hands a ready *http.Transport to fn for the duration of
+// ttl. Used by the ping/speed runners for UDP-family nodes (Hysteria2/TUIC)
+// that xray can't dial. Same lifecycle contract as withXray — process is
+// killed and PID untracked on return regardless of outcome.
+func withSingbox(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transport) error) error {
+	if state.singboxBin == "" {
+		return fmt.Errorf("sing-box not found (pass its path as 2nd arg)")
+	}
+	httpPort, err := findFreePort()
+	if err != nil {
+		return fmt.Errorf("no free port")
+	}
+	cfg := buildSingboxTestConfig(n, httpPort)
+	if cfg == nil {
+		return fmt.Errorf("sing-box: unsupported protocol %s", n.Kind)
+	}
+	traceTest := logTestsEnabled()
+	if traceTest {
+		// Full diagnostics: force info level so failure reasons appear.
+		cfg["log"] = map[string]interface{}{"level": "info", "timestamp": true}
+	}
+	tmpPath, err := writeTempJSON(cfg, "singbox-test")
+	if err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+	defer os.Remove(tmpPath)
+	ctx, cancel := context.WithTimeout(context.Background(), ttl)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, state.singboxBin, "run", "-c", tmpPath)
+	var stderrBuf strings.Builder
+	if traceTest {
+		// sing-box logs to stderr; tee it into the panel and keep a copy in
+		// stderrBuf for the crash-error message below.
+		label := nodeLogLabel(n)
+		cmd.Stdout = &lineSink{engine: "singbox", name: label}
+		cmd.Stderr = io.MultiWriter(&stderrBuf, &lineSink{engine: "singbox", name: label})
+	} else {
+		cmd.Stdout = io.Discard
+		cmd.Stderr = &stderrBuf
+	}
+	hideProcess(cmd)
+	if err = cmd.Start(); err != nil {
+		return fmt.Errorf("sing-box start: %w", err)
+	}
+	trackPID(cmd.Process.Pid)
+	defer func() {
+		cmd.Process.Kill() //nolint:errcheck
+		untrackPID(cmd.Process.Pid)
+	}()
+
+	exitCh := make(chan error, 1)
+	go func() { exitCh <- cmd.Wait() }()
+	portResult := make(chan bool, 1)
+	go func() {
+		portResult <- waitForPort(httpPort, time.Now().Add(singboxStartupTimeout))
+	}()
+	select {
+	case exitErr := <-exitCh:
+		errMsg := strings.TrimSpace(stderrBuf.String())
+		if errMsg == "" {
+			if exitErr != nil {
+				errMsg = exitErr.Error()
+			} else {
+				errMsg = "exited unexpectedly"
+			}
+		}
+		if len(errMsg) > 160 {
+			errMsg = "..." + errMsg[len(errMsg)-160:]
+		}
+		return fmt.Errorf("sing-box: %s", errMsg)
+	case ready := <-portResult:
+		if !ready {
+			return fmt.Errorf("sing-box: port not ready after %s", singboxStartupTimeout)
+		}
+	}
+	return fn(httpPort, makeSharedTransport(httpPort))
+}
+
+// withEngine dispatches a throwaway-proxy probe to the right backend based on
+// the node's protocol: xray for the TCP-family, sing-box for the UDP-family.
+// Ping/speed runners call this instead of withXray directly so a mixed list
+// (VLESS + Hysteria2 + …) just works without per-call-site branching.
+func withEngine(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transport) error) error {
+	if engineForNode(n) == "singbox" {
+		return withSingbox(n, ttl, fn)
+	}
+	return withXray(n, ttl, fn)
+}
+
 // ─────────────────────────── system proxy ────────────────────────
+
+// proxyLockPath marks that WE currently have the Windows system proxy
+// enabled. Written when we set it, removed when we unset it. If it survives
+// to the next startup, the app was killed / the PC shut down without a
+// clean disconnect — see clearStaleProxy.
+func proxyLockPath() string { return filepath.Join(tabsDir(), "proxy.active") }
 
 func setSystemProxy(port int) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -1584,6 +1954,10 @@ func setSystemProxy(port int) error {
 			return fmt.Errorf("reg: %w", err)
 		}
 	}
+	// Record that the proxy is ours and active, so a dirty shutdown can be
+	// detected and recovered on next launch.
+	os.MkdirAll(tabsDir(), 0755) //nolint:errcheck
+	os.WriteFile(proxyLockPath(), []byte(addr), 0644) //nolint:errcheck
 	runHidden("rundll32.exe", "inetcpl.cpl,ClearMyTracksByProcess", "8").Run() //nolint:errcheck
 	return nil
 }
@@ -1591,6 +1965,19 @@ func setSystemProxy(port int) error {
 func unsetSystemProxy() {
 	rp := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	runHidden("reg", "add", rp, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run() //nolint:errcheck
+	os.Remove(proxyLockPath()) //nolint:errcheck
+}
+
+// clearStaleProxy runs once at startup. If the proxy-lock file from a prior
+// session is still present, the app exited (or the machine powered off)
+// while the Windows system proxy was pointed at a localhost port that no
+// longer has anything listening — which breaks ALL internet until cleared.
+// We restore connectivity by disabling the proxy. A clean disconnect
+// removes the lock, so this is a no-op in the normal case.
+func clearStaleProxy() {
+	if _, err := os.Stat(proxyLockPath()); err == nil {
+		unsetSystemProxy()
+	}
 }
 
 // ─────────────────────────── connection manager ──────────────────
@@ -1603,9 +1990,17 @@ func startProxyConnection(entry *ConfigEntry) {
 	connTab := state.activeTab
 	state.mu.RUnlock()
 
-	p, err := parseVless(entry.Raw)
+	n, err := parseNode(entry.Raw)
 	if err != nil {
 		setConnError(cm, entry, err.Error(), connTab)
+		return
+	}
+	entry.mu.Lock()
+	entry.Protocol = string(n.Kind)
+	entry.mu.Unlock()
+
+	if reason := nodeUnsupportedReason(n); reason != "" {
+		setConnError(cm, entry, reason, connTab)
 		return
 	}
 
@@ -1614,16 +2009,31 @@ func startProxyConnection(entry *ConfigEntry) {
 	// is already an IP literal), and lets the kill-switch path actually
 	// boot — when strict_route is on, xray can't reach the OS resolver
 	// on UDP/53 to do this resolution itself.
-	if err := preResolveVPNHost(p); err != nil {
+	if err := preResolveHost(n); err != nil {
 		setConnError(cm, entry, "resolve server: "+err.Error(), connTab)
 		return
 	}
 
 	cm.mu.Lock()
-	cm.state = ConnState{Status: ConnConnecting, Mode: ModeProxy, EntryIndex: entry.Index, EntryName: p.Name, ConnTab: connTab, ConnRaw: entry.Raw}
+	cm.state = ConnState{Status: ConnConnecting, Mode: ModeProxy, EntryIndex: entry.Index, EntryName: n.Name, ConnTab: connTab, ConnRaw: entry.Raw}
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 
+	// Engine branch: TCP-family (VLESS/VMess/Trojan/SS) goes through xray;
+	// UDP-family (Hysteria2/TUIC) goes through a pure-sing-box process.
+	// Both converge on finalizeProxyConnection for the counter/system-proxy
+	// /state wiring.
+	if engineForNode(n) == "singbox" {
+		startProxyConnectionSingbox(cm, entry, n, connTab)
+		return
+	}
+	startProxyConnectionXray(cm, entry, n, connTab)
+}
+
+// startProxyConnectionXray runs the xray-backed proxy path: spawn xray on
+// internal HTTP+SOCKS ports, wait for readiness (or an early crash), then
+// hand off to finalizeProxyConnection for the shared post-spawn wiring.
+func startProxyConnectionXray(cm *connManager, entry *ConfigEntry, n *Node, connTab string) {
 	httpPort, socksPort := connHTTPPort, connSOCKSPort
 	if !portFree(httpPort) {
 		if pf, e := findFreePort(); e == nil {
@@ -1651,7 +2061,12 @@ func startProxyConnection(entry *ConfigEntry) {
 		return
 	}
 
-	tmpPath, err := writeTempJSON(buildXrayConfig(p, intHTTPPort, intSOCKSPort), "xray-conn")
+	xrayCfg := buildXrayConfigForNode(n, intHTTPPort, intSOCKSPort)
+	if xrayCfg == nil {
+		setConnError(cm, entry, fmt.Sprintf("xray: unsupported protocol %s", n.Kind))
+		return
+	}
+	tmpPath, err := writeTempJSON(xrayCfg, "xray-conn")
 	if err != nil {
 		setConnError(cm, entry, err.Error())
 		return
@@ -1659,12 +2074,24 @@ func startProxyConnection(entry *ConfigEntry) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, state.xrayBin, "run", "-c", tmpPath)
-	cmd.Stdout = io.Discard
 	hideProcess(cmd)
 
-	// Capture stderr so we can report the real error if xray crashes.
-	var stderrBuf strings.Builder
-	cmd.Stderr = &stderrBuf
+	// xray writes its console log to STDOUT (unlike sing-box, which uses
+	// stderr), so capture both. Stream them into the Logs panel and keep a
+	// short tail so we can still report the real error if xray crashes at
+	// startup.
+	stdoutPipe, _ := cmd.StdoutPipe()
+	stderrPipe, _ := cmd.StderrPipe()
+	var tailMu sync.Mutex
+	var tail []string
+	sink := func(line string) {
+		tailMu.Lock()
+		tail = append(tail, line)
+		if len(tail) > 6 {
+			tail = tail[len(tail)-6:]
+		}
+		tailMu.Unlock()
+	}
 
 	if err = cmd.Start(); err != nil {
 		cancel()
@@ -1672,6 +2099,9 @@ func startProxyConnection(entry *ConfigEntry) {
 		setConnError(cm, entry, "xray start: "+err.Error())
 		return
 	}
+
+	go pumpProcLog("xray", stdoutPipe, sink)
+	go pumpProcLog("xray", stderrPipe, sink)
 
 	// Watch for immediate crash in background.
 	exitCh := make(chan error, 1)
@@ -1685,10 +2115,18 @@ func startProxyConnection(entry *ConfigEntry) {
 
 	select {
 	case exitErr := <-exitCh:
-		// xray exited before the port opened — report stderr
+		// xray exited before the port opened — report the last stderr line.
 		cancel()
 		os.Remove(tmpPath)
-		errMsg := strings.TrimSpace(stderrBuf.String())
+		tailMu.Lock()
+		errMsg := ""
+		for i := len(tail) - 1; i >= 0; i-- {
+			if s := strings.TrimSpace(tail[i]); s != "" {
+				errMsg = s
+				break
+			}
+		}
+		tailMu.Unlock()
 		if errMsg == "" {
 			if exitErr != nil {
 				errMsg = exitErr.Error()
@@ -1710,46 +2148,176 @@ func startProxyConnection(entry *ConfigEntry) {
 		}
 	}
 
-	// xray is now listening on the internal ports. Bring up the byte
-	// counters in front of them on the externally visible ports. Apps
-	// (and the system proxy below) see the same ports they always did.
+	// xray is now listening on the internal ports — hand off to the shared
+	// post-spawn block (byte counters, system proxy, ConnState, tickers).
+	finalizeProxyConnection(cm, entry, n.Name, connTab, cmd, cancel, tmpPath,
+		httpPort, socksPort, intHTTPPort, intSOCKSPort)
+}
+
+// finalizeProxyConnection performs the post-spawn steps shared by every
+// proxy backend (xray or sing-box): stand up the byte-counting forwarders
+// in front of the engine's internal HTTP/SOCKS ports, point the system
+// proxy at httpPort, record the connected ConnState, and start the uptime
+// /stats tickers. On forwarder failure it tears the just-spawned engine
+// down (mainCancel + tmp cleanup) and reports the error. The engine
+// process must already be listening on intHTTPPort/intSOCKSPort.
+func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab string,
+	mainCmd *exec.Cmd, mainCancel context.CancelFunc, tmpPath string,
+	httpPort, socksPort, intHTTPPort, intSOCKSPort int) {
+
 	counter := &trafficCounter{}
 	fwdCtx, fwdCancel := context.WithCancel(context.Background())
 	if _, err := startCountingForwarder(fwdCtx, httpPort, intHTTPPort, counter, "proxy-http"); err != nil {
 		fwdCancel()
-		cancel()
+		mainCancel()
 		os.Remove(tmpPath)
 		setConnError(cm, entry, "proxy http counter: "+err.Error())
 		return
 	}
 	if _, err := startCountingForwarder(fwdCtx, socksPort, intSOCKSPort, counter, "proxy-socks"); err != nil {
 		fwdCancel()
-		cancel()
+		mainCancel()
 		os.Remove(tmpPath)
 		setConnError(cm, entry, "proxy socks counter: "+err.Error())
 		return
 	}
 
-	if err = setSystemProxy(httpPort); err != nil {
+	if err := setSystemProxy(httpPort); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠  setSystemProxy: %v\n", err)
 	}
 
 	cm.mu.Lock()
-	cm.cmd = cmd
-	cm.cancel = cancel
+	cm.cmd = mainCmd
+	cm.cancel = mainCancel
 	cm.tmpCfg = tmpPath
 	cm.counter = counter
 	cm.fwdCancel = fwdCancel
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeProxy, ConnTab: connTab, ConnRaw: entry.Raw,
-		EntryIndex: entry.Index, EntryName: p.Name,
+		EntryIndex: entry.Index, EntryName: name,
 		HTTPPort: httpPort, SOCKSPort: socksPort,
 		StartedAt: time.Now(),
 	}
 	cm.mu.Unlock()
+	recordLastConnected(entry.Raw)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
 	startStatsTicker(cm)
+	vlog("info", "connected (proxy): %s — HTTP :%d / SOCKS :%d", name, httpPort, socksPort)
+}
+
+// startProxyConnectionSingbox runs the pure-sing-box proxy path for the
+// UDP-family protocols (Hysteria2/TUIC) that xray can't dial. Same shape as
+// the xray path — spawn sing-box on internal HTTP+SOCKS ports, wait for the
+// HTTP port (or an early crash), then hand off to finalizeProxyConnection.
+// The byte counters work here exactly as in the xray path: proxy mode has a
+// real local HTTP/SOCKS hop to instrument (unlike pure-sing-box TUN).
+func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, connTab string) {
+	httpPort, socksPort := connHTTPPort, connSOCKSPort
+	if !portFree(httpPort) {
+		if pf, e := findFreePort(); e == nil {
+			httpPort = pf
+		}
+	}
+	if !portFree(socksPort) {
+		if pf, e := findFreePort(); e == nil {
+			socksPort = pf
+		}
+	}
+	intHTTPPort, e1 := findFreePort()
+	if e1 != nil {
+		setConnError(cm, entry, "no free port for sing-box http")
+		return
+	}
+	intSOCKSPort, e2 := findFreePort()
+	if e2 != nil {
+		setConnError(cm, entry, "no free port for sing-box socks")
+		return
+	}
+
+	cfg := buildSingboxProxyConfig(n, intHTTPPort, intSOCKSPort)
+	if cfg == nil {
+		setConnError(cm, entry, fmt.Sprintf("sing-box: unsupported protocol %s", n.Kind))
+		return
+	}
+	tmpPath, err := writeTempJSON(cfg, "singbox-conn")
+	if err != nil {
+		setConnError(cm, entry, err.Error())
+		return
+	}
+	if debugPath := filepath.Join(tabsDir(), "last-singbox-proxy.json"); true {
+		os.MkdirAll(tabsDir(), 0755)
+		data, _ := json.MarshalIndent(cfg, "", "  ")
+		os.WriteFile(debugPath, data, 0644)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, state.singboxBin, "run", "-c", tmpPath)
+	cmd.Stdout = io.Discard
+	hideProcess(cmd)
+	stderrPipe, _ := cmd.StderrPipe()
+	var tailMu sync.Mutex
+	var tail []string
+
+	if err = cmd.Start(); err != nil {
+		cancel()
+		os.Remove(tmpPath)
+		setConnError(cm, entry, "sing-box start: "+err.Error())
+		return
+	}
+
+	go pumpProcLog("singbox", stderrPipe, func(line string) {
+		tailMu.Lock()
+		tail = append(tail, line)
+		if len(tail) > 6 {
+			tail = tail[len(tail)-6:]
+		}
+		tailMu.Unlock()
+	})
+
+	exitCh := make(chan error, 1)
+	go func() { exitCh <- cmd.Wait() }()
+	portResult := make(chan bool, 1)
+	go func() {
+		portResult <- waitForPort(intHTTPPort, time.Now().Add(singboxConnTimeout))
+	}()
+
+	select {
+	case exitErr := <-exitCh:
+		cancel()
+		os.Remove(tmpPath)
+		tailMu.Lock()
+		errMsg := ""
+		for i := len(tail) - 1; i >= 0; i-- {
+			if s := strings.TrimSpace(tail[i]); s != "" {
+				errMsg = s
+				break
+			}
+		}
+		tailMu.Unlock()
+		if errMsg == "" {
+			if exitErr != nil {
+				errMsg = exitErr.Error()
+			} else {
+				errMsg = "sing-box exited unexpectedly"
+			}
+		}
+		if len(errMsg) > 200 {
+			errMsg = "..." + errMsg[len(errMsg)-200:]
+		}
+		setConnError(cm, entry, "sing-box: "+errMsg)
+		return
+	case ready := <-portResult:
+		if !ready {
+			cancel()
+			os.Remove(tmpPath)
+			setConnError(cm, entry, "sing-box: port not ready after timeout")
+			return
+		}
+	}
+
+	finalizeProxyConnection(cm, entry, n.Name, connTab, cmd, cancel, tmpPath,
+		httpPort, socksPort, intHTTPPort, intSOCKSPort)
 }
 
 func startTUNConnection(entry *ConfigEntry) {
@@ -1774,9 +2342,17 @@ func startTUNConnection(entry *ConfigEntry) {
 	// but prevents accumulation of ghost adapters in Device Manager.
 	removeTUNAdapter()
 
-	p, err := parseVless(entry.Raw)
+	n, err := parseNode(entry.Raw)
 	if err != nil {
 		setConnError(cm, entry, err.Error())
+		return
+	}
+	entry.mu.Lock()
+	entry.Protocol = string(n.Kind)
+	entry.mu.Unlock()
+
+	if reason := nodeUnsupportedReason(n); reason != "" {
+		setConnError(cm, entry, reason)
 		return
 	}
 
@@ -1785,13 +2361,13 @@ func startTUNConnection(entry *ConfigEntry) {
 	// filter would block xray's UDP/53 attempt to the OS resolver, and
 	// the tunnel would deadlock at startup waiting for DNS. Cheap
 	// no-op in all other cases.
-	if err := preResolveVPNHost(p); err != nil {
+	if err := preResolveHost(n); err != nil {
 		setConnError(cm, entry, "resolve server: "+err.Error())
 		return
 	}
 
 	cm.mu.Lock()
-	cm.state = ConnState{Status: ConnConnecting, Mode: ModeTUN, EntryIndex: entry.Index, EntryName: p.Name, ConnTab: connTab, ConnRaw: entry.Raw}
+	cm.state = ConnState{Status: ConnConnecting, Mode: ModeTUN, EntryIndex: entry.Index, EntryName: n.Name, ConnTab: connTab, ConnRaw: entry.Raw}
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 
@@ -1800,6 +2376,24 @@ func startTUNConnection(entry *ConfigEntry) {
 	// a new name means sing-box never conflicts with the old one.
 	tunIfaceName := fmt.Sprintf("xc-tun-%d", time.Now().Unix()%10000)
 
+	// Engine branch. TCP-family protocols use the hybrid path (sing-box TUN
+	// front-end → xray outbound). UDP-family (Hysteria2/TUIC) run as a
+	// single pure-sing-box process: cm.cmd = sing-box, cm.xrayCmd = nil.
+	// stopConnectionLocked already no-ops on a nil xrayCmd, so teardown
+	// needs no special-casing.
+	if engineForNode(n) == "singbox" {
+		startTUNConnectionSingbox(cm, entry, n, connTab, tunIfaceName)
+		return
+	}
+	startTUNConnectionHybrid(cm, entry, n, connTab, tunIfaceName)
+}
+
+// startTUNConnectionHybrid runs the hybrid TUN path for the TCP-family
+// protocols: sing-box owns the TUN device and routing, an xray child holds
+// the actual protocol outbound, and a byte-counter forwarder sits between
+// them so per-session traffic stats work. This is the original 1.4.0 TUN
+// implementation, unchanged behaviourally.
+func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIfaceName string) {
 	// 1. Start xray as local HTTP+SOCKS proxy
 	xrayHTTPPort, e1 := findFreePort()
 	if e1 != nil {
@@ -1811,7 +2405,11 @@ func startTUNConnection(entry *ConfigEntry) {
 		setConnError(cm, entry, "no free port for xray socks")
 		return
 	}
-	xrayCfg := buildXrayConfig(p, xrayHTTPPort, xraySocksPort)
+	xrayCfg := buildXrayConfigForNode(n, xrayHTTPPort, xraySocksPort)
+	if xrayCfg == nil {
+		setConnError(cm, entry, fmt.Sprintf("xray: unsupported protocol %s", n.Kind))
+		return
+	}
 	// For hybrid TUN: xray resolves the VPN server hostname via the OS resolver.
 	// sing-box's route rule `ip_is_private → direct` catches the resulting DNS
 	// packets (OS resolver hits the router at 192.168.x.1 which is private IP)
@@ -1838,10 +2436,9 @@ func startTUNConnection(entry *ConfigEntry) {
 	}
 	xrayCtx, xrayCancel := context.WithCancel(context.Background())
 	xrayCmd := exec.CommandContext(xrayCtx, state.xrayBin, "run", "-c", xrayTmpPath)
-	xrayCmd.Stdout = io.Discard
-	// Capture xray stderr for debugging
-	var xrayStderrBuf strings.Builder
-	xrayCmd.Stderr = &xrayStderrBuf
+	// xray logs to stdout (sing-box uses stderr) — capture both into the panel.
+	xrayStdoutPipe, _ := xrayCmd.StdoutPipe()
+	xrayStderrPipe, _ := xrayCmd.StderrPipe()
 	hideProcess(xrayCmd)
 	if err = xrayCmd.Start(); err != nil {
 		xrayCancel()
@@ -1849,6 +2446,8 @@ func startTUNConnection(entry *ConfigEntry) {
 		setConnError(cm, entry, "xray hybrid start: "+err.Error())
 		return
 	}
+	go pumpProcLog("xray", xrayStdoutPipe, nil)
+	go pumpProcLog("xray", xrayStderrPipe, nil)
 	// Wait for xray port
 	if !waitForPort(xrayHTTPPort, time.Now().Add(xrayStartupTimeout)) {
 		xrayCmd.Process.Kill() //nolint:errcheck
@@ -1857,7 +2456,7 @@ func startTUNConnection(entry *ConfigEntry) {
 		setConnError(cm, entry, "xray hybrid: port not ready")
 		return
 	}
-	fmt.Printf("ℹ  hybrid TUN: xray proxy on :%d/%d for %s\n", xrayHTTPPort, xraySocksPort, p.Network)
+	vlog("info", "hybrid TUN: xray proxy on :%d/%d for %s", xrayHTTPPort, xraySocksPort, n.Network)
 
 	// Insert a byte-counting forwarder between sing-box and xray's SOCKS
 	// inbound. sing-box's `proxy` outbound dials this forwarder; the
@@ -1875,8 +2474,11 @@ func startTUNConnection(entry *ConfigEntry) {
 		setConnError(cm, entry, "tun counter: "+err.Error())
 		return
 	}
-	// 2. Build sing-box TUN config routing through xray proxy (via counter)
-	cfg := buildHybridTUNConfig(tunIfaceName, xrayHTTPPort, counterSocksPort)
+	// 2. Build sing-box TUN config routing through xray proxy (via counter).
+	// VLESS with an XTLS flow (xtls-rprx-vision) can't carry QUIC/UDP-443 —
+	// block it so browsers fall back to TCP instead of failing on HTTPS sites.
+	blockQUIC := n.Vless != nil && strings.TrimSpace(n.Vless.Flow) != ""
+	cfg := buildHybridTUNConfig(tunIfaceName, n.Host, xrayHTTPPort, counterSocksPort, blockQUIC)
 	tmpPath, err := writeTempJSON(cfg, "singbox-tun")
 	if err != nil {
 		fwdCancel()
@@ -1922,14 +2524,25 @@ func startTUNConnection(entry *ConfigEntry) {
 	go func() {
 		if stderrPipe == nil { return }
 		scanner := bufio.NewScanner(stderrPipe)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
+			// Gate on raw bytes before allocating — and cap the crash-tail
+			// slice. Without the cap, stderrLines grew unbounded under a
+			// verbose TUN flood (the source of the ~1 GB RAM spike).
+			if !logs.gate(levelErrWarnBytes(scanner.Bytes())) {
+				continue
+			}
 			line := scanner.Text()
 			stderrMu.Lock()
 			stderrLines = append(stderrLines, line)
+			if len(stderrLines) > 60 {
+				stderrLines = append(stderrLines[:0], stderrLines[len(stderrLines)-50:]...)
+			}
 			stderrMu.Unlock()
 			if logFile != nil {
 				fmt.Fprintln(logFile, line)
 			}
+			logs.add("singbox", parseLevel("singbox", line), line)
 		}
 		if logFile != nil { logFile.Close() }
 	}()
@@ -1966,18 +2579,143 @@ func startTUNConnection(entry *ConfigEntry) {
 	cm.fwdCancel = fwdCancel
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
-		EntryIndex: entry.Index, EntryName: p.Name,
+		EntryIndex: entry.Index, EntryName: n.Name,
 		TUNIface: tunIfaceName, StartedAt: time.Now(),
 	}
 	cm.mu.Unlock()
+	recordLastConnected(entry.Raw)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
 	startStatsTicker(cm)
 }
 
+// startTUNConnectionSingbox runs the pure-sing-box TUN path for the
+// UDP-family protocols (Hysteria2/TUIC). A single sing-box process owns the
+// TUN device AND holds the protocol outbound — there is no xray child and
+// no local SOCKS hop, so the byte counter cannot be inserted and traffic
+// stats are unavailable for the session (the UI surfaces this). cm.xrayCmd
+// stays nil; stopConnectionLocked already no-ops on a nil xrayCmd.
+func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIfaceName string) {
+	cfg := buildSingboxTUNConfig(n, tunIfaceName)
+	if cfg == nil {
+		setConnError(cm, entry, fmt.Sprintf("sing-box: unsupported protocol %s", n.Kind))
+		return
+	}
+	tmpPath, err := writeTempJSON(cfg, "singbox-tun")
+	if err != nil {
+		setConnError(cm, entry, "singbox config write: "+err.Error())
+		return
+	}
+	fmt.Printf("ℹ  pure sing-box TUN config: %s\n", tmpPath)
+	if debugPath := filepath.Join(tabsDir(), "last-singbox-tun.json"); true {
+		os.MkdirAll(tabsDir(), 0755)
+		data, _ := json.MarshalIndent(cfg, "", "  ")
+		os.WriteFile(debugPath, data, 0644)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, state.singboxBin, "run", "-c", tmpPath)
+	stderrPipe, _ := cmd.StderrPipe()
+	cmd.Stdout = io.Discard
+	hideProcess(cmd)
+
+	if err = cmd.Start(); err != nil {
+		cancel()
+		os.Remove(tmpPath)
+		setConnError(cm, entry, "sing-box start: "+err.Error())
+		return
+	}
+
+	exitCh := make(chan error, 1)
+	go func() { exitCh <- cmd.Wait() }()
+	var stderrLines []string
+	var stderrMu sync.Mutex
+	logPath := filepath.Join(tabsDir(), "last-singbox.log")
+	os.MkdirAll(tabsDir(), 0755)
+	logFile, _ := os.Create(logPath)
+	go func() {
+		if stderrPipe == nil {
+			return
+		}
+		scanner := bufio.NewScanner(stderrPipe)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			// Gate on raw bytes before allocating — and cap the crash-tail
+			// slice. Without the cap, stderrLines grew unbounded under a
+			// verbose TUN flood (the source of the ~1 GB RAM spike).
+			if !logs.gate(levelErrWarnBytes(scanner.Bytes())) {
+				continue
+			}
+			line := scanner.Text()
+			stderrMu.Lock()
+			stderrLines = append(stderrLines, line)
+			if len(stderrLines) > 60 {
+				stderrLines = append(stderrLines[:0], stderrLines[len(stderrLines)-50:]...)
+			}
+			stderrMu.Unlock()
+			if logFile != nil {
+				fmt.Fprintln(logFile, line)
+			}
+			logs.add("singbox", parseLevel("singbox", line), line)
+		}
+		if logFile != nil {
+			logFile.Close()
+		}
+	}()
+
+	select {
+	case <-exitCh:
+		cancel()
+		os.Remove(tmpPath)
+		stderrMu.Lock()
+		lines := stderrLines
+		stderrMu.Unlock()
+		errMsg := "sing-box crashed at startup"
+		for i := len(lines) - 1; i >= 0 && i >= len(lines)-3; i-- {
+			if lines[i] != "" {
+				errMsg = lines[i]
+				break
+			}
+		}
+		if len(errMsg) > 180 {
+			errMsg = "..." + errMsg[len(errMsg)-180:]
+		}
+		setConnError(cm, entry, errMsg)
+		return
+	case <-time.After(tunStartupTimeout):
+	}
+
+	cm.mu.Lock()
+	cm.cmd = cmd
+	cm.cancel = cancel
+	cm.tmpCfg = tmpPath
+	// No xray child, no byte counter in the pure-sing-box TUN path.
+	cm.xrayCmd = nil
+	cm.xrayCancel = nil
+	cm.xrayTmpCfg = ""
+	cm.counter = nil
+	cm.fwdCancel = nil
+	cm.state = ConnState{
+		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
+		EntryIndex: entry.Index, EntryName: n.Name,
+		TUNIface: tunIfaceName, StartedAt: time.Now(),
+		StatsUnavailable: true,
+	}
+	cm.mu.Unlock()
+	recordLastConnected(entry.Raw)
+	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	startUptimeTicker(cm)
+	// startStatsTicker self-terminates immediately on a nil counter — no
+	// traffic stats for this path, by design (see buildSingboxTUNConfig).
+}
+
 func stopConnection() {
 	stopConnectionLocked(state.conn)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: state.conn.snap()})
+	// A verbose connection can churn a lot of transient heap (log lines, JSON
+	// batches). Go won't hand that back to the OS for ~5 min on its own, which
+	// is why RSS stayed elevated after disconnect. Force it back now.
+	debug.FreeOSMemory()
 }
 
 // removeTUNAdapter removes the WinTUN/TUN adapter by name so it doesn't linger
@@ -2127,6 +2865,7 @@ func setConnError(cm *connManager, entry *ConfigEntry, msg string, tab ...string
 	cm.state = ConnState{Status: ConnError, EntryIndex: entry.Index, EntryName: name, ErrMsg: msg, ConnTab: connTab, ConnRaw: entry.Raw}
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	vlog("error", "connect %s: %s", name, msg)
 }
 
 func startUptimeTicker(cm *connManager) {
@@ -2200,7 +2939,11 @@ func startStatsTicker(cm *connManager) {
 			if !statsEnabled() {
 				continue
 			}
-			state.broadcast(SSEEvent{Type: "stats_update", Payload: statsSnapshot(counter)})
+			// Lossy — stats_update fires every second (or faster) and the
+			// next pulse fully supersedes this one's byte tallies. Worst
+			// case under buffer pressure the on-screen counter pauses for
+			// one tick; never matters because the next tick replaces it.
+			state.broadcast(SSEEvent{Type: "stats_update", Payload: statsSnapshot(counter), Lossy: true})
 			ticksSincePersist++
 			if ticksSincePersist >= 30 {
 				ticksSincePersist = 0
@@ -2278,10 +3021,68 @@ func measurePing(tr *http.Transport) (int64, error) {
 	return best, nil
 }
 
+// minSpeedBytes is the floor for a "real" measurement. SS configs (and
+// occasionally others) can finish the request with a 200 OK that carries
+// only a few KB before the upstream closes — typically when the SS server
+// rejects the relay after the cipher handshake. Dividing those few KB by a
+// near-zero elapsed-time produces fantasy mbps numbers (200+ MB/s on a
+// 10 Mbps line). We require at least this much body data to call it valid.
+const minSpeedBytes int64 = 256 * 1024
+
+// withCacheBuster appends a unique query param so a CDN / proxy / ISP cache
+// along the path can't answer with a cached or short-circuited body — the
+// speed test must measure a real transfer. Unknown query params are ignored
+// by the bundled presets (Cloudflare __down, cachefly, ovh), and this is the
+// fix for the "response too fast — upstream cache or proxy short-circuit"
+// rejections that used to drop otherwise-fine proxies.
+func withCacheBuster(u string) string {
+	sep := "?"
+	if strings.Contains(u, "?") {
+		sep = "&"
+	}
+	return u + sep + "vcb=" + strconv.FormatInt(time.Now().UnixNano(), 10)
+}
+
+// err429 marks a measurement that ended because the upstream answered with
+// HTTP 429. The outer measureSpeed checks for it via errors.Is to decide
+// whether to fall back to a secondary URL.
+var err429 = errors.New("HTTP 429")
+
+// measureSpeed runs one speed test, with an optional fallback to a second
+// URL ONLY when the primary returns HTTP 429. Each attempt is its own
+// bounded request — same http.Client.Timeout and same defer-close — so a
+// fallback can never extend the test indefinitely or leak the connection
+// (the failure mode that caused tests to hang on "connecting…" in a
+// previous attempt at this feature).
 func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error) {
+	primary := currentSpeedURL()
+	mbps, err := measureSpeedOne(tr, primary, onProgress)
+	if err == nil {
+		return mbps, nil
+	}
+	// Only retry on a clean 429 from the primary. Connect errors, slow
+	// responses, etc. stay as the user-visible error.
+	if !errors.Is(err, err429) {
+		return mbps, err
+	}
+	fb := currentSpeedFallbackURL()
+	if fb == "" || fb == primary {
+		return mbps, err
+	}
+	return measureSpeedOne(tr, fb, onProgress)
+}
+
+// measureSpeedOne is a single attempt: one HTTP request, bounded by
+// Client.Timeout, body always closed via defer. Returned errors are
+// terminal — there's no inner retry that could spin forever.
+func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)) (float64, error) {
 	sd := currentSpeedDuration()
+	// Hard wall-clock cap on the whole download. Client.Timeout covers the
+	// full request including body read, so a hung upstream can't pin the
+	// goroutine past sd+5s — even on SS configs where xray's CONNECT
+	// succeeds but the relayed stream stalls indefinitely.
 	sc := &http.Client{Transport: tr, Timeout: sd + 5*time.Second}
-	req, err := http.NewRequest("GET", currentSpeedURL(), nil)
+	req, err := http.NewRequest("GET", withCacheBuster(urlStr), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -2292,6 +3093,11 @@ func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error)
 		return 0, fmt.Errorf("connect: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == 429 {
+		// Wrap the sentinel so measureSpeed can detect 429 unambiguously
+		// without string-matching on the error message.
+		return 0, fmt.Errorf("%w", err429)
+	}
 	if resp.StatusCode >= 400 {
 		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
@@ -2314,16 +3120,33 @@ func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error)
 			break
 		}
 	}
+	elapsed := time.Since(start)
 	if total == 0 {
 		return 0, fmt.Errorf("no data received")
 	}
-	return float64(total) / time.Since(start).Seconds() / 1024 / 1024, nil
+	// Only one floor now: too few bytes to measure. A proxy that relays
+	// just a few KB before EOF is genuinely broken (the classic SS
+	// "accept CONNECT, reset the stream" failure). The old "response too
+	// fast" floor was dropped — with the cache-buster above defeating
+	// cached/short-circuit replies and a large default file filling the
+	// window, a short-but->=256KB sample now means a real (fast) proxy,
+	// not a fake one, so we report it instead of rejecting it.
+	if total < minSpeedBytes {
+		return 0, fmt.Errorf("tiny response (%d B) — proxy relay closed early", total)
+	}
+	// Guard the divisor: a >=256KB burst can still arrive in well under a
+	// millisecond over a fast local hop. Clamp so the ratio stays finite.
+	secs := elapsed.Seconds()
+	if secs < 0.001 {
+		secs = 0.001
+	}
+	return float64(total) / secs / 1024 / 1024, nil
 }
 
 // ─────────────────────────── entry runners ───────────────────────
 
 func runPingForEntry(entry *ConfigEntry) {
-	p, err := parseVless(entry.Raw)
+	n, err := parseNode(entry.Raw)
 	if err != nil {
 		entry.mu.Lock()
 		entry.PingStatus = StatusFailed
@@ -2332,8 +3155,19 @@ func runPingForEntry(entry *ConfigEntry) {
 		entry.mu.Unlock()
 		return
 	}
+	entry.mu.Lock()
+	entry.Protocol = string(n.Kind)
+	entry.mu.Unlock()
+	if reason := nodeUnsupportedReason(n); reason != "" {
+		entry.mu.Lock()
+		entry.PingStatus = StatusFailed
+		entry.Delay = -1
+		entry.PingErr = reason
+		entry.mu.Unlock()
+		return
+	}
 	ttl := startupTimeout + warmupTimeout + currentPingTimeout()*time.Duration(pingRounds) + 3*time.Second
-	if err = withXray(p, ttl, func(_ int, tr *http.Transport) error {
+	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
 		delay, e := measurePing(tr)
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
@@ -2354,13 +3188,21 @@ func runPingForEntry(entry *ConfigEntry) {
 		entry.PingErr = shortErr(err.Error())
 		entry.mu.Unlock()
 	}
+	entry.mu.Lock()
+	ps, delay, perr, nm := entry.PingStatus, entry.Delay, entry.PingErr, entry.Name
+	entry.mu.Unlock()
+	if ps == StatusOK {
+		tlog("ping ok: %s — %dms", nm, delay)
+	} else {
+		tlog("ping failed: %s — %s", nm, perr)
+	}
 }
 
 // runSpeedForEntry always does ping→speed in a single xray session.
 // Per-row ⬇ speed button should re-measure ping even if already tested,
 // because conditions may have changed and speed result is meaningless without fresh ping.
 func runSpeedForEntry(entry *ConfigEntry, tabID string) {
-	p, err := parseVless(entry.Raw)
+	n, err := parseNode(entry.Raw)
 	if err != nil {
 		entry.mu.Lock()
 		entry.SpeedStatus = StatusFailed
@@ -2368,8 +3210,22 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string) {
 		entry.mu.Unlock()
 		return
 	}
+	entry.mu.Lock()
+	entry.Protocol = string(n.Kind)
+	entry.mu.Unlock()
+	if reason := nodeUnsupportedReason(n); reason != "" {
+		entry.mu.Lock()
+		entry.PingStatus = StatusFailed
+		entry.Delay = -1
+		entry.PingErr = reason
+		entry.SpeedStatus = StatusFailed
+		entry.SpeedErr = reason
+		entry.SpeedLive = 0
+		entry.mu.Unlock()
+		return
+	}
 	ttl := startupTimeout + warmupTimeout + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
-	if err = withXray(p, ttl, func(_ int, tr *http.Transport) error {
+	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
 		// Always re-ping — gives fresh delay AND warms the tunnel for speed test
 		delay, pingErr := measurePing(tr)
 		entry.mu.Lock()
@@ -2394,7 +3250,10 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string) {
 			entry.mu.Lock()
 			entry.SpeedLive = live
 			entry.mu.Unlock()
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+			// Lossy: a later live callback (every ~250ms) supersedes this
+			// one. Dropping under buffer pressure is harmless; the FINAL
+			// terminal update below is reliable.
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID, Lossy: true})
 		})
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
@@ -2411,16 +3270,51 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string) {
 		return nil
 	}); err != nil {
 		entry.mu.Lock()
+		// withXray failed (e.g. xray exited with "exit status N" before
+		// measurePing could even run). The bulk caller sets PingStatus=
+		// TestingPing right before invoking us — so without this branch
+		// the row sits on the blinking "ping" pill forever even though
+		// the test is finished. Mirror the same reset for the speed side.
+		if entry.PingStatus == StatusTestingPing {
+			entry.PingStatus = StatusFailed
+			entry.Delay = -1
+			entry.PingErr = shortErr(err.Error())
+		}
 		entry.SpeedStatus = StatusFailed
 		entry.SpeedMBps = 0
 		entry.SpeedLive = 0
 		entry.SpeedErr = shortErr(err.Error())
 		entry.mu.Unlock()
 	}
+	logTestResult(entry)
+}
+
+// logTestResult emits one [test] line summarising the entry's current ping +
+// speed outcome (gated by the LogTests setting, via tlog).
+func logTestResult(entry *ConfigEntry) {
+	entry.mu.Lock()
+	ps, delay, perr := entry.PingStatus, entry.Delay, entry.PingErr
+	ss, mbps, serr, nm := entry.SpeedStatus, entry.SpeedMBps, entry.SpeedErr, entry.Name
+	entry.mu.Unlock()
+	var b strings.Builder
+	if ps == StatusOK {
+		fmt.Fprintf(&b, "ping %dms", delay)
+	} else {
+		fmt.Fprintf(&b, "ping failed (%s)", perr)
+	}
+	switch ss {
+	case StatusOK:
+		fmt.Fprintf(&b, ", speed %.2f MB/s", mbps)
+	case StatusSkipped:
+		fmt.Fprintf(&b, ", speed skipped")
+	case StatusFailed:
+		fmt.Fprintf(&b, ", speed failed (%s)", serr)
+	}
+	tlog("%s — %s", nm, b.String())
 }
 
 func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
-	p, err := parseVless(entry.Raw)
+	n, err := parseNode(entry.Raw)
 	if err != nil {
 		entry.mu.Lock()
 		entry.PingStatus = StatusFailed
@@ -2431,8 +3325,21 @@ func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
 		entry.mu.Unlock()
 		return
 	}
+	entry.mu.Lock()
+	entry.Protocol = string(n.Kind)
+	entry.mu.Unlock()
+	if reason := nodeUnsupportedReason(n); reason != "" {
+		entry.mu.Lock()
+		entry.PingStatus = StatusFailed
+		entry.Delay = -1
+		entry.PingErr = reason
+		entry.SpeedStatus = StatusSkipped
+		entry.SpeedErr = reason
+		entry.mu.Unlock()
+		return
+	}
 	ttl := startupTimeout + warmupTimeout + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
-	if err = withXray(p, ttl, func(_ int, tr *http.Transport) error {
+	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
 		delay, pingErr := measurePing(tr)
 		entry.mu.Lock()
 		if pingErr != nil || delay < 0 {
@@ -2456,7 +3363,8 @@ func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
 			entry.mu.Lock()
 			entry.SpeedLive = live
 			entry.mu.Unlock()
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+			// Lossy — see runSpeedForEntry's identical callback for why.
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID, Lossy: true})
 		})
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
@@ -2480,6 +3388,7 @@ func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
 		entry.SpeedErr = "xray failed"
 		entry.mu.Unlock()
 	}
+	logTestResult(entry)
 }
 
 func cleanPingErr(e error) string {
@@ -2536,9 +3445,10 @@ func isTestCancelled(ch chan struct{}) bool {
 }
 
 // runPingAll runs ping tests against entries. If `onlyIndices` is non-nil,
-// only entries whose Index is in that set are tested (used for FILTER on UI:
-// only visible configs are tested). Pass nil to test every entry.
-func runPingAll(onlyIndices map[int]bool) {
+// onlyIndices is an ordered list of entry indices to test, in the exact
+// order they should be processed (typically the on-screen sortedList).
+// Pass nil to test every entry in state.entries order.
+func runPingAll(onlyIndices []int) {
 	// If speed is running, cancel it only (don't start ping)
 	if atomic.LoadInt32(&state.speedRunning) == 1 {
 		cancelSpeedAll()
@@ -2563,11 +3473,16 @@ func runPingAll(onlyIndices map[int]bool) {
 	tabID := state.activeTab
 	state.mu.RUnlock()
 
-	// Restrict to onlyIndices if provided.
+	// Restrict to onlyIndices, preserving the client-supplied order so that
+	// tests fire in the exact order the rows appear on screen.
 	var entries []*ConfigEntry
 	if onlyIndices != nil {
+		byIdx := make(map[int]*ConfigEntry, len(allEntries))
 		for _, e := range allEntries {
-			if onlyIndices[e.Index] {
+			byIdx[e.Index] = e
+		}
+		for _, idx := range onlyIndices {
+			if e, ok := byIdx[idx]; ok {
 				entries = append(entries, e)
 			}
 		}
@@ -2582,19 +3497,23 @@ func runPingAll(onlyIndices map[int]bool) {
 	sem := make(chan struct{}, currentPingConcurrency())
 	var wg sync.WaitGroup
 	var done int64
+	// Acquire the semaphore in the main loop BEFORE spawning the goroutine.
+	// This makes the loop block in input order, so the next entry that runs
+	// is always the next one in the sortedList we received — the on-screen
+	// order. (The previous design spawned every goroutine immediately and
+	// let them race for sem slots, which made the visible test order look
+	// random for any concurrency > 1.)
 	for _, e := range entries {
 		if isTestCancelled(cancelCh) { break }
+		state.mu.RLock()
+		cancelled := state.cancelledTabs[tabID]
+		state.mu.RUnlock()
+		if cancelled { break }
+		sem <- struct{}{}
+		if isTestCancelled(cancelCh) { <-sem; break }
 		wg.Add(1)
 		go func(ent *ConfigEntry) {
 			defer wg.Done()
-			state.mu.RLock()
-			cancelled := state.cancelledTabs[tabID]
-			state.mu.RUnlock()
-			if cancelled || isTestCancelled(cancelCh) {
-				atomic.AddInt64(&done, 1)
-				return
-			}
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			if isTestCancelled(cancelCh) {
 				atomic.AddInt64(&done, 1)
@@ -2606,17 +3525,38 @@ func runPingAll(onlyIndices map[int]bool) {
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
 			runPingForEntry(ent)
 			n := atomic.AddInt64(&done, 1)
+			// Terminal entry update — reliable (this is the row's final
+			// status; missing it leaves the UI on a stale "testing" pill).
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
-			state.broadcast(SSEEvent{Type: "bulk_ping_progress", Payload: map[string]interface{}{"done": n, "total": int64(len(entries))}, Tab: tabID})
+			// Bulk-progress tick is lossy: only the latest done/total matters
+			// for the progress bar, and bulk_ping_done at the end is reliable.
+			state.broadcast(SSEEvent{Type: "bulk_ping_progress", Payload: map[string]interface{}{"done": n, "total": int64(len(entries))}, Tab: tabID, Lossy: true})
 		}(e)
 	}
 	wg.Wait()
+	// Reconciliation pass: re-broadcast every tested entry's snapshot in
+	// case any mid-flight reliable entry_update was dropped because a
+	// slow SSE consumer hit the 2-second cap. Repeated updates are
+	// idempotent on the client (onUpdate does an upsert by index), and
+	// this guarantees the UI converges on the server's truth without
+	// the user having to hit RELOAD. Sweep also sanity-checks for any
+	// entry still in TestingPing — force-fails if so (defence in depth;
+	// the per-entry watchdog should already have done this).
+	// Skip the reconcile re-broadcast if the run was cancelled. On a cancel
+	// triggered by RELOAD, the reload re-broadcasts a fresh "loaded" set;
+	// a reconcile firing afterwards would re-assert every old result on top
+	// of the reset table (the "results reappear a second later" bug). The
+	// in-flight workers above already broadcast their own terminal status,
+	// so a normal (uncancelled) finish still converges without this sweep.
+	if !isTestCancelled(cancelCh) {
+		reconcileBulkResults(entries, tabID, false)
+	}
 	state.broadcast(SSEEvent{Type: "bulk_ping_done", Tab: tabID})
 }
 
 // runSpeedAll mirrors runPingAll: when onlyIndices is non-nil, only those
 // entries are tested (for FILTER-aware testing).
-func runSpeedAll(onlyIndices map[int]bool) {
+func runSpeedAll(onlyIndices []int) {
 	// If ping is running, cancel it only (don't start speed)
 	if atomic.LoadInt32(&state.pingRunning) == 1 {
 		cancelPingAll()
@@ -2643,8 +3583,12 @@ func runSpeedAll(onlyIndices map[int]bool) {
 
 	var entries []*ConfigEntry
 	if onlyIndices != nil {
+		byIdx := make(map[int]*ConfigEntry, len(allEntries))
 		for _, e := range allEntries {
-			if onlyIndices[e.Index] {
+			byIdx[e.Index] = e
+		}
+		for _, idx := range onlyIndices {
+			if e, ok := byIdx[idx]; ok {
 				entries = append(entries, e)
 			}
 		}
@@ -2659,19 +3603,19 @@ func runSpeedAll(onlyIndices map[int]bool) {
 	sem := make(chan struct{}, currentSpeedConcurrency())
 	var wg sync.WaitGroup
 	var done int64
+	// See runPingAll for the rationale on sem-before-spawn: tests fire in
+	// the order the client sent (on-screen order) instead of randomly.
 	for _, e := range entries {
 		if isTestCancelled(cancelCh) { break }
+		state.mu.RLock()
+		cancelled := state.cancelledTabs[tabID]
+		state.mu.RUnlock()
+		if cancelled { break }
+		sem <- struct{}{}
+		if isTestCancelled(cancelCh) { <-sem; break }
 		wg.Add(1)
 		go func(ent *ConfigEntry) {
 			defer wg.Done()
-			state.mu.RLock()
-			cancelled := state.cancelledTabs[tabID]
-			state.mu.RUnlock()
-			if cancelled || isTestCancelled(cancelCh) {
-				atomic.AddInt64(&done, 1)
-				return
-			}
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			if isTestCancelled(cancelCh) {
 				atomic.AddInt64(&done, 1)
@@ -2682,13 +3626,78 @@ func runSpeedAll(onlyIndices map[int]bool) {
 			ent.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
 			runSpeedForEntry(ent, tabID)
+			// Watchdog: runSpeedForEntry should have set a terminal status
+			// (ok/failed/skipped). If for any reason it didn't, force-fail
+			// the row so the UI doesn't sit on "connecting…" forever.
+			// Mirrors the same guard at the end of /api/speed-one.
+			ent.mu.Lock()
+			if ent.SpeedStatus == StatusTestingSpeed {
+				ent.SpeedStatus = StatusFailed
+				if ent.SpeedErr == "" {
+					ent.SpeedErr = "no result"
+				}
+				ent.SpeedLive = 0
+			}
+			// Sibling watchdog: PingStatus is set to TestingPing right before
+			// the call. If xray exited early ("exit status N") and the inner
+			// measurePing branch never ran, PingStatus stays stuck. Force-fail
+			// so the row doesn't blink "ping" until the whole bulk completes.
+			if ent.PingStatus == StatusTestingPing {
+				ent.PingStatus = StatusFailed
+				ent.Delay = -1
+				if ent.PingErr == "" {
+					ent.PingErr = "no result"
+				}
+			}
+			ent.mu.Unlock()
 			n := atomic.AddInt64(&done, 1)
+			// Terminal entry update — reliable. This is the very fix point
+			// for the "connecting…" / "ping" stuck-pill class of bugs.
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
-			state.broadcast(SSEEvent{Type: "bulk_speed_progress", Payload: map[string]interface{}{"done": n, "total": int64(len(entries))}, Tab: tabID})
+			// Progress tick is lossy — only the latest done/total matters,
+			// and bulk_speed_done at the end is the reliable terminal.
+			state.broadcast(SSEEvent{Type: "bulk_speed_progress", Payload: map[string]interface{}{"done": n, "total": int64(len(entries))}, Tab: tabID, Lossy: true})
 		}(e)
 	}
 	wg.Wait()
+	// See runPingAll for the rationale — covers the "stuck connecting…"
+	// class of bugs where a slow SSE consumer drops a terminal event.
+	// Skipped on cancel so a RELOAD-triggered stop doesn't re-assert old
+	// speed results on top of the freshly-reset table.
+	if !isTestCancelled(cancelCh) {
+		reconcileBulkResults(entries, tabID, true)
+	}
 	state.broadcast(SSEEvent{Type: "bulk_speed_done", Tab: tabID})
+}
+
+// reconcileBulkResults walks every entry tested in a bulk run and
+// re-broadcasts its final snapshot (reliably). If `includeSpeed` is true
+// the sweep also force-fails any entry stuck on SpeedStatus=TestingSpeed;
+// without it only PingStatus stuck states are corrected (suits bulk ping
+// which doesn't touch SpeedStatus). The function is cheap — one mu lock
+// per entry plus a broadcast — and it's the safety net that lets us keep
+// the high-frequency mid-flight progress events lossy without ever
+// leaving a row stranded on a stale pill.
+func reconcileBulkResults(entries []*ConfigEntry, tabID string, includeSpeed bool) {
+	for _, e := range entries {
+		e.mu.Lock()
+		if e.PingStatus == StatusTestingPing {
+			e.PingStatus = StatusFailed
+			e.Delay = -1
+			if e.PingErr == "" {
+				e.PingErr = "no result"
+			}
+		}
+		if includeSpeed && e.SpeedStatus == StatusTestingSpeed {
+			e.SpeedStatus = StatusFailed
+			e.SpeedLive = 0
+			if e.SpeedErr == "" {
+				e.SpeedErr = "no result"
+			}
+		}
+		e.mu.Unlock()
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: e.snap(), Tab: tabID})
+	}
 }
 
 
@@ -2722,16 +3731,21 @@ func fetchAndInit() {
 			fmt.Fprintf(os.Stderr, "⚠  fetch %s: %v\n", src.URL, err)
 			continue
 		}
-		// Check if any line actually contains vless://
-		hasVless := false
+		// Check if any line actually contains a recognised proxy URL.
+		hasNode := false
 		for _, l := range lines {
-			if strings.Contains(l, "vless://") {
-				hasVless = true
+			for _, s := range nodeSchemes {
+				if strings.Contains(l, s) {
+					hasNode = true
+					break
+				}
+			}
+			if hasNode {
 				break
 			}
 		}
-		if !hasVless {
-			fmt.Fprintf(os.Stderr, "⚠  fetch %s: no vless configs in response (%d lines)\n", src.URL, len(lines))
+		if !hasNode {
+			fmt.Fprintf(os.Stderr, "⚠  fetch %s: no proxy configs in response (%d lines)\n", src.URL, len(lines))
 			continue
 		}
 		raws = append(raws, lines...)
@@ -2786,7 +3800,7 @@ func fetchAndInit() {
 	seen := make(map[string]bool, len(raws))
 	var deduped []string
 	for _, r := range raws {
-		body := vlessBody(strings.TrimSpace(r))
+		body := nodeBody(strings.TrimSpace(r))
 		if body == "" || seen[body] {
 			continue
 		}
@@ -2797,21 +3811,22 @@ func fetchAndInit() {
 	entries := make([]*ConfigEntry, 0, len(deduped))
 	for _, raw := range deduped {
 		e := &ConfigEntry{Raw: raw, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
-		p, parseErr := parseVless(raw)
+		n, parseErr := parseNode(raw)
 		if parseErr != nil {
 			e.Name = raw[:minInt(40, len(raw))]
 			e.PingStatus = StatusFailed
 			e.PingErr = parseErr.Error()
 			e.SpeedStatus = StatusFailed
 			e.SpeedErr = parseErr.Error()
-		} else if shouldSkip(p.Name, excludeFilter) {
+		} else if shouldSkip(n.Name, string(n.Kind), n.Host, n.Network, n.Security, excludeFilter) {
 			continue
 		} else {
-			e.Name = p.Name
-			e.Host = p.Host
-			e.Port = p.Port
-			e.Network = p.Network
-			e.Security = p.Security
+			e.Name = n.Name
+			e.Host = n.Host
+			e.Port = n.Port
+			e.Network = n.Network
+			e.Security = n.Security
+			e.Protocol = string(n.Kind)
 		}
 		entries = append(entries, e)
 	}
@@ -2884,7 +3899,7 @@ func fetchURL(u string) ([]string, error) {
 	var lines []string
 	for _, l := range strings.Split(text, "\n") {
 		l = strings.TrimSpace(l)
-		if strings.HasPrefix(l, "vless://") {
+		if looksLikeNodeURL(l) {
 			lines = append(lines, l)
 		}
 	}
@@ -2924,7 +3939,7 @@ func fetchGitHubPAT() ([]string, error) {
 	var lines []string
 	for _, l := range strings.Split(string(decoded), "\n") {
 		l = strings.TrimSpace(l)
-		if strings.HasPrefix(l, "vless://") {
+		if looksLikeNodeURL(l) {
 			lines = append(lines, l)
 		}
 	}
@@ -2959,17 +3974,29 @@ func parseConfigFile(path string) ([]*ConfigEntry, error) {
 // vless URLs (real ones are typically < 4 KiB).
 func parseConfigReader(r io.Reader) []*ConfigEntry {
 	var entries []*ConfigEntry
-	seen := make(map[string]bool)
+	// NOTE: deliberately no de-duplication here. Dedup is a per-tab setting
+	// ("delete" removes body-dupes server-side via dedupByBody, "hide" is a
+	// reversible JS view filter, "" keeps everything). Collapsing duplicate
+	// lines at parse time would silently drop configs even with dedup OFF —
+	// e.g. pasting 1900 lines and only 1000 surviving. Keep every line; let
+	// the tab's DedupMode decide.
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// Extract vless:// URL from anywhere in the line
-		idx := strings.Index(line, "vless://")
-		if idx < 0 {
+		// Extract a proxy URL from anywhere in the line: scan for the
+		// earliest occurrence of any recognised scheme so lines like
+		// "  <some prefix> trojan://... <suffix>" still parse correctly.
+		bestIdx := -1
+		for _, s := range nodeSchemes {
+			if i := strings.Index(line, s); i >= 0 && (bestIdx < 0 || i < bestIdx) {
+				bestIdx = i
+			}
+		}
+		if bestIdx < 0 {
 			continue
 		}
-		line = line[idx:]
+		line = line[bestIdx:]
 		// Trim trailing garbage (spaces, markdown links etc)
 		if sp := strings.IndexAny(line, " \t\r"); sp > 0 {
 			line = line[:sp]
@@ -2978,13 +4005,8 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 		if line == "" {
 			continue
 		}
-		// Dedup
-		if seen[line] {
-			continue
-		}
-		seen[line] = true
 		e := &ConfigEntry{Raw: line, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
-		p, parseErr := parseVless(line)
+		n, parseErr := parseNode(line)
 		if parseErr != nil {
 			e.Name = line[:minInt(40, len(line))]
 			e.PingStatus = StatusFailed
@@ -2992,11 +4014,12 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 			e.SpeedStatus = StatusFailed
 			e.SpeedErr = parseErr.Error()
 		} else {
-			e.Name = p.Name
-			e.Host = p.Host
-			e.Port = p.Port
-			e.Network = p.Network
-			e.Security = p.Security
+			e.Name = n.Name
+			e.Host = n.Host
+			e.Port = n.Port
+			e.Network = n.Network
+			e.Security = n.Security
+			e.Protocol = string(n.Kind)
 		}
 		entries = append(entries, e)
 	}
@@ -3009,20 +4032,7 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 	return entries
 }
 
-// vlessBody returns the part of a vless URL before the `#` fragment — i.e.
-// the connection details (uuid@host:port?params) without the human name.
-// Two configs with identical bodies but different names are functionally
-// the same server/configuration, which is what dedup should compare on.
-func vlessBody(raw string) string {
-	// Use the LAST `#` since query strings can technically contain a `#`
-	// when malformed, and we want everything up to the fragment marker.
-	if i := strings.LastIndex(raw, "#"); i >= 0 {
-		return raw[:i]
-	}
-	return raw
-}
-
-// dedupByBody removes entries whose vless body (everything before the
+// dedupByBody removes entries whose node body (everything before the
 // `#` fragment) already appeared at a smaller index. The first occurrence
 // in input order is kept. Used by tabs in DedupMode "delete" — the
 // reversible "hide" mode achieves the same visual result via a JS view
@@ -3037,7 +4047,7 @@ func dedupByBody(entries []*ConfigEntry) []*ConfigEntry {
 		if e == nil {
 			continue
 		}
-		body := vlessBody(e.Raw)
+		body := nodeBody(e.Raw)
 		if body == "" || seen[body] {
 			continue
 		}
@@ -3086,18 +4096,6 @@ func applyDeleteDedupInPlace(tabID string) {
 	saveTabs()
 }
 
-// setVlessName replaces the URL fragment of a vless URL with the given
-// (decoded) name, percent-encoding it as needed. Used by disambiguateNames
-// so that copying a row puts the disambiguated name on the clipboard
-// (otherwise "anycast - 3" reverts to plain "anycast" on paste).
-func setVlessName(raw, name string) string {
-	encoded := url.PathEscape(name)
-	if i := strings.LastIndex(raw, "#"); i >= 0 {
-		return raw[:i+1] + encoded
-	}
-	return raw + "#" + encoded
-}
-
 // disambiguateNames walks the entries in the given order. The first
 // occurrence of any name is kept verbatim; for every subsequent occurrence
 // the name gets a " - N" suffix where N starts at 1 and increments. If a
@@ -3128,7 +4126,7 @@ func disambiguateNames(entries []*ConfigEntry) {
 			cand := fmt.Sprintf("%s - %d", base, n)
 			if taken[cand] == 0 {
 				e.Name = cand
-				e.Raw = setVlessName(e.Raw, cand)
+				e.Raw = setNodeName(e.Raw, cand)
 				taken[cand] = 1
 				taken[base] = n + 1
 				break
@@ -3149,7 +4147,10 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", 500)
 		return
 	}
-	ch := make(chan SSEEvent, 128)
+	// 1024-slot buffer absorbs bursts from bulk ping/speed runs (5 concurrent
+	// runners × 4 live-callbacks/sec × few seconds of slack) without forcing
+	// the broadcast path into its 50ms soft-block fallback.
+	ch := make(chan SSEEvent, 1024)
 	state.addClient(ch)
 	defer state.removeClient(ch)
 	send := func(ev SSEEvent) { data, _ := json.Marshal(ev); fmt.Fprintf(w, "data: %s\n\n", data); flusher.Flush() }
@@ -3287,6 +4288,81 @@ func handlePingOne(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// handlePingConnected re-pings the currently connected config regardless of
+// which tab the UI is showing. The browser path (pingOne) needs an index in
+// the active tab; when the connected config lives on another tab the chip
+// calls this instead. We locate the entry by its raw URL (its connection
+// tab first, then any tab) and ping it, broadcasting under that entry's tab.
+func handlePingConnected(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	cs := state.conn.snap()
+	if cs.Status != ConnConnected || cs.ConnRaw == "" {
+		w.WriteHeader(200)
+		w.Write([]byte("not connected"))
+		return
+	}
+	state.mu.RLock()
+	var entry *ConfigEntry
+	var tabID string
+	if ents, ok := state.tabEntries[cs.ConnTab]; ok {
+		for _, e := range ents {
+			if e.Raw == cs.ConnRaw {
+				entry, tabID = e, cs.ConnTab
+				break
+			}
+		}
+	}
+	if entry == nil {
+		for tid, ents := range state.tabEntries {
+			for _, e := range ents {
+				if e.Raw == cs.ConnRaw {
+					entry, tabID = e, tid
+					break
+				}
+			}
+			if entry != nil {
+				break
+			}
+		}
+	}
+	state.mu.RUnlock()
+	if entry == nil {
+		w.WriteHeader(200)
+		w.Write([]byte("entry not found"))
+		return
+	}
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+	go func() {
+		entry.mu.Lock()
+		entry.PingStatus = StatusTestingPing
+		entry.mu.Unlock()
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "⚠ ping connected panic: %v\n", r)
+				}
+			}()
+			runPingForEntry(entry)
+		}()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+		}
+		entry.mu.Lock()
+		if entry.PingStatus == StatusTestingPing {
+			entry.PingStatus = StatusFailed
+			entry.PingErr = "timeout"
+			entry.Delay = -1
+		}
+		entry.mu.Unlock()
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+	}()
+}
+
 func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	idx, err := strconv.Atoi(r.URL.Query().Get("idx"))
@@ -3339,16 +4415,30 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 			entry.SpeedErr = "timeout"
 			entry.SpeedLive = 0
 		}
+		// Same protection for PingStatus: runSpeedForEntry sets PingStatus
+		// inside the withXray callback. If xray crashes before that branch
+		// runs and PingStatus was already TestingPing (e.g. a prior ping was
+		// in flight when speed was clicked), force-fail it too.
+		if entry.PingStatus == StatusTestingPing {
+			entry.PingStatus = StatusFailed
+			entry.Delay = -1
+			if entry.PingErr == "" {
+				entry.PingErr = "timeout"
+			}
+		}
 		entry.mu.Unlock()
 		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
 	}()
 }
 
 // parseFilterIndices reads an optional JSON body of the form
-// {"indices":[0,3,5,...]} and returns it as a map for fast membership checks.
+// {"indices":[0,3,5,...]} and returns it as an ordered slice. Order matters:
+// the bulk test runners iterate in this order and acquire the concurrency
+// semaphore in sequence, so the user-visible test order matches whatever the
+// client sent (which is the on-screen sortedList order).
 // Returns nil if no body or the body is empty/invalid — caller treats nil as
 // "test everything" for backwards compatibility.
-func parseFilterIndices(r *http.Request) map[int]bool {
+func parseFilterIndices(r *http.Request) []int {
 	if r.Body == nil {
 		return nil
 	}
@@ -3362,14 +4452,7 @@ func parseFilterIndices(r *http.Request) map[int]bool {
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil
 	}
-	if req.Indices == nil {
-		return nil
-	}
-	m := make(map[int]bool, len(req.Indices))
-	for _, idx := range req.Indices {
-		m[idx] = true
-	}
-	return m
+	return req.Indices
 }
 
 func handlePingAll(w http.ResponseWriter, r *http.Request) {
@@ -3877,7 +4960,7 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	if len(excludeFilter) > 0 {
 		var filtered []*ConfigEntry
 		for _, e := range allEntries {
-			if !shouldSkip(e.Name, excludeFilter) {
+			if !shouldSkip(e.Name, e.Protocol, e.Host, e.Network, e.Security, excludeFilter) {
 				filtered = append(filtered, e)
 			}
 		}
@@ -4055,6 +5138,13 @@ input,textarea{user-select:text;-webkit-user-select:text}
 #conn-bar.conn-tun{background:#060f1f;border-top-color:#1a2a40}
 #conn-bar.cc{background:#12120a;border-top-color:#2a2a12}
 #conn-bar.ce{background:#1a0707;border-top-color:#3a1212}
+/* Ping chip in the connection bar — shows the connected config's latest
+   delay; click to re-ping it. Colour mirrors the table ping pills. */
+.cping{flex-shrink:0;cursor:pointer;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
+.cping:hover{border-color:var(--accent);color:var(--accent)}
+.cping.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
+.cping.failed{color:var(--red);border-color:rgba(220,80,80,.4)}
+.cping.testing{color:var(--accent);border-color:rgba(232,197,71,.4)}
 
 .cdot{width:8px;height:8px;min-width:8px;max-width:8px;border-radius:50%;flex-shrink:0;align-self:center;background:var(--dim2);transition:background .3s}
 .cdot.cp{background:var(--green);animation:pulse 2s infinite}
@@ -4132,11 +5222,21 @@ header{
 .pbar-fill{height:100%;transition:width .22s ease;width:0;position:absolute;inset:0}
 .pbar-ping{background:var(--accent)}
 
-/* tabs */
-.tab-bar{display:flex;gap:2px;align-items:center;flex-shrink:0;overflow-x:auto;max-width:55%}
+/* tabs — live in the toolbar next to filter/type/sort. The toolbar uses
+   align-items:flex-start (see .toolbar below) so when the tab-bar grows
+   taller (extra rows of tabs wrap downward), the filter/type/sort
+   controls stay anchored at the top-right of the toolbar — only the
+   tab-bar's slot grows; the other controls don't shift down with it.
+   flex:0 1 auto = take exactly the natural max-content width when tabs
+   fit (so the last tab sits flush against the 10px gap before the
+   filter label — no empty trailing space inside the tab-bar's slot),
+   but allow shrinking when over-full so the INTERNAL flex-wrap kicks
+   in and tabs flow onto new rows downward instead of pushing the
+   right-side controls off the row. */
+.tab-bar{display:flex;gap:2px;align-items:center;flex-wrap:wrap;row-gap:3px;flex:0 1 auto;min-width:0}
 .tab-btn{
   all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
-  padding:3px 7px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
+  box-sizing:border-box;height:22px;padding:0 7px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
   transition:all .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em;
   display:inline-flex;align-items:center;gap:3px;
 }
@@ -4144,7 +5244,7 @@ header{
 .tab-btn.active{color:var(--accent);border-color:var(--accent)}
 .tab-add{
   all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
-  padding:3px 0;min-width:20px;display:flex;align-items:center;justify-content:center;
+  box-sizing:border-box;height:22px;padding:0;min-width:20px;display:flex;align-items:center;justify-content:center;
   border-radius:3px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;flex-shrink:0;
 }
 .tab-add:hover{color:var(--accent);border-color:var(--accent)}
@@ -4218,9 +5318,28 @@ textarea.modal-input{resize:vertical;min-width:0}
 .chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px}
 .chip{display:inline-flex;align-items:center;gap:3px;font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
   padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3)}
+.chip-tag{font-size:calc(var(--modal-fs-base) - 3px);text-transform:uppercase;letter-spacing:.04em;opacity:.85;font-weight:800;margin-right:2px}
+.chip.col-name{background:rgba(232,197,71,.12);color:var(--accent);border-color:rgba(232,197,71,.3)}
+.chip.col-type{background:rgba(96,165,250,.14);color:#7bb6ff;border-color:rgba(96,165,250,.35)}
+.chip.col-host{background:rgba(132,204,22,.14);color:#9fd84a;border-color:rgba(132,204,22,.35)}
+.chip.col-transport{background:rgba(168,85,247,.14);color:#b387f0;border-color:rgba(168,85,247,.35)}
+.chip.col-security{background:rgba(244,114,114,.14);color:#f08a8a;border-color:rgba(244,114,114,.35)}
 .chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px)}.chip-x:hover{opacity:1;color:var(--red)}
 .chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:var(--modal-fs-base);outline:none;flex:1;min-width:80px}
+/* Exclude filter — one labelled chip box per column. Values are added with
+   Enter (same UX as "Custom domains without VPN"). Labels match the plain
+   "Deduplicate duplicate configs" style (no caps, no per-column palette). */
+.ef-fields{display:flex;flex-direction:column;gap:12px}
+.ef-field{display:flex;flex-direction:column;gap:4px}
+.ef-field-tag{font-size:var(--modal-fs-base);color:var(--text)}
+.ef-field .chips-wrap{margin-bottom:0}
 .modal-hint{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-top:-6px;margin-bottom:10px}
+/* The exclude-filter intro hint sits below a label, so the global -6px pull
+   would clip it onto the label above. Reset it to a small positive gap. */
+.modal-hint.ef-hint{margin-top:2px;margin-bottom:12px}
+/* Tab-settings modal: render the all-caps section labels in the same plain
+   style as the "Deduplicate duplicate configs" row label. */
+#tab-modal-box .modal-label{text-transform:none;letter-spacing:0;color:var(--text);font-size:var(--modal-fs-base)}
 .settings-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border2)}
 .settings-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
 .section-header{font-size:var(--modal-fs-base);font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
@@ -4273,18 +5392,42 @@ tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px
 
 .toolbar{
   flex-shrink:0;background:var(--bg2);border-bottom:1px solid var(--border);
-  padding:5px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:5px 16px;display:flex;align-items:flex-start;gap:10px;flex-wrap:nowrap;
+}
+/* The right-side controls live inside a single flex item that aligns to
+   the TOP of the toolbar (matching the first row of tabs). Internally
+   it stays display:flex/align-items:center so the labels (.tl) and the
+   filter input — which have different heights — line up neatly with each
+   other. flex-shrink:0 keeps it from getting squeezed; the tab-bar
+   (flex:0 1 auto) absorbs horizontal slack and overflows downward via
+   its own flex-wrap, leaving this block parked at the top-right of the
+   toolbar even when tabs grow into several rows below.
+   margin-left:auto pins this block to the RIGHT edge of the toolbar so
+   it never slides left when the tab count shrinks — it stays parked at
+   top-right exactly as it did originally. The auto margin soaks up all
+   horizontal slack when tabs are few (big gap, right-anchored); when
+   tabs fill the row the slack is 0 and the toolbar's own 10px flex gap
+   provides the separation (≈ the filter→type inter-control gap).
+   Every interactive control (.tab-btn/.tab-add on the left, .finput/
+   .proto-btn/.sort-btn here) is locked to the same 22px box height, so
+   with the toolbar top-aligned the first tab row and this block share
+   the exact same top AND bottom edge. */
+.toolbar-right{
+  display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:nowrap;
+  margin-left:auto;
 }
 .tl{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}
 .finput{
   background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
-  color:var(--text);font-family:var(--font);font-size:12px;padding:3px 9px;width:180px;outline:none;
+  color:var(--text);font-family:var(--font);font-size:12px;padding:0 9px;width:180px;outline:none;
+  box-sizing:border-box;height:22px;
 }
 .finput:focus{border-color:var(--accent)}
 .sort-group{display:flex;gap:4px}
 .sort-btn{
   all:unset;cursor:pointer;font-family:var(--font);font-size:10px;
-  padding:2px 8px;border-radius:2px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;
+  box-sizing:border-box;height:22px;display:inline-flex;align-items:center;justify-content:center;
+  padding:0 8px;border-radius:2px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;
 }
 .sort-btn:hover{color:var(--text);border-color:var(--dim)}
 .sort-btn.active{color:var(--accent);border-color:var(--accent)}
@@ -4300,6 +5443,7 @@ thead th{
   padding:6px 10px;text-align:left;font-size:9px;text-transform:uppercase;
   letter-spacing:.12em;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap;
 }
+thead th.cpr{text-align:center}
 thead th.ct {text-align:center}
 thead th.cs {text-align:center}
 thead th.cp2{text-align:center}
@@ -4309,8 +5453,40 @@ tbody tr{border-bottom:1px solid var(--border);transition:background .08s}
 tbody tr:hover{background:var(--bg3)}
 tbody tr.row-cp{background:#071a09!important;box-shadow:inset 3px 0 0 var(--green)}
 tbody tr.row-ct{background:#060f1f!important;box-shadow:inset 3px 0 0 var(--blue)}
+/* RELOAD highlight: newly-added configs glow green and fade out. The fade is
+   driven by a single global --flash-alpha variable (animated in JS), NOT a
+   per-row CSS animation — so re-rendering a row while scrolling reads the
+   current alpha instead of restarting the animation (which made the glow
+   "re-ignite" on scroll). */
+tbody tr.row-new{background:rgba(80,200,120,var(--flash-alpha,0))!important;box-shadow:inset 3px 0 0 var(--green)}
+.reload-toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 16px;font-size:13px;font-weight:800;letter-spacing:.04em;color:var(--text);z-index:9999;box-shadow:0 4px 16px rgba(0,0,0,.45);transition:opacity .45s;opacity:1;pointer-events:none}
+.reload-toast.fade{opacity:0}
+/* ── Logs dock panel ── */
+#log-panel{position:relative;flex-shrink:0;height:30vh;min-height:120px;display:flex;flex-direction:column;border-top:2px solid var(--border);background:var(--bg2)}
+.log-resize{position:absolute;top:-3px;left:0;right:0;height:6px;cursor:ns-resize;z-index:10}
+.log-resize:hover,.log-resize.dragging{background:var(--accent)}
+.log-head{flex-shrink:0;display:flex;align-items:center;gap:8px;padding:5px 12px;border-bottom:1px solid var(--border2)}
+.log-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--accent)}
+.log-head .spacer{flex:1}
+.log-sel{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:10px;border-radius:3px;padding:1px 4px;outline:none;cursor:pointer}
+.log-auto{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;cursor:pointer;user-select:none}
+.log-head .btn{padding:3px 9px;font-size:10px}
+.log-view{flex:1;overflow-y:auto;padding:6px 12px;font-family:var(--font);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:var(--bg);user-select:text;-webkit-user-select:text;cursor:text}
+.log-line{display:block}
+.log-line .lt{color:var(--dim2)}
+.log-line .ls{font-weight:700;margin:0 6px}
+.log-line.lvl-error{color:#f08a8a}
+.log-line.lvl-warn{color:var(--accent)}
+.log-line.lvl-info{color:var(--dim)}
+.log-line.lvl-raw{color:var(--text)}
+.log-line .ls.src-xray{color:#7bb6ff}
+.log-line .ls.src-singbox{color:#b387f0}
+.log-line .ls.src-vair{color:#9fd84a}
+.log-empty{color:var(--dim);font-style:italic}
+#btn-logs.on{color:var(--accent);border-color:var(--accent)}
 td{padding:5px 10px;vertical-align:middle;font-size:12px}
 .ci{width:38px;color:var(--dim);font-size:11px;text-align:left}
+.cpr{width:64px;text-align:center}
 .cn{min-width:150px;max-width:210px;text-align:left}
 .ch{max-width:155px;text-align:left}.ct{width:88px;text-align:center}.cs{width:72px;text-align:center}
 .cp2{width:110px;text-align:center}
@@ -4318,8 +5494,18 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
 .ca{width:220px;text-align:right}
 
 .nc{display:flex;flex-direction:column;gap:2px}
-.nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+/* name + "last" badge on one row: name flexes/ellipsises, badge stays fixed
+   and is pushed to the right edge (next to the host column). */
+.nm-row{display:flex;align-items:center;gap:6px;min-width:0}
+/* Favorite star — fixed at the left of the name row. */
+.fav{flex:0 0 auto;cursor:pointer;color:var(--dim2);font-size:13px;line-height:1;user-select:none;transition:color .15s}
+.fav:hover{color:var(--accent)}
+.fav.on{color:var(--accent)}
+.nm{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
 .nh{color:var(--dim);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* "last connected" badge — fixed size at the end of the name column; the
+   adjacent name clips before it instead of overlapping. */
+.last-badge{flex:0 0 auto;font-size:8px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);background:rgba(232,197,71,.14);border:1px solid rgba(232,197,71,.35);border-radius:3px;padding:0 3px;line-height:13px}
 .et{font-size:10px;color:var(--red);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:205px}
 
 .vc{display:flex;align-items:center;justify-content:center;gap:5px}
@@ -4341,8 +5527,39 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
 .nb.h2{color:var(--blue);border-color:rgba(96,165,250,.4)}
 .nb.tcp{color:var(--green);border-color:rgba(74,222,128,.4)}
 .nb.httpupgrade,.nb.splithttp,.nb.xhttp{color:var(--purple);border-color:rgba(192,132,252,.4)}
-.sb{font-size:10px;padding:1px 5px;border-radius:2px;color:var(--dim)}
+.sb{font-size:10px;padding:1px 5px;border-radius:2px;color:var(--dim);
+  display:inline-block;max-width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
 .sb.tls{color:var(--blue)}.sb.reality{color:var(--purple);font-weight:700}
+
+.pb{font-size:10px;padding:1px 5px;border-radius:2px;border:1px solid var(--border);color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em;display:inline-block;max-width:54px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
+.pb.vless{color:var(--accent);border-color:rgba(232,197,71,.4)}
+.pb.vmess{color:#818cf8;border-color:rgba(129,140,248,.4)}
+.pb.trojan{color:var(--red);border-color:rgba(248,113,113,.4)}
+.pb.ss{color:var(--teal);border-color:rgba(45,212,191,.4)}
+.pb.ss2022{color:var(--green);border-color:rgba(74,222,128,.4)}
+.pb.hysteria2{color:var(--orange);border-color:rgba(251,146,60,.4)}
+.pb.tuic{color:var(--purple);border-color:rgba(192,132,252,.4)}
+
+/* No flex-wrap here: keeps the 8 pills in a single row so they don't
+   blow out toolbar-right's fixed height (26px) and break the vertical
+   alignment of the labels next to them. */
+.proto-group{display:flex;gap:4px;flex-wrap:nowrap}
+.proto-btn{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;
+  box-sizing:border-box;height:22px;display:inline-flex;align-items:center;justify-content:center;
+  padding:0 8px;border-radius:2px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;text-transform:lowercase;
+}
+.proto-btn:hover{color:var(--text);border-color:var(--dim)}
+.proto-btn.active{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+/* When Ctrl-clicking we may have several pills active at once. Tinted bg
+   makes the selected set visually distinct from a single-select look. */
+.proto-btn#proto-vless.active{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+.proto-btn#proto-vmess.active{color:#a5b1ff;border-color:rgba(129,140,248,.7);background:rgba(129,140,248,.10)}
+.proto-btn#proto-trojan.active{color:var(--red);border-color:rgba(248,113,113,.7);background:rgba(248,113,113,.10)}
+.proto-btn#proto-ss.active{color:var(--teal);border-color:rgba(45,212,191,.7);background:rgba(45,212,191,.10)}
+.proto-btn#proto-ss2022.active{color:var(--green);border-color:rgba(74,222,128,.7);background:rgba(74,222,128,.10)}
+.proto-btn#proto-hysteria2.active{color:var(--orange);border-color:rgba(251,146,60,.7);background:rgba(251,146,60,.10)}
+.proto-btn#proto-tuic.active{color:var(--purple);border-color:rgba(192,132,252,.7);background:rgba(192,132,252,.10)}
 
 .act-cell{display:flex;gap:3px;align-items:center;justify-content:flex-end}
 .cpb{all:unset;cursor:pointer;color:var(--dim);font-size:12px;padding:2px 4px;border-radius:2px;transition:color .12s;display:inline-flex}
@@ -4438,6 +5655,7 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
   <div class="spacer"></div>
   <div class="ctrls">
     <button class="btn ghost" id="btn-settings" onclick="openSettings()" title="Settings">&#9881;</button>
+    <button class="btn ghost" id="btn-logs"      onclick="toggleLogs()" title="Logs">logs</button>
     <button class="btn ghost" id="btn-reload"    onclick="doReload()">reload</button>
     <button class="btn ghost" id="btn-ping-all"  onclick="doPingAll()">ping all</button>
     <button class="btn ghost"  id="btn-speed-all" onclick="doSpeedAll()">speed all</button>
@@ -4453,15 +5671,27 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
     <button class="tab-btn active" data-id="main" onclick="switchTab('main')">Sources</button>
     <button class="tab-add" onclick="addTab()" title="New tab (Ctrl+V to paste configs)">+</button>
   </div>
-  <div class="spacer"></div>
-  <span class="tl">filter</span>
-  <input class="finput" id="fi" placeholder="name / host / type…" oninput="applyFilter()">
-  <span id="fc" style="font-size:11px;color:var(--dim)"></span>
-  <span class="tl" style="margin-left:6px">sort</span>
-  <div class="sort-group">
-    <button class="sort-btn active" id="sort-idx"   onclick="setSort('idx')">default</button>
-    <button class="sort-btn"        id="sort-ping"  onclick="setSort('ping')">ping ↑</button>
-    <button class="sort-btn"        id="sort-speed" onclick="setSort('speed')">speed ↓</button>
+  <div class="toolbar-right">
+    <span class="tl">filter</span>
+    <input class="finput" id="fi" placeholder="name / host / type / transport…" oninput="applyFilter()">
+    <span id="fc" style="font-size:11px;color:var(--dim)"></span>
+    <span class="tl" style="margin-left:6px">type</span>
+    <div class="proto-group" title="Click to filter by one type. Ctrl+click to multi-select.">
+      <button class="proto-btn active" id="proto-all"       onclick="onProtoBtnClick(event,'')">all</button>
+      <button class="proto-btn"        id="proto-vless"     onclick="onProtoBtnClick(event,'vless')">vless</button>
+      <button class="proto-btn"        id="proto-vmess"     onclick="onProtoBtnClick(event,'vmess')">vmess</button>
+      <button class="proto-btn"        id="proto-trojan"    onclick="onProtoBtnClick(event,'trojan')">trojan</button>
+      <button class="proto-btn"        id="proto-ss"        onclick="onProtoBtnClick(event,'ss')">ss</button>
+      <button class="proto-btn"        id="proto-ss2022"    onclick="onProtoBtnClick(event,'ss2022')">ss2022</button>
+      <button class="proto-btn"        id="proto-hysteria2" onclick="onProtoBtnClick(event,'hysteria2')">hy2</button>
+      <button class="proto-btn"        id="proto-tuic"      onclick="onProtoBtnClick(event,'tuic')">tuic</button>
+    </div>
+    <span class="tl" style="margin-left:6px">sort</span>
+    <div class="sort-group">
+      <button class="sort-btn active" id="sort-idx"   onclick="setSort('idx')">default</button>
+      <button class="sort-btn"        id="sort-ping"  onclick="setSort('ping')">ping ↑</button>
+      <button class="sort-btn"        id="sort-speed" onclick="setSort('speed')">speed ↓</button>
+    </div>
   </div>
 </div>
 
@@ -4473,6 +5703,7 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
   <table id="tbl" style="display:none">
     <thead><tr>
       <th class="ci">#</th>
+      <th class="cpr">Type</th>
       <th class="cn">Name</th>
       <th class="ch">Host</th>
       <th class="ct">Transport</th>
@@ -4485,11 +5716,39 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
   </table>
 </div>
 
+<!-- ── Logs dock panel (above the connection bar) ── -->
+<div id="log-panel" style="display:none">
+  <div class="log-resize" id="log-resize" title="Drag to resize"></div>
+  <div class="log-head">
+    <span class="log-title" id="log-title">Logs</span>
+    <select class="log-sel" id="log-src" onchange="renderLogs()">
+      <option value="">all</option>
+      <option value="xray">xray</option>
+      <option value="singbox">sing-box</option>
+      <option value="vair">vair</option>
+      <option value="test">test</option>
+    </select>
+    <select class="log-sel" id="log-lvl" onchange="renderLogs()">
+      <option value="">all</option>
+      <option value="info">info+</option>
+      <option value="warn">warn+</option>
+      <option value="error">error</option>
+    </select>
+    <label class="log-auto"><input type="checkbox" id="log-autoscroll" checked> <span id="log-auto-lbl">auto-scroll</span></label>
+    <div class="spacer"></div>
+    <button class="btn ghost" id="log-copy" onclick="copyLogs()">copy</button>
+    <button class="btn ghost" id="log-clear" onclick="clearLogs()">clear</button>
+    <button class="btn ghost" id="log-close" onclick="toggleLogs(false)" title="Close">&#10005;</button>
+  </div>
+  <div class="log-view" id="log-view"></div>
+</div>
+
 <!-- ── Connection Bar (bottom) ── -->
 <div id="conn-bar">
   <div class="cdot" id="cdot"></div>
   <span id="clabel">DISCONNECTED</span>
   <span id="cdetail" style="flex:1;color:var(--dim)"></span>
+  <span id="cping" class="cping" style="display:none" title="Click to re-check ping"></span>
   <div id="cports"></div>
 
   <!-- Mode selector (always visible) -->
@@ -4506,9 +5765,17 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
 // ── state ──────────────────────────────────────────────────────────
 const entries={};
 let sortMode='idx', filterText='';
+// protoFilter is a Set of selected protocol IDs. Empty Set = "all" (no filter).
+// Plain click on a pill replaces the selection; Ctrl/Meta + click toggles
+// that pill in/out of the selection so the user can show several at once.
+let protoFilter=new Set();
 let connState={status:'idle',entry_index:-1,mode:'proxy'};
+// Raw of the most recently connected config — drives the "last" badge.
+// Seeded from settings on load (survives restarts) and updated live on
+// every successful connection. Only one config carries the badge.
+let lastConnectedRaw='';
 let appInfo={singbox_available:false,is_admin:false,os:'windows'};
-let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false, ping_concurrency:10, speed_concurrency:5, ping_test_url:'', speed_test_url:'', ping_timeout_ms:0, speed_duration_sec:0, tun_mtu:0, stats_disabled:false, stats_total_up:0, stats_total_down:0, dns_leak_protection:false, kill_switch:false, block_lan:false, fakeip_disabled:false, bootstrap_dns:'', direct_dns:'', remote_dns:'', static_hosts:{}, modal_font_size:0, language:''};
+let appSettingsJS={sources_enabled:true, ru_sites_direct:false, direct_domains:[], direct_apps:[], tray_enabled:false, ping_concurrency:10, speed_concurrency:5, ping_test_url:'', speed_test_url:'', speed_test_url_fallback:'', ping_timeout_ms:0, speed_duration_sec:0, tun_mtu:0, stats_disabled:false, stats_total_up:0, stats_total_down:0, dns_leak_protection:false, kill_switch:false, block_lan:false, fakeip_disabled:false, bootstrap_dns:'', direct_dns:'', remote_dns:'', static_hosts:{}, modal_font_size:0, language:'', favorites:[], verbose_logs:false};
 
 // ── i18n / UI prefs ─────────────────────────────────────────────────
 // Modal-only translations. Main window stays English on purpose — table
@@ -4545,6 +5812,11 @@ const I18N = {
     "Custom ping URL": "Свой URL для ping",
     "Speed URL": "URL для speed",
     "Custom speed URL": "Свой URL для speed",
+    "Speed URL fallback": "Резервный URL для speed",
+    "(used when the main URL returns HTTP 429)": "(используется, если основной URL возвращает HTTP 429)",
+    "Custom speed fallback URL": "Свой резервный URL для speed",
+    "None — no fallback": "Без резерва",
+    "Pick \"None\" to disable the retry.": "Выберите «Без резерва», чтобы отключить повтор.",
     "TUN MTU": "TUN MTU",
     "Enable traffic statistics": "Считать трафик",
     "Lifetime total": "Итого за всё время",
@@ -4558,9 +5830,36 @@ const I18N = {
     "TUN Remote DNS": "TUN Remote DNS",
     "TUN Static hosts": "TUN: статические хосты",
     "Minimize to tray on close": "Сворачивать в трей при закрытии",
+    "Verbose logs": "Подробные логи",
+    "Raises xray/sing-box log detail (level info) so the Logs panel shows per-connection lines. Takes effect on next connection.":
+      "Повышает детализацию логов xray/sing-box (уровень info), чтобы в панели логов были видны строки по каждому соединению. Применяется при следующем подключении.",
+    "Log speed/ping tests": "Логировать тесты скорости/пинга",
+    "Logs each ping/speed result plus the full core output during the test (so you can see why a config is unavailable). Off by default — bulk tests can be noisy.":
+      "Логирует каждый результат пинга/скорости и полный вывод ядра во время теста (видно, почему конфигурация недоступна). По умолчанию выключено — массовые тесты могут быть шумными.",
+    "Logs": "Логи",
+    "Copy": "Копировать",
+    "Clear": "Очистить",
+    "Auto-scroll": "Автопрокрутка",
+    "No logs yet — connect to a config to see core output.":
+      "Логов пока нет — подключитесь к конфигу, чтобы увидеть вывод ядра.",
     "Settings font size (px)": "Размер текста в настройках (px)",
     "Language": "Язык",
     "close": "закрыть",
+    "Data": "Данные",
+    "Storage location": "Папка с данными",
+    "Open folder": "Открыть",
+    "Settings backup": "Резервная копия настроек",
+    "Export": "Экспорт",
+    "Import": "Импорт",
+    "Exports tabs, tab settings and app settings to a JSON file. Import replaces the current state — useful when moving Vair to another computer.":
+      "Экспортирует вкладки, настройки вкладок и приложения в JSON-файл. Импорт заменяет текущее состояние — удобно для переноса Vair на другой компьютер.",
+    "Turn the toggle off to import only the app settings and keep your existing tabs.":
+      "Выключите переключатель, чтобы импортировать только настройки приложения, оставив существующие вкладки.",
+    "Import tabs and tab settings": "Импортировать вкладки и их настройки",
+    "Replace current tabs and settings with the imported file? This cannot be undone.":
+      "Заменить текущие вкладки и настройки данными из файла? Отменить это действие будет нельзя.",
+    "Replace current app settings with the imported file? Tabs will not be touched.":
+      "Заменить настройки приложения данными из файла? Вкладки затронуты не будут.",
 
     // Placeholders
     "e.g. vk.com, press Enter": "напр. vk.com, нажмите Enter",
@@ -4612,6 +5911,8 @@ const I18N = {
 
     // openTabSettings
     "Tab Settings": "Настройки вкладки",
+    // "SOURCES" stays as-is to match the untranslated section/tab name.
+    "Sources Settings": "Настройки SOURCES",
     "Name": "Имя",
     "Source URLs (raw links, base64 subscriptions)": "URL источников (raw-ссылки, base64-подписки)",
     "+ add URL": "+ добавить URL",
@@ -4628,7 +5929,8 @@ const I18N = {
     "Hide duplicates from view (reversible)": "Скрыть дубликаты из вида (обратимо)",
     "Permanently delete duplicates": "Безвозвратно удалить дубликаты",
     "Exclude filter": "Фильтр исключений",
-    "Configs with matching name will be hidden.": "Конфиги с совпадающим именем будут скрыты.",
+    "Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.":
+      "Конфиги, совпадающие с любым из значений, скрываются. Введите значение и нажмите Enter, чтобы добавить его; сравнение — подстрока без учёта регистра. Оставьте столбец пустым, чтобы отключить его.",
     "Off: show everything. Hide: filter from view, reversible. Delete: permanently remove duplicate entries. Matching is by vless body (ignores the name).":
       "Off: показывать всё. Hide: скрыть из вида (обратимо). Delete: безвозвратно удалить дубликаты. Сравнение по vless-телу (имя игнорируется).",
 
@@ -4679,7 +5981,12 @@ es.onmessage=e=>{
   const tabMatch=!evTab||evTab===activeTabId;
   if     (ev.type==='loading'&&tabMatch)             onLoading();
   else if(ev.type==='loaded'&&tabMatch)              onLoaded(ev.payload);
-  else if(ev.type==='entry_update'&&tabMatch)        onUpdate(ev.payload);
+  else if(ev.type==='entry_update'){
+    // Capture the connected config's ping for the conn-bar chip even when
+    // this update is for a non-active tab; only feed the table on a match.
+    noteConnPing(ev.payload);
+    if(tabMatch) onUpdate(ev.payload);
+  }
   else if(ev.type==='conn_update')                   onConnUpdate(ev.payload);
   else if(ev.type==='stats_update')                   onStatsUpdate(ev.payload);
   else if(ev.type==='app_info')                      onAppInfo(ev.payload);
@@ -4691,8 +5998,146 @@ es.onmessage=e=>{
   else if(ev.type==='bulk_speed_done')               doneBulk('speed','speed all','btn-speed-all','ghost',evTab);
   else if(ev.type==='tabs_update')                   onTabsUpdate(ev.payload);
   else if(ev.type==='active_tab')                    onActiveTab(ev.payload);
+  else if(ev.type==='log')                           onLogBatch(ev.payload);
 };
 loadAppSettings();
+
+// ── Logs panel ─────────────────────────────────────────────────────
+// Client-side ring of recent log lines (mirrors the server cap). Fed live
+// by SSE 'log' events; (re)filled from /api/logs whenever the panel opens.
+const LOG_CAP=2000;
+let logBuf=[];        // [{t,lvl,src,msg}]
+let logPanelOpen=false;
+// Severity rank for the "info+ / warn+ / error" filter.
+const LOG_LVL_RANK={raw:0, info:1, warn:2, error:3};
+function logSrcLabel(s){ return s==='singbox'?'sing-box':s; }
+function logPassesFilter(l){
+  var src=document.getElementById('log-src'); var lvl=document.getElementById('log-lvl');
+  if(src && src.value && l.src!==src.value) return false;
+  if(lvl && lvl.value){
+    var min=LOG_LVL_RANK[lvl.value]||0;
+    if((LOG_LVL_RANK[l.lvl]||0) < min) return false;
+  }
+  return true;
+}
+function fmtLogTime(ms){
+  var d=new Date(ms||Date.now());
+  function p(n){return (n<10?'0':'')+n;}
+  return p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+}
+function logLineHTML(l){
+  var lvl=l.lvl||'raw';
+  return '<span class="log-line lvl-'+lvl+'">'+
+    '<span class="lt">'+fmtLogTime(l.t)+'</span>'+
+    '<span class="ls src-'+(l.src||'vair')+'">['+x(logSrcLabel(l.src||'vair'))+']</span>'+
+    x(l.msg||'')+'</span>';
+}
+// onLogBatch: the server batches log lines into one SSE event (a few per
+// second) so a flooding core can't freeze the UI. Always buffer; if the panel
+// is open, append the batch in a single DOM write and keep the view pinned to
+// the bottom. Node count is capped so the view can't grow without bound.
+var logDirty=false; // set when a batch was skipped (active selection) — forces a full resync next time
+function onLogBatch(arr){
+  if(!arr) return;
+  if(!Array.isArray(arr)) arr=[arr]; // tolerate a single-object payload
+  if(arr.length===0) return;
+  for(var i=0;i<arr.length;i++) logBuf.push(arr[i]);
+  if(logBuf.length>LOG_CAP) logBuf=logBuf.slice(logBuf.length-LOG_CAP);
+  if(!logPanelOpen) return;
+  var view=document.getElementById('log-view');
+  if(!view) return;
+  // Don't touch the DOM while the user is selecting text here — it would wipe
+  // their selection mid-copy. Buffer silently and resync once it clears.
+  if(selectionInLogPanel()){ logDirty=true; return; }
+  var auto=document.getElementById('log-autoscroll');
+  var atBottom=view.scrollHeight-view.scrollTop-view.clientHeight < 40;
+  if(logDirty){ logDirty=false; renderLogs(); return; }
+  var html='';
+  for(var j=0;j<arr.length;j++){ if(logPassesFilter(arr[j])) html+=logLineHTML(arr[j]); }
+  if(html){
+    view.insertAdjacentHTML('beforeend', html);
+    while(view.childElementCount>LOG_CAP) view.removeChild(view.firstChild);
+  }
+  if(auto && auto.checked && atBottom) view.scrollTop=view.scrollHeight;
+}
+// renderLogs rebuilds the whole view from the buffer (used on open and when
+// a filter changes).
+function renderLogs(){
+  var view=document.getElementById('log-view');
+  if(!view) return;
+  var html='';
+  for(var i=0;i<logBuf.length;i++){ if(logPassesFilter(logBuf[i])) html+=logLineHTML(logBuf[i]); }
+  view.innerHTML=html || '<div class="log-empty">No logs yet — connect to a config to see core output.</div>';
+  var auto=document.getElementById('log-autoscroll');
+  if(auto && auto.checked) view.scrollTop=view.scrollHeight;
+}
+function toggleLogs(force){
+  var panel=document.getElementById('log-panel');
+  var btn=document.getElementById('btn-logs');
+  if(!panel) return;
+  var open=(typeof force==='boolean')?force:(panel.style.display==='none');
+  logPanelOpen=open;
+  panel.style.display=open?'flex':'none';
+  if(btn) btn.classList.toggle('on', open);
+  if(open){
+    // Refill from the server so we don't miss lines emitted while closed.
+    fetch('/api/logs').then(function(r){return r.json();}).then(function(arr){
+      if(Array.isArray(arr)) logBuf=arr.slice(-LOG_CAP);
+      renderLogs();
+    }).catch(function(){ renderLogs(); });
+  }
+}
+function copyLogs(){
+  var lines=[];
+  for(var i=0;i<logBuf.length;i++){
+    var l=logBuf[i];
+    if(!logPassesFilter(l)) continue;
+    lines.push(fmtLogTime(l.t)+' ['+logSrcLabel(l.src||'vair')+'] '+(l.msg||''));
+  }
+  navigator.clipboard.writeText(lines.join('\n')).catch(function(){});
+}
+function clearLogs(){
+  logBuf=[];
+  renderLogs();
+  fetch('/api/logs/clear',{method:'POST'}).catch(function(){});
+}
+function applyLogI18n(){
+  // The Logs panel intentionally stays in English regardless of UI language
+  // (it shows raw core output, so English labels keep it consistent). The
+  // HTML defaults are already English — nothing to translate here.
+}
+// Drag the top edge of the Logs panel to resize it. Height is clamped to a
+// sane range and kept as an inline style, so it persists while the panel is
+// toggled open/closed within a session.
+(function(){
+  var handle=document.getElementById('log-resize');
+  var panel=document.getElementById('log-panel');
+  if(!handle||!panel) return;
+  var startY=0, startH=0;
+  function onMove(e){
+    var dy=startY-e.clientY;           // drag up → taller
+    var h=startH+dy;
+    var max=Math.round(window.innerHeight*0.85);
+    if(h<120) h=120;
+    if(h>max) h=max;
+    panel.style.height=h+'px';
+  }
+  function onUp(){
+    handle.classList.remove('dragging');
+    document.body.style.userSelect='';
+    document.removeEventListener('mousemove',onMove);
+    document.removeEventListener('mouseup',onUp);
+  }
+  handle.addEventListener('mousedown',function(e){
+    startY=e.clientY;
+    startH=panel.getBoundingClientRect().height;
+    handle.classList.add('dragging');
+    document.body.style.userSelect='none';
+    document.addEventListener('mousemove',onMove);
+    document.addEventListener('mouseup',onUp);
+    e.preventDefault();
+  });
+})();
 
 // ── app info → update mode pills ──────────────────────────────────
 function onAppInfo(info){
@@ -4743,7 +6188,14 @@ function setMode(m){
 // changes; uptime alone goes nowhere near the table rows.
 let prevConnSig = '';
 function onConnUpdate(cs){
+  // Reset the cached connected-config ping when we disconnect or when the
+  // connected config changes, so the chip never shows a stale value.
+  var prevRaw=connState&&connState.conn_raw;
+  if(!cs||cs.status!=='connected'||cs.conn_raw!==prevRaw) connPing=null;
   connState=cs;
+  // Remember the config we just connected to so it keeps the "last" badge
+  // even after disconnect. Mirrors the server-side recordLastConnected.
+  if(cs.status==='connected' && cs.conn_raw) lastConnectedRaw=cs.conn_raw;
   const bar  =document.getElementById('conn-bar');
   const dot  =document.getElementById('cdot');
   const lbl  =document.getElementById('clabel');
@@ -4773,7 +6225,8 @@ function onConnUpdate(cs){
     } else {
       ports.innerHTML=
         '<div class="pchip">TUN&nbsp;<b>'+(cs.tun_iface||'vair-tun')+'</b></div>'+
-        '<div class="pchip" style="pointer-events:none;color:var(--dim)">all traffic routed</div>';
+        '<div class="pchip" style="pointer-events:none;color:var(--dim)">all traffic routed</div>'+
+        (cs.stats_unavailable?'<div class="pchip" style="pointer-events:none;color:var(--orange)" title="Hysteria2/TUIC TUN runs as a single sing-box process with no local SOCKS hop, so per-session and lifetime traffic counters cannot be measured.">⚠ traffic stats unavailable</div>':'');
     }
     btnDc.style.display='';
   } else if(cs.status==='connecting'){
@@ -4798,9 +6251,11 @@ function onConnUpdate(cs){
     ports.style.display='none'; btnDc.style.display='none';
   }
 
-  // highlight row
+  // highlight row — findConnIdx matches by raw within the active tab, so the
+  // connected row lights up on any tab that contains this config (-1 when it
+  // isn't present here), not only the tab it was connected from.
   document.querySelectorAll('tbody tr.row-cp,tbody tr.row-ct').forEach(r=>{r.classList.remove('row-cp','row-ct')});
-  if((cs.status==='connected'||cs.status==='connecting')&&(!cs.conn_tab||cs.conn_tab===activeTabId)){
+  if(cs.status==='connected'||cs.status==='connecting'){
     var cidx=findConnIdx();
     if(cidx>=0){
       const row=document.getElementById('r'+cidx);
@@ -4820,6 +6275,50 @@ function onConnUpdate(cs){
     prevConnSig = sig;
     rebuildTable();
   }
+  updateConnPing();
+}
+
+// connPing caches the connected config's latest ping ({status, delay}) so
+// the conn-bar chip can show it on EVERY tab — not just the tab that holds
+// the config. Fed by noteConnPing from any entry_update matching conn_raw.
+let connPing=null;
+function noteConnPing(e){
+  if(!e||!connState||connState.status!=='connected'||!connState.conn_raw)return;
+  if(e.raw!==connState.conn_raw)return;
+  connPing={status:e.ping_status, delay:e.delay};
+  updateConnPing();
+}
+
+// updateConnPing renders the ping chip in the connection bar for the
+// currently connected config. Shows whenever connected (on any tab). Value
+// comes from the live connPing cache, falling back to the active-tab entry
+// if present. Click re-pings: by index when the config is in the active
+// tab, otherwise via the /api/ping/connected endpoint (server finds it).
+function updateConnPing(){
+  var el=document.getElementById('cping');
+  if(!el)return;
+  if(!connState||connState.status!=='connected'){
+    el.style.display='none';
+    return;
+  }
+  el.style.display='';
+  el.onclick=function(){
+    var idx=findConnIdx();
+    if(idx>=0) pingOne(idx);
+    else fetch('/api/ping/connected',{method:'POST'}).catch(function(){});
+  };
+  var st=connPing?connPing.status:null, dl=connPing?connPing.delay:null;
+  if(st===null){
+    var idx=findConnIdx();
+    var e=(idx>=0)?entries[idx]:null;
+    // Seed the cache from the active-tab entry so the value persists after
+    // switching to a tab that doesn't contain this config.
+    if(e){ st=e.ping_status; dl=e.delay; connPing={status:st, delay:dl}; }
+  }
+  if(st==='testing_ping'){ el.className='cping testing'; el.textContent='pinging…'; }
+  else if(st==='ok'){ el.className='cping ok'; el.textContent=dl+' ms'; }
+  else if(st==='failed'){ el.className='cping failed'; el.textContent='ping ✕'; }
+  else { el.className='cping'; el.textContent='ping'; }
 }
 
 function fmtUptime(s){
@@ -4862,6 +6361,11 @@ function onLoading(){
   document.getElementById('tbl').style.display='none';
   document.getElementById('msg-area').innerHTML='<div class="ico"><span class="spinner"></span></div><p>Loading configs…</p>';
 }
+// prevRawsByTab remembers the raw set last seen for each tab so a RELOAD can
+// diff against it and highlight what changed. flashNewIdx holds the indices
+// of just-added configs to flash for a couple of seconds.
+let prevRawsByTab={};
+let flashNewIdx=new Set();
 function onLoaded(list){
   Object.keys(entries).forEach(k=>delete entries[k]);
   document.getElementById('tb').innerHTML='';
@@ -4872,7 +6376,61 @@ function onLoaded(list){
   recomputeDupIndices();
   // Reset progress bar if we switched to a different tab than the one being tested
   if(bulkProgressTab&&bulkProgressTab!==activeTabId) setBar(0);
+
+  // RELOAD change highlight: compare against this tab's previous raw set.
+  // First time a tab is loaded in a session there's no baseline (no flash);
+  // a later reload of the same tab flashes added rows and toasts +N/−M.
+  var tabKey=activeTabId;
+  var newRaws=list.map(function(e){return e.raw;});
+  var prev=prevRawsByTab[tabKey];
+  flashNewIdx=new Set();
+  if(prev){
+    var prevSet=new Set(prev), newSet=new Set(newRaws);
+    var added=0, removed=0;
+    list.forEach(function(e){ if(!prevSet.has(e.raw)){ flashNewIdx.add(e.index); added++; } });
+    prev.forEach(function(r){ if(!newSet.has(r)) removed++; });
+    if(added>0||removed>0) showReloadDelta(added,removed);
+    if(flashNewIdx.size>0) startFlashFade();
+  }
+  prevRawsByTab[tabKey]=newRaws;
+
   rebuildTable();
+}
+// startFlashFade animates the global --flash-alpha from a peak down to 0 over
+// ~2.6s. Because the rows read this variable (rather than running their own
+// animation), the glow stays in sync across all flashed rows and does not
+// restart when a row is re-created during virtual scrolling. At the end it
+// clears the flash set and rebuilds once so the class is dropped.
+let flashRAF=0;
+function startFlashFade(){
+  if(flashRAF) cancelAnimationFrame(flashRAF);
+  var start=Date.now(), dur=2600, peak=0.28;
+  var root=document.documentElement;
+  function step(){
+    var t=(Date.now()-start)/dur;
+    if(t>=1){
+      root.style.setProperty('--flash-alpha','0');
+      flashRAF=0; flashNewIdx=new Set(); rebuildTable();
+      return;
+    }
+    root.style.setProperty('--flash-alpha', (peak*(1-t)).toFixed(3));
+    flashRAF=requestAnimationFrame(step);
+  }
+  flashRAF=requestAnimationFrame(step);
+}
+// showReloadDelta pops a brief toast with how many configs a reload added
+// (+N) and removed (−M).
+function showReloadDelta(added,removed){
+  var parts=[];
+  if(added>0)  parts.push('+'+added);
+  if(removed>0)parts.push('−'+removed);
+  if(parts.length===0)return;
+  var t=document.createElement('div');
+  t.className='reload-toast';
+  t.textContent=parts.join('   ');
+  document.body.appendChild(t);
+  setTimeout(function(){ t.classList.add('fade'); },1900);
+  setTimeout(function(){ t.remove(); },2400);
 }
 function onUpdate(e){
   entries[e.index]=e;
@@ -4882,6 +6440,8 @@ function onUpdate(e){
   }
   updateRow(e.index);
   recalcStats();
+  // If this update is for the connected config, refresh the conn-bar ping chip.
+  if(connState&&connState.status==='connected'&&e.raw&&connState.conn_raw===e.raw) updateConnPing();
 }
 
 // dupBodyIndices is the set of entry indices whose vless "body" (everything
@@ -4957,6 +6517,113 @@ function setSort(m){
   ['idx','ping','speed'].forEach(s=>document.getElementById('sort-'+s).classList.toggle('active',s===m));
   rebuildTable();
 }
+// Ordered list of pill IDs; "" represents the "all" pill (empty selection).
+const PROTO_PILLS=['','vless','vmess','trojan','ss','ss2022','hysteria2','tuic'];
+// onProtoBtnClick is the routed handler for every type-filter pill. Plain
+// click sets the selection to exactly that pill (or clears it when "all").
+// Ctrl/Meta + click toggles the pill in/out of the current selection — this
+// is how users build up a "vmess + ss + trojan" view without an extra menu.
+// "all" + Ctrl is treated the same as plain "all" because mixing "all" with
+// other pills has no coherent meaning.
+function onProtoBtnClick(ev, p){
+  var multi=ev && (ev.ctrlKey || ev.metaKey);
+  if(p==='' || !multi){
+    protoFilter=new Set();
+    if(p) protoFilter.add(p);
+  } else {
+    if(protoFilter.has(p)) protoFilter.delete(p);
+    else protoFilter.add(p);
+  }
+  saveProtoFilter();
+  renderProtoPills();
+  rebuildTable();
+}
+function renderProtoPills(){
+  for(var i=0;i<PROTO_PILLS.length;i++){
+    var s=PROTO_PILLS[i];
+    var id=s===''?'proto-all':'proto-'+s;
+    var el=document.getElementById(id);
+    if(!el) continue;
+    if(s===''){
+      el.classList.toggle('active', protoFilter.size===0);
+    } else {
+      el.classList.toggle('active', protoFilter.has(s));
+    }
+  }
+}
+// Back-compat shim for any external caller (e.g. saved bookmarks, devtools,
+// localStorage restore) that still passes a single protocol string.
+function setProtoFilter(p){
+  protoFilter=new Set();
+  if(p) protoFilter.add(p);
+  saveProtoFilter();
+  renderProtoPills();
+  rebuildTable();
+}
+// protoFilter persistence — survives reloads so the user's type-filter
+// selection (incl. multi-select) sticks. localStorage can throw in some
+// embedded WebView2 / private-mode contexts, so every access is guarded;
+// a failure just degrades to the non-persistent behaviour silently.
+var PROTO_FILTER_LS_KEY='vair.protoFilter';
+function saveProtoFilter(){
+  try{
+    localStorage.setItem(PROTO_FILTER_LS_KEY, JSON.stringify(Array.from(protoFilter)));
+  }catch(e){}
+}
+function loadProtoFilter(){
+  try{
+    var raw=localStorage.getItem(PROTO_FILTER_LS_KEY);
+    if(!raw) return;
+    var arr=JSON.parse(raw);
+    if(!Array.isArray(arr)) return;
+    var next=new Set();
+    // Only accept IDs we still recognise — drops stale values if the
+    // protocol list ever changes between versions.
+    for(var i=0;i<arr.length;i++){
+      if(PROTO_PILLS.indexOf(arr[i])>=0 && arr[i]!=='') next.add(arr[i]);
+    }
+    protoFilter=next;
+  }catch(e){}
+}
+// chipProto derives the *display* protocol from an entry, distinguishing
+// SS2022 from legacy SS by the cipher prefix. Backend reports both as "ss"
+// because xray's outbound is identical — the split is a UI concern only.
+function chipProto(e){
+  var pr=(e.protocol||'vless').toLowerCase().replace(/[^a-z0-9]/g,'');
+  if(pr==='ss' && (e.security||'').indexOf('2022-blake3-')===0) pr='ss2022';
+  return pr;
+}
+// protoLabel maps the (full) protocol key to the short text shown in the
+// TYPE column chip. Only "hysteria2" needs shortening — at 10px it overran
+// the 64px column and bled into the Name cell. "hy2" matches the TYPE
+// filter pill label exactly, so the chip and the filter stay consistent.
+function protoLabel(pr){ return pr==='hysteria2' ? 'hy2' : pr; }
+// Exclude-filter columns the user can target from the tab Settings modal.
+// Keep in lockstep with excludeColumns in main.go shouldSkip.
+var EXCLUDE_COLS=['name','type','host','transport','security'];
+// parseExcludeRule splits a stored rule ("column:value") into {column,value}.
+// Legacy bare strings (no colon, or unknown column) map to "name" so old
+// tabs.json data keeps working without migration.
+function parseExcludeRule(s){
+  if(typeof s!=='string') return {column:'name',value:''};
+  var i=s.indexOf(':');
+  if(i>0){
+    var col=s.substring(0,i).toLowerCase();
+    if(EXCLUDE_COLS.indexOf(col)>=0){
+      return {column:col,value:s.substring(i+1).trim().toLowerCase()};
+    }
+  }
+  return {column:'name',value:s.trim().toLowerCase()};
+}
+// Example placeholders shown (greyed) in each column's chip input. One value
+// per example — values are added one at a time with Enter, not comma lists.
+var EXCLUDE_PLACEHOLDERS={
+  name:'e.g. Russia',
+  type:'e.g. vless',
+  host:'e.g. example.com',
+  transport:'e.g. tcp',
+  security:'e.g. tls'
+};
 function applyFilter(){ filterText=document.getElementById('fi').value.toLowerCase(); rebuildTable(); }
 function matches(e){
   // Per-tab dedup view filter — hide rows whose vless body appeared at an
@@ -4964,17 +6631,34 @@ function matches(e){
   // removed those entries server-side, so they're not in the entries map.
   var tab=tabsList.find(function(t){return t.id===activeTabId;});
   if(tab && tab.dedup_mode==='hide' && dupBodyIndices.has(e.index)) return false;
-  // Per-tab exclude filter
+  // Per-tab exclude filter — rules are "column:value" strings (legacy bare
+  // strings are treated as name-column). Match is case-insensitive substring.
   var ef=tab&&tab.exclude_filter?tab.exclude_filter:[];
   if(ef.length>0){
-    var nm=(e.name||'').toLowerCase();
+    var fields={
+      name:(e.name||'').toLowerCase(),
+      type:chipProto(e),
+      host:(e.host||'').toLowerCase(),
+      transport:(e.network||'').toLowerCase(),
+      security:(e.security||'').toLowerCase()
+    };
     for(var i=0;i<ef.length;i++){
-      if(nm.indexOf(ef[i].toLowerCase())>=0) return false;
+      var r=parseExcludeRule(ef[i]);
+      if(!r.value) continue;
+      var hay=fields[r.column]||fields.name;
+      if(hay.indexOf(r.value)>=0) return false;
     }
+  }
+  // Type pill filter — empty Set means "all". Multi-select: row passes when
+  // its chipProto is in the selected set. chipProto handles the SS / SS2022
+  // split so the filter agrees with the chip the user sees.
+  if(protoFilter && protoFilter.size>0){
+    if(!protoFilter.has(chipProto(e))) return false;
   }
   if(!filterText)return true;
   return(e.name||'').toLowerCase().includes(filterText)||(e.host||'').toLowerCase().includes(filterText)
-    ||(e.network||'').toLowerCase().includes(filterText)||(e.security||'').toLowerCase().includes(filterText);
+    ||(e.network||'').toLowerCase().includes(filterText)||(e.security||'').toLowerCase().includes(filterText)
+    ||(e.protocol||'').toLowerCase().includes(filterText);
 }
 
 // ── table ──────────────────────────────────────────────────────────
@@ -4988,30 +6672,44 @@ const VBUFFER = 10; // rows rendered above/below viewport
 
 function rebuildTable(){
   let list=Object.values(entries).filter(matches);
+  // Per-mode comparator. The favorites-first wrapper below applies it within
+  // each group, so favorites always sit on top but are still ordered by the
+  // active sort (and so are the non-favorites beneath them).
+  var cmp;
   if(sortMode==='ping'){
-    list.sort((a,b)=>{if(a.delay>0&&b.delay>0)return a.delay-b.delay;if(a.delay>0)return -1;if(b.delay>0)return 1;return a.index-b.index;});
+    cmp=function(a,b){if(a.delay>0&&b.delay>0)return a.delay-b.delay;if(a.delay>0)return -1;if(b.delay>0)return 1;return a.index-b.index;};
   }else if(sortMode==='speed'){
     // 1. Speed OK: sorted by speed descending
     // 2. Ping OK but speed failed/skipped: sorted by ping ascending
     // 3. Currently testing
     // 4. Ping failed: sorted by index
-    function speedRank(e){
+    var speedRank=function(e){
       if(e.speed_status==='ok' && e.speed_mbps>0) return 0;
       if(e.ping_status==='ok' && e.delay>0) return 1;
       if(e.speed_status==='testing_speed'||e.ping_status==='testing_ping') return 2;
       if(e.ping_status==='failed') return 3;
       return 4;
-    }
-    list.sort((a,b)=>{
+    };
+    cmp=function(a,b){
       const ra=speedRank(a),rb=speedRank(b);
       if(ra!==rb) return ra-rb;
       if(ra===0) return b.speed_mbps-a.speed_mbps;
       if(ra===1) return a.delay-b.delay;
       return a.index-b.index;
-    });
-  }else{list.sort((a,b)=>a.index-b.index);}
+    };
+  }else{
+    cmp=function(a,b){return a.index-b.index;};
+  }
+  // Favorites always float to the top — in EVERY sort mode — and are sorted
+  // among themselves by the active comparator; non-favorites follow, also
+  // sorted by it.
+  list.sort(function(a,b){
+    var fa=isFav(a.raw)?0:1, fb=isFav(b.raw)?0:1;
+    if(fa!==fb) return fa-fb;
+    return cmp(a,b);
+  });
   sortedList = list;
-  document.getElementById('fc').textContent=filterText?(list.length+'/'+Object.keys(entries).length+' shown'):'';
+  document.getElementById('fc').textContent=filterText?(list.length+'/'+Object.keys(entries).length):'';
   // Counters are derived from sortedList so any change in visibility — sort,
   // filter, dedup toggle, exclude filter, etc — keeps them in sync.
   recalcStats();
@@ -5089,7 +6787,7 @@ function findConnIdx(){
 }
 
 function restoreConnHighlight(){
-  if((connState.status==='connected'||connState.status==='connecting')&&(!connState.conn_tab||connState.conn_tab===activeTabId)){
+  if(connState.status==='connected'||connState.status==='connecting'){
     var idx=findConnIdx();
     if(idx>=0){
       var row=document.getElementById('r'+idx);
@@ -5171,6 +6869,7 @@ function updateRow(idx){
 function buildRow(e,pos){
   const tr=document.createElement('tr'); tr.id='r'+e.index;
   if(selectedRows.has(e.index)) tr.classList.add('selected');
+  if(flashNewIdx.has(e.index)) tr.classList.add('row-new');
   tr.onclick=(ev)=>{
     if(ev.target.closest('.act-cell'))return;
     toggleRowSelect(e.index,ev);
@@ -5200,7 +6899,12 @@ function buildRow(e,pos){
   else if(e.speed_status==='skipped'){sp='pill skipped';st='—';}
 
   const nc=(e.network||'tcp').toLowerCase().replace(/[^a-z]/g,'');
-  const isConn=connState&&connState.status==='connected'&&(!connState.conn_tab||connState.conn_tab===activeTabId)&&(connState.conn_raw?connState.conn_raw===e.raw:connState.entry_index===e.index);
+  // Connected highlight + disconnect button show on EVERY tab that holds
+  // this config (matched by raw), not just the tab it was connected from.
+  // Falling back to entry_index only makes sense within the connected tab
+  // (indices aren't comparable across tabs), so that legacy branch keeps
+  // the tab guard.
+  const isConn=connState&&connState.status==='connected'&&(connState.conn_raw?connState.conn_raw===e.raw:(connState.entry_index===e.index&&(!connState.conn_tab||connState.conn_tab===activeTabId)));
 
   let connectBtn;
   if(isConn){
@@ -5209,20 +6913,32 @@ function buildRow(e,pos){
     connectBtn='<button class="btn sm ghost" onclick="doConnect('+e.index+')" title="'+(selectedMode==='tun'?'TUN mode (all traffic)':'System Proxy (HTTP/SOCKS)')+'">connect</button>';
   }
 
+  const pr=chipProto(e);
+  // "last" badge: the single most-recently-connected config. Sits at the
+  // RIGHT end of the NAME column (next to the host column). The name is a
+  // flex item that shrinks/ellipsises while the badge stays fixed, so a long
+  // config name clips instead of colliding with the badge.
+  const isLast=e.raw && lastConnectedRaw && e.raw===lastConnectedRaw;
+  const lastBadge=isLast?'<span class="last-badge" title="Last connected config">last</span>':'';
+  // Favorite star: left of the name. stopPropagation so toggling doesn't also
+  // select the row. Favorites float to the top in the default sort order.
+  const favOn=isFav(e.raw);
+  const favStar='<span class="fav'+(favOn?' on':'')+'" title="Favorite" onclick="event.stopPropagation();toggleFav('+e.index+')">'+(favOn?'★':'☆')+'</span>';
   tr.innerHTML=
     '<td class="ci">'+pos+'</td>'+
-    '<td class="cn"><div class="nc"><span class="nm" title="'+x(e.name)+'">'+x(e.name)+'</span>'+
+    '<td class="cpr"><span class="pb '+pr+'" title="'+x(pr)+'">'+x(protoLabel(pr))+'</span></td>'+
+    '<td class="cn"><div class="nc"><div class="nm-row">'+favStar+'<span class="nm" title="'+x(e.name)+'">'+x(e.name)+'</span>'+lastBadge+'</div>'+
     '</div></td>'+
     '<td class="ch"><span class="nh">'+x(e.host||'')+(e.port?':'+e.port:'')+'</span></td>'+
     '<td class="ct"><span class="nb '+nc+'">'+x(e.network||'tcp')+'</span></td>'+
-    '<td class="cs"><span class="sb '+(e.security||'none')+'">'+x(e.security||'none')+'</span></td>'+
+    '<td class="cs"><span class="sb '+(e.security||'none')+'" title="'+x(e.security||'none')+'">'+x(e.security||'none')+'</span></td>'+
     '<td class="cp2"><div class="vc"><span class="'+pp+'" title="'+x(pt)+'">'+pt+'</span></div></td>'+
     '<td class="csp"><div class="vc"><span class="'+sp+'" title="'+x(st)+'">'+st+'</span></div></td>'+
     '<td class="ca"><div class="act-cell">'+
       connectBtn+
       '<button class="btn sm ghost" title="Ping" onclick="pingOne('+e.index+')">ping</button>'+
       '<button class="btn sm ghost"  title="Speed" onclick="speedOne('+e.index+')">speed</button>'+
-      '<button class="cpb" title="Copy vless://" onclick="cpRaw(this,'+e.index+')">⎘</button>'+
+      '<button class="cpb" title="Copy URL" onclick="cpRaw(this,'+e.index+')">⎘</button>'+
     '</div></td>';
   return tr;
 }
@@ -5243,12 +6959,12 @@ function doConnect(idx){
 function doDisconnect(){ fetch('/api/disconnect',{method:'POST'}).catch(console.error); }
 function pingOne(idx)   { fetch('/api/ping/one?idx='+idx,{method:'POST'}).catch(console.error); }
 function speedOne(idx)  { fetch('/api/speed/one?idx='+idx,{method:'POST'}).catch(console.error); }
-// Collect indices of currently visible (filter+exclude) entries.
-// matches() already accounts for both the filter input and the per-tab exclude.
+// Collect indices of currently visible entries in on-screen (sortedList)
+// order. sortedList is the result of matches() + the active sort, so the
+// server tests rows in the same order the user sees them — including the
+// default (idx) sort, which is what "test in the order on screen" means.
 function visibleIndices(){
-  var out=[];
-  Object.values(entries).forEach(function(e){ if(matches(e)) out.push(e.index); });
-  return out;
+  return sortedList.map(function(e){ return e.index; });
 }
 // When sending bulk-test requests, restrict to currently visible entries so
 // that running ping/speed all while a filter is active only tests the
@@ -5300,6 +7016,9 @@ function onActiveTab(id){
   // Reset progress bar - only show if the active tab has an ongoing bulk operation
   if(bulkProgressTab!==id) setBar(0);
   renderTabs();
+  // The conn-bar ping chip is scoped to the connected config's tab — refresh
+  // it so it hides/shows correctly after a tab switch.
+  updateConnPing();
 }
 
 function renderTabs(){
@@ -5385,6 +7104,14 @@ function showRowMenu(ev,idx){
   m.innerHTML='<div class="ctx-menu-item" onclick="copySelected();closeCtxMenu()">Copy '+label+'</div>';
   if(activeTabId!=='main'){
     m.innerHTML+='<div class="ctx-menu-item danger" onclick="deleteSelectedRows();closeCtxMenu()">Delete '+label+'</div>';
+    // Count entries that failed ping or speed so the user knows how many the
+    // bulk-delete will remove before clicking.
+    var failed=0;
+    Object.values(entries).forEach(function(en){ if(en.ping_status==='failed'||en.speed_status==='failed') failed++; });
+    if(failed>0){
+      m.innerHTML+='<div class="ctx-sep"></div>';
+      m.innerHTML+='<div class="ctx-menu-item danger" onclick="deleteFailedRows();closeCtxMenu()">Delete failed ping/speed ('+failed+')</div>';
+    }
   }
   m.style.left=ev.clientX+'px';m.style.top=ev.clientY+'px';
   document.body.appendChild(m);
@@ -5408,9 +7135,18 @@ document.querySelector('.tw').addEventListener('contextmenu',function(ev){
   setTimeout(()=>document.addEventListener('click',closeCtxMenu,{once:true}),10);
 });
 
+// containsNodeURL mirrors looksLikeNodeURL on the Go side: any text that
+// embeds one of the recognised proxy URL schemes is treated as paste-worthy.
+function containsNodeURL(text){
+  if(!text) return false;
+  var schemes=['vless://','vmess://','trojan://','ss://','hysteria2://','hy2://','tuic://'];
+  for(var i=0;i<schemes.length;i++){ if(text.indexOf(schemes[i])>=0) return true; }
+  return false;
+}
+
 function pasteFromClipboard(){
   navigator.clipboard.readText().then(function(text){
-    if(!text||!text.includes('vless://'))return;
+    if(!containsNodeURL(text))return;
     fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:text}).catch(console.error);
   }).catch(()=>{});
 }
@@ -5475,11 +7211,24 @@ function copySelected(){
 // reliable: clipboardData.setData is synchronous, doesn't depend on
 // permissions or focus state, and avoids races with the native copy
 // pipeline that were causing stale clipboard contents on Ctrl+C.
+// selectionInLogPanel: true when the user has a live (non-collapsed) text
+// selection anchored inside the Logs panel. Used so Ctrl+C / Ctrl+A defer to
+// native browser behaviour there instead of the table's row-copy/select-all.
+function selectionInLogPanel(){
+  var panel=document.getElementById('log-panel');
+  if(!panel || panel.style.display==='none') return false;
+  var sel=window.getSelection&&window.getSelection();
+  if(!sel || sel.rangeCount===0 || sel.isCollapsed) return false;
+  return panel.contains(sel.anchorNode);
+}
 document.addEventListener('copy',function(e){
   // Inputs and textareas have their own selection — let the native copy
   // handle them so users can still copy text out of the URL/filter fields.
   var ae=document.activeElement;
   if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA')) return;
+  // A highlighted selection in the Logs panel copies natively (lets the user
+  // grab just the lines they dragged over) even if table rows are selected.
+  if(selectionInLogPanel()) return;
   if(selectedRows.size===0) return; // no rows selected — fall through to native
   var lines=gatherSelectedLines();
   if(lines.length===0) return;
@@ -5491,6 +7240,38 @@ document.addEventListener('copy',function(e){
 function deleteSelectedRows(){
   if(selectedRows.size===0||activeTabId==='main')return;
   var indices=[...selectedRows];
+  selectedRows.clear();
+  fetch('/api/tab/delete-entries?id='+activeTabId,{method:'POST',body:JSON.stringify(indices)}).catch(console.error);
+}
+
+// isFav / toggleFav: per-config favorites, keyed by raw URL so they survive
+// reloads and re-sorts. Persisted in app settings; starred rows float to the
+// top in the default sort order.
+function isFav(raw){
+  return !!(raw && appSettingsJS.favorites && appSettingsJS.favorites.indexOf(raw)>=0);
+}
+function toggleFav(idx){
+  var e=entries[idx];
+  if(!e||!e.raw)return;
+  if(!appSettingsJS.favorites) appSettingsJS.favorites=[];
+  var i=appSettingsJS.favorites.indexOf(e.raw);
+  if(i>=0) appSettingsJS.favorites.splice(i,1);
+  else appSettingsJS.favorites.push(e.raw);
+  saveAppSettings();
+  rebuildTable();
+}
+
+// deleteFailedRows removes every entry in the current tab whose ping OR
+// speed test ended in failure. Same delete path as deleteSelectedRows, just
+// a different index set. No-op on the main (Sources) tab — its entries are
+// re-fetched, so deletions there wouldn't stick.
+function deleteFailedRows(){
+  if(activeTabId==='main')return;
+  var indices=[];
+  Object.values(entries).forEach(function(e){
+    if(e.ping_status==='failed'||e.speed_status==='failed') indices.push(e.index);
+  });
+  if(indices.length===0)return;
   selectedRows.clear();
   fetch('/api/tab/delete-entries?id='+activeTabId,{method:'POST',body:JSON.stringify(indices)}).catch(console.error);
 }
@@ -5521,7 +7302,9 @@ function closeCtxMenu(){
 function loadAppSettings(){
   fetch('/api/settings').then(r=>r.json()).then(s=>{
     appSettingsJS=s;
+    if(s.last_connected_raw) lastConnectedRaw=s.last_connected_raw;
     applyUIPrefs();
+    applyLogI18n();
     rebuildTable();
   }).catch(()=>{});
 }
@@ -5617,7 +7400,15 @@ function openSettings(){
         '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Custom speed URL')+'</span>'+
         '<input class="modal-input" id="set-speed-url-custom" style="margin-bottom:0" placeholder="https://..." value="'+x(isCustomURL('speed')?(appSettingsJS.speed_test_url||''):'')+'" onchange="updateTestURLCustom(\'speed\',this.value)">'+
       '</div>'+
-      '<div class="modal-hint">'+t('Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.')+'</div>'+
+      '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Speed URL fallback')+' <span style="color:var(--muted);font-weight:400">'+t('(used when the main URL returns HTTP 429)')+'</span></span>'+
+        '<select class="modal-input" id="set-speed-url-fallback" style="margin-bottom:0" onchange="updateSpeedFallback(this.value)">'+speedFallbackOptions()+'</select>'+
+      '</div>'+
+      '<div class="modal-row" id="speed-fallback-custom-row" style="display:'+(isCustomFallback()?'block':'none')+';margin-bottom:6px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Custom speed fallback URL')+'</span>'+
+        '<input class="modal-input" id="set-speed-url-fallback-custom" style="margin-bottom:0" placeholder="https://..." value="'+x(isCustomFallback()?(appSettingsJS.speed_test_url_fallback||''):'')+'" onchange="updateSpeedFallbackCustom(this.value)">'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.')+' '+t('Pick "None" to disable the retry.')+'</div>'+
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">'+t('Network')+'</div>'+
@@ -5706,6 +7497,36 @@ function openSettings(){
         '<span class="modal-row-label">'+t('Minimize to tray on close')+'</span>'+
         '<label class="toggle"><input type="checkbox" id="set-tray" '+(appSettingsJS.tray_enabled?'checked':'')+' onchange="toggleTray(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Verbose logs')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-verbose-logs" '+(appSettingsJS.verbose_logs?'checked':'')+' onchange="toggleVerboseLogs(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Raises xray/sing-box log detail (level info) so the Logs panel shows per-connection lines. Takes effect on next connection.')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Log speed/ping tests')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-log-tests" '+(appSettingsJS.log_tests?'checked':'')+' onchange="toggleLogTests(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Logs each ping/speed result plus the full core output during the test (so you can see why a config is unavailable). Off by default — bulk tests can be noisy.')+'</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">'+t('Data')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Storage location')+'</span>'+
+        '<button class="btn ghost" onclick="openStorageLocation()">'+t('Open folder')+'</button>'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Settings backup')+'</span>'+
+        '<span style="display:inline-flex;gap:6px">'+
+          '<button class="btn ghost" onclick="exportSettings()">'+t('Export')+'</button>'+
+          '<button class="btn ghost" onclick="importSettings()">'+t('Import')+'</button>'+
+        '</span>'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Import tabs and tab settings')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-import-tabs" checked><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<input type="file" id="import-file" accept=".json,application/json" style="display:none" onchange="handleImportFile(event)">'+
+      '<div class="modal-hint">'+t('Exports tabs, tab settings and app settings to a JSON file. Import replaces the current state — useful when moving Vair to another computer.')+' '+t('Turn the toggle off to import only the app settings and keep your existing tabs.')+'</div>'+
     '</div>'+
     '<div class="modal-btns">'+
       '<button class="btn ghost" onclick="document.getElementById(\'settings-modal\').remove()">'+t('close')+'</button>'+
@@ -5846,6 +7667,97 @@ function toggleTray(on){
   saveAppSettings();
   if(typeof _goToggleTray==='function') _goToggleTray(on);
 }
+function toggleVerboseLogs(on){
+  appSettingsJS.verbose_logs=on;
+  saveAppSettings();
+}
+function toggleLogTests(on){
+  appSettingsJS.log_tests=on;
+  saveAppSettings();
+}
+
+// openStorageLocation asks the server to open %LOCALAPPDATA%\\vair in
+// Explorer — that's where tabs.json, settings.json and the extracted
+// xray/sing-box binaries live.
+function openStorageLocation(){
+  fetch('/api/storage/open',{method:'POST'}).then(function(r){
+    if(!r.ok) r.text().then(function(t){ alert(t||'Could not open folder'); });
+  }).catch(function(err){ alert(err); });
+}
+
+// exportSettings asks the server for the JSON document, then lets the user
+// pick where to save it via a native Save As dialog. The browser-download
+// path (anchor with the download attribute) is only a fallback when the
+// native binding is unavailable — in WebView2 it would usually drop the
+// file in the user's Downloads folder with no chance to choose.
+function exportSettings(){
+  fetch('/api/export').then(function(r){
+    if(!r.ok) throw new Error('export failed: '+r.status);
+    return r.text();
+  }).then(function(text){
+    // Build a timestamped suggested name; the user can change it in the dialog.
+    function pad2(n){return (n<10?'0':'')+n;}
+    var d=new Date();
+    var stamp=d.getFullYear()+pad2(d.getMonth()+1)+pad2(d.getDate())+'_'+pad2(d.getHours())+pad2(d.getMinutes())+pad2(d.getSeconds());
+    var name='vair_settings_'+stamp+'.json';
+    if(typeof window._goSaveExport==='function'){
+      return Promise.resolve(window._goSaveExport(name, text)).then(function(path){
+        // Empty path == user cancelled. Nothing to do; no notification noise.
+        return path;
+      });
+    }
+    // Fallback: trigger a plain browser download.
+    var blob=new Blob([text],{type:'application/json'});
+    var url=URL.createObjectURL(blob);
+    var a=document.createElement('a');
+    a.href=url; a.download=name;
+    document.body.appendChild(a); a.click();
+    setTimeout(function(){ a.remove(); URL.revokeObjectURL(url); }, 0);
+  }).catch(function(err){ alert('Export failed: '+err); });
+}
+
+// importSettings opens the hidden <input type="file">; the change handler
+// (handleImportFile) reads the picked file and POSTs it to /api/import.
+function importSettings(){
+  var inp=document.getElementById('import-file');
+  if(!inp) return;
+  inp.value=''; // allow re-picking the same file
+  inp.click();
+}
+
+function handleImportFile(ev){
+  var f=ev.target.files && ev.target.files[0];
+  if(!f) return;
+  // Read the toggle BEFORE the confirm dialog so a dynamic-language remount
+  // can't drop the element between us and the fetch.
+  var tabsBox=document.getElementById('set-import-tabs');
+  var includeTabs=tabsBox?tabsBox.checked:true;
+  var msg=includeTabs
+    ? t('Replace current tabs and settings with the imported file? This cannot be undone.')
+    : t('Replace current app settings with the imported file? Tabs will not be touched.');
+  if(!confirm(msg)){
+    return;
+  }
+  var reader=new FileReader();
+  reader.onload=function(){
+    fetch('/api/import?tabs='+(includeTabs?'1':'0'),{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: reader.result
+    }).then(function(r){
+      if(!r.ok){
+        r.text().then(function(t){ alert('Import failed: '+t); });
+        return;
+      }
+      // Server has rebroadcast tabs/active_tab/loaded over SSE; force a
+      // full re-render via reload to make sure every cached bit of UI
+      // state (selectedRows, sortMode, modals) starts clean.
+      location.reload();
+    }).catch(function(err){ alert('Import failed: '+err); });
+  };
+  reader.onerror=function(){ alert('Could not read file'); };
+  reader.readAsText(f);
+}
 
 // updateConcurrency stores a clamped concurrency choice in app settings.
 // Server clamps again on receive (defensive), but we mirror the bounds here
@@ -5929,11 +7841,16 @@ var PING_PRESETS=[
   {url:'http://www.msftconnecttest.com/connecttest.txt',    label:'http://www.msftconnecttest.com/connecttest.txt'}
 ];
 var SPEED_PRESETS=[
-  {url:'',                                                  label:'https://speed.cloudflare.com/__down?bytes=10000000 (default)'},
-  {url:'https://speed.cloudflare.com/__down?bytes=50000000',  label:'https://speed.cloudflare.com/__down?bytes=50000000'},
+  {url:'',                                                  label:'https://speed.cloudflare.com/__down?bytes=50000000 (default)'},
+  {url:'https://speed.cloudflare.com/__down?bytes=10000000',  label:'https://speed.cloudflare.com/__down?bytes=10000000'},
   {url:'http://cachefly.cachefly.net/100mb.test',           label:'http://cachefly.cachefly.net/100mb.test'},
   {url:'https://proof.ovh.net/files/100Mb.dat',             label:'https://proof.ovh.net/files/100Mb.dat'}
 ];
+// SPEED_PRESETS[0].url is intentionally empty for the *primary* dropdown
+// (empty value tells the Go side "use the built-in default"). For the
+// fallback dropdown, empty means "no retry" instead — so we need the
+// literal default URL spelled out when listing/matching that preset there.
+var SPEED_DEFAULT_URL='https://speed.cloudflare.com/__down?bytes=50000000';
 
 // isCustomURL: true when the user's current URL doesn't match any
 // preset. We treat the empty string as the default (preset 0), not a
@@ -5987,6 +7904,84 @@ function updateTestURLCustom(kind, raw){
   var v = (raw||'').trim();
   if(kind==='ping') appSettingsJS.ping_test_url = v;
   else appSettingsJS.speed_test_url = v;
+  saveAppSettings();
+}
+// fallbackPresetURL returns the URL value for a SPEED_PRESETS entry as
+// used in the *fallback* dropdown: the first preset (which has an empty
+// URL in the primary list, meaning "use server default") gets remapped to
+// the literal SPEED_DEFAULT_URL so it can actually be selected as a
+// fallback.
+function fallbackPresetURL(p){
+  return p.url || SPEED_DEFAULT_URL;
+}
+// fallbackPresetLabel strips the "(default)" suffix when present. That
+// suffix exists in the primary dropdown to signal "leave empty → use this
+// URL", but in the fallback context it's just confusing — every option is
+// a real URL the user can pick, no defaulting involved.
+function fallbackPresetLabel(p){
+  return (p.label||'').replace(/\s*\(default\)\s*$/,'');
+}
+// isCustomFallback: true when the saved fallback URL is set but doesn't
+// match any SPEED_PRESETS entry — the dropdown should show "Custom URL…"
+// selected and reveal the text input. Empty string means "None", not custom.
+function isCustomFallback(){
+  var cur = appSettingsJS.speed_test_url_fallback||'';
+  if(cur==='' || cur==='__none') return false; // default (CacheFly) or disabled — not custom
+  for(var i=0;i<SPEED_PRESETS.length;i++){
+    if(fallbackPresetURL(SPEED_PRESETS[i])===cur) return false;
+  }
+  return true;
+}
+// speedFallbackOptions reuses SPEED_PRESETS but prepends an explicit
+// "None" option (the default — fallback disabled). The first preset's
+// empty URL is remapped to the actual Cloudflare default so the user can
+// pick it as a fallback target (the label keeps "(default)" — that hints
+// it's the same endpoint the primary slot falls back to when left blank).
+function speedFallbackOptions(){
+  var cur = appSettingsJS.speed_test_url_fallback||'';
+  // Empty / unset = the default (CacheFly is on by default). Only the explicit
+  // "__none" sentinel means the fallback is disabled.
+  if(cur==='') cur='http://cachefly.cachefly.net/100mb.test';
+  var isNone = (cur === '__none');
+  var custom = isCustomFallback();
+  var html='';
+  html += '<option value="__none"'+(isNone?' selected':'')+'>'+t('None — no fallback')+'</option>';
+  for(var i=0;i<SPEED_PRESETS.length;i++){
+    var p = SPEED_PRESETS[i];
+    var url = fallbackPresetURL(p);
+    var sel = (!isNone && !custom && url===cur) ? ' selected' : '';
+    var lbl = fallbackPresetLabel(p);
+    // CacheFly is the built-in fallback default — mark it so in the list.
+    if(url==='http://cachefly.cachefly.net/100mb.test') lbl += ' (default)';
+    html += '<option value="'+x(url)+'"'+sel+'>'+x(lbl)+'</option>';
+  }
+  html += '<option value="__custom"'+(custom?' selected':'')+'>Custom URL…</option>';
+  return html;
+}
+// updateSpeedFallback handles a dropdown change. "__none" clears the saved
+// URL (fallback disabled); "__custom" reveals the text input but doesn't
+// save until the user types and blurs; a preset saves its URL straight in.
+function updateSpeedFallback(val){
+  var customRow = document.getElementById('speed-fallback-custom-row');
+  if(val==='__none'){
+    if(customRow) customRow.style.display='none';
+    // Persist the explicit "disabled" sentinel — empty would mean "default".
+    appSettingsJS.speed_test_url_fallback = '__none';
+    saveAppSettings();
+    return;
+  }
+  if(val==='__custom'){
+    if(customRow) customRow.style.display='block';
+    var inp=document.getElementById('set-speed-url-fallback-custom');
+    if(inp && !inp.value) inp.focus();
+    return;
+  }
+  if(customRow) customRow.style.display='none';
+  appSettingsJS.speed_test_url_fallback = val;
+  saveAppSettings();
+}
+function updateSpeedFallbackCustom(raw){
+  appSettingsJS.speed_test_url_fallback = (raw||'').trim();
   saveAppSettings();
 }
 
@@ -6192,48 +8187,30 @@ function openSourcesSettings(){
   if(document.getElementById('tab-modal'))return;
   var tab=tabsList.find(function(t){return t.id==='main';});
   var ef=tab&&tab.exclude_filter?tab.exclude_filter:[];
-  var chipsHtml='';
-  for(var i=0;i<ef.length;i++){
-    chipsHtml+='<span class="chip" data-c="'+x(ef[i])+'">'+x(ef[i])+'<span class="chip-x" onclick="this.parentElement.remove()">x</span></span>';
-  }
+  // Same per-column exclude filter as the custom tabs. Legacy bare name
+  // rules already stored on the main tab parse into the Name column.
+  var efFieldsHtml=renderExcludeFields(ef);
   var ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='tab-modal';
   ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
   ov.innerHTML=
-    '<div class="modal-box">'+
-      '<div class="modal-title">Sources Settings</div>'+
-      '<div class="modal-label">Auto-refresh interval (minutes, 0 = off)</div>'+
+    '<div class="modal-box" id="tab-modal-box">'+
+      '<div class="modal-title">'+t('Sources Settings')+'</div>'+
+      '<div class="modal-label">'+t('Auto-refresh interval (minutes, 0 = off)')+'</div>'+
       '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(tab&&tab.refresh_min||0)+'" style="width:80px;margin-bottom:10px">'+
-      '<div class="modal-label">Exclude filter</div>'+
-      '<div class="chips-wrap" id="src-filter-chips">'+chipsHtml+
-        '<input class="chip-input" id="src-filter-input" placeholder="e.g. Russia, press Enter" onkeydown="srcFilterKey(event)">'+
-      '</div>'+
-      '<div class="modal-hint">Configs with matching name will be hidden.</div>'+
+      '<div class="modal-label">'+t('Exclude filter')+'</div>'+
+      '<div class="modal-hint ef-hint">'+t('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')+'</div>'+
+      '<div class="ef-fields" id="tab-filter-fields">'+efFieldsHtml+'</div>'+
       '<div class="modal-btns">'+
-        '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">cancel</button>'+
-        '<button class="btn ghost" onclick="saveSourcesSettings()">save</button>'+
+        '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">'+t('cancel')+'</button>'+
+        '<button class="btn ghost" onclick="saveSourcesSettings()">'+t('save')+'</button>'+
       '</div>'+
     '</div>';
   document.body.appendChild(ov);
 }
-function srcFilterKey(ev){
-  if(ev.key!=='Enter')return;
-  ev.preventDefault();
-  var val=ev.target.value.trim();
-  if(!val)return;
-  ev.target.value='';
-  var wrap=document.getElementById('src-filter-chips');
-  var inp=document.getElementById('src-filter-input');
-  var sp=document.createElement('span');
-  sp.className='chip';sp.setAttribute('data-c',val);
-  sp.innerHTML=x(val)+'<span class="chip-x" onclick="this.parentElement.remove()">x</span>';
-  wrap.insertBefore(sp,inp);
-}
 function saveSourcesSettings(){
   var refreshMin=parseInt(document.getElementById('ms-src-refresh').value)||0;
-  var chips=document.querySelectorAll('#src-filter-chips .chip');
-  var ef=[];
-  chips.forEach(function(c){ef.push(c.getAttribute('data-c'));});
+  var ef=collectExcludeFilter();
   document.getElementById('tab-modal').remove();
   fetch('/api/tab/set-url?id=main',{method:'POST',
     headers:{'Content-Type':'application/json'},
@@ -6334,10 +8311,7 @@ function openTabSettings(tabId){
   if(urls.length===0) urlsHtml='<div class="url-row"><input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button></div>';
 
   var ef=tab.exclude_filter||[];
-  var efHtml='';
-  for(var i=0;i<ef.length;i++){
-    efHtml+='<span class="chip" data-c="'+x(ef[i])+'">'+x(ef[i])+'<span class="chip-x" onclick="this.parentElement.remove()">x</span></span>';
-  }
+  var efFieldsHtml=renderExcludeFields(ef);
 
   // Seed modalFiles with what's already saved on the tab. We only carry
   // file metadata (name, path, size, mtime) — actual content is read from
@@ -6384,10 +8358,8 @@ function openTabSettings(tabId){
       '</div>'+
       '<div class="settings-section">'+
         '<div class="modal-label">'+t('Exclude filter')+'</div>'+
-        '<div class="chips-wrap" id="tab-filter-chips">'+efHtml+
-          '<input class="chip-input" id="tab-filter-input" placeholder="'+t('e.g. Russia, press Enter')+'" onkeydown="tabFilterKey(event)">'+
-        '</div>'+
-        '<div class="modal-hint">'+t('Configs with matching name will be hidden.')+'</div>'+
+        '<div class="modal-hint ef-hint">'+t('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')+'</div>'+
+        '<div class="ef-fields" id="tab-filter-fields">'+efFieldsHtml+'</div>'+
       '</div>'+
       '<div class="modal-btns">'+
         '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">'+t('cancel')+'</button>'+
@@ -6399,18 +8371,82 @@ function openTabSettings(tabId){
   document.getElementById('ms-name').focus();
   document.getElementById('ms-name').select();
 }
-function tabFilterKey(ev){
+// efChipHtml renders one stored value as a removable chip.
+function efChipHtml(v){
+  return '<span class="chip" data-v="'+x(v)+'">'+x(v)+
+    '<span class="chip-x" onclick="removeEfChip(this)">x</span></span>';
+}
+// renderExcludeFields builds one labelled chip box per column, pre-filled
+// with the values already stored on the tab. Values are added by typing and
+// pressing Enter (same UX as "Custom domains without VPN"); each chip has an
+// x to remove it. saveTabSettings / saveSourcesSettings read the chips back
+// into "col:value" rules. Legacy bare name rules parse into the Name column.
+function renderExcludeFields(rules){
+  var byCol={name:[],type:[],host:[],transport:[],security:[]};
+  if(rules && rules.length){
+    for(var i=0;i<rules.length;i++){
+      var r=parseExcludeRule(rules[i]);
+      if(!r.value) continue;
+      byCol[r.column].push(r.value);
+    }
+  }
+  var html='';
+  for(var k=0;k<EXCLUDE_COLS.length;k++){
+    var col=EXCLUDE_COLS[k];
+    var list=byCol[col];
+    var label=col.charAt(0).toUpperCase()+col.slice(1);
+    var chips='';
+    for(var j=0;j<list.length;j++) chips+=efChipHtml(list[j]);
+    html+='<div class="ef-field" data-col="'+col+'">'+
+      '<div class="ef-field-tag">'+label+'</div>'+
+      '<div class="chips-wrap" data-col="'+col+'">'+chips+
+        '<input class="chip-input ef-chip-input" data-col="'+col+'" placeholder="'+x(EXCLUDE_PLACEHOLDERS[col])+'" onkeydown="efChipKey(event)">'+
+      '</div>'+
+    '</div>';
+  }
+  return html;
+}
+// efChipKey turns the typed value into a chip on Enter. Modal-local only —
+// nothing is persisted until the user presses Save (which reads the chips).
+function efChipKey(ev){
   if(ev.key!=='Enter')return;
   ev.preventDefault();
-  var val=ev.target.value.trim();
+  var inp=ev.target;
+  var val=inp.value.trim();
   if(!val)return;
-  ev.target.value='';
-  var wrap=document.getElementById('tab-filter-chips');
-  var inp=document.getElementById('tab-filter-input');
-  var sp=document.createElement('span');
-  sp.className='chip';sp.setAttribute('data-c',val);
-  sp.innerHTML=x(val)+'<span class="chip-x" onclick="this.parentElement.remove()">x</span>';
-  wrap.insertBefore(sp,inp);
+  var wrap=inp.parentElement;
+  var existing=wrap.querySelectorAll('.chip');
+  for(var i=0;i<existing.length;i++){
+    if((existing[i].getAttribute('data-v')||'').toLowerCase()===val.toLowerCase()){ inp.value=''; return; }
+  }
+  inp.insertAdjacentHTML('beforebegin', efChipHtml(val));
+  inp.value='';
+}
+function removeEfChip(el){
+  var chip=el.parentElement;
+  if(chip) chip.remove();
+}
+// collectExcludeFilter reads every chip (plus any half-typed leftover in the
+// inputs) back into the stored "col:value" rule list, de-duplicated and in
+// column-display order so reopening the modal is stable.
+function collectExcludeFilter(){
+  var ef=[];
+  var seen={};
+  document.querySelectorAll('#tab-filter-fields .chips-wrap').forEach(function(wrap){
+    var col=wrap.getAttribute('data-col');
+    var push=function(v){
+      v=(v||'').trim();
+      if(!v) return;
+      var stored=col+':'+v;
+      if(seen[stored]) return;
+      seen[stored]=1;
+      ef.push(stored);
+    };
+    wrap.querySelectorAll('.chip').forEach(function(c){ push(c.getAttribute('data-v')); });
+    var inp=wrap.querySelector('.ef-chip-input');
+    if(inp) push(inp.value); // don't lose a value the user forgot to Enter
+  });
+  return ef;
 }
 function addURLRow(){
   var wrap=document.getElementById('ms-urls');
@@ -6466,9 +8502,8 @@ function saveTabSettings(tabId){
     var v=inp.value.trim();
     if(v) urls.push(v);
   });
-  var chips=document.querySelectorAll('#tab-filter-chips .chip');
-  var ef=[];
-  chips.forEach(function(c){ef.push(c.getAttribute('data-c'));});
+  // Exclude filter: chips added via Enter, read back into "col:value" rules.
+  var ef=collectExcludeFilter();
   // Send only the file metadata the server needs to find and read each
   // file. Strip isNew (client-only) and size/mtime (server re-stats on
   // save anyway, so what we'd send is stale). Content is never on the
@@ -6489,13 +8524,31 @@ function saveTabSettings(tabId){
 
 // ── Row selection + delete ───────────────────────────────────────────────────
 document.addEventListener('keydown',function(e){
-  // Ctrl+A: select all rows (prevent text selection always)
+  // Ctrl+A: select every row currently on-screen. sortedList is the
+  // filter+sort result that the table actually renders, so this naturally
+  // respects FILTER, TYPE pills, and the per-tab Exclude filter — copying
+  // afterwards never includes hidden configs.
   if(e.ctrlKey&&(e.key==='a'||e.key==='A')){
     if(document.activeElement&&(document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA'))return;
+    // If the user is selecting inside the Logs panel, Ctrl+A selects all the
+    // log text there instead of the table rows.
+    if(selectionInLogPanel()){
+      var view=document.getElementById('log-view');
+      if(view){
+        e.preventDefault();
+        e.stopPropagation();
+        var r=document.createRange();
+        r.selectNodeContents(view);
+        var s=window.getSelection();
+        s.removeAllRanges();
+        s.addRange(r);
+      }
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     selectedRows.clear();
-    Object.values(entries).forEach(en=>selectedRows.add(en.index));
+    sortedList.forEach(en=>selectedRows.add(en.index));
     rebuildTable();
     return;
   }
@@ -6540,7 +8593,7 @@ function toggleRowSelect(idx,e){
 document.addEventListener('paste', function(e){
   if(document.activeElement&&(document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA'))return;
   const text=(e.clipboardData||window.clipboardData).getData('text');
-  if(!text||!text.includes('vless://'))return;
+  if(!containsNodeURL(text))return;
   if(activeTabId==='main'){
     fetch('/api/tab/create',{method:'POST'}).then(r=>r.json()).then(tab=>{
       fetch('/api/tab/switch?id='+tab.id,{method:'POST'}).then(()=>{
@@ -6612,6 +8665,14 @@ document.addEventListener('paste', function(e){
     if(!e.target.closest('.tb-btns')) _goWinMaximize().then(syncMaxIcon);
   });
 })();
+
+// Restore the persisted type-filter selection and reflect it in the pills.
+// Runs at end-of-script so PROTO_PILLS / renderProtoPills are defined (no
+// temporal-dead-zone) and the proto-* buttons exist in the DOM. The table
+// is (re)built from SSE-driven loads, which call matches() → protoFilter,
+// so no explicit rebuildTable() is needed here.
+loadProtoFilter();
+renderProtoPills();
 
 </script>
 </body>
@@ -6774,6 +8835,230 @@ func handleRestartAdmin(w http.ResponseWriter, r *http.Request) {
 	}()
 }
 
+// handleStorageOpen reveals %LOCALAPPDATA%\vair in Explorer so the user
+// can see/back up tabs.json, settings.json, and the extracted xray/sing-box
+// binaries. Failures are reported as a 500 with the error text so the UI
+// can flash a notification.
+func handleStorageOpen(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if err := openStorageLocation(tabsDir()); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
+// handleLogs returns the current log buffer as JSON — used by the Logs panel
+// to fill itself on open. Live updates afterwards arrive via the SSE "log".
+func handleLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(logs.snapshot())
+}
+
+// handleLogsClear empties the log buffer (the panel's "Clear" button).
+func handleLogsClear(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	logs.clear()
+	go debug.FreeOSMemory() // hand the buffer's heap back to the OS
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
+// settingsExport is the on-disk file format produced by /api/export and
+// consumed by /api/import. Schema version is checked on import; bump it
+// whenever a field changes shape so old exports either keep working or
+// fail with a clear message instead of silently corrupting state.
+type settingsExport struct {
+	Version     int             `json:"version"`
+	ExportedAt  string          `json:"exported_at"`
+	AppName     string          `json:"app"`
+	AppSettings AppSettings     `json:"app_settings"`
+	Tabs        []persistedTab  `json:"tabs"`
+}
+
+const settingsExportVersion = 1
+
+// buildSettingsExport snapshots tabs + their current config entries + the
+// app settings into a single document. We send config entries (not just
+// source URLs) because a tab might be a hand-pasted collection with no
+// source URL — round-tripping it through export/import has to preserve
+// that data.
+func buildSettingsExport() settingsExport {
+	state.mu.RLock()
+	var tabs []persistedTab
+	for _, t := range state.tabs {
+		pt := persistedTab{
+			ID: t.ID, Name: t.Name,
+			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles,
+			RefreshMin: t.RefreshMin, ExcludeFilter: t.ExcludeFilter,
+			DedupMode: t.DedupMode,
+		}
+		if !t.IsMain {
+			// Snapshot the raw config strings for pasted tabs so the import
+			// on another machine sees the same configs without needing the
+			// original source URL to be reachable.
+			for _, e := range state.tabEntries[t.ID] {
+				if e != nil && e.Raw != "" {
+					pt.Configs = append(pt.Configs, e.Raw)
+				}
+			}
+		}
+		tabs = append(tabs, pt)
+	}
+	state.mu.RUnlock()
+	settingsMu.RLock()
+	settingsCopy := appSettings
+	settingsMu.RUnlock()
+	return settingsExport{
+		Version:     settingsExportVersion,
+		ExportedAt:  time.Now().UTC().Format(time.RFC3339),
+		AppName:     "Vair",
+		AppSettings: settingsCopy,
+		Tabs:        tabs,
+	}
+}
+
+func handleSettingsExport(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	data, err := json.MarshalIndent(buildSettingsExport(), "", "  ")
+	if err != nil {
+		http.Error(w, "marshal: "+err.Error(), 500)
+		return
+	}
+	filename := fmt.Sprintf("vair_settings_%s.json", time.Now().Format("20060102_150405"))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+	w.WriteHeader(200)
+	w.Write(data)
+}
+
+// handleSettingsImport accepts a settingsExport JSON payload and applies it
+// in place of the current state. The on-disk tabs.json / settings.json get
+// rewritten, the in-memory state is rebuilt, and clients are told to
+// reload via the SSE channel so the UI re-renders with the new tabs.
+func handleSettingsImport(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	// tabs=0 → import only the app settings; leave the user's existing tabs
+	// untouched. Default (no param, or anything except "0") is full import.
+	includeTabs := r.URL.Query().Get("tabs") != "0"
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024*1024))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), 400)
+		return
+	}
+	var imp settingsExport
+	if err := json.Unmarshal(body, &imp); err != nil {
+		http.Error(w, "parse JSON: "+err.Error(), 400)
+		return
+	}
+	if imp.Version == 0 || imp.Version > settingsExportVersion {
+		http.Error(w, fmt.Sprintf("unsupported export version %d (expected %d)", imp.Version, settingsExportVersion), 400)
+		return
+	}
+	if includeTabs && len(imp.Tabs) == 0 {
+		http.Error(w, "no tabs in export", 400)
+		return
+	}
+
+	// Take ownership of the new state. Stop any running tests so they
+	// don't reference about-to-be-replaced *ConfigEntry pointers.
+	if atomic.LoadInt32(&state.pingRunning) == 1 {
+		cancelPingAll()
+	}
+	if atomic.LoadInt32(&state.speedRunning) == 1 {
+		cancelSpeedAll()
+	}
+	stopConnection()
+
+	// Replace app settings (atomic on disk + in memory).
+	settingsMu.Lock()
+	appSettings = imp.AppSettings
+	settingsMu.Unlock()
+	saveSettings()
+
+	// App-settings-only import: skip the tab rebuild entirely. The SSE push
+	// at the end still refreshes any UI that watches app_settings.
+	if !includeTabs {
+		state.broadcast(SSEEvent{Type: "app_info", Payload: map[string]interface{}{
+			"singbox_available": state.singboxBin != "",
+			"is_admin":          checkAdmin(),
+			"os":                "windows",
+		}})
+		w.WriteHeader(200)
+		fmt.Fprintf(w, `{"tabs":0,"app_settings_only":true}`)
+		return
+	}
+
+	// Rebuild tabs in memory from the imported document. Mirrors loadTabs
+	// (which reads the same persistedTab shape) but on injected data
+	// instead of tabs.json.
+	state.mu.Lock()
+	state.tabs = []Tab{{ID: "main", Name: "Sources", IsMain: true, Closable: false}}
+	state.tabEntries = make(map[string][]*ConfigEntry)
+	state.entries = nil
+	for _, pt := range imp.Tabs {
+		if pt.ID == "main" {
+			for i, t := range state.tabs {
+				if t.ID == "main" {
+					state.tabs[i].ExcludeFilter = pt.ExcludeFilter
+					state.tabs[i].RefreshMin = pt.RefreshMin
+					break
+				}
+			}
+			continue
+		}
+		mode := pt.DedupMode
+		if mode == "" && pt.Dedup {
+			mode = "hide"
+		}
+		urls := pt.SourceURLs
+		if len(urls) == 0 && pt.SourceURL != "" {
+			urls = []string{pt.SourceURL}
+		}
+		tab := Tab{
+			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
+			SourceURLs: urls, SourceFiles: pt.SourceFiles,
+			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter, DedupMode: mode,
+		}
+		state.tabs = append(state.tabs, tab)
+		state.tabEntries[tab.ID] = parseConfigLines(strings.Join(pt.Configs, "\n"))
+	}
+	// Make sure the active tab still exists; if the imported set dropped it,
+	// fall back to "main".
+	activeOK := false
+	for _, t := range state.tabs {
+		if t.ID == state.activeTab {
+			activeOK = true
+			break
+		}
+	}
+	if !activeOK {
+		state.activeTab = "main"
+	}
+	state.entries = state.tabEntries[state.activeTab]
+	state.mu.Unlock()
+	saveTabs()
+
+	// Push the new tab list, active tab, and a "loaded" snapshot of the
+	// active tab's entries so every connected client refreshes without
+	// needing a page reload.
+	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
+	state.broadcast(SSEEvent{Type: "active_tab", Payload: state.activeTab})
+	if cur := state.entries; cur != nil {
+		snaps := make([]ConfigEntry, len(cur))
+		for i, e := range cur {
+			snaps[i] = e.snap()
+		}
+		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: state.activeTab})
+	}
+
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"tabs":%d}`, len(imp.Tabs))
+}
+
 func registerRoutes() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -6784,6 +9069,7 @@ func registerRoutes() {
 	http.HandleFunc("/api/disconnect", handleDisconnect)
 	http.HandleFunc("/api/conn/state", handleConnState)
 	http.HandleFunc("/api/ping/one", handlePingOne)
+	http.HandleFunc("/api/ping/connected", handlePingConnected)
 	http.HandleFunc("/api/ping/all", handlePingAll)
 	http.HandleFunc("/api/speed/one", handleSpeedOne)
 	http.HandleFunc("/api/speed/all", handleSpeedAll)
@@ -6800,10 +9086,33 @@ func registerRoutes() {
 	http.HandleFunc("/api/settings", handleSettings)
 	http.HandleFunc("/api/stats/reset", handleStatsReset)
 	http.HandleFunc("/api/restart-admin", handleRestartAdmin)
+	http.HandleFunc("/api/storage/open", handleStorageOpen)
+	http.HandleFunc("/api/export", handleSettingsExport)
+	http.HandleFunc("/api/import", handleSettingsImport)
+	http.HandleFunc("/api/logs", handleLogs)
+	http.HandleFunc("/api/logs/clear", handleLogsClear)
+	go logFlushLoop()
 }
 
 func httpListenAndServe() error {
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", webPort), nil); err != nil {
+	addr := fmt.Sprintf(":%d", webPort)
+	// The elevated relaunch (restartAsAdmin) starts the new instance before
+	// the old one has fully released the port. Retry the bind for a few
+	// seconds so the admin handoff doesn't kill the fresh process with a
+	// "address already in use" error.
+	var ln net.Listener
+	var err error
+	for i := 0; i < 40; i++ {
+		ln, err = net.Listen("tcp", addr)
+		if err == nil {
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", addr, err)
+	}
+	if err := http.Serve(ln, nil); err != nil {
 		return fmt.Errorf("server error: %w", err)
 	}
 	return nil

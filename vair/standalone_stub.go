@@ -13,3 +13,5 @@ func prewarmBinary(_ string)    {}
 // only for syntax checking; nothing reaches these.
 func pickConfigFiles(_ uintptr) []string { return nil }
 func listRunningProcessNames() []string  { return nil }
+func openStorageLocation(_ string) error { return nil }
+func saveJSONFile(_ uintptr, _ string, _ []byte) (string, error) { return "", nil }
