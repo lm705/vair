@@ -1,8 +1,8 @@
 # Vair
 
-一款用于检测并连接 VLESS 协议 VPN 配置的客户端，基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
+一款用于测试和连接 **VLESS、VMess、Trojan、Shadowsocks（包括 SS2022）、Hysteria2、TUIC** 协议 VPN 配置的客户端。基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
 
-仅支持 **VLESS** 协议。
+仅支持 **Windows**。
 
 ## vless_alive.txt
 
