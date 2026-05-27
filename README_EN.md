@@ -2,7 +2,7 @@
 
 A client for testing and connecting to VPN configurations supporting the **VLESS, VMess, Trojan, Shadowsocks (including SS2022), Hysteria2, TUIC** protocols. Built on top of [Xray-core](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box).
 
-Only the **VLESS** protocol is supported.
+**Windows** only.
 
 ## vless_alive.txt
 
