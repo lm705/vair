@@ -97,11 +97,11 @@ func extractBinaries() (fresh bool, err error) {
 		perm os.FileMode
 	}
 	files := []entry{
-		{"xray.exe",    embeddedXray,    0755},
-		{"sing-box.exe",embeddedSingbox, 0755},
-		{"geoip.dat",   embeddedGeoIP,   0644},
+		{"xray.exe", embeddedXray, 0755},
+		{"sing-box.exe", embeddedSingbox, 0755},
+		{"geoip.dat", embeddedGeoIP, 0644},
 		{"geosite.dat", embeddedGeosite, 0644},
-		{"icon.ico",    embeddedIcon,    0644},
+		{"icon.ico", embeddedIcon, 0644},
 	}
 	for _, f := range files {
 		dst := filepath.Join(dir, f.name)
@@ -113,7 +113,7 @@ func extractBinaries() (fresh bool, err error) {
 		}
 		fresh = true
 	}
-	state.xrayBin    = filepath.Join(dir, "xray.exe")
+	state.xrayBin = filepath.Join(dir, "xray.exe")
 	state.singboxBin = filepath.Join(dir, "sing-box.exe")
 	return fresh, nil
 }
@@ -129,63 +129,76 @@ func prewarmBinary(binPath string) {
 // ── Win32 ─────────────────────────────────────────────────────────────────────
 
 var (
-	user32  = windows.NewLazySystemDLL("user32.dll")
+	user32 = windows.NewLazySystemDLL("user32.dll")
 	dwmapi = windows.NewLazySystemDLL("dwmapi.dll")
 
-	procGetWindowLongW              = user32.NewProc("GetWindowLongW")
-	procSetWindowLongW              = user32.NewProc("SetWindowLongW")
-	procSetWindowLongPtrW           = user32.NewProc("SetWindowLongPtrW")
-	procCallWindowProcW             = user32.NewProc("CallWindowProcW")
-	procSetWindowPos                = user32.NewProc("SetWindowPos")
-	procShowWindow                  = user32.NewProc("ShowWindow")
-	procIsZoomed                    = user32.NewProc("IsZoomed")
-	procSendMessageW                = user32.NewProc("SendMessageW")
-	procReleaseCapture              = user32.NewProc("ReleaseCapture")
-	procGetSystemMetrics            = user32.NewProc("GetSystemMetrics")
-	procGetWindowRect               = user32.NewProc("GetWindowRect")
-	procSystemParametersInfoW      = user32.NewProc("SystemParametersInfoW")
-	procLoadImageW                  = user32.NewProc("LoadImageW")
-	procPostMessageW                = user32.NewProc("PostMessageW")
+	procGetWindowLongW               = user32.NewProc("GetWindowLongW")
+	procSetWindowLongW               = user32.NewProc("SetWindowLongW")
+	procSetWindowLongPtrW            = user32.NewProc("SetWindowLongPtrW")
+	procCallWindowProcW              = user32.NewProc("CallWindowProcW")
+	procSetWindowPos                 = user32.NewProc("SetWindowPos")
+	procShowWindow                   = user32.NewProc("ShowWindow")
+	procIsZoomed                     = user32.NewProc("IsZoomed")
+	procSendMessageW                 = user32.NewProc("SendMessageW")
+	procReleaseCapture               = user32.NewProc("ReleaseCapture")
+	procGetSystemMetrics             = user32.NewProc("GetSystemMetrics")
+	procGetWindowRect                = user32.NewProc("GetWindowRect")
+	procSystemParametersInfoW        = user32.NewProc("SystemParametersInfoW")
+	procLoadImageW                   = user32.NewProc("LoadImageW")
+	procPostMessageW                 = user32.NewProc("PostMessageW")
 	procDwmExtendFrameIntoClientArea = dwmapi.NewProc("DwmExtendFrameIntoClientArea")
 	procSetForegroundWindow          = user32.NewProc("SetForegroundWindow")
 	procBringWindowToTop             = user32.NewProc("BringWindowToTop")
 	procIsWindowVisible              = user32.NewProc("IsWindowVisible")
-	procDwmSetWindowAttribute       = dwmapi.NewProc("DwmSetWindowAttribute")
-	procEnumChildWindows            = user32.NewProc("EnumChildWindows")
-	procCreatePopupMenu             = user32.NewProc("CreatePopupMenu")
-	procInsertMenuW                 = user32.NewProc("InsertMenuW")
-	procTrackPopupMenu              = user32.NewProc("TrackPopupMenu")
-	procDestroyMenu                 = user32.NewProc("DestroyMenu")
-	procGetCursorPos                = user32.NewProc("GetCursorPos")
+	procDwmSetWindowAttribute        = dwmapi.NewProc("DwmSetWindowAttribute")
+	procEnumChildWindows             = user32.NewProc("EnumChildWindows")
+	procCreatePopupMenu              = user32.NewProc("CreatePopupMenu")
+	procInsertMenuW                  = user32.NewProc("InsertMenuW")
+	procTrackPopupMenu               = user32.NewProc("TrackPopupMenu")
+	procDestroyMenu                  = user32.NewProc("DestroyMenu")
+	procGetCursorPos                 = user32.NewProc("GetCursorPos")
+	procMonitorFromWindow            = user32.NewProc("MonitorFromWindow")
+	procGetMonitorInfoW              = user32.NewProc("GetMonitorInfoW")
 
-	shell32                        = windows.NewLazySystemDLL("shell32.dll")
-	procShellNotifyIconW           = shell32.NewProc("Shell_NotifyIconW")
+	shell32              = windows.NewLazySystemDLL("shell32.dll")
+	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
 
 	// File-open dialog (used by _goPickFiles).
-	comdlg32              = windows.NewLazySystemDLL("comdlg32.dll")
-	procGetOpenFileNameW  = comdlg32.NewProc("GetOpenFileNameW")
-	procGetSaveFileNameW  = comdlg32.NewProc("GetSaveFileNameW")
+	comdlg32             = windows.NewLazySystemDLL("comdlg32.dll")
+	procGetOpenFileNameW = comdlg32.NewProc("GetOpenFileNameW")
+	procGetSaveFileNameW = comdlg32.NewProc("GetSaveFileNameW")
 )
 
 type dwmMargins struct{ Left, Right, Top, Bottom int32 }
 
 // Win32 structs for WM_GETMINMAXINFO
 type winPoint struct{ X, Y int32 }
-type winRect  struct{ Left, Top, Right, Bottom int32 }
+type winRect struct{ Left, Top, Right, Bottom int32 }
 type minMaxInfo struct {
-	Reserved    winPoint
-	MaxSize     winPoint // maximized window size
-	MaxPosition winPoint // maximized window position
+	Reserved     winPoint
+	MaxSize      winPoint // maximized window size
+	MaxPosition  winPoint // maximized window position
 	MinTrackSize winPoint
 	MaxTrackSize winPoint
 }
 
+// monitorInfo mirrors the Win32 MONITORINFO struct. RcWork is the monitor's
+// work area (full bounds minus taskbar) in virtual-desktop coordinates.
+type monitorInfo struct {
+	CbSize    uint32
+	RcMonitor winRect
+	RcWork    winRect
+	DwFlags   uint32
+}
+
+const monitorDefaultToNearest = 2 // MONITOR_DEFAULTTONEAREST
+
 // GWL_STYLE = -16, GWL_EXSTYLE = -20, GWLP_WNDPROC = -4
 // Must be int32 vars — uintptr can't hold negative constants at compile time.
 var (
-	gwlStyleVal  int32 = -16
-	gwlExStyle   int32 = -20
-	gwlpWndproc  int32 = -4
+	gwlStyleVal int32 = -16
+	gwlExStyle  int32 = -20
+	gwlpWndproc int32 = -4
 )
 
 const (
@@ -207,6 +220,7 @@ const (
 	swpNomove       = 0x0002
 	swpNosize       = 0x0001
 	swpNozorder     = 0x0004
+	swpNoactivate   = 0x0010
 
 	wmNclbuttondown = 0x00A1
 	wmSysCommand    = 0x0112
@@ -217,7 +231,7 @@ const (
 	wmLbuttonup     = 0x0202
 	wmRbuttonup     = 0x0205
 
-	htCaption     = 2
+	htCaption       = 2
 	wmNccalcsize    = 0x0083
 	wmNchittest     = 0x0084
 	wmGetMinMaxInfo = 0x0024
@@ -238,9 +252,9 @@ const (
 	// Win32 value is -1; as uintptr on 64-bit = 0xFFFFFFFFFFFFFFFF.
 	htTransparent = ^uintptr(0)
 
-	iconSmall     = 0
-	iconBig       = 1
-	imageIcon     = 1
+	iconSmall      = 0
+	iconBig        = 1
+	imageIcon      = 1
 	lrLoadfromfile = 0x00000010
 	lrDefaultsize  = 0x00000040
 )
@@ -266,9 +280,9 @@ var origWndProc uintptr
 const resizeBorder = 8 // pixels, slightly wider than default for easy grabbing
 
 var (
-	resizeParentHWND uintptr          // set once in addChildSubclassing
-	childOrigProcs   sync.Map         // hwnd (uintptr) → original WndProc (uintptr)
-	childWndProcCB   uintptr          // single stable callback for all children
+	resizeParentHWND uintptr  // set once in addChildSubclassing
+	childOrigProcs   sync.Map // hwnd (uintptr) → original WndProc (uintptr)
+	childWndProcCB   uintptr  // single stable callback for all children
 )
 
 // initChildResizeCB initialises childWndProcCB.  Must be called before
@@ -302,16 +316,84 @@ func initChildResizeCB() {
 // Safe to call multiple times; children that are already subclassed are skipped.
 func addChildSubclassing(parentHWND uintptr) {
 	resizeParentHWND = parentHWND
+	gwlp := uintptr(uint32(gwlpWndproc))
 	cb := syscall.NewCallback(func(child, _ uintptr) uintptr {
-		gwlp := uintptr(uint32(gwlpWndproc))
-		// Subclass the child: replace its WndProc with ours
-		orig, _, _ := procSetWindowLongPtrW.Call(child, gwlp, childWndProcCB)
-		if orig != 0 && orig != childWndProcCB {
-			childOrigProcs.Store(child, orig)
+		if _, done := childOrigProcs.Load(child); !done {
+			orig, _, _ := procSetWindowLongPtrW.Call(child, gwlp, childWndProcCB)
+			if orig != 0 && orig != childWndProcCB {
+				childOrigProcs.Store(child, orig)
+			}
 		}
 		return 1 // continue enumeration
 	})
 	procEnumChildWindows.Call(parentHWND, cb, 0)
+}
+
+// idealWindowSize returns the preferred (w,h) for a window on a monitor whose
+// work area is workW×workH: pct% of the work area, floored at minWinW×minWinH —
+// but never larger than the work area itself (so a small monitor gets a small
+// window). No upper cap: 100% fills the monitor's work area, 50% is half, etc.,
+// so the percentage is honest. This is the SINGLE source of truth for "default
+// window size", used both at launch and on un-maximize, so the result is
+// deterministic per monitor and never path-dependent.
+func idealWindowSize(workW, workH, pct int32) (int32, int32) {
+	if pct < 40 {
+		pct = 40
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	w := workW * pct / 100
+	h := workH * pct / 100
+	// Lower floor: the in-app layout (header stats + controls, conn-bar) needs
+	// ~960 CSS px to lay out without wrapping. minWinW gives headroom over that
+	// (window frame + a little slack). Below it the body's min-width + the OS
+	// window's horizontal scroll keep the UI usable rather than collapsing.
+	const minWinW, minWinH = 980, 620
+	if w < minWinW {
+		w = minWinW
+	}
+	if h < minWinH {
+		h = minWinH
+	}
+	// Never exceed the monitor's work area (a 1366×768 laptop must not get a
+	// 980-wide window forced past its edge). On a monitor smaller than the
+	// floor this yields a window = the whole work area, which is the best we
+	// can do; the CSS min-width + horizontal scroll then handle the overflow.
+	if w > workW {
+		w = workW
+	}
+	if h > workH {
+		h = workH
+	}
+	return w, h
+}
+
+// applyIdealWindowSize resizes + centers the window to idealWindowSize for the
+// monitor it currently sits on, using the user's WindowSizePct setting. Called
+// on un-maximize (so restore is recomputed per-monitor, not the stale launch
+// rect) and when the size setting changes. Deterministic: the same monitor + %
+// always yields the same window, regardless of how the user got there — which
+// fixes the "small size sticks after moving between monitors" bug.
+func applyIdealWindowSize(hwnd uintptr) {
+	hMon, _, _ := procMonitorFromWindow.Call(hwnd, monitorDefaultToNearest)
+	if hMon == 0 {
+		return
+	}
+	var mi monitorInfo
+	mi.CbSize = uint32(unsafe.Sizeof(mi))
+	if r, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi))); r == 0 {
+		return
+	}
+	work := mi.RcWork
+	workW := work.Right - work.Left
+	workH := work.Bottom - work.Top
+	w, h := idealWindowSize(workW, workH, int32(currentWindowSizePct()))
+	// Center within the work area.
+	x := work.Left + (workW-w)/2
+	y := work.Top + (workH-h)/2
+	procSetWindowPos.Call(hwnd, 0, uintptr(x), uintptr(y), uintptr(w), uintptr(h),
+		swpNozorder|swpNoactivate)
 }
 
 // wndProcCallback is the custom WndProc that handles SC_MINIMIZE from taskbar.
@@ -355,31 +437,64 @@ func init() {
 			var wr winRect
 			procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&wr)))
 			const border = 6 // resize border width in pixels
-			left   := cx < wr.Left  + border
-			right  := cx >= wr.Right - border
-			top    := cy < wr.Top   + border
-			bottom := cy >= wr.Bottom - border
+			left := cx < wr.Left+border
+			right := cx >= wr.Right-border
+			top := cy < wr.Top+border
+			bottom := cy >= wr.Bottom-border
 			switch {
-			case top && left:  return htTopLeft
-			case top && right: return htTopRight
-			case bottom && left:  return htBottomLeft
-			case bottom && right: return htBottomRight
-			case top:    return htTop
-			case bottom: return htBottom
-			case left:   return htLeft
-			case right:  return htRight
+			case top && left:
+				return htTopLeft
+			case top && right:
+				return htTopRight
+			case bottom && left:
+				return htBottomLeft
+			case bottom && right:
+				return htBottomRight
+			case top:
+				return htTop
+			case bottom:
+				return htBottom
+			case left:
+				return htLeft
+			case right:
+				return htRight
 			}
 			// Anything else: let the default proc decide (htClient for the content area)
 			ret, _, _ := procCallWindowProcW.Call(origWndProc, hwnd, msg, wParam, lParam)
 			return ret
 
 		case wmGetMinMaxInfo:
-			// Limit maximized window to the work area so it never covers the taskbar.
+			// Limit a maximized window to the work area of the monitor the window
+			// is CURRENTLY on (not the primary monitor). The old code used
+			// SystemParametersInfo(SPI_GETWORKAREA), which always returns the
+			// PRIMARY monitor's work area — so maximizing on a smaller secondary
+			// display produced an oversized window spilling past its edges.
+			//
+			// MaxSize/MaxPosition are in coordinates relative to the target
+			// monitor's top-left, so we offset by RcMonitor (the monitor origin
+			// in the virtual desktop) — for a monitor left of/above the primary
+			// these are negative, which is exactly what Windows expects here.
 			if lParam != 0 {
+				mmi := (*minMaxInfo)(unsafe.Pointer(lParam))
+				hMon, _, _ := procMonitorFromWindow.Call(hwnd, monitorDefaultToNearest)
+				var mi monitorInfo
+				mi.CbSize = uint32(unsafe.Sizeof(mi))
+				if hMon != 0 {
+					r1, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi)))
+					if r1 != 0 {
+						work := mi.RcWork
+						mon := mi.RcMonitor
+						mmi.MaxPosition.X = work.Left - mon.Left
+						mmi.MaxPosition.Y = work.Top - mon.Top
+						mmi.MaxSize.X = work.Right - work.Left
+						mmi.MaxSize.Y = work.Bottom - work.Top
+						return 0
+					}
+				}
+				// Fallback: primary-monitor work area (previous behaviour).
 				var workArea winRect
 				procSystemParametersInfoW.Call(spiGetWorkArea, 0,
 					uintptr(unsafe.Pointer(&workArea)), 0)
-				mmi := (*minMaxInfo)(unsafe.Pointer(lParam))
 				mmi.MaxPosition.X = workArea.Left
 				mmi.MaxPosition.Y = workArea.Top
 				mmi.MaxSize.X = workArea.Right - workArea.Left
@@ -414,19 +529,19 @@ func init() {
 // setupWindow makes the WebView2 window frameless while keeping all expected
 // Windows behaviours: taskbar minimize, Aero Snap, alt-tab, window icon.
 func setupWindow(hwnd uintptr) {
-	gwl   := uintptr(uint32(gwlStyleVal))
+	gwl := uintptr(uint32(gwlStyleVal))
 	gwlEx := uintptr(uint32(gwlExStyle))
-	gwlp  := uintptr(uint32(gwlpWndproc))
+	gwlp := uintptr(uint32(gwlpWndproc))
 
 	// ── 1. Strip title bar, keep resize/minimize/maximize behaviour ──────────
 	style, _, _ := procGetWindowLongW.Call(hwnd, gwl)
 	style &^= wsCaption | wsSysMenu
-	style |=  wsThickFrame | wsMinimizeBox | wsMaximizeBox
+	style |= wsThickFrame | wsMinimizeBox | wsMaximizeBox
 	procSetWindowLongW.Call(hwnd, gwl, style)
 
 	// ── 2. Ensure the taskbar button is always visible ────────────────────────
 	exStyle, _, _ := procGetWindowLongW.Call(hwnd, gwlEx)
-	exStyle |=  wsExAppWindow
+	exStyle |= wsExAppWindow
 	exStyle &^= wsExToolWindow
 	procSetWindowLongW.Call(hwnd, gwlEx, exStyle)
 
@@ -464,8 +579,9 @@ func setupWindow(hwnd uintptr) {
 // ICON_SMALL (32x32) is used for notification area and legacy title bars.
 // setWindowIcon loads icon.ico and sets it as the window/taskbar/alt-tab icon.
 // Windows selects icon size based on DPI:
-//   SM_CXICON  (index 11): large icon size — used for WM_SETICON ICON_BIG (taskbar)
-//   SM_CXSMICON (index 49): small icon size — used for WM_SETICON ICON_SMALL
+//
+//	SM_CXICON  (index 11): large icon size — used for WM_SETICON ICON_BIG (taskbar)
+//	SM_CXSMICON (index 49): small icon size — used for WM_SETICON ICON_SMALL
 func setWindowIcon(hwnd uintptr) {
 	iconPath := filepath.Join(binDir, "icon.ico")
 	if _, err := os.Stat(iconPath); err != nil {
@@ -480,9 +596,11 @@ func setWindowIcon(hwnd uintptr) {
 	// For the taskbar (ICON_BIG): use 48px — larger than SM_CXICON (32px)
 	// which makes the icon sharper and more prominent on the taskbar.
 	// Windows will downscale if the taskbar slot is smaller.
-	bigSz   := uintptr(48)
+	bigSz := uintptr(48)
 	smallSz, _, _ := procGetSystemMetrics.Call(49) // SM_CXSMICON (16 at 100%, 20 at 125%)
-	if smallSz == 0 { smallSz = 16 }
+	if smallSz == 0 {
+		smallSz = 16
+	}
 
 	hBig, _, _ := procLoadImageW.Call(
 		0, uintptr(unsafe.Pointer(pathW)),
@@ -510,15 +628,16 @@ const logoBase64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAAAiCAYAAADvVd+PAAAAIGNIUk0AAHom
 func openNativeWindow(addr string) {
 	time.Sleep(300 * time.Millisecond)
 
-	// Scale window to ~80% of screen, capped at 1440x920
-	screenW, _, _ := procGetSystemMetrics.Call(0)  // SM_CXSCREEN
-	screenH, _, _ := procGetSystemMetrics.Call(1)  // SM_CYSCREEN
-	winW := int(screenW) * 80 / 100
-	winH := int(screenH) * 80 / 100
-	if winW > 1440 { winW = 1440 }
-	if winH > 920 { winH = 920 }
-	if winW < 900 { winW = 900 }
-	if winH < 600 { winH = 600 }
+	// Initial size = WindowSizePct% of the primary monitor (the window opens
+	// centered there), via the same idealWindowSize logic used on un-maximize so
+	// launch and restore agree. SM_CXSCREEN/CYSCREEN is the primary monitor's
+	// full size; close enough to its work area for the initial placement, and
+	// the caps/floors in idealWindowSize keep it sane.
+	screenW, _, _ := procGetSystemMetrics.Call(0) // SM_CXSCREEN
+	screenH, _, _ := procGetSystemMetrics.Call(1) // SM_CYSCREEN
+	iw, ih := idealWindowSize(int32(screenW), int32(screenH), int32(currentWindowSizePct()))
+	winW := int(iw)
+	winH := int(ih)
 
 	w := webview.NewWithOptions(webview.WebViewOptions{
 		Debug:     false,
@@ -564,13 +683,25 @@ func openNativeWindow(addr string) {
 				continue
 			}
 			cs := state.conn.snap()
+			settingsMu.RLock()
+			autoOn := appSettings.AutoConnect
+			settingsMu.RUnlock()
 			tip := "Vair"
 			if cs.Status == ConnConnected {
 				mode := "Proxy"
 				if cs.Mode == ModeTUN {
 					mode = "TUN"
 				}
-				tip = fmt.Sprintf("Vair — %s [%s]", cs.EntryName, mode)
+				// EntryName is already the joined "A → B" for a chain; prefix it
+				// so the tray clearly distinguishes a chain from a single config.
+				if len(cs.Chain) > 1 {
+					tip = fmt.Sprintf("Vair — ⛓ %s [%s]", cs.EntryName, mode)
+				} else {
+					tip = fmt.Sprintf("Vair — %s [%s]", cs.EntryName, mode)
+				}
+			}
+			if autoOn {
+				tip += " ⟳ auto"
 			}
 			if tip != lastTip {
 				updateTrayTooltip(hwnd, tip)
@@ -610,6 +741,11 @@ func openNativeWindow(addr string) {
 		zoomed, _, _ := procIsZoomed.Call(hwnd)
 		if zoomed != 0 {
 			procShowWindow.Call(hwnd, swRestore)
+			// Recompute the restore size for THIS monitor (deterministic per
+			// monitor + size%), instead of reusing the stale launch rect that was
+			// based on the primary monitor. Fixes both "too big on small monitor"
+			// and "stays small after moving to a big monitor".
+			applyIdealWindowSize(hwnd)
 			return false
 		}
 		procShowWindow.Call(hwnd, swMaximize)
@@ -618,6 +754,16 @@ func openNativeWindow(addr string) {
 	w.Bind("_goWinIsMaximized", func() bool {
 		zoomed, _, _ := procIsZoomed.Call(hwnd)
 		return zoomed != 0
+	})
+	// _goApplyWindowSize re-applies the default window size for the current
+	// monitor, using the freshly-saved WindowSizePct. Called from the Settings
+	// UI right after the % changes. No-op while maximized (the change takes
+	// effect on the next un-maximize instead).
+	w.Bind("_goApplyWindowSize", func() {
+		if zoomed, _, _ := procIsZoomed.Call(hwnd); zoomed != 0 {
+			return
+		}
+		applyIdealWindowSize(hwnd)
 	})
 	w.Bind("_goWinDragStart", func() {
 		procReleaseCapture.Call()
@@ -695,8 +841,8 @@ func openNativeWindow(addr string) {
 // ── System Tray (notify icon) ─────────────────────────────────────────────────
 
 const (
-	nimAdd    = 0x00000000
-	nimDelete = 0x00000002
+	nimAdd     = 0x00000000
+	nimDelete  = 0x00000002
 	nifMessage = 0x01
 	nifIcon    = 0x02
 	nifTip     = 0x04
@@ -768,18 +914,37 @@ func showTrayMenu(hwnd uintptr) {
 	cs := state.conn.snap()
 	isConnected := cs.Status == ConnConnected
 
+	settingsMu.RLock()
+	autoOn := appSettings.AutoConnect
+	settingsMu.RUnlock()
+
 	menuIdx := uint32(0)
 
 	if isConnected {
-		// Show connected config name (greyed, informational)
+		// Show connected config name (greyed, informational). For a chain,
+		// EntryName is the joined "A → B"; mark it with ⛓ so it's distinguishable.
 		mode := "Proxy"
 		if cs.Mode == ModeTUN {
 			mode = "TUN"
 		}
-		label := fmt.Sprintf("● %s [%s]", cs.EntryName, mode)
+		marker := "●"
+		if len(cs.Chain) > 1 {
+			marker = "⛓"
+		}
+		label := fmt.Sprintf("%s %s [%s]", marker, cs.EntryName, mode)
 		labelW, _ := syscall.UTF16PtrFromString(label)
 		procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString|mfGreyed, 0, uintptr(unsafe.Pointer(labelW)))
 		menuIdx++
+	}
+
+	if autoOn {
+		// Greyed info line so the user can see auto mode is active from the tray.
+		autoLabelW, _ := syscall.UTF16PtrFromString("⟳ Auto-connect: ON")
+		procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString|mfGreyed, 0, uintptr(unsafe.Pointer(autoLabelW)))
+		menuIdx++
+	}
+
+	if isConnected || autoOn {
 		procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfSeparator, 0, 0)
 		menuIdx++
 	}
@@ -787,6 +952,14 @@ func showTrayMenu(hwnd uintptr) {
 	showW, _ := syscall.UTF16PtrFromString("Show")
 	procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString, 1001, uintptr(unsafe.Pointer(showW)))
 	menuIdx++
+
+	if autoOn {
+		// Switch now: ask the supervisor to fail over to the next-best config
+		// (or connect, if currently idle) on its next tick.
+		switchW, _ := syscall.UTF16PtrFromString("Switch now")
+		procInsertMenuW.Call(hMenu, uintptr(menuIdx), mfString, 1004, uintptr(unsafe.Pointer(switchW)))
+		menuIdx++
+	}
 
 	if isConnected {
 		disconnectW, _ := syscall.UTF16PtrFromString("Disconnect")
@@ -810,6 +983,15 @@ func showTrayMenu(hwnd uintptr) {
 		procShowWindow.Call(hwnd, swRestore)
 		procSetForegroundWindow.Call(hwnd)
 	case 1002:
+		// Deliberate disconnect from the tray = same intent as the in-app
+		// Disconnect button: disarm auto so the supervisor doesn't immediately
+		// reconnect/failover. Without this, auto kept running after a tray
+		// disconnect and pulled a new connection right back up.
+		autoWant.Store(false)
+		autoManaged.Store(false)
+		autoLiveRtt.Store(0)
+		autoForce.Store(false)
+		broadcastAuto("paused", "", "", "manual")
 		go func() {
 			stopConnection()
 			// Update tray tooltip
@@ -818,6 +1000,12 @@ func showTrayMenu(hwnd uintptr) {
 	case 1003:
 		removeTrayIcon(hwnd)
 		procPostMessageW.Call(hwnd, wmClose, 0, 0)
+	case 1004:
+		// Switch now (same as the panel button / HTTP endpoint): arm intent and
+		// force the supervisor to fail over / connect on its next tick.
+		autoWant.Store(true)
+		autoForce.Store(true)
+		autoKick()
 	}
 }
 
@@ -947,29 +1135,29 @@ const (
 )
 
 type openFileNameW struct {
-	StructSize     uint32
-	Owner          uintptr
-	Instance       uintptr
-	Filter         *uint16
-	CustomFilter   *uint16
-	MaxCustFilter  uint32
-	FilterIndex    uint32
-	File           *uint16
-	MaxFile        uint32
-	FileTitle      *uint16
-	MaxFileTitle   uint32
-	InitialDir     *uint16
-	Title          *uint16
-	Flags          uint32
-	FileOffset     uint16
-	FileExtension  uint16
-	DefExt         *uint16
-	CustData       uintptr
-	FnHook         uintptr
-	TemplateName   *uint16
-	PvReserved     uintptr
-	DwReserved     uint32
-	FlagsEx        uint32
+	StructSize    uint32
+	Owner         uintptr
+	Instance      uintptr
+	Filter        *uint16
+	CustomFilter  *uint16
+	MaxCustFilter uint32
+	FilterIndex   uint32
+	File          *uint16
+	MaxFile       uint32
+	FileTitle     *uint16
+	MaxFileTitle  uint32
+	InitialDir    *uint16
+	Title         *uint16
+	Flags         uint32
+	FileOffset    uint16
+	FileExtension uint16
+	DefExt        *uint16
+	CustData      uintptr
+	FnHook        uintptr
+	TemplateName  *uint16
+	PvReserved    uintptr
+	DwReserved    uint32
+	FlagsEx       uint32
 }
 
 // pickConfigFiles shows the file picker and returns the selected paths.
@@ -983,12 +1171,12 @@ func pickConfigFiles(ownerHwnd uintptr) []string {
 	title := utf16Z("Select config file(s)")
 
 	ofn := openFileNameW{
-		Owner:    ownerHwnd,
-		Filter:   &filter[0],
-		File:     &buf[0],
-		MaxFile:  bufLen,
-		Title:    &title[0],
-		Flags:    ofnAllowMultiSelect | ofnExplorer | ofnPathMustExist | ofnFileMustExist | ofnHideReadOnly | ofnNoChangeDir,
+		Owner:   ownerHwnd,
+		Filter:  &filter[0],
+		File:    &buf[0],
+		MaxFile: bufLen,
+		Title:   &title[0],
+		Flags:   ofnAllowMultiSelect | ofnExplorer | ofnPathMustExist | ofnFileMustExist | ofnHideReadOnly | ofnNoChangeDir,
 	}
 	ofn.StructSize = uint32(unsafe.Sizeof(ofn))
 
@@ -1116,7 +1304,7 @@ type processEntry32W struct {
 }
 
 var (
-	kernel32                  = windows.NewLazySystemDLL("kernel32.dll")
+	kernel32                     = windows.NewLazySystemDLL("kernel32.dll")
 	procCreateToolhelp32Snapshot = kernel32.NewProc("CreateToolhelp32Snapshot")
 	procProcess32FirstW          = kernel32.NewProc("Process32FirstW")
 	procProcess32NextW           = kernel32.NewProc("Process32NextW")
@@ -1258,6 +1446,13 @@ func standaloneMain() {
 	registerRoutes()
 	loadTabs()
 	loadSettings()
+	// Auto-connect now implies connect-on-startup (the separate toggle was
+	// removed): if the feature is on, arm intent so the supervisor connects to
+	// the fastest working config once entries load.
+	if appSettings.AutoConnect {
+		autoWant.Store(true)
+	}
+	go startAutoSupervisor()
 	go func() {
 		if err := httpListenAndServe(); err != nil {
 			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)

@@ -1,0 +1,860 @@
+package main
+
+import (
+	"fmt"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// autoWant is the auto-supervisor's desired-state flag: true means "we
+// should be connected" (set on any user/auto connect and at startup when
+// auto-connect-on-start is on), false means the user deliberately
+// disconnected (suppresses auto-reconnect until the next manual connect or
+// restart). It is intentionally NOT part of ConnState — that struct is
+// wholesale-replaced on every transition, while this flag must persist
+// across an engine death so failover can fire. See startAutoSupervisor.
+var autoWant atomic.Bool
+
+// autoManaged is true when the *current* connection was established by the
+// supervisor (auto-connect/failover) rather than a user click. It gates the
+// "honor the candidate pool while connected" switch: we may move an
+// auto-chosen config to match a pool change, but must never yank a config the
+// user picked by hand. Set false on every user connect, true when the
+// supervisor connects.
+var autoManaged atomic.Bool
+
+// autoLiveRtt is the most recent live-probe round-trip in milliseconds for the
+// connected config (0 = unknown / not probing). Surfaced in the Auto panel
+// status so the user can see how fast the current link actually is. Updated by
+// the supervisor on each health probe; reset to 0 on disconnect.
+var autoLiveRtt atomic.Int64
+
+// autoForce, set via /api/auto/switch ("Switch now"), asks the supervisor to
+// run an immediate failover/connect on its next tick, bypassing the health
+// threshold and the min-dwell gate. autoWake nudges the supervisor so it reacts
+// within ~instant rather than waiting out its sleep.
+var autoForce atomic.Bool
+var autoWake = make(chan struct{}, 1)
+
+// autoProbeNow asks the supervisor to run a health probe on its next tick
+// instead of waiting out the full health interval. Set after a manual connect
+// while auto is on, so the panel shows the just-connected config's live ping
+// within ~2s rather than after one probe interval. Self-clearing in the loop.
+var autoProbeNow atomic.Bool
+
+// autoKick wakes the supervisor loop without blocking (buffered, drop-if-full).
+func autoKick() {
+	select {
+	case autoWake <- struct{}{}:
+	default:
+	}
+}
+
+// ─────────────────────────── auto-connect / failover ──────────────────────
+//
+// A single long-lived supervisor goroutine (startAutoSupervisor) drives both
+// auto-connect-on-start and failover. Each tick it reads AppSettings + the live
+// ConnState and acts. It takes cm.actionMu via TryLock, so a user
+// connect/disconnect always wins and the supervisor simply skips that tick.
+
+type autoCand struct {
+	entry *ConfigEntry
+	tabID string
+	raw   string
+	delay int64
+	speed float64 // measured download MBps (0 = no valid speed result)
+	rank  int     // 0 = ping OK (then by ascending delay), 1 = untested, 2 = ping failed
+}
+
+// autoHealthInterval is the probe spacing for the connected-health check.
+func autoHealthInterval() time.Duration {
+	settingsMu.RLock()
+	s := appSettings.AutoHealthSec
+	settingsMu.RUnlock()
+	if s <= 0 {
+		s = 30
+	} else if s < 5 {
+		s = 5
+	}
+	return time.Duration(s) * time.Second
+}
+
+// autoEffectiveMode resolves the mode for auto actions: explicit AutoMode, else
+// the last-connected mode, else proxy. TUN downgrades to proxy without admin.
+func autoEffectiveMode() ConnMode {
+	settingsMu.RLock()
+	m := appSettings.AutoMode
+	last := appSettings.LastConnectedMode
+	settingsMu.RUnlock()
+	mode := ConnMode(m)
+	if m == "" {
+		mode = ConnMode(last)
+	}
+	if mode != ModeProxy && mode != ModeTUN {
+		mode = ModeProxy
+	}
+	if mode == ModeTUN && !checkAdmin() {
+		mode = ModeProxy
+	}
+	return mode
+}
+
+// autoPool returns the candidate tab IDs, defaulting to the main tab.
+func autoPool() []string {
+	settingsMu.RLock()
+	pool := append([]string(nil), appSettings.AutoTabs...)
+	settingsMu.RUnlock()
+	if len(pool) == 0 {
+		pool = []string{"main"}
+	}
+	return pool
+}
+
+// autoPoolHasEntries reports whether any pool tab currently has configs loaded.
+func autoPoolHasEntries(pool []string) bool {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, tid := range pool {
+		if len(state.tabEntries[tid]) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// autoPoolHasPingData reports whether at least one pool config has a finished
+// ping result (OK or Failed). autoPingTabs pings the whole pool in one
+// synchronous sweep, so "any tested" reliably means "the sweep ran"; a fresh
+// fetch resets entries to Pending, flipping this back to false so the
+// supervisor re-pings before its next connect.
+func autoPoolHasPingData(pool []string) bool {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, tid := range pool {
+		for _, e := range state.tabEntries[tid] {
+			st := e.snap().PingStatus
+			if st == StatusOK || st == StatusFailed {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// autoConnInPool reports whether the currently-connected config belongs to the
+// selected candidate pool. Match is by raw URL within a pool tab (not just
+// ConnTab) so the same config living in multiple tabs still counts. Used to
+// honor a pool change made from the panel while already connected.
+func autoConnInPool(cs ConnState, pool []string) bool {
+	if cs.ConnRaw == "" {
+		return true // nothing to evaluate — don't force a switch
+	}
+	inPool := map[string]bool{}
+	for _, tid := range pool {
+		inPool[tid] = true
+	}
+	// Fast path: the connection's own tab is in the pool.
+	if inPool[cs.ConnTab] {
+		return true
+	}
+	// Otherwise, see if the connected raw appears in any pool tab.
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, tid := range pool {
+		for _, e := range state.tabEntries[tid] {
+			if e.snap().Raw == cs.ConnRaw {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// autoTabExcludeRules returns each pool tab's exclude-filter rules, keyed by
+// tab ID. Caller must hold state.mu (R). Used to defensively re-apply the
+// per-tab exclude filter when auto-connect picks candidates: the fetch paths
+// already drop excluded configs, but if the user edits a tab's exclude rules
+// without reloading, the in-memory entries are still the unfiltered set — so
+// auto re-checks here rather than offering a config the tab is meant to hide.
+func autoTabExcludeRulesLocked(pool []string) map[string][]string {
+	inPool := map[string]bool{}
+	for _, tid := range pool {
+		inPool[tid] = true
+	}
+	out := map[string][]string{}
+	for _, t := range state.tabs {
+		if inPool[t.ID] && len(t.ExcludeFilter) > 0 {
+			out[t.ID] = t.ExcludeFilter
+		}
+	}
+	return out
+}
+
+// autoEntryExcluded reports whether a config (already snapped) is hidden by its
+// tab's exclude rules. rules is the slice for that tab (nil ⇒ never excluded).
+func autoEntryExcluded(es ConfigEntry, rules []string) bool {
+	if len(rules) == 0 {
+		return false
+	}
+	return shouldSkip(es.Name, es.Protocol, es.Host, es.Network, es.Security, rules)
+}
+
+// autoCandidates collects connectable configs from the pool, skipping the
+// excluded raw, configs still in cooldown, unsupported/unparseable ones, and
+// any config hidden by its tab's exclude filter.
+// Ordered: ping-OK first (by descending speed when AutoRankBySpeed is on, else
+// by ascending delay), then untested, then ping-failed.
+func autoCandidates(pool []string, excludeRaw string, cooldown map[string]time.Time) []autoCand {
+	settingsMu.RLock()
+	rankBySpeed := appSettings.AutoRankBySpeed
+	settingsMu.RUnlock()
+	now := time.Now()
+	seen := map[string]bool{}
+	var out []autoCand
+	state.mu.RLock()
+	excludeRules := autoTabExcludeRulesLocked(pool)
+	for _, tid := range pool {
+		rules := excludeRules[tid]
+		for _, e := range state.tabEntries[tid] {
+			es := e.snap()
+			if es.Raw == "" || es.Raw == excludeRaw || seen[es.Raw] {
+				continue
+			}
+			if autoEntryExcluded(es, rules) {
+				continue
+			}
+			if t, ok := cooldown[es.Raw]; ok && now.Before(t) {
+				continue
+			}
+			n, err := parseNode(es.Raw)
+			if err != nil || nodeUnsupportedReason(n) != "" {
+				continue
+			}
+			seen[es.Raw] = true
+			rank := 1
+			if es.PingStatus == StatusOK {
+				rank = 0
+			} else if es.PingStatus == StatusFailed {
+				rank = 2
+			}
+			spd := 0.0
+			if es.SpeedStatus == StatusOK {
+				spd = es.SpeedMBps
+			}
+			out = append(out, autoCand{entry: e, tabID: tid, raw: es.Raw, delay: es.Delay, speed: spd, rank: rank})
+		}
+	}
+	state.mu.RUnlock()
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].rank != out[j].rank {
+			return out[i].rank < out[j].rank
+		}
+		if out[i].rank == 0 {
+			if rankBySpeed {
+				si, sj := out[i].speed, out[j].speed
+				// Configs with a real speed result rank ahead of those without,
+				// fastest first; ties / no-speed fall back to ping delay.
+				if (si > 0) != (sj > 0) {
+					return si > 0
+				}
+				if si > 0 && sj > 0 && si != sj {
+					return si > sj
+				}
+			}
+			return out[i].delay < out[j].delay
+		}
+		return false
+	})
+	return out
+}
+
+// autoBumpCooldown puts a raw on an exponential cooldown so a flapping config
+// drops out of the candidate list for a while (30s, doubling, capped 30 min).
+func autoBumpCooldown(raw string, cooldown map[string]time.Time, backoff map[string]time.Duration) {
+	const base = 30 * time.Second
+	const max = 30 * time.Minute
+	d := backoff[raw]
+	if d == 0 {
+		d = base
+	} else {
+		d *= 2
+		if d > max {
+			d = max
+		}
+	}
+	backoff[raw] = d
+	cooldown[raw] = time.Now().Add(d)
+}
+
+func autoLabel(e *ConfigEntry) string {
+	es := e.snap()
+	if es.Name != "" {
+		return es.Name
+	}
+	return fmt.Sprintf("#%d", es.Index)
+}
+
+// autoHasFasterCandidate reports whether the candidate pool holds a config
+// meaningfully faster than the currently-connected one, by the active ranking
+// metric (ping delay, or download speed when AutoRankBySpeed). It gates the
+// over-budget (slow-but-alive) failover so we never downgrade to a worse
+// config — a dead probe bypasses this entirely. Returns false when the current
+// config's own metric is unknown (can't prove an improvement → stay put), and
+// compares like-for-like (clean best-of-3 ping vs ping, speed vs speed) so a
+// spiky single live probe can't make a slower candidate look faster.
+func autoHasFasterCandidate(pool []string, cs ConnState, cooldown map[string]time.Time) bool {
+	settingsMu.RLock()
+	bySpeed := appSettings.AutoRankBySpeed
+	settingsMu.RUnlock()
+	var curDelay int64 = -1
+	var curSpeed float64 = -1
+	state.mu.RLock()
+	for _, tid := range pool {
+		for _, e := range state.tabEntries[tid] {
+			es := e.snap()
+			if es.Raw == cs.ConnRaw {
+				curDelay = es.Delay
+				if es.SpeedStatus == StatusOK {
+					curSpeed = es.SpeedMBps
+				}
+			}
+		}
+	}
+	state.mu.RUnlock()
+	// Unknown current metric ⇒ can't prove any candidate is better ⇒ don't move.
+	if bySpeed && curSpeed <= 0 {
+		return false
+	}
+	if !bySpeed && curDelay <= 0 {
+		return false
+	}
+	for _, c := range autoCandidates(pool, cs.ConnRaw, cooldown) {
+		es := c.entry.snap()
+		if es.PingStatus != StatusOK {
+			continue
+		}
+		if bySpeed {
+			if c.speed > curSpeed*1.15 { // ≥15% faster download
+				return true
+			}
+		} else if es.Delay > 0 && es.Delay < curDelay-20 { // ≥20ms lower ping
+			return true
+		}
+	}
+	return false
+}
+
+// broadcastAuto pushes an auto_update SSE event so the panel + conn-bar badge
+// can reflect the supervisor's activity. state ∈ {switching, connected,
+// all_down}.
+func broadcastAuto(stateStr, name, raw, reason string) {
+	settingsMu.RLock()
+	enabled := appSettings.AutoConnect
+	settingsMu.RUnlock()
+	state.broadcast(SSEEvent{Type: "auto_update", Payload: map[string]interface{}{
+		"enabled":      enabled,
+		"state":        stateStr,
+		"current_name": name,
+		"current_raw":  raw,
+		"reason":       reason,
+		"all_down":     stateStr == "all_down",
+		"rtt_ms":       autoLiveRtt.Load(),
+	}})
+}
+
+// autoTryConnect connects to one candidate and verifies the live tunnel.
+// Caller MUST hold cm.actionMu. Returns true only on a verified connection.
+func autoTryConnect(c autoCand, mode ConnMode) bool {
+	if mode == ModeTUN {
+		startTUNConnectionOnTab(c.entry, c.tabID)
+	} else {
+		startProxyConnectionOnTab(c.entry, c.tabID)
+	}
+	if state.conn.snap().Status != ConnConnected {
+		return false
+	}
+	// Give the freshly-started tunnel a moment to settle, then verify it
+	// actually passes traffic (a config can "connect" yet not route).
+	for attempt := 0; attempt < 2; attempt++ {
+		time.Sleep(800 * time.Millisecond)
+		if state.conn.snap().Status != ConnConnected {
+			return false
+		}
+		// Alive-only at connect time: never reject a slow-but-working config
+		// here, or failover could get stuck when every candidate is slow.
+		// The latency budget is enforced separately by the live monitor.
+		if alive, rtt := probeLiveTunnel(state.conn); alive {
+			// Publish THIS config's live RTT immediately so the panel shows the
+			// new config's ping right after a switch, instead of lingering on
+			// the previous (often slow) config's stale value.
+			autoLiveRtt.Store(rtt.Milliseconds())
+			return true
+		}
+	}
+	return false
+}
+
+// autoConnectFromPool tries pool candidates in order until one connects and
+// verifies. preferRaw (if set & present) is tried first; excludeRaw is skipped.
+// At most autoMaxAttempts are tried per sweep — cooled-down failures fall out
+// so subsequent sweeps advance through the rest of the pool. Caller MUST hold
+// cm.actionMu. Returns true on success.
+func autoConnectFromPool(pool []string, preferRaw, excludeRaw string, mode ConnMode, reason string, cooldown map[string]time.Time, backoff map[string]time.Duration) bool {
+	const autoMaxAttempts = 8
+	cands := autoCandidates(pool, excludeRaw, cooldown)
+	if len(cands) == 0 {
+		broadcastAuto("all_down", "", "", "no candidates")
+		vlog("warning", "auto: no eligible config in pool")
+		return false
+	}
+	if preferRaw != "" {
+		for i := range cands {
+			if cands[i].raw == preferRaw {
+				c := cands[i]
+				cands = append(cands[:i], cands[i+1:]...)
+				cands = append([]autoCand{c}, cands...)
+				break
+			}
+		}
+	}
+	// Clear the previous config's live RTT so the "switching" broadcasts (and any
+	// failed attempt) don't keep showing the old config's ping. autoTryConnect
+	// republishes the real value once the new config verifies.
+	autoLiveRtt.Store(0)
+	for i, c := range cands {
+		if i >= autoMaxAttempts {
+			vlog("warning", "auto: tried %d candidates without success; will retry", autoMaxAttempts)
+			return false
+		}
+		name := autoLabel(c.entry)
+		broadcastAuto("switching", name, c.raw, reason)
+		vlog("info", "auto: trying %s (%s)", name, mode)
+		if autoTryConnect(c, mode) {
+			delete(cooldown, c.raw)
+			delete(backoff, c.raw)
+			autoManaged.Store(true) // supervisor owns this connection
+			broadcastAuto("connected", name, c.raw, reason)
+			vlog("info", "auto: connected → %s (%s)", name, reason)
+			return true
+		}
+		autoBumpCooldown(c.raw, cooldown, backoff)
+		vlog("warning", "auto: %s did not work, trying next", name)
+	}
+	// Every candidate failed. That almost always means a local/network-wide
+	// outage rather than each config being individually bad — so the cooldowns
+	// we just stamped are misleading and would make the *next* sweep skip the
+	// genuinely-fastest configs and land on a slower one. Clear them so the next
+	// attempt starts clean and re-tries the fastest config first.
+	for k := range cooldown {
+		delete(cooldown, k)
+	}
+	for k := range backoff {
+		delete(backoff, k)
+	}
+	broadcastAuto("all_down", "", "", "all candidates failed")
+	vlog("warning", "auto: all candidates in pool failed")
+	return false
+}
+
+// autoPingRunning guards autoPingTabs so two background sweeps can't overlap.
+var autoPingRunning int32
+
+// autoPingTabs pings every config across the given tabs (deduped) so the
+// supervisor has fresh Delay/PingStatus for its "fastest by ping" ordering.
+// A config-list refresh rebuilds entries with no ping data, so this is what
+// keeps ordering meaningful. It yields to any user-initiated bulk test
+// (state.pingRunning / speedRunning) and never overlaps another auto-ping.
+// The currently-connected config is skipped (we already know it works via the
+// live probe, and a parallel test connection could trip per-account limits).
+// Results broadcast as entry_update; it deliberately avoids the bulk_ping_*
+// progress machinery, which is single-tab UI state.
+// autoTestTabs pings (and, when withSpeed, speed-tests) every config across the
+// given tabs. withSpeed runs the full ping→speed measurement so the supervisor
+// can rank by real download speed (AutoRankBySpeed); otherwise it's ping-only
+// (fast, for connect ordering). See autoPingTabs / the refresh path for callers.
+func autoTestTabs(tabIDs []string, withSpeed bool) {
+	if atomic.LoadInt32(&state.pingRunning) == 1 || atomic.LoadInt32(&state.speedRunning) == 1 {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&autoPingRunning, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&autoPingRunning, 0)
+
+	cs := state.conn.snap()
+	connRaw := ""
+	if cs.Status == ConnConnected {
+		connRaw = cs.ConnRaw
+	}
+
+	type pingItem struct {
+		e   *ConfigEntry
+		tab string
+	}
+	var list []pingItem
+	seen := map[string]bool{}
+	state.mu.RLock()
+	excludeRules := autoTabExcludeRulesLocked(tabIDs)
+	for _, tid := range tabIDs {
+		rules := excludeRules[tid]
+		for _, e := range state.tabEntries[tid] {
+			es := e.snap()
+			if es.Raw == "" || es.Raw == connRaw || seen[es.Raw] {
+				continue
+			}
+			// Don't waste test traffic on configs the tab's exclude filter hides.
+			if autoEntryExcluded(es, rules) {
+				continue
+			}
+			seen[es.Raw] = true
+			list = append(list, pingItem{e: e, tab: tid})
+		}
+	}
+	state.mu.RUnlock()
+	if len(list) == 0 {
+		return
+	}
+
+	sem := make(chan struct{}, currentPingConcurrency())
+	var wg sync.WaitGroup
+	for _, item := range list {
+		// Step aside the moment the user kicks off a manual bulk test.
+		if atomic.LoadInt32(&state.pingRunning) == 1 || atomic.LoadInt32(&state.speedRunning) == 1 {
+			break
+		}
+		// Bail if auto was turned off mid-sweep. Otherwise a stale sweep keeps
+		// autoPingRunning=1 to completion, so a quick disable→enable can't start a
+		// fresh sweep (the CAS fails) and the supervisor waits on the old one —
+		// the "it waits instead of starting" the user reported.
+		settingsMu.RLock()
+		stillOn := appSettings.AutoConnect
+		settingsMu.RUnlock()
+		if !stillOn {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(ent *ConfigEntry, tab string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ent.mu.Lock()
+			ent.PingStatus = StatusTestingPing
+			if withSpeed {
+				ent.SpeedStatus = StatusTestingSpeed
+			}
+			ent.mu.Unlock()
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tab})
+			if withSpeed {
+				// runSpeedForEntry does ping→speed in one engine session.
+				runSpeedForEntry(ent, tab)
+			} else {
+				runPingForEntry(ent)
+			}
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tab})
+		}(item.e, item.tab)
+	}
+	wg.Wait()
+	if withSpeed {
+		vlog("info", "auto: refreshed ping+speed for %d candidate config(s)", len(list))
+	} else {
+		vlog("info", "auto: refreshed ping for %d candidate config(s)", len(list))
+	}
+}
+
+// autoPingTabs is the ping-only entry point (connect ordering). Kept as a thin
+// wrapper so existing call sites read clearly.
+func autoPingTabs(tabIDs []string) { autoTestTabs(tabIDs, false) }
+
+// autoPingAfterRefresh re-pings a freshly auto-refreshed tab, but only when
+// auto-connect is on and the tab is part of the candidate pool. Called right
+// after a pool tab's auto-refresh completes (the refresh wipes ping data).
+func autoPingAfterRefresh(tabID string) {
+	settingsMu.RLock()
+	on := appSettings.AutoConnect && appSettings.AutoPingRefresh
+	withSpeed := appSettings.AutoRankBySpeed
+	settingsMu.RUnlock()
+	if !on {
+		return
+	}
+	for _, p := range autoPool() {
+		if p == tabID {
+			// When ranking by speed, run the full ping→speed test so the
+			// candidate list has fresh Mbps to rank by — same trigger as ping.
+			autoTestTabs([]string{tabID}, withSpeed)
+			return
+		}
+	}
+}
+
+// refreshSourcelessTab handles the auto-refresh tick for a user tab that has no
+// source URL/file (only pasted configs). There's nothing to re-fetch, but the
+// user set a refresh interval, so we honor it by resetting each config's test
+// results back to "pending" — exactly what a real reload does to a sourced tab.
+// This makes auto-refresh a meaningful feature for sourceless tabs (stale ping/
+// speed numbers get cleared on the cadence) independent of the auto-connect
+// feature. If the tab is also in the auto-connect pool, autoPingAfterRefresh
+// then re-tests it so the cleared rows get fresh data.
+func refreshSourcelessTab(tabID string) {
+	state.mu.Lock()
+	entries := state.tabEntries[tabID]
+	for _, e := range entries {
+		e.mu.Lock()
+		e.PingStatus = StatusPending
+		e.Delay = -1
+		e.PingErr = ""
+		e.SpeedStatus = StatusPending
+		e.SpeedMBps = 0
+		e.SpeedLive = 0
+		e.SpeedErr = ""
+		e.mu.Unlock()
+	}
+	active := state.activeTab == tabID
+	state.mu.Unlock()
+	if active {
+		state.mu.RLock()
+		snaps := make([]ConfigEntry, len(entries))
+		for i, e := range entries {
+			snaps[i] = e.snap()
+		}
+		state.mu.RUnlock()
+		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
+	}
+	vlog("info", "auto-refresh: reset test results for %d config(s) in sourceless tab", len(entries))
+	// If this tab feeds auto-connect, re-test the cleared rows so they're ranked.
+	autoPingAfterRefresh(tabID)
+}
+
+// startAutoSupervisor is the single goroutine that drives auto-connect and
+// failover. Launched once at startup (both startup paths). It does nothing
+// while AutoConnect is off (no probing overhead).
+func startAutoSupervisor() {
+	cm := state.conn
+	failCount := 0
+	var lastSwitch, lastProbe, nextRetry time.Time
+	cooldown := map[string]time.Time{}
+	backoff := map[string]time.Duration{}
+	const minDwell = 60 * time.Second
+
+	for {
+		select {
+		case <-time.After(2 * time.Second):
+		case <-autoWake: // "Switch now" or similar — react without waiting
+		}
+
+		settingsMu.RLock()
+		on := appSettings.AutoConnect
+		// Auto-switch (failover while connected) is no longer a separate toggle:
+		// it's an intrinsic part of auto-connect, always on when the feature is on.
+		sw := on
+		threshold := appSettings.AutoFailThreshold
+		maxLat := appSettings.AutoMaxLatencyMs
+		lastRaw := appSettings.LastConnectedRaw
+		settingsMu.RUnlock()
+		if !on {
+			failCount = 0
+			autoForce.Store(false) // don't carry a stale force into re-enable
+			continue
+		}
+		// A pending "Switch now" request. Consumed by whichever branch acts on
+		// it; left armed while a transient connect/disconnect settles.
+		forced := autoForce.Load()
+		if threshold < 1 {
+			threshold = 2
+		}
+		pool := autoPool()
+		mode := autoEffectiveMode()
+		probeEvery := autoHealthInterval()
+
+		cs := cm.snap()
+		switch cs.Status {
+		case ConnConnecting, ConnDisconnecting:
+			// transient — wait for it to settle
+		case ConnConnected:
+			// "Switch now" — leave the current config (cooled down so we don't
+			// bounce straight back) and grab the next-best, ignoring threshold
+			// and min-dwell. Works for user- and auto-owned connections alike.
+			if forced && autoPoolHasEntries(pool) {
+				if cm.actionMu.TryLock() {
+					autoForce.Store(false)
+					autoBumpCooldown(cs.ConnRaw, cooldown, backoff)
+					vlog("info", "auto: manual switch from %s", cs.EntryName)
+					ok := autoConnectFromPool(pool, "", cs.ConnRaw, mode, "manual switch", cooldown, backoff)
+					cm.actionMu.Unlock()
+					failCount = 0
+					lastProbe = time.Now()
+					if ok {
+						lastSwitch = time.Now()
+					} else {
+						nextRetry = time.Now().Add(probeEvery)
+					}
+				}
+				continue
+			}
+			// Honor the candidate pool. If the user changed the selected tabs
+			// while *auto* is keeping us connected to a config that's no longer
+			// in the pool, switch to one that is. Applies whether or not
+			// auto-switch-on-failure is on (picking tabs must do something while
+			// connected), but only for supervisor-owned connections — never
+			// yank a config the user connected to by hand.
+			if autoManaged.Load() && !autoConnInPool(cs, pool) && autoPoolHasEntries(pool) {
+				if time.Since(lastSwitch) < minDwell {
+					continue
+				}
+				if !cm.actionMu.TryLock() {
+					continue
+				}
+				vlog("info", "auto: %s is outside the selected tabs — switching", cs.EntryName)
+				ok := autoConnectFromPool(pool, "", cs.ConnRaw, mode, "tabs changed", cooldown, backoff)
+				cm.actionMu.Unlock()
+				failCount = 0
+				lastProbe = time.Now()
+				if ok {
+					lastSwitch = time.Now()
+				} else {
+					nextRetry = time.Now().Add(probeEvery)
+				}
+				continue
+			}
+			// A manual connect requests an immediate probe so the panel shows the
+			// just-connected config's live ping within ~2s. Honor it even when
+			// auto-switch is off (it's display-only there) and regardless of the
+			// probe interval.
+			probeNow := autoProbeNow.CompareAndSwap(true, false)
+			if !sw {
+				failCount = 0
+				// Still probe once for display if the user just connected manually.
+				if probeNow {
+					if alive, rtt := probeLiveTunnel(cm); alive {
+						autoLiveRtt.Store(rtt.Milliseconds())
+						broadcastAuto("health", cs.EntryName, cs.ConnRaw, "")
+					} else {
+						autoLiveRtt.Store(0)
+					}
+				}
+				continue
+			}
+			if !probeNow && time.Since(lastProbe) < probeEvery {
+				continue
+			}
+			lastProbe = time.Now()
+			alive, rtt := probeLiveTunnel(cm)
+			if alive {
+				autoLiveRtt.Store(rtt.Milliseconds())
+			} else {
+				autoLiveRtt.Store(0)
+			}
+			overBudget := alive && maxLat > 0 && rtt > time.Duration(maxLat)*time.Millisecond
+			if alive && !overBudget {
+				failCount = 0
+				// Refresh the panel with the live latency of a healthy link.
+				broadcastAuto("health", cs.EntryName, cs.ConnRaw, "")
+				continue
+			}
+			// A dead probe counts as a failure (any working config beats a broken
+			// one). An over-budget-but-alive probe also counts, but only triggers
+			// a switch when a genuinely faster config exists — see the guard
+			// below — so we never downgrade to a worse config just because the
+			// current one had a latency spike.
+			failCount++
+			reason := "probe failed"
+			if overBudget {
+				reason = fmt.Sprintf("too slow %dms", rtt.Milliseconds())
+				vlog("warning", "auto: %s too slow (%dms > %dms) (%d/%d)", cs.EntryName, rtt.Milliseconds(), maxLat, failCount, threshold)
+			} else {
+				vlog("warning", "auto: health probe failed (%d/%d) for %s", failCount, threshold, cs.EntryName)
+			}
+			if failCount < threshold || time.Since(lastSwitch) < minDwell {
+				continue
+			}
+			// Slow-but-alive: keep the current config unless the pool actually
+			// has a faster one. Otherwise switching would only move us to an
+			// equal-or-worse config. (A dead probe ignores this — it must move.)
+			if overBudget && !autoHasFasterCandidate(pool, cs, cooldown) {
+				failCount = 0 // re-arm; stay on the best-available (slow) config
+				broadcastAuto("health", cs.EntryName, cs.ConnRaw, "slow but best")
+				vlog("info", "auto: %s slow (%dms) but no faster candidate — staying", cs.EntryName, rtt.Milliseconds())
+				continue
+			}
+			// Pick the failover target by *fresh* ping ranking. If the pool has no
+			// ping data (e.g. an auto-refresh just reset entries to "pending"),
+			// autoCandidates falls back to tab order — which is the "switched to a
+			// random config, not the fastest" the user reported. Re-ping first so
+			// the sweep ranks by real delay, exactly like the manual "Switch now".
+			// The connected config is skipped inside autoPingTabs, so this is cheap
+			// and safe while still connected.
+			if !autoPoolHasPingData(pool) && atomic.LoadInt32(&autoPingRunning) == 0 {
+				autoPingTabs(pool)
+			}
+			if !cm.actionMu.TryLock() {
+				continue // user action in progress — yield
+			}
+			// Cool down the failing config so we don't immediately flap back.
+			autoBumpCooldown(cs.ConnRaw, cooldown, backoff)
+			ok := autoConnectFromPool(pool, "", cs.ConnRaw, mode, reason, cooldown, backoff)
+			cm.actionMu.Unlock()
+			failCount = 0
+			lastProbe = time.Now()
+			if ok {
+				lastSwitch = time.Now()
+			} else {
+				nextRetry = time.Now().Add(probeEvery)
+			}
+		case ConnIdle, ConnError:
+			// "Switch now" while disconnected = connect now: it arms intent and
+			// skips the back-off timer so the next-best config comes up at once.
+			if forced {
+				autoForce.Store(false)
+				autoWant.Store(true)
+				nextRetry = time.Time{}
+			}
+			if !autoWant.Load() || time.Now().Before(nextRetry) {
+				continue
+			}
+			if !autoPoolHasEntries(pool) {
+				continue // entries not loaded yet (startup) — retry next tick
+			}
+			// Never connect mid-ping: if a candidate ping (enable / refresh /
+			// startup) is in flight, wait for it so we pick the fastest config,
+			// not whichever happens to come up first.
+			if atomic.LoadInt32(&autoPingRunning) == 1 {
+				continue
+			}
+			// First connect with no ping data yet → ping the whole pool now
+			// (blocking) so ordering is by real delay. A config-list refresh
+			// resets entries to "pending", which re-triggers this next pass.
+			if !autoPoolHasPingData(pool) {
+				autoPingTabs(pool)
+				if !autoWant.Load() {
+					continue // user disconnected while we were pinging
+				}
+				if !autoPoolHasPingData(pool) {
+					// Ping couldn't run (e.g. user bulk test busy) — retry
+					// rather than connect to an unranked config.
+					nextRetry = time.Now().Add(probeEvery)
+					continue
+				}
+			}
+			if !cm.actionMu.TryLock() {
+				continue
+			}
+			// Re-check under the lock: the ping above can take several seconds,
+			// during which the user may have connected by hand. Never connect
+			// over a live/in-progress session, and respect a mid-ping manual
+			// disconnect (autoWant cleared).
+			if s := cm.snap().Status; (s != ConnIdle && s != ConnError) || !autoWant.Load() {
+				cm.actionMu.Unlock()
+				continue
+			}
+			ok := autoConnectFromPool(pool, lastRaw, "", mode, "auto-connect", cooldown, backoff)
+			cm.actionMu.Unlock()
+			if ok {
+				lastSwitch = time.Now()
+				lastProbe = time.Now()
+			} else {
+				nextRetry = time.Now().Add(probeEvery)
+			}
+		}
+	}
+}

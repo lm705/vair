@@ -250,13 +250,13 @@ func parseVless(raw string) (*VlessParams, error) {
 // TrojanParams holds parsed parameters of a `trojan://` URL.
 //
 // URL grammar (de-facto, no RFC): trojan://password@host:port?security=tls&sni=...&type=ws&path=...&host=...&alpn=...&fp=...&allowInsecure=0#name
-// - The password sits in the URL userinfo (no username component).
-// - `security` defaults to `tls` (Trojan is TLS-only by design — running it
-//   over plain TCP defeats its purpose), unlike VLESS which defaults to `none`.
-// - `type` (network) defaults to `tcp`. WS/gRPC/h2 variants exist in xray
-//   and reuse the same streamSettings as VLESS.
-// - REALITY is technically supported by xray for Trojan but extremely rare
-//   in the wild; we still parse `pbk`/`sid`/`spx` for symmetry.
+//   - The password sits in the URL userinfo (no username component).
+//   - `security` defaults to `tls` (Trojan is TLS-only by design — running it
+//     over plain TCP defeats its purpose), unlike VLESS which defaults to `none`.
+//   - `type` (network) defaults to `tcp`. WS/gRPC/h2 variants exist in xray
+//     and reuse the same streamSettings as VLESS.
+//   - REALITY is technically supported by xray for Trojan but extremely rare
+//     in the wild; we still parse `pbk`/`sid`/`spx` for symmetry.
 type TrojanParams struct {
 	Raw           string
 	Password      string
@@ -1517,26 +1517,137 @@ func buildXrayConfigForNode(n *Node, httpPort, socksPort int) map[string]interfa
 	if n == nil {
 		return nil
 	}
-	cfg := xrayShell(httpPort, socksPort)
-	outbounds := cfg["outbounds"].([]interface{})
-	switch n.Kind {
-	case KindVLESS:
-		outbounds[0] = xrayOutboundVless(n.Vless)
-	case KindTrojan:
-		outbounds[0] = xrayOutboundTrojan(n.Trojan)
-	case KindVMess:
-		outbounds[0] = xrayOutboundVmess(n.Vmess)
-	case KindSS:
-		outbounds[0] = xrayOutboundShadowsocks(n.SS)
-	default:
+	ob := xrayOutboundForNode(n)
+	if ob == nil {
 		// Not an xray protocol; caller bug.
 		return nil
 	}
+	cfg := xrayShell(httpPort, socksPort)
+	outbounds := cfg["outbounds"].([]interface{})
+	outbounds[0] = ob
 	cfg["outbounds"] = outbounds
 	if socksPort > 0 {
 		cfg["routing"] = xrayRoutingForProxy()
 	}
 	return cfg
+}
+
+// xrayOutboundForNode returns the bare proxy outbound stanza for an
+// xray-handled node (VLESS/VMess/Trojan/SS), tagged "proxy". Returns nil for
+// non-xray protocols. Factored out of buildXrayConfigForNode so the chain
+// builder can assemble several of these into one config.
+func xrayOutboundForNode(n *Node) map[string]interface{} {
+	if n == nil {
+		return nil
+	}
+	switch n.Kind {
+	case KindVLESS:
+		return xrayOutboundVless(n.Vless)
+	case KindTrojan:
+		return xrayOutboundTrojan(n.Trojan)
+	case KindVMess:
+		return xrayOutboundVmess(n.Vmess)
+	case KindSS:
+		return xrayOutboundShadowsocks(n.SS)
+	}
+	return nil
+}
+
+// buildXrayChainConfig assembles a multi-hop ("chain") xray config. Order is
+// user-meaningful: nodes[0] is the ENTRY hop (first server your machine dials),
+// nodes[len-1] is the EXIT hop (the server that egresses to the internet — its
+// IP is what sites see). Traffic path: you → nodes[0] → … → nodes[len-1] → net.
+//
+// xray wiring (this is the part that's easy to get backwards):
+//   - The routing rule sends traffic to the outbound tagged "proxy" — and that
+//     outbound is the one that egresses, i.e. the EXIT. So the EXIT (nodes[last])
+//     gets tag "proxy".
+//   - An outbound reaches ITS OWN server through streamSettings.sockopt.
+//     dialerProxy. So each hop i (i>=1) dials through hop i-1: the connection to
+//     hop i's server is tunnelled via the previous hop. The ENTRY (nodes[0]) has
+//     no dialerProxy — your machine dials it directly.
+//
+// Concretely for [Czech, NL]: Czech=entry (tag hop0, no dialer), NL=exit
+// (tag "proxy", dialerProxy=hop0). Routing → "proxy" (NL). NL's link to the NL
+// server is dialed through Czech, and Czech is dialed directly. Net path:
+// you → Czech → NL → internet; exit IP = NL.
+//
+// All nodes MUST be xray-family (see chainEngineReason). A nil/empty list or
+// any non-xray node returns nil.
+func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int) map[string]interface{} {
+	if len(nodes) == 0 {
+		return nil
+	}
+	if len(nodes) == 1 {
+		return buildXrayConfigForNode(nodes[0], httpPort, socksPort)
+	}
+	cfg := xrayShell(httpPort, socksPort)
+	shell := cfg["outbounds"].([]interface{})
+	// shell layout: [proxy-placeholder(nil), direct, block]. Keep direct+block.
+	direct, block := shell[1], shell[2]
+
+	last := len(nodes) - 1
+	// Tag each hop: the exit (routing target) is "proxy"; the others "hop{i}".
+	tagFor := func(i int) string {
+		if i == last {
+			return "proxy"
+		}
+		return fmt.Sprintf("hop%d", i)
+	}
+
+	hops := make([]interface{}, 0, len(nodes))
+	for i, n := range nodes {
+		ob := xrayOutboundForNode(n)
+		if ob == nil {
+			return nil // non-xray node slipped through — caller must pre-validate
+		}
+		ob["tag"] = tagFor(i)
+		// Every hop except the entry dials through the PREVIOUS hop.
+		if i > 0 {
+			ss, _ := ob["streamSettings"].(map[string]interface{})
+			if ss == nil {
+				ss = map[string]interface{}{}
+				ob["streamSettings"] = ss
+			}
+			sockopt, _ := ss["sockopt"].(map[string]interface{})
+			if sockopt == nil {
+				sockopt = map[string]interface{}{}
+				ss["sockopt"] = sockopt
+			}
+			sockopt["dialerProxy"] = tagFor(i - 1)
+		}
+		hops = append(hops, ob)
+	}
+	// Final outbound list: [hop0(entry), …, proxy(exit), direct, block].
+	outs := make([]interface{}, 0, len(hops)+2)
+	outs = append(outs, hops...)
+	outs = append(outs, direct, block)
+	cfg["outbounds"] = outs
+	if socksPort > 0 {
+		cfg["routing"] = xrayRoutingForProxy()
+	}
+	return cfg
+}
+
+// chainEngineReason validates that a set of nodes can form a single-engine
+// chain. Returns "" when the chain is buildable, or a human-readable reason
+// why not (mixed engines, or a non-xray node). Chains are currently xray-only:
+// xray's dialerProxy links TCP-family outbounds (VLESS/VMess/Trojan/SS) in one
+// process. Hysteria2/TUIC run under sing-box and can't be mixed into an xray
+// dialer chain, so they're rejected with a clear message.
+func chainEngineReason(nodes []*Node) string {
+	if len(nodes) < 2 {
+		return "a chain needs at least 2 configs"
+	}
+	for _, n := range nodes {
+		if n == nil {
+			return "unparseable config in selection"
+		}
+		if engineFor(n.Kind) != "xray" {
+			return fmt.Sprintf("%s can't be chained (chains support VLESS/VMess/Trojan/Shadowsocks only)", n.Kind)
+		}
+	}
+	return ""
 }
 
 // nodeUnsupportedReason returns a non-empty human-readable reason when the

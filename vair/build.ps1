@@ -10,6 +10,18 @@ param(
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# GitHub release assets are served from a CDN that only accepts TLS 1.2+.
+# Windows PowerShell 5.1 still negotiates TLS 1.0/1.1 by default, which makes
+# WebClient/Invoke-WebRequest fail mid-transfer ("Базовое соединение закрыто").
+# Force a modern protocol set for the whole session before any download.
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 `
+    -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
+try {
+    # Tls13 isn't defined on older .NET; add it opportunistically.
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13
+} catch {}
+
 function Step  { Write-Host "  >>  $args" -ForegroundColor Cyan }
 function OK    { Write-Host "  OK  $args" -ForegroundColor Green }
 function Warn  { Write-Host "  !!  $args" -ForegroundColor Yellow }
@@ -36,7 +48,27 @@ function Get-LatestRelease {
 function Download-File {
     param([string]$Url, [string]$Dest)
     Write-Host "      $Url" -ForegroundColor DarkGray
-    (New-Object System.Net.WebClient).DownloadFile($Url, $Dest)
+    # Invoke-WebRequest follows GitHub's CDN redirect and honours the TLS
+    # protocol set above. Retry a few times so a transient blip (the
+    # "Непредвиденная ошибка при передаче" the WebClient hit) doesn't abort the
+    # whole build. -UseBasicParsing avoids the IE engine dependency.
+    $attempts = 4
+    for ($i = 1; $i -le $attempts; $i++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing `
+                -Headers @{ "User-Agent" = "build-script" } -TimeoutSec 300
+            return
+        } catch {
+            if ($i -eq $attempts) {
+                # Last-resort fallback to WebClient (same TLS settings apply).
+                Write-Host "      Invoke-WebRequest failed, trying WebClient..." -ForegroundColor DarkGray
+                (New-Object System.Net.WebClient).DownloadFile($Url, $Dest)
+                return
+            }
+            Write-Host "      download attempt $i failed ($($_.Exception.Message)); retrying..." -ForegroundColor DarkGray
+            Start-Sleep -Seconds ([Math]::Min(10, $i * 2))
+        }
+    }
 }
 
 if (-not $SkipDownload) {
