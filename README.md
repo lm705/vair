@@ -2,7 +2,7 @@
 
 GUI клиент для проверки и подключения к VPN-конфигурациям протоколов **VLESS, VMess, Trojan, Shadowsocks (включая SS2022), Hysteria2, TUIC**. Построен на базе [Xray-core](https://github.com/XTLS/Xray-core) и [sing-box](https://github.com/SagerNet/sing-box).
 
-[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/USERNAME/REPONAME/total)](https://github.com/USERNAME/REPONAME/releases)
+[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/lm705/vair/total)](https://github.com/USERNAME/REPONAME/releases)
 
 Только на **Windows**.
 
