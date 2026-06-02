@@ -2,13 +2,11 @@
 
 GUI клиент для проверки и подключения к VPN-конфигурациям протоколов **VLESS, VMess, Trojan, Shadowsocks (включая SS2022), Hysteria2, TUIC**. Построен на базе [Xray-core](https://github.com/XTLS/Xray-core) и [sing-box](https://github.com/SagerNet/sing-box).
 
-[![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/lm705/vair/total)](https://github.com/lm705/vair/releases)
-
 Только на **Windows**.
 
 [Wiki](https://github.com/lm705/vair/wiki)
 
-[![Download](https://img.shields.io/badge/Download-blue?style=for-the-badge&logo=github)](https://github.com/lm705/vair/releases/tag/v1.6.0)
+[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
 
 ## vless_alive.txt
 
