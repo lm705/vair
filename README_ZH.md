@@ -1,8 +1,18 @@
 # Vair
 
+[Русский](README.md) | [English](README_EN.md) | [فارسی](README_FA.md) | **中文**
+
+> ⚠️ 本翻译由 AI 生成，可能不够准确，请以[俄语版本](README.md)为准。
+
 一款用于测试和连接 **VLESS、VMess、Trojan、Shadowsocks（包括 SS2022）、Hysteria2、TUIC** 协议 VPN 配置的客户端。基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
 
 仅支持 **Windows**。
+
+[Wiki](https://github.com/lm705/vair/wiki)
+
+[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+
+> 💡 如有建议、错误或任何反馈，请在 [**Issues**](https://github.com/lm705/vair/issues) 中提交。
 
 ## vless_alive.txt
 
@@ -46,4 +56,13 @@
 >
 >*UQBxGaG0hBVKarg6TJVaqvCN0hOFAodQjnCZ9rdnUaWxcbDV*
 
+## 仓库统计
+
 ![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
+<a href="https://www.star-history.com/?repos=lm705%2Fvair&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left" />
+ </picture>
+</a>
