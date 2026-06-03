@@ -1,5 +1,7 @@
 # Vair
 
+**Русский** | [English](README_EN.md) | [فارسی](README_FA.md) | [中文](README_ZH.md)
+
 GUI клиент для проверки и подключения к VPN-конфигурациям протоколов **VLESS, VMess, Trojan, Shadowsocks (включая SS2022), Hysteria2, TUIC**. Построен на базе [Xray-core](https://github.com/XTLS/Xray-core) и [sing-box](https://github.com/SagerNet/sing-box).
 
 Только на **Windows**.
@@ -7,6 +9,8 @@ GUI клиент для проверки и подключения к VPN-кон
 [Wiki](https://github.com/lm705/vair/wiki)
 
 [![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+
+> 💡 Предложения, ошибки и любые пожелания, пожалуйста, пишите в [**Issues**](https://github.com/lm705/vair/issues).
 
 ## vless_alive.txt
 
