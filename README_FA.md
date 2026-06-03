@@ -1,8 +1,18 @@
 # Vair
 
+[Русский](README.md) | [English](README_EN.md) | **فارسی** | [中文](README_ZH.md)
+
+> ⚠️ این ترجمه توسط هوش مصنوعی انجام شده و ممکن است نادقیق باشد. نسخهٔ [روسی](README.md) مرجع اصلی است.
+
 کلاینتی برای آزمایش و اتصال به پیکربندی‌های VPN با پروتکل‌های **VLESS، VMess، Trojan، Shadowsocks (شامل SS2022)، Hysteria2، TUIC**. بر پایه [Xray-core](https://github.com/XTLS/Xray-core) و [sing-box](https://github.com/SagerNet/sing-box) ساخته شده است.
 
 فقط برای **Windows**.
+
+[Wiki](https://github.com/lm705/vair/wiki)
+
+[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+
+> 💡 لطفاً پیشنهادها، اشکالات و هر بازخوردی را در [**Issues**](https://github.com/lm705/vair/issues) مطرح کنید.
 
 ## vless_alive.txt
 
@@ -46,4 +56,13 @@
 >
 >*UQBxGaG0hBVKarg6TJVaqvCN0hOFAodQjnCZ9rdnUaWxcbDV*
 
+## آمار مخزن
+
 ![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
+<a href="https://www.star-history.com/?repos=lm705%2Fvair&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left" />
+ </picture>
+</a>
