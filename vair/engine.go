@@ -98,12 +98,6 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 		})
 	}
 
-	// ruSitesDirect is still needed below to decide whether the RU rule_set
-	// definitions get attached to the route.
-	settingsMu.RLock()
-	ruSitesDirect := appSettings.RuSitesDirect
-	settingsMu.RUnlock()
-
 	// default_domain_resolver picks the DNS server used when sing-box
 	// itself needs to resolve a name in a routing rule (e.g. the IP
 	// for a CIDR-matching geosite). In legacy mode → OS resolver. In
@@ -119,12 +113,8 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 		"default_domain_resolver": defaultResolver,
 		"find_process":            true,
 		"rules":                   rules,
-		"final":                   "proxy",
 	}
-
-	if ruSitesDirect {
-		route["rule_set"] = singboxRuRuleSet()
-	}
+	applySingboxRouteMode(route)
 
 	return map[string]interface{}{
 		"log":      map[string]interface{}{"level": "warn", "timestamp": true},
@@ -176,6 +166,12 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 //  3. If FakeIP enabled: A/AAAA → dns-fakeip.
 //  4. Everything else falls through to `final = dns-remote`.
 func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
+	// only_blocked has the INVERSE policy: resolve everything directly by default,
+	// and only blocked-in-RU domains through the tunnel (so they get a clean,
+	// un-poisoned IP). Independent of the leak-protection toggle.
+	if routingMode() == "only_blocked" {
+		return buildDNSBlockOnlyBlocked()
+	}
 	if !leakProtect {
 		return map[string]interface{}{
 			"servers": []interface{}{
@@ -243,8 +239,11 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 	// 2. Direct bypass: RU geosite + user-defined direct domains.
 	settingsMu.RLock()
 	ruSitesDirect := appSettings.RuSitesDirect
-	directDomains := make([]string, len(appSettings.DirectDomains))
-	copy(directDomains, appSettings.DirectDomains)
+	var directDomains []string
+	if !appSettings.DirectDomainsDisabled {
+		directDomains = make([]string, len(appSettings.DirectDomains))
+		copy(directDomains, appSettings.DirectDomains)
+	}
 	settingsMu.RUnlock()
 	if ruSitesDirect {
 		rules = append(rules, map[string]interface{}{
@@ -284,6 +283,48 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 		"final":             "dns-remote",
 		"independent_cache": true,
 		"strategy":          "ipv4_only", // avoid AAAA round-trips
+	}
+}
+
+// buildDNSBlockOnlyBlocked is the DNS module for only_blocked mode. Blocked-in-RU
+// domains resolve through the proxy (dns-remote) so they get a clean, un-poisoned
+// IP; everything else resolves directly (dns-direct, the final). No global FakeIP:
+// non-blocked names must resolve to their real direct IPs, and blocked traffic is
+// still steered to the proxy by domain (sniff + the geosite-ru-blocked rule_set,
+// which is also attached to the route by applySingboxRouteMode).
+func buildDNSBlockOnlyBlocked() map[string]interface{} {
+	servers := []interface{}{
+		map[string]interface{}{"tag": "dns-local", "type": "local"},
+		map[string]interface{}{"tag": "dns-bootstrap", "type": "udp", "server": bootstrapDNSIP()},
+		map[string]interface{}{"tag": "dns-direct", "type": "udp", "server": directDNSIP()},
+		parseRemoteDNSServer(), // dns-remote (DoH through the proxy outbound)
+	}
+	rules := []interface{}{}
+	// Static hosts win first.
+	if hosts := staticHostsSnapshot(); len(hosts) > 0 {
+		predefined := make(map[string]interface{}, len(hosts))
+		var domainList []string
+		for domain, ip := range hosts {
+			predefined[domain] = []string{ip}
+			domainList = append(domainList, domain)
+		}
+		servers = append(servers, map[string]interface{}{
+			"tag": "dns-hosts", "type": "hosts", "predefined": predefined,
+		})
+		rules = append(rules, map[string]interface{}{"domain": domainList, "server": "dns-hosts"})
+	}
+	// Manual + custom-URL "through VPN" domains → resolve through the tunnel.
+	if proxyDomains := append(effectiveProxyDomains(), customBlocklistDomains()...); len(proxyDomains) > 0 {
+		rules = append(rules, map[string]interface{}{"domain_suffix": proxyDomains, "server": "dns-remote"})
+	}
+	// Blocked-in-RU domains → resolve through the tunnel (clean IP).
+	rules = append(rules, map[string]interface{}{"rule_set": "geosite-ru-blocked", "server": "dns-remote"})
+	return map[string]interface{}{
+		"servers":           servers,
+		"rules":             rules,
+		"final":             "dns-direct",
+		"independent_cache": true,
+		"strategy":          "ipv4_only",
 	}
 }
 

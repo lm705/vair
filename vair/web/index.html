@@ -14,6 +14,32 @@
   --accent:#e8c547;--green:#4ade80;--red:#f87171;
   --blue:#60a5fa;--orange:#fb923c;--purple:#c084fc;--teal:#2dd4bf;
   --font:'JetBrains Mono',Consolas,monospace;
+  /* Connection-bar state tints + row highlights. Defined as variables so the
+     light theme can override them (the dark defaults are near-black greens/blues
+     that look wrong on a light background). */
+  --cbar-cp:#071a09;--cbar-cp-bd:#1a3a20;
+  --cbar-tun:#060f1f;--cbar-tun-bd:#1a2a40;
+  --cbar-cc:#12120a;--cbar-cc-bd:#2a2a12;
+  --cbar-ce:#1a0707;--cbar-ce-bd:#3a1212;
+  --row-cp:#071a09;--row-ct:#060f1f;
+  --shadow:rgba(0,0,0,.5);--overlay:rgba(0,0,0,.55);
+}
+/* ── Light theme ──────────────────────────────────────────────────────────
+   Applied when <body class="theme-light">. Overrides only the palette tokens;
+   every component reads them through var(), so the whole UI re-tints. Chosen
+   for comfortable contrast on a light background (dark text on near-white). */
+body.theme-light{
+  --bg:#f4f4f5;--bg2:#ffffff;--bg3:#ececef;--bg4:#e2e2e6;
+  --border:#d4d4d8;--border2:#c4c4c8;
+  --text:#1d1d20;--dim:#8a8a90;--dim2:#c8c8cc;
+  --accent:#b8860b;--green:#15803d;--red:#dc2626;
+  --blue:#2563eb;--orange:#ea580c;--purple:#9333ea;--teal:#0d9488;
+  --cbar-cp:#dcf5e2;--cbar-cp-bd:#a8d8b4;
+  --cbar-tun:#dde9fb;--cbar-tun-bd:#a8c2e8;
+  --cbar-cc:#f7f2d8;--cbar-cc-bd:#e0d49a;
+  --cbar-ce:#fbe0e0;--cbar-ce-bd:#e8a8a8;
+  --row-cp:#e6f6ea;--row-ct:#e6effb;
+  --shadow:rgba(0,0,0,.18);--overlay:rgba(0,0,0,.35);
 }
 html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.4;user-select:none;-webkit-user-select:none}
 /* The header (stats + controls) and conn-bar need ~960px to lay out in one
@@ -34,10 +60,10 @@ input,textarea{user-select:text;-webkit-user-select:text}
   background:var(--bg2);transition:background .3s,border-color .3s;
   min-height:38px;overflow:visible;
 }
-#conn-bar.cp{background:#071a09;border-top-color:#1a3a20}
-#conn-bar.conn-tun{background:#060f1f;border-top-color:#1a2a40}
-#conn-bar.cc{background:#12120a;border-top-color:#2a2a12}
-#conn-bar.ce{background:#1a0707;border-top-color:#3a1212}
+#conn-bar.cp{background:var(--cbar-cp);border-top-color:var(--cbar-cp-bd)}
+#conn-bar.conn-tun{background:var(--cbar-tun);border-top-color:var(--cbar-tun-bd)}
+#conn-bar.cc{background:var(--cbar-cc);border-top-color:var(--cbar-cc-bd)}
+#conn-bar.ce{background:var(--cbar-ce);border-top-color:var(--cbar-ce-bd)}
 /* Ping chip in the connection bar — shows the connected config's latest
    delay; click to re-ping it. Colour mirrors the table ping pills. */
 .cping{flex-shrink:0;cursor:pointer;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
@@ -226,7 +252,7 @@ header{
 
 /* tab settings modal */
 .modal-overlay{
-  position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,.55);
+  position:fixed;inset:0;z-index:9998;background:var(--overlay);
   display:flex;align-items:center;justify-content:center;
 }
 /* Modal text scale.
@@ -333,6 +359,20 @@ textarea.modal-input{resize:vertical;min-width:0}
 .url-row .modal-input{flex:1;margin-bottom:0}
 .url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:12px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px}
 .url-rm:hover{color:var(--red);background:rgba(248,113,113,.1)}
+.url-qr{all:unset;cursor:pointer;color:var(--dim);font-size:10px;font-weight:700;padding:0 6px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px;text-transform:uppercase;letter-spacing:.03em}
+.url-qr:hover{color:var(--accent);background:rgba(232,197,71,.1)}
+/* Read-only SOURCES URL rows (built-in, copy-only). COPY/QR use the same
+   borderless .url-qr style as the user-tab QR button, vertically centered next
+   to the URL field. */
+.src-url-row{display:flex;gap:4px;align-items:center;margin-bottom:6px}
+.src-url-row:last-child{margin-bottom:0}
+.src-url{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;padding:5px 8px;
+  color:var(--text);font-size:11px;user-select:text}
+.btn.sm{padding:3px 9px;font-size:10px}
+/* QR modal — always white quiet-zone behind the code so it scans on any theme. */
+.qr-wrap{display:inline-block;background:#fff;padding:12px;border-radius:6px}
+.qr-img{display:block;width:260px;height:260px;image-rendering:pixelated}
 
 /* file rows in tab settings */
 .file-row{
@@ -409,8 +449,8 @@ thead th.csp{text-align:center}
 thead th.ca {text-align:center}
 tbody tr{border-bottom:1px solid var(--border);transition:background .08s}
 tbody tr:hover{background:var(--bg3)}
-tbody tr.row-cp{background:#071a09!important;box-shadow:inset 3px 0 0 var(--green)}
-tbody tr.row-ct{background:#060f1f!important;box-shadow:inset 3px 0 0 var(--blue)}
+tbody tr.row-cp{background:var(--row-cp)!important;box-shadow:inset 3px 0 0 var(--green)}
+tbody tr.row-ct{background:var(--row-ct)!important;box-shadow:inset 3px 0 0 var(--blue)}
 /* RELOAD highlight: newly-added configs glow green and fade out. The fade is
    driven by a single global --flash-alpha variable (animated in JS), NOT a
    per-row CSS animation — so re-rendering a row while scrolling reads the
@@ -450,13 +490,72 @@ tbody tr.row-new{background:rgba(80,200,120,var(--flash-alpha,0))!important;box-
 .auto-status.warn .as-dot{background:#f0b429}
 .auto-status.down .as-dot{background:#e5484d}
 .auto-cands{margin-top:8px;display:flex;flex-direction:column;gap:2px;max-height:168px;overflow-y:auto}
-.auto-cand{display:flex;align-items:center;gap:8px;font-size:12px;padding:4px 8px;border:1px solid var(--border2);border-radius:4px;background:var(--bg2)}
+.auto-cand{display:flex;align-items:center;gap:8px;font-size:12px;padding:4px 8px;border:1px solid var(--border2);border-radius:4px;background:var(--bg2);cursor:pointer;transition:border-color .12s,background .12s}
+.auto-cand:hover{border-color:var(--dim);background:var(--bg3)}
 .auto-cand.current{border-color:var(--accent);background:rgba(232,197,71,.08)}
+.auto-cand.current:hover{border-color:var(--accent)}
 .auto-cand .ac-rank{flex:0 0 auto;width:18px;text-align:center;color:var(--dim);font-size:11px}
 .auto-cand .ac-name{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
 .auto-cand.current .ac-name{color:var(--accent)}
 .auto-cand .ac-metric{flex:0 0 auto;color:var(--dim);font-size:11px}
 .auto-switch-now{margin-top:10px;display:inline-flex;align-self:flex-start}
+/* Collapsible AUTO settings: a clickable arrow header that toggles the block
+   below it. Expanded by default. */
+/* No border-top here: the STATUS section above already draws a divider
+   (its border-bottom), so adding one here would show two stacked lines. */
+.auto-collapse-head{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;
+  font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
+  padding:2px 0 9px}
+.auto-collapse-head:hover{color:var(--text)}
+.auto-collapse-arrow{display:inline-block;font-size:10px;transition:transform .15s}
+.auto-collapse-head.collapsed .auto-collapse-arrow{transform:rotate(-90deg)}
+.auto-collapse-body.collapsed{display:none}
+/* Header row of the AUTO panel: title on the left, Detach button on the right. */
+.auto-title-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px}
+.auto-detach,.auto-return{flex-shrink:0}
+/* Detach and Back-to-app share the same spot in the title row: only one is
+   visible at a time. Detach shows in normal mode; Back-to-app shows when
+   detached. (They never coexist, so the title row always has exactly two
+   flex children — title + one button — and space-between keeps the button
+   pinned to the right.) */
+.auto-return{display:none}
+body.auto-standalone .auto-detach{display:none}
+body.auto-standalone .auto-return{display:inline-flex}
+body.auto-standalone .auto-close-btn{display:none}
+/* Standalone AUTO view: hide the whole app body, keep only the title bar (for
+   window move/min/max/close) and the AUTO panel. The OS window is resized 1:1
+   to the panel (see _goDetachResize), and the panel scrolls internally past the
+   window height — exactly like the normal modal. */
+/* A compact detached window may be narrower than the app's 960px min-width;
+   drop that floor so the window can shrink to the panel's ~600px. */
+body.auto-standalone{min-width:0}
+body.auto-standalone header,
+body.auto-standalone .prog-area,
+body.auto-standalone .toolbar,
+body.auto-standalone .tw,
+body.auto-standalone #conn-bar,
+body.auto-standalone #log-panel{display:none!important}
+/* The overlay becomes a normal flex item BENEATH the title bar (so the Vair
+   title bar with minimize/maximize/close stays visible at the top), fills the
+   remaining height, and centers the panel. No dim backdrop and NO outer padding
+   — the panel reads as the window body itself, flush to the edges. min-height:0
+   lets it shrink so the panel can scroll inside it. */
+body.auto-standalone #auto-modal{
+  position:relative;inset:auto;z-index:auto;
+  flex:1 1 auto;min-height:0;
+  background:var(--bg);
+  display:flex;align-items:flex-start;justify-content:center;
+  padding:0;box-sizing:border-box;overflow:hidden;
+}
+/* Frameless: drop the box border/radius and match the window background so the
+   panel doesn't look like a window-inside-a-window. It fills the window width
+   (no side gap) and scrolls internally past the window height (max-height:100%
+   of the overlay + the inherited overflow-y:auto). The box's own padding stays
+   for readable content margins, like the rest of the app. */
+body.auto-standalone #auto-modal .modal-box{
+  width:min(560px,100%);max-height:100%;margin:0;
+  border:none;border-radius:0;background:var(--bg);
+}
 .auto-tabs-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px;margin-bottom:14px}
 .auto-tab-pill{
   all:unset;cursor:pointer;font-family:var(--font);font-size:11px;
@@ -471,7 +570,7 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
 .ci{width:38px;color:var(--dim);font-size:11px;text-align:left}
 .cpr{width:64px;text-align:center}
 .cn{min-width:150px;max-width:210px;text-align:left}
-.ch{max-width:155px;text-align:left}.ct{width:88px;text-align:center}.cs{width:72px;text-align:center}
+.ch{max-width:155px;text-align:left;overflow:hidden}.ct{width:88px;text-align:center}.cs{width:72px;text-align:center}
 .cp2{width:110px;text-align:center}
 .csp{width:130px;text-align:center}
 .ca{width:220px;text-align:right}
@@ -485,7 +584,10 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
 .fav:hover{color:var(--accent)}
 .fav.on{color:var(--accent)}
 .nm{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
-.nh{color:var(--dim);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* display:block so the cell width (table-layout:fixed) actually constrains the
+   host text — an inline span ignores overflow/width, so on small monitors a long
+   host overflowed and collided with the transport column. Full value on hover. */
+.nh{display:block;max-width:100%;color:var(--dim);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* "last connected" badge — fixed size at the end of the name column; the
    adjacent name clips before it instead of overlapping. */
 .last-badge{flex:0 0 auto;font-size:8px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);background:rgba(232,197,71,.14);border:1px solid rgba(232,197,71,.35);border-radius:3px;padding:0 3px;line-height:13px}
@@ -655,7 +757,7 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
     <!-- Compact-mode dropdown trigger: shows the active tab name + ▾ when the
          tab buttons would otherwise wrap onto multiple rows. Hidden (display:none
          via .tab-bar:not(.compact)) in normal mode. -->
-    <button class="tab-dd-trigger" id="tab-dd-trigger" onclick="openTabDropdown(event)" title="Switch tab">
+    <button class="tab-dd-trigger" id="tab-dd-trigger" onclick="openTabDropdown(event)" oncontextmenu="onTabTriggerMenu(event)" title="Switch tab">
       <span class="tab-dd-name" id="tab-dd-name">Sources</span><span class="tab-dd-caret">▾</span>
     </button>
     <button class="tab-btn active" data-id="main" onclick="switchTab('main')">Sources</button>
@@ -792,6 +894,19 @@ const I18N = {
     // Settings — labels / buttons
     "Enable Sources tab": "Включить вкладку «SOURCES»",
     "Russian sites without VPN": "Российские сайты без VPN",
+    "Routing mode": "Режим маршрутизации",
+    "All traffic through VPN": "Весь трафик через VPN",
+    "Everything except Russian sites": "Всё, кроме российских сайтов",
+    "Only blocked-in-Russia resources": "Только заблокированное в РФ",
+    "How traffic is split between the VPN and a direct connection. Takes effect on next connection.":
+      "Как трафик распределяется между VPN и прямым подключением. Применяется при следующем подключении.",
+    "Custom domains through VPN": "Свои домены через VPN",
+    "e.g. youtube.com, press Enter": "напр. youtube.com, нажмите Enter",
+    "Domains routed THROUGH the VPN in addition to the built-in blocked-list. Takes effect on next connection.":
+      "Домены, которые идут ЧЕРЕЗ VPN в дополнение к встроенному списку блокировок. Применяется при следующем подключении.",
+    "Custom blocklist URL": "Свой список блокировок (URL)",
+    "Optional plain-text domain list (one per line) fetched and routed through the VPN. Auto-updated.":
+      "Необязательный текстовый список доменов (по одному в строке): скачивается и идёт через VPN. Авто-обновляется.",
     "Custom domains without VPN": "Свои домены без VPN",
     "Apps without VPN (TUN mode only)": "Приложения без VPN (только TUN)",
     "Browse running processes": "Просмотреть запущенные процессы",
@@ -813,6 +928,15 @@ const I18N = {
     "Enable traffic statistics": "Считать трафик",
     "Lifetime total": "Итого за всё время",
     "reset total": "сбросить итог",
+    "SOCKS authentication": "Аутентификация SOCKS",
+    "Protects the local SOCKS5 proxy (proxy mode) with a username/password so other local apps can't use it or probe your VPN server. Off by default; turn it on to require credentials. Takes effect on next connection.":
+      "Защищает локальный SOCKS5-прокси (режим proxy) логином/паролем, чтобы другие локальные приложения не могли им воспользоваться или определить ваш VPN-сервер. По умолчанию выключено; включите, чтобы требовать логин/пароль. Применяется при следующем подключении.",
+    "SOCKS username": "Логин SOCKS",
+    "SOCKS password": "Пароль SOCKS",
+    "Generate new credentials": "Сгенерировать новые данные",
+    "Reset": "Сбросить",
+    "Enter these in your SOCKS5 client. Reset generates new random credentials.":
+      "Введите эти данные в SOCKS5-клиенте. «Сбросить» создаёт новые случайные.",
     "TUN DNS leak protection": "TUN: защита от утечек DNS",
     "TUN Kill-switch": "TUN: Kill-switch",
     "TUN Block LAN traffic": "TUN: блокировать LAN-трафик",
@@ -836,6 +960,9 @@ const I18N = {
       "Логов пока нет — подключитесь к конфигу, чтобы увидеть вывод ядра.",
     "Settings font size (px)": "Размер текста в настройках (px)",
     "Language": "Язык",
+    "Theme": "Тема",
+    "Dark": "Тёмная",
+    "Light": "Светлая",
     "Window size (% of screen)": "Размер окна (% экрана)",
     "Default window size as a percent of the monitor it opens on (40–100, default 80). Recomputed per monitor, so a smaller screen gets a proportionally smaller window. Applies now (if not maximized) and on every launch.":
       "Размер окна по умолчанию в процентах от монитора, на котором оно открывается (40–100, по умолчанию 80). Пересчитывается под каждый монитор, поэтому меньший экран получает пропорционально меньшее окно. Применяется сразу (если окно не развёрнуто) и при каждом запуске.",
@@ -911,6 +1038,17 @@ const I18N = {
     "Tab Settings": "Настройки вкладки",
     // "SOURCES" stays as-is to match the untranslated section/tab name.
     "Sources Settings": "Настройки SOURCES",
+    "Source URL (read-only)": "URL источника (только чтение)",
+    "No source URL.": "Нет URL источника.",
+    "Loading…": "Загрузка…",
+    "Failed to load.": "Не удалось загрузить.",
+    "copy": "копировать",
+    "Show QR": "Показать QR",
+    "QR code": "QR-код",
+    "QR": "QR",
+    "Scan with a proxy client on your phone.": "Отсканируйте прокси-клиентом на телефоне.",
+    "Scan to open this source URL.": "Отсканируйте, чтобы открыть URL источника.",
+    "Enter a URL first": "Сначала введите URL",
     "Name": "Имя",
     "Source URLs (raw links, base64 subscriptions)": "URL источников (raw-ссылки, base64-подписки)",
     "+ add URL": "+ добавить URL",
@@ -976,6 +1114,12 @@ const I18N = {
     "Rank candidates by measured download speed (Mbps) instead of ping delay. Configs without a speed result fall back to ping order.":
       "Ранжировать кандидатов по измеренной скорости загрузки (Мбит/с), а не по задержке ping. Конфиги без результата скорости упорядочиваются по ping.",
     "Switch now": "Переключить сейчас",
+    "Detach": "Отделить",
+    "Detach as a compact window": "Отделить в компактное окно",
+    "Back to app": "Вернуться в приложение",
+    "Show / hide settings": "Показать / скрыть настройки",
+    "Click to connect to this config": "Нажмите, чтобы подключиться к этому конфигу",
+    "Could not connect to that config": "Не удалось подключиться к этому конфигу",
     "Connect as chain": "Подключить цепочкой",
     "chain": "цепочка",
     "chain hop": "узел цепочки",
@@ -1030,6 +1174,13 @@ function applyUIPrefs(){
   var fs = appSettingsJS && appSettingsJS.modal_font_size;
   if(!fs || fs < 9 || fs > 20) fs = 11;
   document.documentElement.style.setProperty('--modal-fs-base', fs+'px');
+  applyTheme();
+}
+// applyTheme toggles the light/dark palette by adding/removing body.theme-light.
+// Dark is the default (no class); only "light" adds the class.
+function applyTheme(){
+  var light = appSettingsJS && appSettingsJS.theme === 'light';
+  document.body.classList.toggle('theme-light', !!light);
 }
 let selectedMode='proxy';
 
@@ -1784,7 +1935,10 @@ function matches(e){
   if(tab && tab.dedup_mode==='hide' && dupBodyIndices.has(e.index)) return false;
   // Per-tab exclude filter — rules are "column:value" strings (legacy bare
   // strings are treated as name-column). Match is case-insensitive substring.
-  var ef=tab&&tab.exclude_filter?tab.exclude_filter:[];
+  // Skipped when the filter's toggle is off (exclude_disabled) — the rules stay
+  // saved but aren't applied, so previously-hidden configs reappear. (This is
+  // the view side; the server also stops dropping them and re-fetches the tab.)
+  var ef=(tab && !tab.exclude_disabled && tab.exclude_filter)?tab.exclude_filter:[];
   if(ef.length>0){
     var fields={
       name:(e.name||'').toLowerCase(),
@@ -2026,6 +2180,15 @@ function buildRow(e,pos){
     if(ev.target.closest('.act-cell'))return;
     toggleRowSelect(e.index,ev);
   };
+  // Double-click a row to connect (current selected mode). Ignore double-clicks
+  // on the action buttons (their own handlers run). If this config is already
+  // the live connection, a double-click is a no-op rather than a reconnect.
+  tr.ondblclick=(ev)=>{
+    if(ev.target.closest('.act-cell'))return;
+    ev.preventDefault();
+    if(connState&&connState.status==='connected'&&connState.conn_raw===e.raw) return;
+    doConnect(e.index);
+  };
   tr.oncontextmenu=(ev)=>{
     ev.preventDefault();
     if(!selectedRows.has(e.index)){
@@ -2098,7 +2261,7 @@ function buildRow(e,pos){
     '<td class="cpr"><span class="pb '+pr+'" title="'+x(pr)+'">'+x(protoLabel(pr))+'</span></td>'+
     '<td class="cn"><div class="nc"><div class="nm-row">'+favStar+'<span class="nm" title="'+x(e.name)+'">'+x(e.name)+'</span>'+lastBadge+'</div>'+
     '</div></td>'+
-    '<td class="ch"><span class="nh">'+x(e.host||'')+(e.port?':'+e.port:'')+'</span></td>'+
+    '<td class="ch"><span class="nh" title="'+x((e.host||'')+(e.port?':'+e.port:''))+'">'+x(e.host||'')+(e.port?':'+e.port:'')+'</span></td>'+
     '<td class="ct"><span class="nb '+nc+'">'+x(e.network||'tcp')+'</span></td>'+
     '<td class="cs"><span class="sb '+(e.security||'none')+'" title="'+x(e.security||'none')+'">'+x(e.security||'none')+'</span></td>'+
     '<td class="cp2"><div class="vc"><span class="'+pp+'" title="'+x(pt)+'">'+pt+'</span></div></td>'+
@@ -2251,6 +2414,16 @@ function updateTabLayout(){
   }
 }
 
+// onTabTriggerMenu opens the active tab's context menu when the user right-clicks
+// the compact-mode dropdown trigger itself — so the tab menu (Settings / Delete
+// tab / etc.) is reachable without first expanding the list.
+function onTabTriggerMenu(e){
+  e.preventDefault();
+  e.stopPropagation();
+  var act=tabsList.find(function(t){return t.id===activeTabId;});
+  if(act) showTabMenu(e, act);
+}
+
 // openTabDropdown shows the compact-mode tab switcher (a list of all tabs).
 // Clicking a tab switches to it; right-click opens the same per-tab context
 // menu as a normal tab button.
@@ -2343,6 +2516,11 @@ function showRowMenu(ev,idx){
   // Localized "config" / "N configs" noun for the Copy/Delete labels.
   var label=selCount>1?(selCount+' '+t('configs')):t('config');
   m.innerHTML='<div class="ctx-menu-item" onclick="copySelected();closeCtxMenu()">'+t('Copy')+' '+label+'</div>';
+  // Show QR — single selection only; works on any tab (incl. SOURCES) since it
+  // just reads the config's raw URL.
+  if(selCount<=1){
+    m.innerHTML+='<div class="ctx-menu-item" onclick="showQR('+idx+');closeCtxMenu()">'+t('Show QR')+'</div>';
+  }
   // Chain: only meaningful with 2+ configs selected. Order = top→bottom on
   // screen (entry → exit). Server rejects mixed-engine selections.
   if(selCount>1){
@@ -2395,10 +2573,18 @@ function containsNodeURL(text){
   for(var i=0;i<schemes.length;i++){ if(text.indexOf(schemes[i])>=0) return true; }
   return false;
 }
+// looksLikeBase64Configs: the whole clipboard is one base64 blob (a subscription
+// body) with no scheme URL. The server decodes it and extracts the configs.
+function looksLikeBase64Configs(text){
+  var t=(text||'').replace(/\s+/g,'');
+  return t.length>=24 && /^[A-Za-z0-9+/_-]+={0,2}$/.test(t);
+}
+// pasteworthy: either readable config URLs or a raw base64 subscription blob.
+function pasteworthy(text){ return containsNodeURL(text)||looksLikeBase64Configs(text); }
 
 function pasteFromClipboard(){
   navigator.clipboard.readText().then(function(text){
-    if(!containsNodeURL(text))return;
+    if(!pasteworthy(text))return;
     fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:text}).catch(console.error);
   }).catch(()=>{});
 }
@@ -2486,6 +2672,30 @@ function selectionInLogPanel(){
   if(!sel || sel.rangeCount===0 || sel.isCollapsed) return false;
   return panel.contains(sel.anchorNode);
 }
+// lastInteract records which area the user last clicked into ('table' or
+// 'logs'). A live text selection (selectionInLogPanel) is the strongest signal,
+// but a bare click in the logs leaves only a COLLAPSED selection, which used to
+// make Ctrl+A wrongly fall through to the (hidden) table. Tracking the last
+// click gives Ctrl+A / Ctrl+C a reliable target even with no active selection.
+var lastInteract='table';
+(function trackInteract(){
+  var attach=function(){
+    var tw=document.querySelector('.tw');
+    var lp=document.getElementById('log-panel');
+    if(!tw||!lp){ setTimeout(attach,200); return; }
+    tw.addEventListener('mousedown',function(){ lastInteract='table'; },true);
+    lp.addEventListener('mousedown',function(){ lastInteract='logs'; },true);
+  };
+  attach();
+})();
+// logsAreTarget: should Ctrl+A / Ctrl+C act on the Logs panel? True when there's
+// a live selection there, OR the panel is open and it was the last area clicked.
+function logsAreTarget(){
+  var panel=document.getElementById('log-panel');
+  if(!panel || panel.style.display==='none') return false;
+  if(selectionInLogPanel()) return true;
+  return lastInteract==='logs';
+}
 document.addEventListener('copy',function(e){
   // Inputs and textareas have their own selection — let the native copy
   // handle them so users can still copy text out of the URL/filter fields.
@@ -2493,6 +2703,8 @@ document.addEventListener('copy',function(e){
   if(ae && (ae.tagName==='INPUT' || ae.tagName==='TEXTAREA')) return;
   // A highlighted selection in the Logs panel copies natively (lets the user
   // grab just the lines they dragged over) even if table rows are selected.
+  // Only defer to native when there's an actual selection there — a bare click
+  // (collapsed) in logs shouldn't block copying the selected table rows.
   if(selectionInLogPanel()) return;
   if(selectedRows.size===0) return; // no rows selected — fall through to native
   var lines=gatherSelectedLines();
@@ -2542,6 +2754,74 @@ function renameEntry(idx){
       .then(function(r){ if(!r.ok) return r.text().then(function(m){ toast(m||t('Rename failed')); }); })
       .catch(console.error);
   });
+}
+
+// showQR opens a styled modal with the config's QR code (rendered server-side
+// as a PNG via /api/qr). Lets the user scan a config into a phone client.
+// Works on any tab, including SOURCES.
+function showQR(idx){
+  var e=entries[idx];
+  if(!e) return;
+  var existing=document.getElementById('qr-modal');
+  if(existing) existing.remove();
+  var ov=document.createElement('div');
+  ov.className='modal-overlay';ov.id='qr-modal';
+  ov.onclick=function(ev){ if(ev.target===ov) ov.remove(); };
+  var name=e.name||'';
+  ov.innerHTML='<div class="modal-box" style="width:auto;max-width:92vw;text-align:center">'+
+    '<div class="modal-title" style="margin-bottom:10px">'+t('QR code')+'</div>'+
+    (name?'<div class="modal-hint" style="margin:0 0 10px;text-align:center">'+x(name)+'</div>':'')+
+    '<div class="qr-wrap"><img class="qr-img" src="/api/qr?idx='+idx+'&t='+Date.now()+'" alt="QR"></div>'+
+    '<div class="modal-hint" style="margin:10px 0 14px;text-align:center">'+t('Scan with a proxy client on your phone.')+'</div>'+
+    '<div class="modal-btns" style="justify-content:center">'+
+      '<button class="btn ghost" id="qr-copy">'+t('copy')+'</button>'+
+      '<button class="btn ghost" onclick="document.getElementById(\'qr-modal\').remove()">'+t('close')+'</button>'+
+    '</div>'+
+  '</div>';
+  document.body.appendChild(ov);
+  // Copy via a handler (not inline) so the raw URL — which can contain quotes,
+  // backslashes, etc. — never has to be escaped into an HTML attribute.
+  var cpb=document.getElementById('qr-copy');
+  if(cpb) cpb.onclick=function(){
+    navigator.clipboard.writeText(e.raw).then(function(){
+      cpb.textContent='✓';
+      setTimeout(function(){ cpb.textContent=t('copy'); },1400);
+    }).catch(function(){});
+  };
+  var esc=function(ev){ if(ev.key==='Escape'){ var m=document.getElementById('qr-modal'); if(m)m.remove(); document.removeEventListener('keydown',esc); } };
+  document.addEventListener('keydown',esc);
+}
+
+// showQRText opens the QR modal for an arbitrary URL string (a source /
+// subscription URL), via /api/qr-text. Used by both the SOURCES settings and a
+// user tab's source-URL rows — anything that's a plain URL, not a config index.
+function showQRText(url){
+  if(!url) return;
+  var existing=document.getElementById('qr-modal');
+  if(existing) existing.remove();
+  var ov=document.createElement('div');
+  ov.className='modal-overlay';ov.id='qr-modal';
+  ov.onclick=function(ev){ if(ev.target===ov) ov.remove(); };
+  ov.innerHTML='<div class="modal-box" style="width:auto;max-width:92vw;text-align:center">'+
+    '<div class="modal-title" style="margin-bottom:10px">'+t('QR code')+'</div>'+
+    '<div class="modal-hint" style="margin:0 0 10px;text-align:center;max-width:280px;word-break:break-all;white-space:normal">'+x(url)+'</div>'+
+    '<div class="qr-wrap"><img class="qr-img" src="/api/qr-text?data='+encodeURIComponent(url)+'&t='+Date.now()+'" alt="QR"></div>'+
+    '<div class="modal-hint" style="margin:10px 0 14px;text-align:center">'+t('Scan to open this source URL.')+'</div>'+
+    '<div class="modal-btns" style="justify-content:center">'+
+      '<button class="btn ghost" id="qr-copy">'+t('copy')+'</button>'+
+      '<button class="btn ghost" onclick="document.getElementById(\'qr-modal\').remove()">'+t('close')+'</button>'+
+    '</div>'+
+  '</div>';
+  document.body.appendChild(ov);
+  var cpb=document.getElementById('qr-copy');
+  if(cpb) cpb.onclick=function(){
+    navigator.clipboard.writeText(url).then(function(){
+      cpb.textContent='✓';
+      setTimeout(function(){ cpb.textContent=t('copy'); },1400);
+    }).catch(function(){});
+  };
+  var esc=function(ev){ if(ev.key==='Escape'){ var m=document.getElementById('qr-modal'); if(m)m.remove(); document.removeEventListener('keydown',esc); } };
+  document.addEventListener('keydown',esc);
 }
 
 // promptModal is a styled replacement for window.prompt(): a single text input
@@ -2637,6 +2917,12 @@ function saveAppSettings(cb){
 
 function openSettings(){
   if(document.getElementById('settings-modal'))return;
+  // If SOCKS auth is on but credentials are missing (e.g. an upgraded settings
+  // file), generate them so the fields show real values that match the server.
+  if(appSettingsJS.socks_auth && (!appSettingsJS.socks_user || !appSettingsJS.socks_pass)){
+    ensureSocksCreds();
+    saveAppSettings();
+  }
   var ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='settings-modal';
   ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
@@ -2653,6 +2939,15 @@ function openSettings(){
     appChipsHtml+='<span class="chip" data-a="'+x(apps[i])+'">'+x(apps[i])+'<span class="chip-x" onclick="removeAppChip(this)">x</span></span>';
   }
 
+  // "Custom domains THROUGH VPN" chips (only_blocked mode).
+  var pdomains=appSettingsJS.proxy_domains||[];
+  var proxyDomainChipsHtml='';
+  for(var i=0;i<pdomains.length;i++){
+    proxyDomainChipsHtml+='<span class="chip" data-pd="'+x(pdomains[i])+'">'+x(pdomains[i])+'<span class="chip-x" onclick="removeProxyDomainChip(this)">x</span></span>';
+  }
+  // Current routing mode (derive from the legacy toggle when unset).
+  var rmode=appSettingsJS.routing_mode||(appSettingsJS.ru_sites_direct?'bypass_ru':'proxy_all');
+
   ov.innerHTML='<div class="modal-box">'+
     '<div class="modal-title">'+t('Settings')+'</div>'+
     '<div class="settings-section">'+
@@ -2664,22 +2959,43 @@ function openSettings(){
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">'+t('Routing')+'</div>'+
-      '<div class="modal-row">'+
-        '<span class="modal-row-label">'+t('Russian sites without VPN')+'</span>'+
-        '<label class="toggle"><input type="checkbox" id="set-ru-direct" '+(appSettingsJS.ru_sites_direct?'checked':'')+' onchange="toggleRuSites(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '<div class="modal-row" style="display:block;margin-bottom:12px">'+
+        '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Routing mode')+'</span>'+
+        '<select class="modal-input" id="set-routing-mode" style="margin-bottom:0" onchange="setRoutingMode(this.value)">'+
+          '<option value="proxy_all"'+(rmode==='proxy_all'?' selected':'')+'>'+t('All traffic through VPN')+'</option>'+
+          '<option value="bypass_ru"'+(rmode==='bypass_ru'?' selected':'')+'>'+t('Everything except Russian sites')+'</option>'+
+          '<option value="only_blocked"'+(rmode==='only_blocked'?' selected':'')+'>'+t('Only blocked-in-Russia resources')+'</option>'+
+        '</select>'+
       '</div>'+
-      '<div class="modal-hint">'+t('Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.')+'</div>'+
+      '<div class="modal-hint">'+t('How traffic is split between the VPN and a direct connection. Takes effect on next connection.')+'</div>'+
+      '<div id="only-blocked-opts" style="'+(rmode==='only_blocked'?'':'display:none')+'">'+
+        '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
+          '<span class="modal-row-label">'+t('Custom domains through VPN')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="set-proxy-domains-on" '+(appSettingsJS.proxy_domains_disabled?'':'checked')+' onchange="toggleProxyDomains(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
+        '<div class="chips-wrap" id="proxy-domain-chips" style="'+(appSettingsJS.proxy_domains_disabled?'opacity:.45':'')+'">'+proxyDomainChipsHtml+
+          '<input class="chip-input" id="proxy-domain-input" placeholder="'+t('e.g. youtube.com, press Enter')+'" onkeydown="proxyDomainChipKey(event)">'+
+        '</div>'+
+        '<div class="modal-hint">'+t('Domains routed THROUGH the VPN in addition to the built-in blocked-list. Takes effect on next connection.')+'</div>'+
+        '<div class="modal-row" style="display:block;margin-top:10px;margin-bottom:4px">'+
+          '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('Custom blocklist URL')+'</span>'+
+          '<input class="modal-input" id="set-blocklist-url" style="margin-bottom:0" value="'+x(appSettingsJS.blocklist_url||'')+'" placeholder="https://…/domains.txt" onchange="updateBlocklistURL(this.value)">'+
+        '</div>'+
+        '<div class="modal-hint" style="margin-top:0">'+t('Optional plain-text domain list (one per line) fetched and routed through the VPN. Auto-updated.')+'</div>'+
+      '</div>'+
       '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
         '<span class="modal-row-label">'+t('Custom domains without VPN')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-direct-domains-on" '+(appSettingsJS.direct_domains_disabled?'':'checked')+' onchange="toggleDirectDomains(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
-      '<div class="chips-wrap" id="domain-chips">'+domainChipsHtml+
+      '<div class="chips-wrap" id="domain-chips" style="'+(appSettingsJS.direct_domains_disabled?'opacity:.45':'')+'">'+domainChipsHtml+
         '<input class="chip-input" id="domain-input" placeholder="'+t('e.g. vk.com, press Enter')+'" onkeydown="domainChipKey(event)">'+
       '</div>'+
       '<div class="modal-hint">'+t('Enter a domain — all its subdomains are included automatically. Takes effect on next connection.')+'</div>'+
       '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
         '<span class="modal-row-label">'+t('Apps without VPN (TUN mode only)')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-direct-apps-on" '+(appSettingsJS.direct_apps_disabled?'':'checked')+' onchange="toggleDirectApps(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
-      '<div class="chips-wrap" id="app-chips">'+appChipsHtml+
+      '<div class="chips-wrap" id="app-chips" style="'+(appSettingsJS.direct_apps_disabled?'opacity:.45':'')+'">'+appChipsHtml+
         '<input class="chip-input" id="app-input" placeholder="'+t('e.g. chrome.exe, press Enter')+'" onkeydown="appChipKey(event)">'+
       '</div>'+
       '<div class="modal-hint">'+t("Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).")+' <a href="#" onclick="openProcessPicker(event)" style="color:var(--accent);text-decoration:underline">'+t('Browse running processes')+'</a>. '+t('Takes effect on next connection.')+'</div>'+
@@ -2757,6 +3073,25 @@ function openSettings(){
     '<div class="settings-section">'+
       '<div class="section-header">'+t('Security')+'</div>'+
       '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('SOCKS authentication')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-socks-auth" '+(appSettingsJS.socks_auth?'checked':'')+' onchange="toggleSocksAuth(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t("Protects the local SOCKS5 proxy (proxy mode) with a username/password so other local apps can't use it or probe your VPN server. Off by default; turn it on to require credentials. Takes effect on next connection.")+'</div>'+
+      '<div id="socks-creds" style="'+(appSettingsJS.socks_auth?'':'display:none')+'">'+
+        '<div class="modal-row" style="display:block;margin-bottom:8px">'+
+          '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('SOCKS username')+'</span>'+
+          '<input class="modal-input" id="set-socks-user" style="margin-bottom:0" value="'+x(appSettingsJS.socks_user||'')+'" onchange="updateSocksUser(this.value)">'+
+        '</div>'+
+        '<div class="modal-row" style="display:block;margin-bottom:6px">'+
+          '<span class="modal-row-label" style="display:block;margin-bottom:4px">'+t('SOCKS password')+'</span>'+
+          '<div style="display:flex;gap:6px;align-items:stretch">'+
+            '<input class="modal-input" id="set-socks-pass" style="margin-bottom:0;flex:1" value="'+x(appSettingsJS.socks_pass||'')+'" onchange="updateSocksPass(this.value)">'+
+            '<button class="btn ghost sm" onclick="regenSocksCreds()" title="'+t('Generate new credentials')+'">'+t('Reset')+'</button>'+
+          '</div>'+
+        '</div>'+
+        '<div class="modal-hint" style="margin-top:0">'+t('Enter these in your SOCKS5 client. Reset generates new random credentials.')+'</div>'+
+      '</div>'+
+      '<div class="modal-row">'+
         '<span class="modal-row-label">'+t('TUN DNS leak protection')+'</span>'+
         '<label class="toggle"><input type="checkbox" id="set-dnslp" '+(appSettingsJS.dns_leak_protection?'checked':'')+' onchange="toggleDNSLeakProtection(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
@@ -2802,6 +3137,13 @@ function openSettings(){
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">'+t('Appearance')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Theme')+'</span>'+
+        '<select class="modal-input num-input" style="width:120px;text-align:left" id="set-theme" onchange="updateTheme(this.value)">'+
+          '<option value="dark"'+(appSettingsJS.theme!=="light"?" selected":"")+'>'+t('Dark')+'</option>'+
+          '<option value="light"'+(appSettingsJS.theme==="light"?" selected":"")+'>'+t('Light')+'</option>'+
+        '</select>'+
+      '</div>'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">'+t('Language')+'</span>'+
         '<select class="modal-input num-input" style="width:120px;text-align:left" id="set-lang" onchange="updateLanguage(this.value)">'+
@@ -3004,7 +3346,7 @@ function loadAutoCands(){
       else if(bySpeed && c.speed_mbps>0) metric=c.speed_mbps.toFixed(1)+' MB/s'+(ms?' · '+ms:'');
       else if(ms) metric=ms;
       else metric=t('untested');
-      h+='<div class="auto-cand'+(c.current?' current':'')+'">'+
+      h+='<div class="auto-cand'+(c.current?' current':'')+'" data-raw="'+x(c.raw||'')+'" onclick="autoConnectCand(this.getAttribute(\'data-raw\'))" title="'+t('Click to connect to this config')+'">'+
         '<span class="ac-rank">'+(i+1)+'</span>'+
         '<span class="ac-name">'+x(c.name||'')+(c.current?' <b>•</b>':'')+'</span>'+
         '<span class="ac-metric">'+x(metric)+'</span></div>';
@@ -3024,7 +3366,9 @@ function openAuto(){
   if(document.getElementById('auto-modal')) return;
   var ov=document.createElement('div');
   ov.className='modal-overlay';ov.id='auto-modal';
-  ov.onclick=function(ev){if(ev.target===ov)ov.remove();};
+  // Backdrop-click closes only in normal (overlay) mode; in standalone the
+  // overlay IS the window body, so a stray click must not close it.
+  ov.onclick=function(ev){if(ev.target===ov && !autoStandalone)ov.remove();};
 
   // Candidate-tabs pills (toggle to select). Empty auto_tabs ⇒ default to main.
   var sel=appSettingsJS.auto_tabs;
@@ -3043,7 +3387,11 @@ function openAuto(){
     '<option value="tun"'+(am==='tun'?' selected':'')+'>TUN</option>';
 
   ov.innerHTML='<div class="modal-box">'+
-    '<div class="modal-title">'+t('Auto-connect')+'</div>'+
+    '<div class="auto-title-row">'+
+      '<div class="modal-title" style="margin-bottom:0">'+t('Auto-connect')+'</div>'+
+      '<button class="btn ghost sm auto-detach" id="auto-detach" onclick="toggleAutoStandalone()" title="'+t('Detach as a compact window')+'">⧉ '+t('Detach')+'</button>'+
+      '<button class="btn ghost sm auto-return" id="auto-return" onclick="toggleAutoStandalone()" title="'+t('Back to app')+'">⧉ '+t('Back to app')+'</button>'+
+    '</div>'+
     '<div class="settings-section">'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">'+t('Enable auto-connect')+'</span>'+
@@ -3051,6 +3399,19 @@ function openAuto(){
       '</div>'+
       '<div class="modal-hint">'+t('Connects to the fastest working config on launch and keeps it connected. While connected, the live link is monitored and, if it stops passing traffic, the app switches to another working config automatically.')+'</div>'+
     '</div>'+
+    // STATUS sits right under the enable toggle so the live state + candidate
+    // list are the first thing you see. The detailed settings below are
+    // collapsible (see the arrow header) and expanded by default.
+    '<div class="settings-section">'+
+      '<div class="section-header">'+t('Status')+'</div>'+
+      '<div class="auto-status" id="auto-status"><span class="as-dot"></span></div>'+
+      '<div class="auto-cands" id="auto-cands"></div>'+
+      '<button class="btn ghost auto-switch-now" id="auto-switch-now" onclick="autoSwitchNow()">'+t('Switch now')+'</button>'+
+    '</div>'+
+    '<div class="auto-collapse-head" id="auto-settings-toggle" onclick="toggleAutoSettings()" title="'+t('Show / hide settings')+'">'+
+      '<span class="auto-collapse-arrow">▾</span><span>'+t('Settings')+'</span>'+
+    '</div>'+
+    '<div class="auto-collapse-body" id="auto-settings-body">'+
     '<div class="settings-section">'+
       '<div class="section-header">'+t('Candidate tabs')+'</div>'+
       '<div class="auto-tabs-wrap" id="auto-tabs">'+tabsHtml+'</div>'+
@@ -3086,19 +3447,103 @@ function openAuto(){
       '</div>'+
       '<div class="modal-hint">'+t('Treat the current config as failing when the live probe is slower than this, then switch to the fastest available config. 0 disables the speed check.')+'</div>'+
     '</div>'+
-    '<div class="settings-section">'+
-      '<div class="section-header">'+t('Status')+'</div>'+
-      '<div class="auto-status" id="auto-status"><span class="as-dot"></span></div>'+
-      '<div class="auto-cands" id="auto-cands"></div>'+
-      '<button class="btn ghost auto-switch-now" id="auto-switch-now" onclick="autoSwitchNow()">'+t('Switch now')+'</button>'+
-    '</div>'+
+    '</div>'+ // /auto-collapse-body
     '<div class="modal-btns">'+
-      '<button class="btn ghost" onclick="document.getElementById(\'auto-modal\').remove()">'+t('close')+'</button>'+
+      '<button class="btn ghost auto-close-btn" onclick="closeAuto()">'+t('close')+'</button>'+
     '</div>'+
   '</div>';
   document.body.appendChild(ov);
+  // Re-enter standalone view if it was active (e.g. modal re-opened).
+  if(autoStandalone) document.body.classList.add('auto-standalone');
+  // Restore the collapse state (settings expanded by default).
+  if(!autoSettingsExpanded){
+    var ah=document.getElementById('auto-settings-toggle');
+    var ab=document.getElementById('auto-settings-body');
+    if(ah) ah.classList.add('collapsed');
+    if(ab) ab.classList.add('collapsed');
+  }
   renderAutoStatus();
   loadAutoCands();
+}
+
+// autoSettingsExpanded controls the collapsible block holding all AUTO settings
+// (everything except the enable toggle, the Back-to-app/Detach button and the
+// STATUS section). Expanded by default. Collapsing it shrinks the detached
+// window to just the essential info; expanding grows it again.
+var autoSettingsExpanded=true;
+function toggleAutoSettings(){
+  autoSettingsExpanded=!autoSettingsExpanded;
+  var head=document.getElementById('auto-settings-toggle');
+  var body=document.getElementById('auto-settings-body');
+  if(head) head.classList.toggle('collapsed',!autoSettingsExpanded);
+  if(body) body.classList.toggle('collapsed',!autoSettingsExpanded);
+  // In the detached window, re-fit the OS window to the new panel height.
+  if(autoStandalone) resizeWindowToAutoPanel();
+}
+
+// autoConnectCand connects to a specific candidate the user clicked in the
+// STATUS table. Works across tabs (the server resolves the config by its raw
+// URL in the candidate pool). Keeps AUTO armed but marks the pick user-owned,
+// so failover still kicks in if the chosen config dies.
+function autoConnectCand(raw){
+  if(!raw) return;
+  fetch('/api/auto/connect-cand?mode='+encodeURIComponent(selectedMode||'')+'&raw='+encodeURIComponent(raw),{method:'POST'})
+    .then(function(r){ if(!r.ok) toast(t('Could not connect to that config')); })
+    .catch(function(){});
+}
+
+// closeAuto closes the AUTO panel. If it was standalone, leave standalone view
+// and restore the window size so the main app is visible again at full size.
+function closeAuto(){
+  if(autoStandalone && typeof _goRestoreFromDetach==='function') _goRestoreFromDetach();
+  document.body.classList.remove('auto-standalone');
+  autoStandalone=false;
+  var m=document.getElementById('auto-modal'); if(m) m.remove();
+}
+
+// autoStandalone: when true, the AUTO panel is the whole window — the rest of
+// the app (header, tabs, table, conn-bar, logs) is hidden via body.auto-standalone,
+// and the overlay drops its dim backdrop so the panel reads as the window body.
+// The OS window itself (move / minimize / maximize / close-to-tray) is unchanged
+// — this is purely a view toggle. The frameless title-bar drag still works.
+var autoStandalone=false;
+function toggleAutoStandalone(){
+  autoStandalone=!autoStandalone;
+  document.body.classList.toggle('auto-standalone', autoStandalone);
+  if(autoStandalone){
+    // Make sure the panel is open, then resize the OS window to fit it 1:1.
+    if(!document.getElementById('auto-modal')) openAuto();
+    resizeWindowToAutoPanel();
+  } else if(typeof _goRestoreFromDetach==='function'){
+    // Back to app: restore the window to its pre-detach size/position.
+    _goRestoreFromDetach();
+  }
+}
+// resizeWindowToAutoPanel measures the AUTO panel + title bar and asks the Go
+// side to size the OS window to match it 1:1 with the normal AUTO modal: the
+// panel's natural width (560) and its natural height, but capped at ~85% of the
+// work area (like the modal's max-height:85vh) so a long config list scrolls
+// inside the window rather than forcing a full-screen-tall window. Run after a
+// frame so the standalone flex layout settles before we measure.
+function resizeWindowToAutoPanel(){
+  if(typeof _goDetachResize!=='function') return;
+  requestAnimationFrame(function(){
+    var box=document.querySelector('#auto-modal .modal-box');
+    if(!box) return;
+    var tb=document.getElementById('titlebar');
+    var tbH=(tb && tb.classList.contains('active'))?tb.offsetHeight:0;
+    // Pass the panel's NATURAL size. The Go side (_goDetachResize) clamps the
+    // height to the user's window-size-% setting and centers on the current
+    // monitor, so the window grows when the settings are expanded but never past
+    // pct% of the screen — and the panel scrolls internally beyond that. With no
+    // overlay padding in standalone, width = panel width exactly (the scrollbar,
+    // if any, sits inside the panel). scrollHeight is the full content height even
+    // when collapsed/clipped, so collapsing the settings shrinks the window.
+    var contentH=box.scrollHeight;
+    if(contentH<160) contentH=160;
+    var boxW=Math.ceil(box.getBoundingClientRect().width); // 560 (border-box)
+    _goDetachResize(boxW, contentH+tbH, window.devicePixelRatio||1);
+  });
 }
 
 function autoToggle(field,on){
@@ -3249,6 +3694,30 @@ function toggleSources(on){
 function toggleRuSites(on){
   appSettingsJS.ru_sites_direct=on;
   saveAppSettings();
+}
+
+// toggleDirectDomains / toggleDirectApps enable or disable the split-tunnel
+// routing for the saved "without VPN" lists WITHOUT clearing them — the chips
+// stay (just dimmed) and the values persist; they're simply not applied to the
+// generated routing while off. Both default ON.
+function toggleDirectDomains(on){
+  appSettingsJS.direct_domains_disabled=!on;
+  var w=document.getElementById('domain-chips'); if(w) w.style.opacity=on?'':'0.45';
+  saveAppSettings();
+}
+function toggleDirectApps(on){
+  appSettingsJS.direct_apps_disabled=!on;
+  var w=document.getElementById('app-chips'); if(w) w.style.opacity=on?'':'0.45';
+  saveAppSettings();
+}
+
+// dimToggle dims the element with id targetId when its checkbox is off — used by
+// the per-tab Exclude filter / Auto-refresh switches to show that the saved
+// value is inactive (it's still preserved). No save here; the tab-settings save
+// reads the checkbox state.
+function dimToggle(cb, targetId){
+  var el=document.getElementById(targetId);
+  if(el) el.style.opacity=cb.checked?'':'0.45';
 }
 
 function toggleTray(on){
@@ -3410,6 +3879,13 @@ function updateModalFontSize(raw){
   appSettingsJS.modal_font_size=v;
   var inp=document.getElementById('set-modal-fs'); if(inp) inp.value=v;
   applyUIPrefs();
+  saveAppSettings();
+}
+// updateTheme switches between dark and light palettes, applies immediately and
+// persists. "dark" is stored as the default; only "light" is a real override.
+function updateTheme(v){
+  appSettingsJS.theme = (v==='light') ? 'light' : 'dark';
+  applyTheme();
   saveAppSettings();
 }
 // updateWindowSize persists the default-window-size percent and, on the native
@@ -3672,6 +4148,55 @@ function toggleBlockLAN(on){
   appSettingsJS.block_lan = !!on;
   saveAppSettings();
 }
+// socksRandHex returns n hex chars of (preferably crypto-strong) randomness for
+// the local SOCKS proxy credentials.
+function socksRandHex(n){
+  try{
+    var a=new Uint8Array(Math.ceil(n/2));
+    (window.crypto||window.msCrypto).getRandomValues(a);
+    return Array.prototype.map.call(a,function(b){return ('0'+b.toString(16)).slice(-2);}).join('').slice(0,n);
+  }catch(e){
+    var s='',c='0123456789abcdef';
+    for(var i=0;i<n;i++) s+=c[Math.floor(Math.random()*16)];
+    return s;
+  }
+}
+// ensureSocksCreds fills in random credentials if they're missing.
+function ensureSocksCreds(){
+  if(!appSettingsJS.socks_user) appSettingsJS.socks_user=socksRandHex(16);
+  if(!appSettingsJS.socks_pass) appSettingsJS.socks_pass=socksRandHex(32);
+}
+function applySocksCredsToInputs(){
+  var u=document.getElementById('set-socks-user'); if(u) u.value=appSettingsJS.socks_user||'';
+  var p=document.getElementById('set-socks-pass'); if(p) p.value=appSettingsJS.socks_pass||'';
+}
+function toggleSocksAuth(on){
+  appSettingsJS.socks_auth = !!on;
+  if(on) ensureSocksCreds(); // show generated credentials on enable
+  var box=document.getElementById('socks-creds'); if(box) box.style.display=on?'':'none';
+  applySocksCredsToInputs();
+  saveAppSettings();
+}
+function updateSocksUser(v){
+  v=(v||'').trim();
+  if(!v) v=socksRandHex(16); // never leave it empty
+  appSettingsJS.socks_user=v;
+  applySocksCredsToInputs();
+  saveAppSettings();
+}
+function updateSocksPass(v){
+  v=(v||'').trim();
+  if(!v) v=socksRandHex(32);
+  appSettingsJS.socks_pass=v;
+  applySocksCredsToInputs();
+  saveAppSettings();
+}
+function regenSocksCreds(){
+  appSettingsJS.socks_user=socksRandHex(16);
+  appSettingsJS.socks_pass=socksRandHex(32);
+  applySocksCredsToInputs();
+  saveAppSettings();
+}
 function toggleFakeIP(on){
   // Storage is inverted (fakeip_disabled) so the JSON default state
   // (omitted/false) corresponds to FakeIP being ON when leak
@@ -3753,6 +4278,53 @@ function removeDomainChip(el){
   saveAppSettings();
 }
 
+// ── Routing mode + "through VPN" domains / custom blocklist (only_blocked) ────
+function setRoutingMode(v){
+  appSettingsJS.routing_mode=v;
+  var box=document.getElementById('only-blocked-opts');
+  if(box) box.style.display=(v==='only_blocked')?'':'none';
+  saveAppSettings();
+}
+function toggleProxyDomains(on){
+  appSettingsJS.proxy_domains_disabled=!on;
+  var w=document.getElementById('proxy-domain-chips'); if(w) w.style.opacity=on?'':'0.45';
+  saveAppSettings();
+}
+function proxyDomainChipKey(ev){
+  if(ev.key!=='Enter')return;
+  ev.preventDefault();
+  var val=ev.target.value.trim().toLowerCase().replace(/^https?:\/\//,'').replace(/\/.*$/,'');
+  if(!val)return;
+  if(!appSettingsJS.proxy_domains)appSettingsJS.proxy_domains=[];
+  for(var i=0;i<appSettingsJS.proxy_domains.length;i++){ if(appSettingsJS.proxy_domains[i].toLowerCase()===val)return; }
+  appSettingsJS.proxy_domains.push(val);
+  ev.target.value='';
+  saveAppSettings(function(){
+    var wrap=document.getElementById('proxy-domain-chips');
+    var inp=document.getElementById('proxy-domain-input');
+    if(!wrap||!inp)return;
+    wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
+    for(var i=0;i<appSettingsJS.proxy_domains.length;i++){
+      var sp=document.createElement('span');
+      sp.className='chip';sp.setAttribute('data-pd',appSettingsJS.proxy_domains[i]);
+      sp.innerHTML=x(appSettingsJS.proxy_domains[i])+'<span class="chip-x" onclick="removeProxyDomainChip(this)">x</span>';
+      wrap.insertBefore(sp,inp);
+    }
+  });
+}
+function removeProxyDomainChip(el){
+  var chip=el.parentElement;
+  var d=chip.getAttribute('data-pd');
+  chip.remove();
+  if(!appSettingsJS.proxy_domains)return;
+  appSettingsJS.proxy_domains=appSettingsJS.proxy_domains.filter(function(v){return v.toLowerCase()!==d.toLowerCase();});
+  saveAppSettings();
+}
+function updateBlocklistURL(v){
+  appSettingsJS.blocklist_url=(v||'').trim();
+  saveAppSettings();
+}
+
 // Apps without VPN — process names matched by sing-box (TUN mode only).
 function appChipKey(ev){
   if(ev.key!=='Enter')return;
@@ -3810,14 +4382,24 @@ function openSourcesSettings(){
     '<div class="modal-box" id="tab-modal-box">'+
       '<div class="modal-title">'+t('Sources Settings')+'</div>'+
       '<div class="settings-section">'+
-        '<div class="modal-label">'+t('Auto-refresh interval (minutes, 0 = off)')+'</div>'+
-        '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(tab&&tab.refresh_min||0)+'" style="width:80px">'+
+        '<div class="modal-label">'+t('Source URL (read-only)')+'</div>'+
+        '<div id="src-url-list" class="modal-hint" style="margin:0">'+t('Loading…')+'</div>'+
+      '</div>'+
+      '<div class="settings-section">'+
+        '<div class="modal-row" style="margin-bottom:6px">'+
+          '<span class="modal-label" style="margin:0">'+t('Auto-refresh interval (minutes, 0 = off)')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="ms-src-refresh-on" '+(tab&&tab.refresh_disabled?'':'checked')+' onchange="dimToggle(this,\'ms-src-refresh\')"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
+        '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(tab&&tab.refresh_min||0)+'" style="width:80px;'+(tab&&tab.refresh_disabled?'opacity:.45':'')+'">'+
         '<div class="modal-hint">'+t('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')+'</div>'+
       '</div>'+
       '<div class="settings-section">'+
-        '<div class="modal-label">'+t('Exclude filter')+'</div>'+
+        '<div class="modal-row" style="margin-bottom:6px">'+
+          '<span class="modal-label" style="margin:0">'+t('Exclude filter')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="ms-src-exclude-on" '+(tab&&tab.exclude_disabled?'':'checked')+' onchange="dimToggle(this,\'tab-filter-fields\')"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
         '<div class="modal-hint ef-hint">'+t('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')+'</div>'+
-        '<div class="ef-fields" id="tab-filter-fields">'+efFieldsHtml+'</div>'+
+        '<div class="ef-fields" id="tab-filter-fields" style="'+(tab&&tab.exclude_disabled?'opacity:.45':'')+'">'+efFieldsHtml+'</div>'+
       '</div>'+
       '<div class="modal-btns">'+
         '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">'+t('cancel')+'</button>'+
@@ -3825,14 +4407,34 @@ function openSourcesSettings(){
       '</div>'+
     '</div>';
   document.body.appendChild(ov);
+  // Built-in SOURCES URLs are compiled in (not editable) — fetch and show them
+  // read-only, each with a copy button.
+  fetch('/api/sources-info').then(function(r){return r.json();}).then(function(d){
+    var box=document.getElementById('src-url-list');
+    if(!box) return;
+    var urls=(d&&d.urls)||[];
+    if(!urls.length){ box.textContent=t('No source URL.'); return; }
+    // Encode each URL as a JS string literal for the inline handlers — URLs are
+    // safe here (no quotes), but JSON.stringify keeps it correct regardless.
+    box.innerHTML=urls.map(function(u){
+      var js=JSON.stringify(u);
+      return '<div class="src-url-row"><span class="src-url" title="'+x(u)+'">'+x(u)+'</span>'+
+        '<button class="url-qr" onclick=\'cpText('+x(js)+')\'>'+t('copy')+'</button>'+
+        '<button class="url-qr" onclick=\'showQRText('+x(js)+')\'>'+t('QR')+'</button></div>';
+    }).join('');
+  }).catch(function(){
+    var box=document.getElementById('src-url-list'); if(box) box.textContent=t('Failed to load.');
+  });
 }
 function saveSourcesSettings(){
   var refreshMin=parseInt(document.getElementById('ms-src-refresh').value)||0;
   var ef=collectExcludeFilter();
+  var refreshDisabled=!document.getElementById('ms-src-refresh-on').checked;
+  var excludeDisabled=!document.getElementById('ms-src-exclude-on').checked;
   document.getElementById('tab-modal').remove();
   fetch('/api/tab/set-url?id=main',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({refresh_min:refreshMin,exclude_filter:ef})
+    body:JSON.stringify({refresh_min:refreshMin,exclude_filter:ef,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled})
   }).then(function(){rebuildTable();}).catch(console.error);
 }
 
@@ -3924,9 +4526,9 @@ function openTabSettings(tabId){
   if(urls.length===0&&tab.source_url) urls=[tab.source_url];
   var urlsHtml='';
   for(var i=0;i<urls.length;i++){
-    urlsHtml+='<div class="url-row"><input class="modal-input ms-url" value="'+x(urls[i])+'" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button></div>';
+    urlsHtml+=urlRowHtml(urls[i]);
   }
-  if(urls.length===0) urlsHtml='<div class="url-row"><input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button></div>';
+  if(urls.length===0) urlsHtml=urlRowHtml('');
 
   var ef=tab.exclude_filter||[];
   var efFieldsHtml=renderExcludeFields(ef);
@@ -3966,8 +4568,11 @@ function openTabSettings(tabId){
         '<div class="modal-hint">'+t('Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.')+'</div>'+
       '</div>'+
       '<div class="settings-section">'+
-        '<div class="modal-label">'+t('Auto-refresh interval (minutes, 0 = off)')+'</div>'+
-        '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px">'+
+        '<div class="modal-row" style="margin-bottom:6px">'+
+          '<span class="modal-label" style="margin:0">'+t('Auto-refresh interval (minutes, 0 = off)')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="ms-refresh-on" '+(tab.refresh_disabled?'':'checked')+' onchange="dimToggle(this,\'ms-refresh\')"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
+        '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px;'+(tab.refresh_disabled?'opacity:.45':'')+'">'+
         '<div class="modal-hint">'+t('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')+'</div>'+
       '</div>'+
       '<div class="settings-section">'+
@@ -3978,9 +4583,12 @@ function openTabSettings(tabId){
         '<div class="modal-hint">'+t('Off: show everything. Hide: filter from view, reversible. Delete: permanently remove duplicate entries. Matching is by vless body (ignores the name).')+'</div>'+
       '</div>'+
       '<div class="settings-section">'+
-        '<div class="modal-label">'+t('Exclude filter')+'</div>'+
+        '<div class="modal-row" style="margin-bottom:6px">'+
+          '<span class="modal-label" style="margin:0">'+t('Exclude filter')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="ms-exclude-on" '+(tab.exclude_disabled?'':'checked')+' onchange="dimToggle(this,\'tab-filter-fields\')"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
         '<div class="modal-hint ef-hint">'+t('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')+'</div>'+
-        '<div class="ef-fields" id="tab-filter-fields">'+efFieldsHtml+'</div>'+
+        '<div class="ef-fields" id="tab-filter-fields" style="'+(tab.exclude_disabled?'opacity:.45':'')+'">'+efFieldsHtml+'</div>'+
       '</div>'+
       '<div class="modal-btns">'+
         '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">'+t('cancel')+'</button>'+
@@ -4069,12 +4677,31 @@ function collectExcludeFilter(){
   });
   return ef;
 }
+// urlRowHtml renders one editable source-URL row for the tab settings modal:
+// the input, a QR button (encodes whatever's currently typed), and the remove
+// (x) button. Shared by the initial render and addURLRow so they stay in sync.
+function urlRowHtml(val){
+  return '<div class="url-row">'+
+    '<input class="modal-input ms-url" value="'+x(val||'')+'" placeholder="https://raw.githubusercontent.com/...">'+
+    '<button class="url-qr" onclick="qrFromRow(this)" title="'+t('QR')+'">QR</button>'+
+    '<button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button>'+
+  '</div>';
+}
+// qrFromRow shows a QR of the URL currently typed in this row's input.
+function qrFromRow(btn){
+  var inp=btn.parentElement.querySelector('.ms-url');
+  var u=inp?inp.value.trim():'';
+  if(!u){ toast(t('Enter a URL first')); return; }
+  showQRText(u);
+}
 function addURLRow(){
   var wrap=document.getElementById('ms-urls');
   if(!wrap)return;
   var div=document.createElement('div');
   div.className='url-row';
-  div.innerHTML='<input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/..."><button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button>';
+  div.innerHTML='<input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/...">'+
+    '<button class="url-qr" onclick="qrFromRow(this)" title="'+t('QR')+'">QR</button>'+
+    '<button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button>';
   wrap.appendChild(div);
   div.querySelector('input').focus();
 }
@@ -4113,6 +4740,10 @@ function selectDedupMode(btn){
 function saveTabSettings(tabId){
   var name=document.getElementById('ms-name').value.trim();
   var refreshMin=parseInt(document.getElementById('ms-refresh').value)||0;
+  var refreshOnEl=document.getElementById('ms-refresh-on');
+  var excludeOnEl=document.getElementById('ms-exclude-on');
+  var refreshDisabled=refreshOnEl?!refreshOnEl.checked:false;
+  var excludeDisabled=excludeOnEl?!excludeOnEl.checked:false;
   // Read the active segmented-control choice. Empty data-mode means "off".
   var dedupMode='';
   var activeSeg=document.querySelector('#ms-dedup-seg .seg-btn.active');
@@ -4139,7 +4770,7 @@ function saveTabSettings(tabId){
   }
   fetch('/api/tab/set-url?id='+encodeURIComponent(tabId),{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({urls:urls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup_mode:dedupMode})
+    body:JSON.stringify({urls:urls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup_mode:dedupMode,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled})
   }).then(function(){rebuildTable();}).catch(console.error);
 }
 
@@ -4151,9 +4782,9 @@ document.addEventListener('keydown',function(e){
   // afterwards never includes hidden configs.
   if(e.ctrlKey&&(e.key==='a'||e.key==='A')){
     if(document.activeElement&&(document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA'))return;
-    // If the user is selecting inside the Logs panel, Ctrl+A selects all the
-    // log text there instead of the table rows.
-    if(selectionInLogPanel()){
+    // If the Logs panel is the active area (live selection there, or it was the
+    // last thing clicked), Ctrl+A selects all the log text instead of rows.
+    if(logsAreTarget()){
       var view=document.getElementById('log-view');
       if(view){
         e.preventDefault();
@@ -4214,7 +4845,7 @@ function toggleRowSelect(idx,e){
 document.addEventListener('paste', function(e){
   if(document.activeElement&&(document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA'))return;
   const text=(e.clipboardData||window.clipboardData).getData('text');
-  if(!containsNodeURL(text))return;
+  if(!pasteworthy(text))return;
   if(activeTabId==='main'){
     fetch('/api/tab/create',{method:'POST'}).then(r=>r.json()).then(tab=>{
       fetch('/api/tab/switch?id='+tab.id,{method:'POST'}).then(()=>{

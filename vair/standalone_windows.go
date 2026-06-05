@@ -38,6 +38,33 @@ var embeddedGeosite []byte
 //go:embed bin/icon.ico
 var embeddedIcon []byte
 
+// RU-bypass rule-sets for sing-box, embedded as a local fallback. At runtime we
+// still try to download the freshest copy from upstream; these are used only
+// when that download fails (e.g. GitHub blocked) so sing-box never aborts at
+// start over an unreachable remote rule-set. See ruleset_windows.go.
+//
+//go:embed bin/geoip-ru.srs
+var embeddedGeoipRuSrs []byte
+
+//go:embed bin/geosite-ru.srs
+var embeddedGeositeRuSrs []byte
+
+// RU-blocked rule-sets — route only blocked-in-RU resources through the VPN.
+// srs for sing-box, dat (xray geosite/geoip, category "ru-blocked") for xray.
+// Same embed + refresh + fallback model as the RU-bypass sets above.
+//
+//go:embed bin/geosite-ru-blocked.srs
+var embeddedGeositeRuBlockedSrs []byte
+
+//go:embed bin/geoip-ru-blocked.srs
+var embeddedGeoipRuBlockedSrs []byte
+
+//go:embed bin/geosite-ru-blocked.dat
+var embeddedGeositeRuBlockedDat []byte
+
+//go:embed bin/geoip-ru-blocked.dat
+var embeddedGeoipRuBlockedDat []byte
+
 var binDir string
 
 // ── Binary extraction ─────────────────────────────────────────────────────────
@@ -112,6 +139,22 @@ func extractBinaries() (fresh bool, err error) {
 			return false, fmt.Errorf("extract %s: %w", f.name, err)
 		}
 		fresh = true
+	}
+	// RU rule-set baselines: write the embedded copy only if the file is MISSING,
+	// so a fresher version fetched at runtime (refreshRuRuleSets) isn't clobbered
+	// on the next launch — unlike the size-compared binaries above.
+	for _, rs := range []entry{
+		{"geoip-ru.srs", embeddedGeoipRuSrs, 0644},
+		{"geosite-ru.srs", embeddedGeositeRuSrs, 0644},
+		{"geosite-ru-blocked.srs", embeddedGeositeRuBlockedSrs, 0644},
+		{"geoip-ru-blocked.srs", embeddedGeoipRuBlockedSrs, 0644},
+		{"geosite-ru-blocked.dat", embeddedGeositeRuBlockedDat, 0644},
+		{"geoip-ru-blocked.dat", embeddedGeoipRuBlockedDat, 0644},
+	} {
+		dst := filepath.Join(dir, rs.name)
+		if _, statErr := os.Stat(dst); statErr != nil {
+			os.WriteFile(dst, rs.data, rs.perm) //nolint:errcheck
+		}
 	}
 	state.xrayBin = filepath.Join(dir, "xray.exe")
 	state.singboxBin = filepath.Join(dir, "sing-box.exe")
@@ -283,6 +326,22 @@ var (
 	resizeParentHWND uintptr  // set once in addChildSubclassing
 	childOrigProcs   sync.Map // hwnd (uintptr) → original WndProc (uintptr)
 	childWndProcCB   uintptr  // single stable callback for all children
+)
+
+// preDetachRect remembers the window rect before the AUTO panel was detached
+// into a compact window, so _goRestoreFromDetach can put it back. preDetachValid
+// guards against restoring when nothing was saved.
+//
+// detachActive is true while the compact detached AUTO window is showing, and
+// detachRect is that compact window's rect. They let _goWinMaximize restore to
+// the compact size (not the full app size) when the user un-maximizes a detached
+// window — otherwise the titlebar maximize button would blow the panel back up
+// to the full application window.
+var (
+	preDetachRect  winRect
+	preDetachValid bool
+	detachActive   bool
+	detachRect     winRect
 )
 
 // initChildResizeCB initialises childWndProcCB.  Must be called before
@@ -741,6 +800,31 @@ func openNativeWindow(addr string) {
 		zoomed, _, _ := procIsZoomed.Call(hwnd)
 		if zoomed != 0 {
 			procShowWindow.Call(hwnd, swRestore)
+			if detachActive {
+				// In the compact detached AUTO window: restore to the compact SIZE,
+				// not the full app size — otherwise un-maximizing blows the panel
+				// back up to the whole application window. Re-center on the monitor
+				// the window is CURRENTLY on (it may have been moved to another
+				// monitor before maximizing), so it doesn't jump back to the primary
+				// screen where it was first detached.
+				cw := detachRect.Right - detachRect.Left
+				ch := detachRect.Bottom - detachRect.Top
+				cx, cy := detachRect.Left, detachRect.Top
+				if hMon, _, _ := procMonitorFromWindow.Call(hwnd, monitorDefaultToNearest); hMon != 0 {
+					var mi monitorInfo
+					mi.CbSize = uint32(unsafe.Sizeof(mi))
+					if r, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi))); r != 0 {
+						workW := mi.RcWork.Right - mi.RcWork.Left
+						workH := mi.RcWork.Bottom - mi.RcWork.Top
+						cx = mi.RcWork.Left + (workW-cw)/2
+						cy = mi.RcWork.Top + (workH-ch)/2
+					}
+				}
+				procSetWindowPos.Call(hwnd, 0, uintptr(cx), uintptr(cy),
+					uintptr(cw), uintptr(ch), swpNozorder|swpNoactivate)
+				detachRect = winRect{Left: cx, Top: cy, Right: cx + cw, Bottom: cy + ch}
+				return false
+			}
 			// Recompute the restore size for THIS monitor (deterministic per
 			// monitor + size%), instead of reusing the stale launch rect that was
 			// based on the primary monitor. Fixes both "too big on small monitor"
@@ -768,6 +852,117 @@ func openNativeWindow(addr string) {
 	w.Bind("_goWinDragStart", func() {
 		procReleaseCapture.Call()
 		procSendMessageW.Call(hwnd, wmNclbuttondown, htCaption, 0)
+	})
+	// _goDetachResize resizes the window to the AUTO panel's size (CSS px ×
+	// devicePixelRatio = physical px) when the panel is detached into a compact
+	// standalone window, saving the pre-detach rect so it can be restored. The
+	// window keeps its top-left corner; size is clamped to the current monitor's
+	// work area so the panel can't end up larger than the screen.
+	w.Bind("_goDetachResize", func(cssW, cssH, dpr float64) {
+		if dpr <= 0 {
+			dpr = 1
+		}
+		var wr winRect
+		procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&wr)))
+		// Don't capture a maximized rect as the "restore" target.
+		if zoomed, _, _ := procIsZoomed.Call(hwnd); zoomed != 0 {
+			procShowWindow.Call(hwnd, swRestore)
+			procGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&wr)))
+		}
+		// Save the pre-detach rect ONLY on the first detach. This bind is also
+		// called when the panel's settings are expanded/collapsed (to re-fit the
+		// window); if we re-saved here, "Back to app" would restore the compact
+		// rect and crop the main window. detachActive is true after the first
+		// detach, so guard on it.
+		if !detachActive {
+			preDetachRect = wr
+			preDetachValid = true
+		}
+
+		pw := int32(cssW*dpr + 0.5)
+		ph := int32(cssH*dpr + 0.5)
+		// Keep the window's CENTER fixed: detaching, or expanding/collapsing the
+		// settings, grows/shrinks the window in place instead of jumping it to the
+		// screen center. (On first detach the center = the main window's center, so
+		// a centered main window yields a centered compact window.) The HEIGHT cap
+		// honors the user's window-size-% setting (the same percent the main window
+		// uses) so expanded settings grow only up to pct% of the work area and the
+		// panel scrolls past that. Width is capped at the full work area only, so
+		// the ~560px panel is never squished.
+		pct := int32(currentWindowSizePct())
+		if pct < 40 {
+			pct = 40
+		} else if pct > 100 {
+			pct = 100
+		}
+		cx := wr.Left + (wr.Right-wr.Left)/2
+		cy := wr.Top + (wr.Bottom-wr.Top)/2
+		if hMon, _, _ := procMonitorFromWindow.Call(hwnd, monitorDefaultToNearest); hMon != 0 {
+			var mi monitorInfo
+			mi.CbSize = uint32(unsafe.Sizeof(mi))
+			if r, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi))); r != 0 {
+				workW := mi.RcWork.Right - mi.RcWork.Left
+				workH := mi.RcWork.Bottom - mi.RcWork.Top
+				maxH := workH * pct / 100
+				if pw > workW {
+					pw = workW
+				}
+				if ph > maxH {
+					ph = maxH
+				}
+			}
+		}
+		if pw < 320 {
+			pw = 320
+		}
+		if ph < 200 {
+			ph = 200
+		}
+		// Place by center, then nudge fully on-screen if growing pushed an edge off
+		// the monitor's work area (keeps it "where it is" without spilling off).
+		x := cx - pw/2
+		y := cy - ph/2
+		if hMon, _, _ := procMonitorFromWindow.Call(hwnd, monitorDefaultToNearest); hMon != 0 {
+			var mi monitorInfo
+			mi.CbSize = uint32(unsafe.Sizeof(mi))
+			if r, _, _ := procGetMonitorInfoW.Call(hMon, uintptr(unsafe.Pointer(&mi))); r != 0 {
+				if x+pw > mi.RcWork.Right {
+					x = mi.RcWork.Right - pw
+				}
+				if y+ph > mi.RcWork.Bottom {
+					y = mi.RcWork.Bottom - ph
+				}
+				if x < mi.RcWork.Left {
+					x = mi.RcWork.Left
+				}
+				if y < mi.RcWork.Top {
+					y = mi.RcWork.Top
+				}
+			}
+		}
+		procSetWindowPos.Call(hwnd, 0, uintptr(x), uintptr(y), uintptr(pw), uintptr(ph),
+			swpNozorder|swpNoactivate)
+		// Remember the compact rect + that we're detached, so an un-maximize from
+		// the titlebar restores to this size rather than the full app size.
+		detachRect = winRect{Left: x, Top: y, Right: x + pw, Bottom: y + ph}
+		detachActive = true
+	})
+	// _goRestoreFromDetach restores the window to the size/position it had before
+	// the AUTO panel was detached.
+	w.Bind("_goRestoreFromDetach", func() {
+		detachActive = false
+		if !preDetachValid {
+			return
+		}
+		// If the detached window was left maximized, un-maximize first so the
+		// restored rect actually takes effect (and the zoomed flag is cleared).
+		if zoomed, _, _ := procIsZoomed.Call(hwnd); zoomed != 0 {
+			procShowWindow.Call(hwnd, swRestore)
+		}
+		r := preDetachRect
+		procSetWindowPos.Call(hwnd, 0, uintptr(r.Left), uintptr(r.Top),
+			uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), swpNozorder|swpNoactivate)
+		preDetachValid = false
 	})
 	w.Bind("_goLogoBase64", func() string { return logoBase64 })
 
@@ -1443,6 +1638,14 @@ func standaloneMain() {
 	// system proxy enabled (pointed at a now-dead localhost port), internet
 	// would be broken until cleared. Do this before anything else network.
 	clearStaleProxy()
+	// Sweep any TUN adapters orphaned by a previous crash/kill. A clean
+	// disconnect already removes its own adapter (and the teardown glob also
+	// catches ghosts on the next TUN disconnect), so this is just hygiene for
+	// the crash case — now that the per-connect cleanup was dropped to speed up
+	// TUN connects. Backgrounded so it never delays launch; a real TUN connect
+	// can't happen for seconds (entries must load / the window must come up),
+	// long after this finishes.
+	go removeTUNAdapter()
 	registerRoutes()
 	loadTabs()
 	loadSettings()

@@ -60,10 +60,19 @@ func startAutoRefresh() {
 		settingsMu.RUnlock()
 
 		for _, t := range tabs {
-			if t.RefreshMin <= 0 {
+			// Auto-refresh toggled off for this tab → skip (interval is preserved).
+			if t.RefreshDisabled || t.RefreshMin <= 0 {
 				continue
 			}
 			if t.IsMain && !srcEnabled {
+				continue
+			}
+			// First time we see this tab (app startup, or a just-added tab): start
+			// its clock now so the first auto-refresh lands one full interval later,
+			// not on the next 1-minute tick. (Bug: an empty map made time.Since(zero)
+			// huge, so it refreshed almost immediately after launch.)
+			if _, seen := lastRefresh[t.ID]; !seen {
+				lastRefresh[t.ID] = time.Now()
 				continue
 			}
 			if time.Since(lastRefresh[t.ID]) < time.Duration(t.RefreshMin)*time.Minute {
@@ -100,10 +109,14 @@ func registerRoutes() {
 	http.HandleFunc("/api/conn/state", handleConnState)
 	http.HandleFunc("/api/auto/switch", handleAutoSwitch)
 	http.HandleFunc("/api/auto/candidates", handleAutoCandidates)
+	http.HandleFunc("/api/auto/connect-cand", handleAutoConnectCand)
 	http.HandleFunc("/api/ping/one", handlePingOne)
 	http.HandleFunc("/api/ping/connected", handlePingConnected)
 	http.HandleFunc("/api/check-exit", handleCheckExit)
 	http.HandleFunc("/api/entry/rename", handleRenameEntry)
+	http.HandleFunc("/api/sources-info", handleSourcesInfo)
+	http.HandleFunc("/api/qr", handleQR)
+	http.HandleFunc("/api/qr-text", handleQRText)
 	http.HandleFunc("/api/ping/all", handlePingAll)
 	http.HandleFunc("/api/speed/one", handleSpeedOne)
 	http.HandleFunc("/api/speed/all", handleSpeedAll)

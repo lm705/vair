@@ -24,7 +24,7 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 	if err != nil {
 		return fmt.Errorf("no free port")
 	}
-	cfg := buildXrayConfigForNode(n, httpPort, -1)
+	cfg := buildXrayConfigForNode(n, httpPort, -1, "", "")
 	if cfg == nil {
 		return fmt.Errorf("xray: unsupported protocol %s", n.Kind)
 	}
@@ -191,7 +191,22 @@ func withEngine(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Trans
 // clean disconnect — see clearStaleProxy.
 func proxyLockPath() string { return filepath.Join(tabsDir(), "proxy.active") }
 
+// appliedProxyPort is the local port the Windows system proxy currently points
+// at, as set by us (0 = not set). It lets setSystemProxy skip the WinINET
+// registry churn when nothing actually changes — the key speedup for switching
+// between configs in proxy mode, where the public port stays the same and only
+// the core underneath swaps. Only touched from the connect/disconnect paths,
+// which are serialised by cm.actionMu (plus clearStaleProxy at startup, before
+// any connection), so it needs no separate lock.
+var appliedProxyPort int
+
 func setSystemProxy(port int) error {
+	if appliedProxyPort == port {
+		// Already pointed here — skip the 3 reg writes + the inetcpl cache flush
+		// (which broadcasts WM_SETTINGCHANGE to every top-level window). This is
+		// what makes a same-port proxy switch feel instant.
+		return nil
+	}
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	bypass := "localhost;127.*;10.*;172.16.*;192.168.*;*.local;<local>"
 	rp := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
@@ -209,6 +224,7 @@ func setSystemProxy(port int) error {
 	os.MkdirAll(tabsDir(), 0755)                                               //nolint:errcheck
 	os.WriteFile(proxyLockPath(), []byte(addr), 0644)                          //nolint:errcheck
 	runHidden("rundll32.exe", "inetcpl.cpl,ClearMyTracksByProcess", "8").Run() //nolint:errcheck
+	appliedProxyPort = port
 	return nil
 }
 
@@ -216,6 +232,7 @@ func unsetSystemProxy() {
 	rp := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	runHidden("reg", "add", rp, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run() //nolint:errcheck
 	os.Remove(proxyLockPath())                                                                 //nolint:errcheck
+	appliedProxyPort = 0
 }
 
 // clearStaleProxy runs once at startup. If the proxy-lock file from a prior
@@ -253,7 +270,7 @@ func startProxyConnection(entry *ConfigEntry) {
 // with the right tab.
 func startProxyConnectionOnTab(entry *ConfigEntry, connTab string) {
 	cm := state.conn
-	stopConnectionLocked(cm)
+	stopConnectionLocked(cm, true) // proxy→proxy: keep the system proxy set
 
 	n, err := parseNode(entry.Raw)
 	if err != nil {
@@ -318,7 +335,7 @@ func startChain(entries []*ConfigEntry, mode ConnMode) {
 // conn-bar shows the full "A → B" chain.
 func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 	cm := state.conn
-	stopConnectionLocked(cm)
+	stopConnectionLocked(cm, mode != ModeTUN) // keep proxy only for a proxy chain
 
 	if len(entries) < 2 {
 		if len(entries) == 1 {
@@ -372,7 +389,7 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 		cm.state = ConnState{Status: ConnConnecting, Mode: ModeTUN, EntryIndex: entries[0].Index, EntryName: chainName, ConnTab: connTab, ConnRaw: entries[0].Raw, Chain: labels, ChainRaws: raws}
 		cm.mu.Unlock()
 		state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
-		tunIfaceName := fmt.Sprintf("xc-tun-%d", time.Now().Unix()%10000)
+		tunIfaceName := fmt.Sprintf("vair-%d", time.Now().Unix()%10000)
 		startTUNConnectionHybrid(cm, entries[0], nodes[0], connTab, tunIfaceName, nodes, labels, raws)
 		return
 	}
@@ -383,7 +400,10 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 
 	runXrayProxyConfig(cm, entries[0], chainName, connTab, labels, raws, func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
-		return buildXrayChainConfig(nodes, intHTTPPort, intSOCKSPort)
+		// Proxy mode = user-facing SOCKS → use the configured SOCKS-auth credentials
+		// (empty when the setting is off).
+		su, sp := proxySocksCreds()
+		return buildXrayChainConfig(nodes, intHTTPPort, intSOCKSPort, su, sp)
 	})
 }
 
@@ -392,7 +412,10 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 // wait/finalize sequence (also used by the chain path).
 func startProxyConnectionXray(cm *connManager, entry *ConfigEntry, n *Node, connTab string) {
 	runXrayProxyConfig(cm, entry, n.Name, connTab, nil, nil, func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
-		return buildXrayConfigForNode(n, intHTTPPort, intSOCKSPort)
+		// Proxy mode = user-facing SOCKS → use the configured SOCKS-auth credentials
+		// (empty when the setting is off).
+		su, sp := proxySocksCreds()
+		return buildXrayConfigForNode(n, intHTTPPort, intSOCKSPort, su, sp)
 	})
 }
 
@@ -445,6 +468,9 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, state.xrayBin, "run", "-c", tmpPath)
+	// Point xray at the asset dir so external geo files (ext:geosite-ru-blocked.dat
+	// etc.) resolve even if the exe-dir fallback ever changes.
+	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+filepath.Dir(state.xrayBin))
 	hideProcess(cmd)
 
 	// xray writes its console log to STDOUT (unlike sing-box, which uses
@@ -732,12 +758,14 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 	}
 
 	cm := state.conn
-	stopConnectionLocked(cm)
+	stopConnectionLocked(cm, false) // TUN: drop any system proxy from a prior proxy session
 
-	// Best-effort cleanup of any stale adapters from previous sessions.
-	// With unique names below this is no longer strictly required,
-	// but prevents accumulation of ghost adapters in Device Manager.
-	removeTUNAdapter()
+	// NOTE: no removeTUNAdapter() here anymore. Adapter names are unique per
+	// session (vair-<unixtime>), so a fresh connect never collides with a stale
+	// adapter, and stopConnectionLocked already removed the previous TUN adapter
+	// on teardown. Ghost adapters left by a *crash* are swept once at startup
+	// (see cleanupStaleTUNAdapters). Dropping this saves a full PowerShell launch
+	// (~300–700ms) off every TUN connect.
 
 	n, err := parseNode(entry.Raw)
 	if err != nil {
@@ -771,7 +799,7 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 	// Unique interface name per session avoids "file already exists".
 	// Even if Windows hasn't fully cleaned the previous adapter kernel-side,
 	// a new name means sing-box never conflicts with the old one.
-	tunIfaceName := fmt.Sprintf("xc-tun-%d", time.Now().Unix()%10000)
+	tunIfaceName := fmt.Sprintf("vair-%d", time.Now().Unix()%10000)
 
 	// Engine branch. TCP-family protocols use the hybrid path (sing-box TUN
 	// front-end → xray outbound). UDP-family (Hysteria2/TUIC) run as a
@@ -810,10 +838,22 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		return
 	}
 	var xrayCfg map[string]interface{}
+	// TUN hybrid: this xray SOCKS is the INTERNAL handoff sing-box dials (with the
+	// matching credentials) — never user-facing — so it always keeps auth on with
+	// the per-launch random credentials, independent of the user's SOCKS-auth
+	// setting.
 	if isChain {
-		xrayCfg = buildXrayChainConfig(chainNodes, xrayHTTPPort, xraySocksPort)
+		xrayCfg = buildXrayChainConfig(chainNodes, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass)
 	} else {
-		xrayCfg = buildXrayConfigForNode(n, xrayHTTPPort, xraySocksPort)
+		xrayCfg = buildXrayConfigForNode(n, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass)
+		// In hybrid TUN the proxy-vs-direct split is made by sing-box; the xray
+		// child must send everything it receives straight to the proxy. Otherwise
+		// the child's own routing (e.g. only_blocked default→direct) could push a
+		// connection — or a DoH DNS query — out the child's direct outbound,
+		// bypassing the VPN. (Chains keep their internal hop routing.)
+		if xrayCfg != nil {
+			xrayCfg["routing"] = xrayRoutingAllProxy()
+		}
 	}
 	if xrayCfg == nil {
 		setConnError(cm, entry, fmt.Sprintf("xray: unsupported protocol %s", n.Kind))
@@ -845,6 +885,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	}
 	xrayCtx, xrayCancel := context.WithCancel(context.Background())
 	xrayCmd := exec.CommandContext(xrayCtx, state.xrayBin, "run", "-c", xrayTmpPath)
+	xrayCmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+filepath.Dir(state.xrayBin))
 	// xray logs to stdout (sing-box uses stderr) — capture both into the panel.
 	xrayStdoutPipe, _ := xrayCmd.StdoutPipe()
 	xrayStderrPipe, _ := xrayCmd.StderrPipe()
@@ -1142,7 +1183,7 @@ func stopConnection() {
 	// sequence (which would double-kill / clobber cm fields). See connManager.
 	state.conn.actionMu.Lock()
 	defer state.conn.actionMu.Unlock()
-	stopConnectionLocked(state.conn)
+	stopConnectionLocked(state.conn, false)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: state.conn.snap()})
 	// A verbose connection can churn a lot of transient heap (log lines, JSON
 	// batches). Go won't hand that back to the OS for ~5 min on its own, which
@@ -1154,11 +1195,19 @@ func stopConnection() {
 // in the system and doesn't cause "file already exists" on reconnect.
 func removeTUNAdapter() {
 	runHidden("powershell", "-NonInteractive", "-Command",
-		`Get-NetAdapter -Name 'xc-tun-*' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:$false`,
+		`Get-NetAdapter -Name 'vair-*','xc-tun-*' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:$false`,
 	).Run() //nolint:errcheck
 }
 
-func stopConnectionLocked(cm *connManager) {
+// stopConnectionLocked tears down the live connection. keepProxy=true is passed
+// by the proxy-connect path: it means "we're about to reconnect in proxy mode,
+// so leave the Windows system-proxy setting in place". Combined with the
+// setSystemProxy dedup, a same-port proxy→proxy switch then does ZERO WinINET
+// work (no unset+reset churn). It also avoids the old brief window where the
+// proxy was disabled mid-switch — during which apps would leak direct. Every
+// other caller (real disconnect, switch to TUN) passes false so the proxy is
+// properly removed.
+func stopConnectionLocked(cm *connManager, keepProxy bool) {
 	cm.mu.Lock()
 	if cm.state.Status == ConnIdle {
 		cm.mu.Unlock()
@@ -1262,7 +1311,14 @@ func stopConnectionLocked(cm *connManager) {
 	}
 
 	if wasProxy {
-		unsetSystemProxy()
+		// Keep the system proxy set when we're switching proxy→proxy (the new
+		// connect re-binds the same public port and setSystemProxy dedups to a
+		// no-op). Only actually clear it on a real disconnect / switch to TUN.
+		if !keepProxy {
+			unsetSystemProxy()
+		}
+		// Still wait for the public port to free so the new forwarder can bind it
+		// (exits early via portFree — usually well under the 400ms cap).
 		if prevHTTPPort > 0 {
 			deadline := time.Now().Add(400 * time.Millisecond)
 			for time.Now().Before(deadline) {

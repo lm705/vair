@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	qrcode "github.com/skip2/go-qrcode"
 )
 
 // ─────────────────────────── HTTP handlers ───────────────────────
@@ -211,6 +213,83 @@ func handleAutoSwitch(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// handleQR renders the raw URL of a config on the active tab as a QR-code PNG.
+// Query: idx (entry index on the active tab). Works for any tab, including
+// SOURCES — it only reads the config's raw URL, never edits it. Used by the
+// "Show QR" context-menu item to let the user scan a config into a phone client.
+func handleQR(w http.ResponseWriter, r *http.Request) {
+	idx, err := strconv.Atoi(r.URL.Query().Get("idx"))
+	if err != nil {
+		http.Error(w, "bad idx", 400)
+		return
+	}
+	state.mu.RLock()
+	if idx < 0 || idx >= len(state.entries) {
+		state.mu.RUnlock()
+		http.Error(w, "not found", 404)
+		return
+	}
+	raw := state.entries[idx].Raw
+	state.mu.RUnlock()
+	if raw == "" {
+		http.Error(w, "empty config", 400)
+		return
+	}
+	// Medium ECC balances density vs scannability; 512px is crisp on screen and
+	// still scans from a phone. Long VLESS/Reality URLs push QR to a high version
+	// automatically — go-qrcode handles version selection.
+	png, err := qrcode.Encode(raw, qrcode.Medium, 512)
+	if err != nil {
+		http.Error(w, "qr encode: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(png)
+}
+
+// handleQRText renders an arbitrary string (query param `data`) as a QR-code
+// PNG. Used for source/subscription URLs — both the built-in SOURCES URLs and a
+// user tab's source URLs — which aren't tied to a config index like handleQR.
+func handleQRText(w http.ResponseWriter, r *http.Request) {
+	data := r.URL.Query().Get("data")
+	if strings.TrimSpace(data) == "" {
+		http.Error(w, "empty data", 400)
+		return
+	}
+	// Cap input: a QR tops out around ~2.9 KB of bytes, and a subscription URL is
+	// far shorter. Reject anything implausibly long rather than fail in Encode.
+	if len(data) > 2000 {
+		http.Error(w, "data too long for QR", 400)
+		return
+	}
+	png, err := qrcode.Encode(data, qrcode.Medium, 512)
+	if err != nil {
+		http.Error(w, "qr encode: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Write(png)
+}
+
+// handleSourcesInfo returns the built-in SOURCES source URLs. They are compiled
+// in (sourceDefs), not user-editable like custom-tab URLs, so the Sources
+// Settings modal shows them read-only (copy only).
+func handleSourcesInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	urls := make([]string, 0, len(sourceDefs))
+	for _, s := range sourceDefs {
+		if s.URL != "" {
+			urls = append(urls, s.URL)
+		}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"urls": urls})
+}
+
 // handleAutoCandidates returns the ranked candidate pool the supervisor would
 // choose from (same ordering as autoCandidates), for the panel's live list.
 func handleAutoCandidates(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +325,55 @@ func handleAutoCandidates(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(out)
 }
 
+// handleAutoConnectCand connects to a specific candidate chosen by the user in
+// the AUTO panel's STATUS table (left-click). It finds the candidate in the
+// current pool by its raw URL and connects to that exact entry — across tabs,
+// so a click works even for a config on a non-active tab. Mirrors handleConnect:
+// arms auto-want (keep-alive / failover-on-death) but marks the connection
+// user-owned (autoManaged=false) so the supervisor won't switch away from the
+// user's pick on its own.
+func handleAutoConnectCand(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	raw := r.URL.Query().Get("raw")
+	if raw == "" {
+		http.Error(w, "bad raw", 400)
+		return
+	}
+	mode := r.URL.Query().Get("mode")
+	var found *autoCand
+	for _, c := range autoCandidates(autoPool(), "", nil) {
+		if c.entry.snap().Raw == raw {
+			cc := c
+			found = &cc
+			break
+		}
+	}
+	if found == nil {
+		http.Error(w, "candidate not found", 404)
+		return
+	}
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+	autoWant.Store(true)
+	autoManaged.Store(false)
+	autoLiveRtt.Store(0)
+	autoProbeNow.Store(true)
+	// The *OnTab connect functions require the caller to hold cm.actionMu (they
+	// don't lock themselves — only the public startProxyConnection wrapper does).
+	// Take it here so this user-driven connect serialises against the supervisor
+	// and other connect/disconnect flows, exactly like handleConnect.
+	go func() {
+		cm := state.conn
+		cm.actionMu.Lock()
+		defer cm.actionMu.Unlock()
+		if mode == "tun" {
+			startTUNConnectionOnTab(found.entry, found.tabID)
+		} else {
+			startProxyConnectionOnTab(found.entry, found.tabID)
+		}
+	}()
+}
+
 func handlePingOne(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	idx, err := strconv.Atoi(r.URL.Query().Get("idx"))
@@ -264,7 +392,11 @@ func handlePingOne(w http.ResponseWriter, r *http.Request) {
 	state.mu.RUnlock()
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
+	// Register a cancel channel so RELOAD on this tab can stop this manual ping.
+	cancelCh := make(chan struct{})
+	registerManualTest(tabID, cancelCh)
 	go func() {
+		defer unregisterManualTest(tabID, cancelCh)
 		entry.mu.Lock()
 		entry.PingStatus = StatusTestingPing
 		entry.mu.Unlock()
@@ -278,7 +410,7 @@ func handlePingOne(w http.ResponseWriter, r *http.Request) {
 					fmt.Fprintf(os.Stderr, "⚠ ping test panic: %v\n", r)
 				}
 			}()
-			runPingForEntry(entry)
+			runPingForEntry(entry, cancelCh)
 		}()
 		select {
 		case <-done:
@@ -287,7 +419,9 @@ func handlePingOne(w http.ResponseWriter, r *http.Request) {
 		}
 
 		entry.mu.Lock()
-		if entry.PingStatus == StatusTestingPing {
+		// Cancelled by RELOAD → leave pending (runPingForEntry already set it);
+		// only the genuine 20s-watchdog case force-fails a stuck "testing" pill.
+		if entry.PingStatus == StatusTestingPing && !isTestCancelled(cancelCh) {
 			entry.PingStatus = StatusFailed
 			entry.PingErr = "timeout"
 			entry.Delay = -1
@@ -355,7 +489,7 @@ func handlePingConnected(w http.ResponseWriter, r *http.Request) {
 					fmt.Fprintf(os.Stderr, "⚠ ping connected panic: %v\n", r)
 				}
 			}()
-			runPingForEntry(entry)
+			runPingForEntry(entry, nil)
 		}()
 		select {
 		case <-done:
@@ -379,6 +513,10 @@ func handlePingConnected(w http.ResponseWriter, r *http.Request) {
 // uses: proxy mode via the local HTTP port, TUN mode direct (system routes it
 // through the tunnel). Queries ip-api.com (no key, returns JSON over the
 // tunnel). Synchronous (the UI shows a spinner); ~8s hard cap.
+// checkExitHost is the geo/IP service used by the "check IP" button. It's forced
+// through the proxy in only_blocked mode so the button reflects the VPN exit.
+const checkExitHost = "ip-api.com"
+
 func handleCheckExit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -411,8 +549,10 @@ func handleCheckExit(w http.ResponseWriter, r *http.Request) {
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 	// ip-api.com: free, no key, HTTP/JSON. fields filters the payload to what we
-	// show. We hit it THROUGH the tunnel, so the reported IP is the exit IP.
-	const exitURL = "http://ip-api.com/json/?fields=status,message,country,countryCode,city,query,isp"
+	// show. We hit it THROUGH the tunnel, so the reported IP is the exit IP. In
+	// only_blocked mode the routing forces checkExitHost through the proxy (see
+	// the routing builders) so this still reflects the VPN exit, not the direct IP.
+	exitURL := "http://" + checkExitHost + "/json/?fields=status,message,country,countryCode,city,query,isp"
 	req, _ := http.NewRequest("GET", exitURL, nil)
 	resp, err := client.Do(req)
 	if err != nil {
@@ -549,7 +689,12 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 	state.mu.RUnlock()
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
+	// Register a cancel channel so RELOAD on this tab can stop this manual speed
+	// test promptly (it aborts the in-flight ping/download via the threaded cancel).
+	cancelCh := make(chan struct{})
+	registerManualTest(tabID, cancelCh)
 	go func() {
+		defer unregisterManualTest(tabID, cancelCh)
 		entry.mu.Lock()
 		entry.SpeedStatus = StatusTestingSpeed
 		entry.SpeedMBps = 0
@@ -567,7 +712,7 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 					fmt.Fprintf(os.Stderr, "⚠ speed test panic: %v\n", r)
 				}
 			}()
-			runSpeedForEntry(entry, tabID)
+			runSpeedForEntry(entry, tabID, cancelCh)
 		}()
 		select {
 		case <-done:
@@ -576,9 +721,11 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(os.Stderr, "⚠ speed test timeout for #%d\n", entry.Index)
 		}
 
-		// Guarantee status is never stuck on "testing"
+		// Guarantee status is never stuck on "testing" — unless cancelled by
+		// RELOAD, in which case runSpeedForEntry already left it pending.
+		cancelled := isTestCancelled(cancelCh)
 		entry.mu.Lock()
-		if entry.SpeedStatus == StatusTestingSpeed {
+		if entry.SpeedStatus == StatusTestingSpeed && !cancelled {
 			entry.SpeedStatus = StatusFailed
 			entry.SpeedErr = "timeout"
 			entry.SpeedLive = 0
@@ -587,7 +734,7 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 		// inside the withXray callback. If xray crashes before that branch
 		// runs and PingStatus was already TestingPing (e.g. a prior ping was
 		// in flight when speed was clicked), force-fail it too.
-		if entry.PingStatus == StatusTestingPing {
+		if entry.PingStatus == StatusTestingPing && !cancelled {
 			entry.PingStatus = StatusFailed
 			entry.Delay = -1
 			if entry.PingErr == "" {
@@ -681,6 +828,31 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state.mu.RUnlock()
+
+	// Stop an in-flight ping/speed run IMMEDIATELY — but ONLY if it's testing
+	// THIS tab. Tests are global (one at a time across all tabs), so reloading a
+	// different tab must not abort a test running elsewhere; it just refreshes
+	// its own configs. cancelTestsOnTab checks testingTab before cancelling.
+	// When it does cancel, two effects: the bulk loop stops taking new configs
+	// AND the in-flight ping/download aborts within one read (via the cancel
+	// channel threaded into measurePing/measureSpeedOne); it also makes the
+	// runner skip reconcileBulkResults, so old results never re-assert onto the
+	// freshly-reset list (the historical "old test bled into the new list" bug).
+	cancelTestsOnTab(tabID)
+	// Briefly mark the tab cancelled so any bulk loop bound to THIS tab bails
+	// before we re-broadcast the fresh list. It's per-tab, so safe to set
+	// unconditionally. We clear it on a short independent timer — the reload
+	// itself fires IMMEDIATELY below (no longer gated behind a 300ms sleep, which
+	// made RELOAD feel laggy on idle tabs).
+	state.mu.Lock()
+	state.cancelledTabs[tabID] = true
+	state.mu.Unlock()
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		state.mu.Lock()
+		delete(state.cancelledTabs, tabID)
+		state.mu.Unlock()
+	}()
 
 	if tabID == "main" {
 		go fetchAndInit()
@@ -890,14 +1062,30 @@ func handleTabRename(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// strSlicesEqual reports whether two string slices have identical contents in
+// the same order (nil and empty are treated as equal).
+func strSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	id := r.URL.Query().Get("id")
 	type tabSettingsReq struct {
-		URLs          []string  `json:"urls"`
-		Files         []TabFile `json:"files"`
-		RefreshMin    int       `json:"refresh_min"`
-		ExcludeFilter []string  `json:"exclude_filter"`
+		URLs            []string  `json:"urls"`
+		Files           []TabFile `json:"files"`
+		RefreshMin      int       `json:"refresh_min"`
+		ExcludeFilter   []string  `json:"exclude_filter"`
+		ExcludeDisabled bool      `json:"exclude_disabled"`
+		RefreshDisabled bool      `json:"refresh_disabled"`
 		// New 3-state field. Legacy "dedup":true is accepted below for
 		// older clients during the migration window.
 		DedupMode string `json:"dedup_mode"`
@@ -955,10 +1143,16 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var sourcesChanged bool
+	var excludeChanged bool
 	var oldMode string
 	state.mu.Lock()
 	for i, t := range state.tabs {
 		if t.ID == id {
+			// The exclude filter is applied at FETCH time (matching configs are
+			// dropped from the list), so a change to it — including toggling it
+			// off — needs a rebuild to re-show / re-hide configs.
+			excludeChanged = t.ExcludeDisabled != req.ExcludeDisabled ||
+				!strSlicesEqual(t.ExcludeFilter, req.ExcludeFilter)
 			if !t.IsMain {
 				oldURLs := strings.Join(t.SourceURLs, "|")
 				newURLs := strings.Join(cleanURLs, "|")
@@ -972,12 +1166,43 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 			}
 			state.tabs[i].RefreshMin = req.RefreshMin
 			state.tabs[i].ExcludeFilter = req.ExcludeFilter
+			state.tabs[i].ExcludeDisabled = req.ExcludeDisabled
+			state.tabs[i].RefreshDisabled = req.RefreshDisabled
 			break
 		}
 	}
 	state.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
+
+	// If the exclude filter changed (content or the on/off toggle), rebuild the
+	// list so dropped configs reappear / new matches are removed. Excluded
+	// configs aren't kept server-side, so the only way to bring them back is to
+	// re-fetch the tab's sources. (Sourceless paste-only tabs have nothing to
+	// re-fetch and the filter never dropped their configs, so they fall through.)
+	if excludeChanged {
+		if id == "main" {
+			go fetchAndInit()
+			w.WriteHeader(200)
+			w.Write([]byte("ok"))
+			return
+		}
+		if len(cleanURLs) > 0 || len(cleanFiles) > 0 {
+			state.mu.Lock()
+			state.tabEntries[id] = nil
+			if state.activeTab == id {
+				state.entries = nil
+			}
+			state.mu.Unlock()
+			if state.activeTab == id {
+				state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
+			}
+			go fetchTabURLs(id, cleanURLs, cleanFiles)
+			w.WriteHeader(200)
+			w.Write([]byte("ok"))
+			return
+		}
+	}
 
 	// "delete" mode requested AND mode has actually transitioned into delete
 	// AND sources didn't change → apply server-side dedup to the current
@@ -1118,7 +1343,9 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	var dedupMode string
 	for _, t := range state.tabs {
 		if t.ID == tabID {
-			excludeFilter = t.ExcludeFilter
+			if !t.ExcludeDisabled {
+				excludeFilter = t.ExcludeFilter
+			}
 			dedupMode = t.DedupMode
 			break
 		}
@@ -1472,6 +1699,7 @@ func buildSettingsExport() settingsExport {
 			ID: t.ID, Name: t.Name,
 			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles,
 			RefreshMin: t.RefreshMin, ExcludeFilter: t.ExcludeFilter,
+			ExcludeDisabled: t.ExcludeDisabled, RefreshDisabled: t.RefreshDisabled,
 			DedupMode: t.DedupMode,
 		}
 		if !t.IsMain {
@@ -1584,6 +1812,8 @@ func handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 				if t.ID == "main" {
 					state.tabs[i].ExcludeFilter = pt.ExcludeFilter
 					state.tabs[i].RefreshMin = pt.RefreshMin
+					state.tabs[i].ExcludeDisabled = pt.ExcludeDisabled
+					state.tabs[i].RefreshDisabled = pt.RefreshDisabled
 					break
 				}
 			}
@@ -1600,7 +1830,9 @@ func handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 		tab := Tab{
 			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
 			SourceURLs: urls, SourceFiles: pt.SourceFiles,
-			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter, DedupMode: mode,
+			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter,
+			ExcludeDisabled: pt.ExcludeDisabled, RefreshDisabled: pt.RefreshDisabled,
+			DedupMode: mode,
 		}
 		state.tabs = append(state.tabs, tab)
 		state.tabEntries[tab.ID] = parseConfigLines(strings.Join(pt.Configs, "\n"))

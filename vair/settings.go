@@ -16,7 +16,32 @@ type AppSettings struct {
 	RuSitesDirect  bool     `json:"ru_sites_direct"`
 	DirectDomains  []string `json:"direct_domains"`
 	DirectApps     []string `json:"direct_apps"`
-	TrayEnabled    bool     `json:"tray_enabled"`
+	// DirectDomainsDisabled / DirectAppsDisabled turn OFF the split-tunnel routing
+	// for the saved "Custom domains without VPN" / "Apps without VPN" lists
+	// WITHOUT clearing them — the lists persist but aren't applied to the
+	// generated routing. Inverted bool so the JSON zero value (omitted) means
+	// "enabled": both features default ON.
+	DirectDomainsDisabled bool `json:"direct_domains_disabled,omitempty"`
+	DirectAppsDisabled    bool `json:"direct_apps_disabled,omitempty"`
+	// RoutingMode selects the traffic policy:
+	//   "bypass_ru"    — everything through the VPN except Russian sites (legacy
+	//                    RuSitesDirect=true). RU geosite/geoip go direct.
+	//   "only_blocked" — direct by default, only resources BLOCKED in Russia go
+	//                    through the VPN (runetfreedom ru-blocked rule-sets).
+	//   "proxy_all"    — everything through the VPN (legacy RuSitesDirect=false).
+	// Unset is derived from the legacy RuSitesDirect toggle (see routingMode()),
+	// so old settings files keep their behaviour without an explicit migration.
+	RoutingMode string `json:"routing_mode,omitempty"`
+	// ProxyDomains is the manual "Custom domains THROUGH VPN" list (mirror of
+	// DirectDomains); meaningful in only_blocked mode. ProxyDomainsDisabled keeps
+	// the list but stops applying it.
+	ProxyDomains         []string `json:"proxy_domains,omitempty"`
+	ProxyDomainsDisabled bool     `json:"proxy_domains_disabled,omitempty"`
+	// BlocklistURL is an optional user-supplied plain-text domain list (one
+	// suffix per line) fetched + auto-updated and routed through the VPN in
+	// addition to the bundled runetfreedom list (only_blocked mode).
+	BlocklistURL string `json:"blocklist_url,omitempty"`
+	TrayEnabled  bool   `json:"tray_enabled"`
 	// Per-user concurrency overrides for bulk tests. Zero / unset falls back
 	// to the defaults below. Capped at sane upper bounds inside the
 	// accessors so a fat-fingered "9999" doesn't melt the local network.
@@ -72,6 +97,9 @@ type AppSettings struct {
 	// 11. Language uses BCP-47-ish short codes — "" / "en" / "ru".
 	ModalFontSize int    `json:"modal_font_size,omitempty"`
 	Language      string `json:"language,omitempty"`
+	// Theme is the UI colour scheme: "" / "dark" (default) or "light". Applied
+	// client-side by toggling body.theme-light; the server only stores it.
+	Theme string `json:"theme,omitempty"`
 	// WindowSizePct is the default window size as a percent of the current
 	// monitor's work area (clamped 40–100, capped 1440×920 / floored 900×600 in
 	// idealWindowSize). 0 / unset → 80 (the historical default). Applied at
@@ -110,6 +138,14 @@ type AppSettings struct {
 	// When true the ip_is_private→direct rule is removed and even
 	// 192.168.x.x goes through the tunnel.
 	BlockLAN bool `json:"block_lan,omitempty"`
+	// SocksAuth protects the local SOCKS5 proxy (proxy mode) with a
+	// username/password so other local apps can't use it or probe the VPN server.
+	// OFF by default. When ON, the proxy SOCKS listener requires SocksUser/SocksPass
+	// (generated at random if unset; editable / resettable from Settings). The
+	// internal TUN handoff keeps its own separate auth regardless of this setting.
+	SocksAuth bool   `json:"socks_auth,omitempty"`
+	SocksUser string `json:"socks_user,omitempty"`
+	SocksPass string `json:"socks_pass,omitempty"`
 	// FakeIPDisabled is also inverted: zero/false = FakeIP enabled
 	// (when DNSLeakProtection is on). FakeIP returns 198.18.0.0/15
 	// pseudo-addresses for A/AAAA queries; real resolution happens
@@ -457,6 +493,70 @@ func allowLANTraffic() bool {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
 	return !appSettings.BlockLAN
+}
+
+// routingMode returns the effective traffic policy: "bypass_ru", "only_blocked"
+// or "proxy_all". When RoutingMode is unset (old settings file / fresh install)
+// it's derived from the legacy RuSitesDirect toggle so behaviour is preserved.
+func routingMode() string {
+	settingsMu.RLock()
+	m := appSettings.RoutingMode
+	ruDirect := appSettings.RuSitesDirect
+	settingsMu.RUnlock()
+	switch m {
+	case "bypass_ru", "only_blocked", "proxy_all":
+		return m
+	}
+	if ruDirect {
+		return "bypass_ru"
+	}
+	return "proxy_all"
+}
+
+// effectiveProxyDomains returns the manual "through VPN" domain list, or nil when
+// the list is toggled off. Mirror of the DirectDomains handling.
+func effectiveProxyDomains() []string {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	if appSettings.ProxyDomainsDisabled {
+		return nil
+	}
+	out := make([]string, 0, len(appSettings.ProxyDomains))
+	for _, d := range appSettings.ProxyDomains {
+		if d = strings.TrimSpace(d); d != "" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// blocklistURL returns the trimmed custom blocklist URL ("" = none).
+func blocklistURL() string {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return strings.TrimSpace(appSettings.BlocklistURL)
+}
+
+// proxySocksCreds returns the username/password the user-facing SOCKS5 proxy
+// (proxy mode) should require. Returns ("","") when SOCKS auth is off — the
+// listener then accepts connections without credentials. When on, it uses the
+// user's custom credentials, falling back to the per-launch random ones if unset.
+func proxySocksCreds() (user, pass string) {
+	settingsMu.RLock()
+	on := appSettings.SocksAuth
+	u := strings.TrimSpace(appSettings.SocksUser)
+	p := strings.TrimSpace(appSettings.SocksPass)
+	settingsMu.RUnlock()
+	if !on {
+		return "", ""
+	}
+	if u == "" {
+		u = proxyAuthUser
+	}
+	if p == "" {
+		p = proxyAuthPass
+	}
+	return u, p
 }
 
 func fakeIPEnabled() bool {

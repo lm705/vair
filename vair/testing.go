@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,25 +15,79 @@ import (
 
 // ─────────────────────────── ping / speed ────────────────────────
 
-func measurePing(tr *http.Transport) (int64, error) {
+// measurePing does a warm-up request then pingRounds timed GETs, returning the
+// best (lowest) round-trip in ms. cancel (nil for single-config / auto callers)
+// lets a bulk RELOAD abort promptly: it's checked between requests, AND attached
+// to each request's context so even a request blocked mid-flight is torn down
+// the instant cancel fires — without waiting out the warm-up / per-round timeout.
+func measurePing(tr *http.Transport, cancel <-chan struct{}) (int64, error) {
 	url := currentPingURL()
 	pt := currentPingTimeout()
-	wc := &http.Client{Transport: tr, Timeout: currentWarmupTimeout(),
+	// cancelled reports whether the bulk run was cancelled (nil cancel = never).
+	cancelled := func() bool {
+		if cancel == nil {
+			return false
+		}
+		select {
+		case <-cancel:
+			return true
+		default:
+			return false
+		}
+	}
+	// reqCtx returns a request whose context is cancelled when either the given
+	// timeout elapses or the bulk `cancel` channel closes. The watcher goroutine
+	// exits when the request finishes (done closed) so it never leaks.
+	reqCtx := func(timeout time.Duration) (*http.Request, context.CancelFunc, chan struct{}) {
+		ctx, cf := context.WithTimeout(context.Background(), timeout)
+		done := make(chan struct{})
+		if cancel != nil {
+			go func() {
+				select {
+				case <-cancel:
+					cf() // bulk cancelled → abort the in-flight request now
+				case <-done:
+				}
+			}()
+		}
+		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+		return req, cf, done
+	}
+
+	if cancelled() {
+		return -1, errPingCancelled
+	}
+	wc := &http.Client{Transport: tr,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	w, err := wc.Get(url)
+	wreq, wcf, wdone := reqCtx(currentWarmupTimeout())
+	w, err := wc.Do(wreq)
+	close(wdone)
+	wcf()
 	if err != nil {
+		if cancelled() {
+			return -1, errPingCancelled
+		}
 		return -1, fmt.Errorf("warmup: %w", err)
 	}
 	io.Copy(io.Discard, w.Body)
 	w.Body.Close()
-	mc := &http.Client{Transport: tr, Timeout: pt,
+	mc := &http.Client{Transport: tr,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var best int64 = -1
 	var lastErr error
 	for i := 0; i < pingRounds; i++ {
+		if cancelled() {
+			return -1, errPingCancelled
+		}
 		start := time.Now()
-		resp, e := mc.Get(url)
+		mreq, mcf, mdone := reqCtx(pt)
+		resp, e := mc.Do(mreq)
 		if e != nil {
+			close(mdone)
+			mcf()
+			if cancelled() {
+				return -1, errPingCancelled
+			}
 			lastErr = e
 			if best > 0 {
 				break
@@ -42,6 +97,8 @@ func measurePing(tr *http.Transport) (int64, error) {
 		ms := time.Since(start).Milliseconds()
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+		close(mdone)
+		mcf()
 		if best < 0 || ms < best {
 			best = ms
 		}
@@ -82,20 +139,30 @@ func withCacheBuster(u string) string {
 // whether to fall back to a secondary URL.
 var err429 = errors.New("HTTP 429")
 
+// errSpeedCancelled is returned by measureSpeedOne when the bulk run is
+// cancelled mid-download (e.g. RELOAD). Callers treat it as "stop", not a real
+// failure — the row's result is left as-is rather than marked failed.
+var errSpeedCancelled = errors.New("speed test cancelled")
+
+// errPingCancelled is the ping-side equivalent: measurePing returns it when the
+// bulk run is cancelled, so the runner leaves the row pending instead of failed.
+var errPingCancelled = errors.New("ping cancelled")
+
 // measureSpeed runs one speed test, with an optional fallback to a second
 // URL ONLY when the primary returns HTTP 429. Each attempt is its own
 // bounded request — same http.Client.Timeout and same defer-close — so a
 // fallback can never extend the test indefinitely or leak the connection
 // (the failure mode that caused tests to hang on "connecting…" in a
-// previous attempt at this feature).
-func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error) {
+// previous attempt at this feature). cancel (nil for single-config tests)
+// aborts the download promptly when the bulk run is cancelled.
+func measureSpeed(tr *http.Transport, onProgress func(float64), cancel <-chan struct{}) (float64, error) {
 	primary := currentSpeedURL()
-	mbps, err := measureSpeedOne(tr, primary, onProgress)
+	mbps, err := measureSpeedOne(tr, primary, onProgress, cancel)
 	if err == nil {
 		return mbps, nil
 	}
 	// Only retry on a clean 429 from the primary. Connect errors, slow
-	// responses, etc. stay as the user-visible error.
+	// responses, cancellation, etc. stay as the user-visible/terminal result.
 	if !errors.Is(err, err429) {
 		return mbps, err
 	}
@@ -103,13 +170,13 @@ func measureSpeed(tr *http.Transport, onProgress func(float64)) (float64, error)
 	if fb == "" || fb == primary {
 		return mbps, err
 	}
-	return measureSpeedOne(tr, fb, onProgress)
+	return measureSpeedOne(tr, fb, onProgress, cancel)
 }
 
 // measureSpeedOne is a single attempt: one HTTP request, bounded by
 // Client.Timeout, body always closed via defer. Returned errors are
 // terminal — there's no inner retry that could spin forever.
-func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)) (float64, error) {
+func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64), cancel <-chan struct{}) (float64, error) {
 	sd := currentSpeedDuration()
 	// Hard wall-clock cap on the whole download. Client.Timeout covers the
 	// full request including body read, so a hung upstream can't pin the
@@ -141,6 +208,18 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 	deadline := start.Add(sd)
 	lastReport := start
 	for time.Now().Before(deadline) {
+		// Abort mid-download the instant the bulk run is cancelled (e.g. RELOAD).
+		// Without this the current config keeps reading its full ~4s window even
+		// though the user already asked to stop — the source of the "RELOAD waits
+		// for the in-flight speed test" lag. Checked each 64KB chunk, so it bails
+		// within one read.
+		if cancel != nil {
+			select {
+			case <-cancel:
+				return 0, errSpeedCancelled
+			default:
+			}
+		}
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			total += int64(n)
@@ -179,7 +258,10 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 
 // ─────────────────────────── entry runners ───────────────────────
 
-func runPingForEntry(entry *ConfigEntry) {
+// runPingForEntry pings one config. cancel (nil for single-config / auto
+// callers) lets a bulk RELOAD abort the ping promptly — a cancelled ping leaves
+// the row pending rather than marking it failed.
+func runPingForEntry(entry *ConfigEntry, cancel <-chan struct{}) {
 	n, err := parseNode(entry.Raw)
 	if err != nil {
 		entry.mu.Lock()
@@ -202,10 +284,15 @@ func runPingForEntry(entry *ConfigEntry) {
 	}
 	ttl := startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + 3*time.Second
 	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
-		delay, e := measurePing(tr)
+		delay, e := measurePing(tr, cancel)
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
-		if e != nil || delay < 0 {
+		if errors.Is(e, errPingCancelled) {
+			// Cancelled (RELOAD). Leave the row pending — the reload replaces it.
+			entry.PingStatus = StatusPending
+			entry.Delay = -1
+			entry.PingErr = ""
+		} else if e != nil || delay < 0 {
 			entry.PingStatus = StatusFailed
 			entry.Delay = -1
 			entry.PingErr = cleanPingErr(e)
@@ -235,7 +322,9 @@ func runPingForEntry(entry *ConfigEntry) {
 // runSpeedForEntry always does ping→speed in a single xray session.
 // Per-row ⬇ speed button should re-measure ping even if already tested,
 // because conditions may have changed and speed result is meaningless without fresh ping.
-func runSpeedForEntry(entry *ConfigEntry, tabID string) {
+// cancel (nil for single-config / auto callers) lets a bulk RELOAD abort the
+// download promptly instead of waiting out the full speed window.
+func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) {
 	n, err := parseNode(entry.Raw)
 	if err != nil {
 		entry.mu.Lock()
@@ -261,8 +350,19 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string) {
 	ttl := startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
 	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
 		// Always re-ping — gives fresh delay AND warms the tunnel for speed test
-		delay, pingErr := measurePing(tr)
+		delay, pingErr := measurePing(tr, cancel)
 		entry.mu.Lock()
+		if errors.Is(pingErr, errPingCancelled) {
+			// Cancelled during the pre-speed ping (RELOAD). Leave the row pending.
+			entry.PingStatus = StatusPending
+			entry.Delay = -1
+			entry.PingErr = ""
+			entry.SpeedStatus = StatusPending
+			entry.SpeedErr = ""
+			entry.SpeedLive = 0
+			entry.mu.Unlock()
+			return nil
+		}
 		if pingErr != nil || delay < 0 {
 			entry.PingStatus = StatusFailed
 			entry.Delay = -1
@@ -288,11 +388,16 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string) {
 			// one. Dropping under buffer pressure is harmless; the FINAL
 			// terminal update below is reliable.
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID, Lossy: true})
-		})
+		}, cancel)
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
 		entry.SpeedLive = 0
-		if e != nil {
+		if errors.Is(e, errSpeedCancelled) {
+			// Cancelled mid-download (RELOAD). Don't mark the row failed — the
+			// reload is about to replace this entry anyway. Leave it as-is.
+			entry.SpeedStatus = StatusPending
+			entry.SpeedErr = ""
+		} else if e != nil {
 			entry.SpeedStatus = StatusFailed
 			entry.SpeedMBps = 0
 			entry.SpeedErr = shortErr(e.Error())
@@ -374,7 +479,7 @@ func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
 	}
 	ttl := startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
 	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
-		delay, pingErr := measurePing(tr)
+		delay, pingErr := measurePing(tr, nil)
 		entry.mu.Lock()
 		if pingErr != nil || delay < 0 {
 			entry.PingStatus = StatusFailed
@@ -399,7 +504,7 @@ func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
 			entry.mu.Unlock()
 			// Lossy — see runSpeedForEntry's identical callback for why.
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID, Lossy: true})
-		})
+		}, nil)
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
 		entry.SpeedLive = 0
@@ -445,6 +550,58 @@ var (
 	testingTab    string // which tab is being tested
 )
 
+// manualTests tracks the cancel channels of in-flight per-config (manual) ping
+// /speed tests, keyed by the tab they run on. Unlike the bulk runs (one global
+// run at a time), several manual tests can run at once and on different tabs, so
+// each gets its own channel registered here. RELOAD on a tab cancels exactly the
+// manual tests on THAT tab (see cancelTestsOnTab) without touching a bulk run or
+// manual tests elsewhere. Guarded by manualMu.
+var (
+	manualMu    sync.Mutex
+	manualTests = map[string]map[chan struct{}]struct{}{}
+)
+
+func registerManualTest(tabID string, ch chan struct{}) {
+	manualMu.Lock()
+	if manualTests[tabID] == nil {
+		manualTests[tabID] = map[chan struct{}]struct{}{}
+	}
+	manualTests[tabID][ch] = struct{}{}
+	manualMu.Unlock()
+}
+
+func unregisterManualTest(tabID string, ch chan struct{}) {
+	manualMu.Lock()
+	if m := manualTests[tabID]; m != nil {
+		delete(m, ch)
+		if len(m) == 0 {
+			delete(manualTests, tabID)
+		}
+	}
+	manualMu.Unlock()
+}
+
+// cancelManualTestsOnTab closes every registered manual-test cancel channel for
+// the given tab. Safe to call when none exist. Returns true if any were closed.
+func cancelManualTestsOnTab(tabID string) bool {
+	manualMu.Lock()
+	defer manualMu.Unlock()
+	m := manualTests[tabID]
+	if m == nil {
+		return false
+	}
+	cancelled := false
+	for ch := range m {
+		select {
+		case <-ch:
+		default:
+			close(ch)
+			cancelled = true
+		}
+	}
+	return cancelled
+}
+
 func cancelPingAll() {
 	testMu.Lock()
 	if pingCancelCh != nil {
@@ -476,6 +633,46 @@ func isTestCancelled(ch chan struct{}) bool {
 	default:
 		return false
 	}
+}
+
+// cancelTestsOnTab cancels tests bound to the given tab — both per-config
+// (manual) tests and a bulk PING ALL / SPEED ALL run, but the bulk one ONLY if
+// it's testing THIS tab. RELOAD on a tab that isn't under test must not stop a
+// bulk run elsewhere; it should only refresh its own configs. (The PING ALL /
+// SPEED ALL buttons still cancel the bulk run globally via cancelPingAll/
+// cancelSpeedAll — a deliberate "one bulk test at a time" toggle.)
+// Returns true if it cancelled anything.
+func cancelTestsOnTab(tabID string) bool {
+	// Manual per-config tests on this tab — always safe to cancel; they're
+	// independent and tab-scoped.
+	cancelled := cancelManualTestsOnTab(tabID)
+	// Bulk run: only if it's running AND on this tab. testingTab can be stale
+	// from a finished run, so gate on the running flags too.
+	if atomic.LoadInt32(&state.pingRunning) == 0 && atomic.LoadInt32(&state.speedRunning) == 0 {
+		return cancelled
+	}
+	testMu.Lock()
+	defer testMu.Unlock()
+	if testingTab != tabID {
+		return cancelled
+	}
+	if pingCancelCh != nil {
+		select {
+		case <-pingCancelCh:
+		default:
+			close(pingCancelCh)
+			cancelled = true
+		}
+	}
+	if speedCancelCh != nil {
+		select {
+		case <-speedCancelCh:
+		default:
+			close(speedCancelCh)
+			cancelled = true
+		}
+	}
+	return cancelled
 }
 
 // runPingAll runs ping tests against entries. If `onlyIndices` is non-nil,
@@ -564,7 +761,7 @@ func runPingAll(onlyIndices []int) {
 			ent.PingStatus = StatusTestingPing
 			ent.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
-			runPingForEntry(ent)
+			runPingForEntry(ent, cancelCh)
 			n := atomic.AddInt64(&done, 1)
 			// Terminal entry update — reliable (this is the row's final
 			// status; missing it leaves the UI on a stale "testing" pill).
@@ -673,7 +870,7 @@ func runSpeedAll(onlyIndices []int) {
 			ent.PingStatus = StatusTestingPing
 			ent.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
-			runSpeedForEntry(ent, tabID)
+			runSpeedForEntry(ent, tabID, cancelCh)
 			// Watchdog: runSpeedForEntry should have set a terminal status
 			// (ok/failed/skipped). If for any reason it didn't, force-fail
 			// the row so the UI doesn't sit on "connecting…" forever.

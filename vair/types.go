@@ -161,6 +161,12 @@ type Tab struct {
 	SourceFiles   []TabFile `json:"source_files,omitempty"`
 	RefreshMin    int       `json:"refresh_min,omitempty"`
 	ExcludeFilter []string  `json:"exclude_filter,omitempty"`
+	// ExcludeDisabled / RefreshDisabled turn OFF the exclude filter / auto-refresh
+	// for this tab WITHOUT clearing their values (the filter rules and refresh
+	// interval persist but aren't applied while off). Inverted bool so the JSON
+	// zero value (omitted) means "enabled": both default ON for every tab.
+	ExcludeDisabled bool `json:"exclude_disabled,omitempty"`
+	RefreshDisabled bool `json:"refresh_disabled,omitempty"`
 	// DedupMode is "" (off), "hide" (client-side view filter, reversible),
 	// or "delete" (server-side removal, not reversible). The Tab.Dedup
 	// boolean from earlier dev builds is auto-migrated to "hide" on load.
@@ -168,13 +174,15 @@ type Tab struct {
 }
 
 type persistedTab struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	SourceURL     string    `json:"source_url,omitempty"`
-	SourceURLs    []string  `json:"source_urls,omitempty"`
-	SourceFiles   []TabFile `json:"source_files,omitempty"`
-	RefreshMin    int       `json:"refresh_min,omitempty"`
-	ExcludeFilter []string  `json:"exclude_filter,omitempty"`
+	ID              string    `json:"id"`
+	Name            string    `json:"name"`
+	SourceURL       string    `json:"source_url,omitempty"`
+	SourceURLs      []string  `json:"source_urls,omitempty"`
+	SourceFiles     []TabFile `json:"source_files,omitempty"`
+	RefreshMin      int       `json:"refresh_min,omitempty"`
+	ExcludeFilter   []string  `json:"exclude_filter,omitempty"`
+	ExcludeDisabled bool      `json:"exclude_disabled,omitempty"`
+	RefreshDisabled bool      `json:"refresh_disabled,omitempty"`
 	// Two fields cover the migration: old builds wrote `dedup: true` for
 	// what's now `dedup_mode: "hide"`. loadTabs picks DedupMode if set,
 	// otherwise upgrades the legacy bool.
@@ -251,7 +259,8 @@ func saveTabs() {
 		pt := persistedTab{
 			ID: t.ID, Name: t.Name,
 			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles, RefreshMin: t.RefreshMin,
-			ExcludeFilter: t.ExcludeFilter, DedupMode: t.DedupMode,
+			ExcludeFilter: t.ExcludeFilter, ExcludeDisabled: t.ExcludeDisabled,
+			RefreshDisabled: t.RefreshDisabled, DedupMode: t.DedupMode,
 		}
 		if len(t.SourceURLs) == 1 {
 			pt.SourceURL = t.SourceURLs[0]
@@ -298,6 +307,8 @@ func loadTabs() {
 				if t.ID == "main" {
 					state.tabs[i].ExcludeFilter = pt.ExcludeFilter
 					state.tabs[i].RefreshMin = pt.RefreshMin
+					state.tabs[i].ExcludeDisabled = pt.ExcludeDisabled
+					state.tabs[i].RefreshDisabled = pt.RefreshDisabled
 					break
 				}
 			}
@@ -316,7 +327,9 @@ func loadTabs() {
 		tab := Tab{
 			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
 			SourceURLs: urls, SourceFiles: pt.SourceFiles,
-			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter, DedupMode: mode,
+			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter,
+			ExcludeDisabled: pt.ExcludeDisabled, RefreshDisabled: pt.RefreshDisabled,
+			DedupMode: mode,
 		}
 		state.tabs = append(state.tabs, tab)
 		entries := parseConfigLines(strings.Join(pt.Configs, "\n"))

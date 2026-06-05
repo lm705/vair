@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +63,118 @@ var nodeSchemes = []string{
 	"hysteria2://",
 	"hy2://",
 	"tuic://",
+}
+
+// looseHostPort parses "host:port" tolerating trailing junk after the port
+// (e.g. "1.2.3.4:443?" or "1.2.3.4:443@label🇬🇧") that real-world feeds glue on.
+// The port is the leading digit run; the host is stripped of brackets/spaces.
+func looseHostPort(s string) (host string, port int, ok bool) {
+	s = strings.TrimSpace(s)
+	h, portStr, err := net.SplitHostPort(s)
+	if err != nil {
+		i := strings.LastIndexByte(s, ':')
+		if i < 0 {
+			return "", 0, false
+		}
+		h, portStr = s[:i], s[i+1:]
+	}
+	j := 0
+	for j < len(portStr) && portStr[j] >= '0' && portStr[j] <= '9' {
+		j++
+	}
+	if j == 0 {
+		return "", 0, false
+	}
+	p, _ := strconv.Atoi(portStr[:j])
+	h = strings.TrimSpace(strings.Trim(h, "[]"))
+	if h == "" || p <= 0 || p > 65535 {
+		return "", 0, false
+	}
+	return h, p, true
+}
+
+// splitFragment splits a node URL into the part before the '#name' fragment and
+// the decoded name. Strip the fragment BEFORE url.Parse so a malformed name
+// (e.g. a bad percent-escape like "%2v" some feeds produce) can't fail the parse.
+func splitFragment(raw string) (base, name string) {
+	if i := strings.IndexByte(raw, '#'); i >= 0 {
+		base = raw[:i]
+		if dec, err := url.QueryUnescape(raw[i+1:]); err == nil {
+			name = dec
+		} else {
+			name = raw[i+1:]
+		}
+		return base, name
+	}
+	return raw, ""
+}
+
+// base64Prefix returns the leading run of base64 characters (standard + URL-safe
+// alphabets and padding). Used to drop trailing junk glued after a base64 body
+// (e.g. a vmess link with "[name]@channel" appended after the JSON blob).
+func base64Prefix(s string) string {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == '=' {
+			// Padding only appears at the end; consume it and stop, so junk glued
+			// right after the padding (e.g. "==----必进") is dropped.
+			for i < len(s) && s[i] == '=' {
+				i++
+			}
+			break
+		}
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '+' || c == '/' || c == '-' || c == '_' {
+			i++
+			continue
+		}
+		break
+	}
+	return s[:i]
+}
+
+// splitConfigURLs extracts every proxy URL from a line, even when several are
+// concatenated without whitespace (e.g. "ss://...#namevmess://...ss://..."), by
+// splitting at each scheme boundary. "://" never appears inside a base64 vmess
+// payload (':' isn't a base64 char), so a vmess body is never sliced. Trailing
+// whitespace-delimited junk is trimmed from each segment.
+func splitConfigURLs(line string) []string {
+	var starts []int
+	for i := 0; i < len(line); {
+		matched := false
+		for _, s := range nodeSchemes {
+			if strings.HasPrefix(line[i:], s) {
+				starts = append(starts, i)
+				// Skip past the scheme so a sub-scheme isn't matched inside it
+				// ("ss://" is a substring of "vmess://").
+				i += len(s)
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			i++
+		}
+	}
+	if len(starts) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(starts))
+	for k, st := range starts {
+		end := len(line)
+		if k+1 < len(starts) {
+			end = starts[k+1]
+		}
+		seg := line[st:end]
+		if sp := strings.IndexAny(seg, " \t\r\n"); sp > 0 {
+			seg = seg[:sp]
+		}
+		if seg = strings.TrimSpace(seg); seg != "" {
+			out = append(out, seg)
+		}
+	}
+	return out
 }
 
 // looksLikeNodeURL reports whether the given (already trimmed) line starts
@@ -208,7 +321,8 @@ func parseVless(raw string) (*VlessParams, error) {
 	if !strings.HasPrefix(raw, "vless://") {
 		return nil, fmt.Errorf("not a vless URL")
 	}
-	u, err := url.Parse(raw)
+	base, name := splitFragment(raw)
+	u, err := url.Parse(base)
 	if err != nil {
 		return nil, fmt.Errorf("url.Parse: %w", err)
 	}
@@ -223,7 +337,7 @@ func parseVless(raw string) (*VlessParams, error) {
 	} else if p.Port, err = strconv.Atoi(port); err != nil {
 		return nil, fmt.Errorf("bad port: %w", err)
 	}
-	p.Name = u.Fragment
+	p.Name = name
 	if p.Name == "" {
 		p.Name = fmt.Sprintf("%s:%d", p.Host, p.Port)
 	}
@@ -445,7 +559,10 @@ type vmessLink struct {
 	Type string `json:"type"`
 	Host string `json:"host"`
 	Path string `json:"path"`
-	TLS  string `json:"tls"`
+	// TLS is `any`: some feeds write a bool (`"tls": false`) or number instead of
+	// the usual string ("tls" / "" / "none"). A string field would fail the whole
+	// JSON unmarshal and the config would be wrongly rejected ("empty uuid").
+	TLS  any    `json:"tls"`
 	SNI  string `json:"sni"`
 	ALPN string `json:"alpn"`
 	FP   string `json:"fp"`
@@ -479,6 +596,9 @@ func parseVmess(raw string) (*VmessParams, error) {
 }
 
 func tryParseVmessBase64(raw, body, fragName string) (*VmessParams, error) {
+	// Drop trailing junk glued after the base64 body (e.g. "[name]@channel"),
+	// which would otherwise fail the decode and fall through to the URI parser.
+	body = base64Prefix(strings.TrimSpace(body))
 	var decoded []byte
 	var err error
 	// Try in this order: std → std-no-pad → URL → URL-no-pad. Same set as fetchURL.
@@ -525,7 +645,7 @@ func tryParseVmessBase64(raw, body, fragName string) (*VmessParams, error) {
 	p.Port = anyToInt(l.Port, 443)
 	p.AlterID = anyToInt(l.Aid, 0)
 	// security: TLS on/off. Producers use "tls" / "" / "none" / "xtls" etc.
-	tls := strings.ToLower(strings.TrimSpace(l.TLS))
+	tls := strings.ToLower(strings.TrimSpace(anyToStr(l.TLS)))
 	if tls == "tls" || tls == "reality" || tls == "xtls" {
 		p.Security = "tls"
 	} else {
@@ -621,6 +741,26 @@ func anyToInt(v any, dflt int) int {
 	return dflt
 }
 
+// anyToStr coerces a JSON value that should be a string but may arrive as a bool
+// or number (some vmess feeds write `"tls": false`). For booleans true → "tls".
+func anyToStr(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case bool:
+		if x {
+			return "tls"
+		}
+		return ""
+	case float64:
+		if x != 0 {
+			return "tls"
+		}
+		return ""
+	}
+	return ""
+}
+
 // ─────────────────────────── Shadowsocks params + parser ───────
 //
 // Shadowsocks has *four* common URL shapes — historical baggage from a
@@ -702,36 +842,46 @@ func parseShadowsocks(raw string) (*SSParams, error) {
 	p := &SSParams{Raw: raw, Name: name}
 
 	if strings.Contains(body, "@") {
-		// SIP002 or SS2022-plain.
+		// SIP002 or SS2022-plain. Try the LAST '@' first (the password may contain
+		// '@'); if the part after it isn't a valid host:port, fall back to the
+		// FIRST '@' (covers base64 userinfo + a junk "@label" glued after the port).
 		idx := strings.LastIndex(body, "@")
 		userinfo := body[:idx]
-		hostport := body[idx+1:]
-		host, portStr, err := net.SplitHostPort(hostport)
-		if err != nil {
-			return nil, fmt.Errorf("ss: bad host:port: %w", err)
+		host, port, ok := looseHostPort(body[idx+1:])
+		if !ok {
+			if fi := strings.IndexByte(body, '@'); fi >= 0 && fi != idx {
+				if h, pt, ok2 := looseHostPort(body[fi+1:]); ok2 {
+					userinfo, host, port, ok = body[:fi], h, pt, true
+				}
+			}
 		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("ss: bad port: %w", err)
+		if !ok {
+			return nil, fmt.Errorf("ss: bad host:port")
 		}
 		p.Host = host
 		p.Port = port
 
-		// Plain first (covers SS2022 and any modern client that doesn't
-		// bother to base64 a method that's all-ASCII anyway). Falls back to
-		// base64 if the plain candidate's method doesn't match the strict
-		// "method-name" character set.
-		if m, pw, ok := splitMethodPassword(userinfo); ok {
+		// Userinfo may be percent-encoded by some feeds — notably the ':'
+		// between method and password as %3A (e.g. "aes-128-gcm%3Apass").
+		// Decode first so the plain "method:password" split below sees the
+		// real ':'. Keep the raw form as a fallback in case the producer
+		// percent-escaped base64 padding instead.
+		userDecoded := userinfo
+		if dec, err := url.QueryUnescape(userinfo); err == nil {
+			userDecoded = dec
+		}
+		// Plain first (covers SS2022, SIP002-plain, and any feed that left the
+		// method:password readable — possibly %-encoded). Try the decoded form,
+		// then the raw, before falling back to base64.
+		if m, pw, ok := splitMethodPassword(userDecoded); ok {
+			p.Method, p.Password = m, pw
+		} else if m, pw, ok := splitMethodPassword(userinfo); ok {
 			p.Method, p.Password = m, pw
 		} else {
-			// Userinfo in SIP002 should be percent-decoded before base64
-			// decoding (the spec mandates BASE64URL but real-world feeds
-			// sometimes %-escape '+', '/', '=' anyway).
-			candidate := userinfo
-			if dec, err := url.QueryUnescape(userinfo); err == nil {
-				candidate = dec
-			}
-			decoded, err := ssDecodeBase64(candidate)
+			// Base64(method:password). The spec mandates BASE64URL but real-world
+			// feeds sometimes %-escape '+', '/', '=', so try the percent-decoded
+			// candidate.
+			decoded, err := ssDecodeBase64(userDecoded)
 			if err != nil {
 				return nil, fmt.Errorf("ss: userinfo neither plain nor base64: %w", err)
 			}
@@ -753,14 +903,9 @@ func parseShadowsocks(raw string) (*SSParams, error) {
 			return nil, fmt.Errorf("ss: legacy form missing '@'")
 		}
 		userinfo := decoded[:at]
-		hostport := decoded[at+1:]
-		host, portStr, err := net.SplitHostPort(hostport)
-		if err != nil {
-			return nil, fmt.Errorf("ss: legacy bad host:port: %w", err)
-		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, fmt.Errorf("ss: legacy bad port: %w", err)
+		host, port, hpOK := looseHostPort(decoded[at+1:])
+		if !hpOK {
+			return nil, fmt.Errorf("ss: legacy bad host:port")
 		}
 		m, pw, ok := splitMethodPassword(userinfo)
 		if !ok {
@@ -1206,7 +1351,7 @@ func setNodeName(raw, name string) string {
 // block + freedom). The caller appends the proxy outbound and (optionally)
 // the routing section. Sniffing is enabled only in persistent mode so that
 // the test path stays as minimal as possible.
-func xrayShell(httpPort, socksPort int) map[string]interface{} {
+func xrayShell(httpPort, socksPort int, socksUser, socksPass string) map[string]interface{} {
 	persistent := socksPort > 0
 	sniffing := map[string]interface{}{
 		"enabled":      persistent,
@@ -1221,16 +1366,23 @@ func xrayShell(httpPort, socksPort int) map[string]interface{} {
 		},
 	}
 	if persistent {
+		// SOCKS auth: a non-empty username requires password auth on the local
+		// SOCKS listener so other local apps can't use the proxy or probe the VPN
+		// server; an empty username means no auth. The internal TUN handoff always
+		// passes credentials, so this only affects the user-facing proxy listener.
+		socksSettings := map[string]interface{}{"udp": true}
+		if socksUser != "" {
+			socksSettings["auth"] = "password"
+			socksSettings["accounts"] = []interface{}{
+				map[string]interface{}{"user": socksUser, "pass": socksPass},
+			}
+		} else {
+			socksSettings["auth"] = "noauth"
+		}
 		inbounds = append(inbounds, map[string]interface{}{
 			"tag": "socks", "listen": "127.0.0.1", "port": socksPort,
 			"protocol": "socks",
-			"settings": map[string]interface{}{
-				"auth": "password",
-				"accounts": []interface{}{
-					map[string]interface{}{"user": proxyAuthUser, "pass": proxyAuthPass},
-				},
-				"udp": true,
-			},
+			"settings": socksSettings,
 			"sniffing": sniffing,
 		})
 	}
@@ -1314,42 +1466,77 @@ func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, 
 // hybrid TUN) sessions. Snapshots the settings under lock so we don't race
 // against settings mutations mid-build.
 func xrayRoutingForProxy() map[string]interface{} {
+	mode := routingMode()
+	settingsMu.RLock()
+	var directDomains []string
+	if !appSettings.DirectDomainsDisabled {
+		directDomains = make([]string, len(appSettings.DirectDomains))
+		copy(directDomains, appSettings.DirectDomains)
+	}
+	settingsMu.RUnlock()
+
 	rules := []interface{}{
 		map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
 	}
-	settingsMu.RLock()
-	ruDirect := appSettings.RuSitesDirect
-	directDomains := make([]string, len(appSettings.DirectDomains))
-	copy(directDomains, appSettings.DirectDomains)
-	settingsMu.RUnlock()
-	if ruDirect {
+	// addDomains appends a domain rule ("domain:" = suffix match) to the given tag.
+	addDomains := func(domains []string, tag string) {
+		var suffixes []string
+		for _, d := range domains {
+			if d = strings.TrimSpace(d); d != "" {
+				suffixes = append(suffixes, "domain:"+d)
+			}
+		}
+		if len(suffixes) > 0 {
+			rules = append(rules, map[string]interface{}{"type": "field", "domain": suffixes, "outboundTag": tag})
+		}
+	}
+	// Custom "without VPN" domains → direct (all modes; no-op where default is direct).
+	addDomains(directDomains, "direct")
+
+	switch mode {
+	case "only_blocked":
+		// Default direct; only blocked-in-RU resources go through the VPN.
+		refreshBlockedRuleSets()
+		refreshCustomBlocklist(blocklistURL())
+		proxyDomains := effectiveProxyDomains()
+		proxyDomains = append(proxyDomains, customBlocklistDomains()...)
+		// Force the "check IP" service through the VPN so the button reflects the
+		// tunnel exit (it isn't a blocked resource, so it'd go direct otherwise).
+		proxyDomains = append(proxyDomains, checkExitHost)
+		addDomains(proxyDomains, "proxy")
+		rules = append(rules,
+			map[string]interface{}{"type": "field", "domain": []string{"ext:geosite-ru-blocked.dat:ru-blocked"}, "outboundTag": "proxy"},
+			map[string]interface{}{"type": "field", "ip": []string{"ext:geoip-ru-blocked.dat:ru-blocked"}, "outboundTag": "proxy"},
+			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
+		)
+	case "bypass_ru":
+		// Everything through the VPN except Russian sites.
 		rules = append(rules,
 			map[string]interface{}{"type": "field", "domain": []string{"geosite:category-ru"}, "outboundTag": "direct"},
 			map[string]interface{}{"type": "field", "ip": []string{"geoip:ru"}, "outboundTag": "direct"},
+			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
+		)
+	default: // proxy_all
+		rules = append(rules,
+			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
 		)
 	}
-	if len(directDomains) > 0 {
-		var suffixes []string
-		for _, d := range directDomains {
-			d = strings.TrimSpace(d)
-			if d == "" {
-				continue
-			}
-			// "domain:" prefix = suffix match (vk.com matches *.vk.com and vk.com)
-			suffixes = append(suffixes, "domain:"+d)
-		}
-		if len(suffixes) > 0 {
-			rules = append(rules,
-				map[string]interface{}{"type": "field", "domain": suffixes, "outboundTag": "direct"},
-			)
-		}
-	}
-	rules = append(rules,
-		map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
-	)
 	return map[string]interface{}{
 		"domainStrategy": "IPIfNonMatch",
 		"rules":          rules,
+	}
+}
+
+// xrayRoutingAllProxy sends everything to the proxy outbound (private IPs direct
+// as a safety net). Used for the hybrid-TUN xray child, where sing-box has
+// already decided proxy-vs-direct and the child must not re-split.
+func xrayRoutingAllProxy() map[string]interface{} {
+	return map[string]interface{}{
+		"domainStrategy": "AsIs",
+		"rules": []interface{}{
+			map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
+			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
+		},
 	}
 }
 
@@ -1513,7 +1700,7 @@ func splitALPN(s string) []string {
 // buildXrayConfigForNode is the protocol-dispatching entry point. Returns
 // nil if n.Kind is not an xray-handled protocol — callers should check
 // engineFor(n.Kind) first to route UDP-family protocols to sing-box.
-func buildXrayConfigForNode(n *Node, httpPort, socksPort int) map[string]interface{} {
+func buildXrayConfigForNode(n *Node, httpPort, socksPort int, socksUser, socksPass string) map[string]interface{} {
 	if n == nil {
 		return nil
 	}
@@ -1522,7 +1709,7 @@ func buildXrayConfigForNode(n *Node, httpPort, socksPort int) map[string]interfa
 		// Not an xray protocol; caller bug.
 		return nil
 	}
-	cfg := xrayShell(httpPort, socksPort)
+	cfg := xrayShell(httpPort, socksPort, socksUser, socksPass)
 	outbounds := cfg["outbounds"].([]interface{})
 	outbounds[0] = ob
 	cfg["outbounds"] = outbounds
@@ -1574,14 +1761,14 @@ func xrayOutboundForNode(n *Node) map[string]interface{} {
 //
 // All nodes MUST be xray-family (see chainEngineReason). A nil/empty list or
 // any non-xray node returns nil.
-func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int) map[string]interface{} {
+func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int, socksUser, socksPass string) map[string]interface{} {
 	if len(nodes) == 0 {
 		return nil
 	}
 	if len(nodes) == 1 {
-		return buildXrayConfigForNode(nodes[0], httpPort, socksPort)
+		return buildXrayConfigForNode(nodes[0], httpPort, socksPort, socksUser, socksPass)
 	}
-	cfg := xrayShell(httpPort, socksPort)
+	cfg := xrayShell(httpPort, socksPort, socksUser, socksPass)
 	shell := cfg["outbounds"].([]interface{})
 	// shell layout: [proxy-placeholder(nil), direct, block]. Keep direct+block.
 	direct, block := shell[1], shell[2]
@@ -1714,12 +1901,18 @@ func engineFor(k NodeKind) string {
 func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 	allowLAN := allowLANTraffic()
 
+	mode := routingMode()
 	settingsMu.RLock()
-	ruSitesDirect := appSettings.RuSitesDirect
-	directDomains := make([]string, len(appSettings.DirectDomains))
-	copy(directDomains, appSettings.DirectDomains)
-	directApps := make([]string, len(appSettings.DirectApps))
-	copy(directApps, appSettings.DirectApps)
+	var directDomains []string
+	if !appSettings.DirectDomainsDisabled {
+		directDomains = make([]string, len(appSettings.DirectDomains))
+		copy(directDomains, appSettings.DirectDomains)
+	}
+	var directApps []string
+	if !appSettings.DirectAppsDisabled {
+		directApps = make([]string, len(appSettings.DirectApps))
+		copy(directApps, appSettings.DirectApps)
+	}
 	settingsMu.RUnlock()
 
 	rules := []interface{}{
@@ -1758,53 +1951,137 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 			})
 		}
 	}
-	// Russian sites bypass VPN.
-	if ruSitesDirect {
+	// addSuffix appends a domain_suffix rule to the given outbound.
+	addSuffix := func(domains []string, outbound string) {
+		var suffixes []string
+		for _, d := range domains {
+			if d = strings.TrimSpace(d); d != "" {
+				suffixes = append(suffixes, d)
+			}
+		}
+		if len(suffixes) > 0 {
+			rules = append(rules, map[string]interface{}{"domain_suffix": suffixes, "outbound": outbound})
+		}
+	}
+	// Custom "without VPN" domains → direct (all modes).
+	addSuffix(directDomains, "direct")
+
+	switch mode {
+	case "only_blocked":
+		// Manual + custom-URL "through VPN" domains → proxy, then blocked-in-RU
+		// sets → proxy. Everything else falls through to route.final = "direct"
+		// (set by applySingboxRouteMode).
+		proxyDomains := effectiveProxyDomains()
+		proxyDomains = append(proxyDomains, customBlocklistDomains()...)
+		// Force the "check IP" service through the VPN so the button reflects the
+		// tunnel exit (it isn't a blocked resource, so it'd go direct otherwise).
+		proxyDomains = append(proxyDomains, checkExitHost)
+		addSuffix(proxyDomains, "proxy")
+		rules = append(rules,
+			map[string]interface{}{"rule_set": "geosite-ru-blocked", "outbound": "proxy"},
+			map[string]interface{}{"rule_set": "geoip-ru-blocked", "outbound": "proxy"},
+		)
+	case "bypass_ru":
 		rules = append(rules,
 			map[string]interface{}{"rule_set": "geosite-ru", "outbound": "direct"},
 			map[string]interface{}{"rule_set": "geoip-ru", "outbound": "direct"},
 		)
 	}
-	// Custom domains → direct (user-defined in Settings).
-	if len(directDomains) > 0 {
-		var suffixes []string
-		for _, d := range directDomains {
-			d = strings.TrimSpace(d)
-			if d != "" {
-				suffixes = append(suffixes, d)
-			}
-		}
-		if len(suffixes) > 0 {
-			rules = append(rules,
-				map[string]interface{}{"domain_suffix": suffixes, "outbound": "direct"},
-			)
-		}
-	}
 	return rules
 }
 
 // singboxRuRuleSet returns the route.rule_set definitions for the RU-bypass
-// geosite/geoip remote rule sets. Only meaningful when RuSitesDirect is on;
-// callers gate on that and attach the result to route["rule_set"].
+// geosite/geoip rule sets. Only meaningful when RuSitesDirect is on; callers
+// gate on that and attach the result to route["rule_set"].
+//
+// The sets are referenced as LOCAL files (under binDir) rather than remote URLs:
+// the remote form downloaded from raw.githubusercontent.com at start, which is
+// blocked in Russia and made sing-box abort with a FATAL. refreshRuRuleSets
+// still tries to pull the freshest copy from upstream (best-effort, throttled);
+// the embedded baseline is the fallback, so a local file is always present.
 func singboxRuRuleSet() []interface{} {
+	refreshRuRuleSets()
 	return []interface{}{
 		map[string]interface{}{
-			"type":            "remote",
-			"tag":             "geosite-ru",
-			"format":          "binary",
-			"url":             "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs",
-			"download_detour": "direct",
-			"update_interval": "24h",
+			"type":   "local",
+			"tag":    "geosite-ru",
+			"format": "binary",
+			"path":   ruRuleSetLocalPath("geosite-ru.srs"),
 		},
 		map[string]interface{}{
-			"type":            "remote",
-			"tag":             "geoip-ru",
-			"format":          "binary",
-			"url":             "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs",
-			"download_detour": "direct",
-			"update_interval": "24h",
+			"type":   "local",
+			"tag":    "geoip-ru",
+			"format": "binary",
+			"path":   ruRuleSetLocalPath("geoip-ru.srs"),
 		},
 	}
+}
+
+// singboxBlockedRuleSet returns the route.rule_set definitions for the RU-blocked
+// sets (only_blocked mode), as local srs files with the same best-effort upstream
+// refresh + embedded fallback as singboxRuRuleSet. Also kicks the custom blocklist
+// refresh so its domains are fresh when singboxRoutingRules reads them.
+func singboxBlockedRuleSet() []interface{} {
+	refreshBlockedRuleSets()
+	refreshCustomBlocklist(blocklistURL())
+	return []interface{}{
+		map[string]interface{}{
+			"type":   "local",
+			"tag":    "geosite-ru-blocked",
+			"format": "binary",
+			"path":   ruRuleSetLocalPath("geosite-ru-blocked.srs"),
+		},
+		map[string]interface{}{
+			"type":   "local",
+			"tag":    "geoip-ru-blocked",
+			"format": "binary",
+			"path":   ruRuleSetLocalPath("geoip-ru-blocked.srs"),
+		},
+	}
+}
+
+// applySingboxRouteMode sets route.final and route.rule_set according to the
+// active routing mode. only_blocked defaults to direct and attaches the
+// ru-blocked rule-sets (matched → proxy in singboxRoutingRules); the other modes
+// default to proxy, with the RU-bypass rule-sets attached for bypass_ru.
+func applySingboxRouteMode(route map[string]interface{}) {
+	switch routingMode() {
+	case "only_blocked":
+		route["final"] = "direct"
+		route["rule_set"] = singboxBlockedRuleSet()
+	case "bypass_ru":
+		route["final"] = "proxy"
+		route["rule_set"] = singboxRuRuleSet()
+	default: // proxy_all
+		route["final"] = "proxy"
+		delete(route, "rule_set")
+	}
+}
+
+// customBlocklistDomains reads the user's fetched custom blocklist (plain domain
+// list; one suffix per line; #/! comments and a leading "0.0.0.0"/"*." ignored).
+// Capped to keep the generated config sane. Empty when none configured/fetched.
+func customBlocklistDomains() []string {
+	data, err := os.ReadFile(customBlocklistPath())
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "!") {
+			continue
+		}
+		fields := strings.Fields(line) // handles "0.0.0.0 domain" hosts format
+		d := strings.TrimPrefix(fields[len(fields)-1], "*.")
+		if d != "" {
+			out = append(out, d)
+		}
+		if len(out) >= 200000 {
+			break
+		}
+	}
+	return out
 }
 
 // singboxOutboundHysteria2 builds the sing-box "hysteria2" outbound. The
@@ -2018,15 +2295,9 @@ func buildSingboxProxyConfig(n *Node, httpPort, socksPort int) map[string]interf
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
 		"default_domain_resolver": "dns-local",
-		"final":                   "proxy",
 		"rules":                   singboxRoutingRules(false),
 	}
-	settingsMu.RLock()
-	ruSitesDirect := appSettings.RuSitesDirect
-	settingsMu.RUnlock()
-	if ruSitesDirect {
-		route["rule_set"] = singboxRuRuleSet()
-	}
+	applySingboxRouteMode(route)
 
 	return map[string]interface{}{
 		"log": map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
@@ -2084,10 +2355,6 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 		"stack":          "gvisor",
 	}
 
-	settingsMu.RLock()
-	ruSitesDirect := appSettings.RuSitesDirect
-	settingsMu.RUnlock()
-
 	defaultResolver := "dns-local"
 	if leakProtect {
 		defaultResolver = "dns-bootstrap"
@@ -2097,11 +2364,8 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 		"default_domain_resolver": defaultResolver,
 		"find_process":            true,
 		"rules":                   singboxRoutingRules(false),
-		"final":                   "proxy",
 	}
-	if ruSitesDirect {
-		route["rule_set"] = singboxRuRuleSet()
-	}
+	applySingboxRouteMode(route)
 
 	return map[string]interface{}{
 		"log":      map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},

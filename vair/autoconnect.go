@@ -52,6 +52,18 @@ func autoKick() {
 	}
 }
 
+// autoKickSoon re-wakes the supervisor after a short delay. Used when a forced
+// "Switch now" couldn't run *this* tick (actionMu held by another action, or
+// the connection was mid connect/disconnect): instead of waiting the full 2s
+// loop interval, we retry in ~150ms so the switch feels immediate once the
+// blocking action clears. autoForce stays armed, so the next wake acts on it.
+func autoKickSoon() {
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		autoKick()
+	}()
+}
+
 // ─────────────────────────── auto-connect / failover ──────────────────────
 //
 // A single long-lived supervisor goroutine (startAutoSupervisor) drives both
@@ -185,7 +197,7 @@ func autoTabExcludeRulesLocked(pool []string) map[string][]string {
 	}
 	out := map[string][]string{}
 	for _, t := range state.tabs {
-		if inPool[t.ID] && len(t.ExcludeFilter) > 0 {
+		if inPool[t.ID] && !t.ExcludeDisabled && len(t.ExcludeFilter) > 0 {
 			out[t.ID] = t.ExcludeFilter
 		}
 	}
@@ -323,6 +335,18 @@ func autoHasFasterCandidate(pool []string, cs ConnState, cooldown map[string]tim
 		}
 	}
 	state.mu.RUnlock()
+	// For the ping comparison, use the CURRENT LIVE latency (the live probe RTT
+	// that just tripped the budget), not the config's stale clean list-ping.
+	// They differ a lot: list-ping is a best-of-3 on a fresh test engine (e.g.
+	// 90ms), while the live probe reflects the loaded tunnel right now (e.g.
+	// 243ms). Comparing candidates against the stale 90ms made AUTO conclude "no
+	// faster candidate" even when a 150ms candidate is clearly better than the
+	// 243ms we're actually getting — the exact case where Switch now (which has
+	// no such guard) does switch. Prefer the live RTT; fall back to list-ping.
+	liveMs := autoLiveRtt.Load()
+	if liveMs > 0 {
+		curDelay = liveMs
+	}
 	// Unknown current metric ⇒ can't prove any candidate is better ⇒ don't move.
 	if bySpeed && curSpeed <= 0 {
 		return false
@@ -339,7 +363,7 @@ func autoHasFasterCandidate(pool []string, cs ConnState, cooldown map[string]tim
 			if c.speed > curSpeed*1.15 { // ≥15% faster download
 				return true
 			}
-		} else if es.Delay > 0 && es.Delay < curDelay-20 { // ≥20ms lower ping
+		} else if es.Delay > 0 && es.Delay < curDelay-20 { // ≥20ms lower ping than current live latency
 			return true
 		}
 	}
@@ -412,9 +436,16 @@ func autoConnectFromPool(pool []string, preferRaw, excludeRaw string, mode ConnM
 	if preferRaw != "" {
 		for i := range cands {
 			if cands[i].raw == preferRaw {
-				c := cands[i]
-				cands = append(cands[:i], cands[i+1:]...)
-				cands = append([]autoCand{c}, cands...)
+				// Only jump the last-connected config to the front if it actually
+				// passed its ping (rank 0). If its fresh ping failed/timed out
+				// (rank 2) or it's untested (rank 1), DON'T prefer it — leave it in
+				// sorted position so AUTO connects to the fastest working config
+				// instead of stubbornly retrying a dead "last" config.
+				if cands[i].rank == 0 {
+					c := cands[i]
+					cands = append(cands[:i], cands[i+1:]...)
+					cands = append([]autoCand{c}, cands...)
+				}
 				break
 			}
 		}
@@ -441,6 +472,15 @@ func autoConnectFromPool(pool []string, preferRaw, excludeRaw string, mode ConnM
 		}
 		autoBumpCooldown(c.raw, cooldown, backoff)
 		vlog("warning", "auto: %s did not work, trying next", name)
+		// TUN settle gap: each failed TUN attempt tore down a WinTUN adapter and
+		// rewrote the default route. removeTUNAdapter() returns before Windows
+		// finishes releasing the device, so firing the next TUN create immediately
+		// can race the kernel (transient "adapter busy") and churns system routing
+		// in a burst. A brief pause between attempts lets the adapter/route settle.
+		// Proxy mode has no adapter, so it needs no delay and stays fast.
+		if mode == ModeTUN && i < len(cands)-1 {
+			time.Sleep(1200 * time.Millisecond)
+		}
 	}
 	// Every candidate failed. That almost always means a local/network-wide
 	// outage rather than each config being individually bad — so the cooldowns
@@ -483,12 +523,6 @@ func autoTestTabs(tabIDs []string, withSpeed bool) {
 	}
 	defer atomic.StoreInt32(&autoPingRunning, 0)
 
-	cs := state.conn.snap()
-	connRaw := ""
-	if cs.Status == ConnConnected {
-		connRaw = cs.ConnRaw
-	}
-
 	type pingItem struct {
 		e   *ConfigEntry
 		tab string
@@ -501,7 +535,12 @@ func autoTestTabs(tabIDs []string, withSpeed bool) {
 		rules := excludeRules[tid]
 		for _, e := range state.tabEntries[tid] {
 			es := e.snap()
-			if es.Raw == "" || es.Raw == connRaw || seen[es.Raw] {
+			// NB: the currently-connected config is intentionally NOT skipped — it
+			// gets re-tested too. Each test spins up its own isolated engine on a
+			// separate port (see runPingForEntry/withEngine), so probing the live
+			// config doesn't disturb the active tunnel, and the candidate list then
+			// shows fresh ping/speed for it like every other config.
+			if es.Raw == "" || seen[es.Raw] {
 				continue
 			}
 			// Don't waste test traffic on configs the tab's exclude filter hides.
@@ -548,9 +587,9 @@ func autoTestTabs(tabIDs []string, withSpeed bool) {
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tab})
 			if withSpeed {
 				// runSpeedForEntry does ping→speed in one engine session.
-				runSpeedForEntry(ent, tab)
+				runSpeedForEntry(ent, tab, nil)
 			} else {
-				runPingForEntry(ent)
+				runPingForEntry(ent, nil)
 			}
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tab})
 		}(item.e, item.tab)
@@ -632,10 +671,23 @@ func refreshSourcelessTab(tabID string) {
 func startAutoSupervisor() {
 	cm := state.conn
 	failCount := 0
-	var lastSwitch, lastProbe, nextRetry time.Time
+	var lastSwitch, lastProbe, nextRetry, lastTUNSwitch, lastSlowRetest time.Time
 	cooldown := map[string]time.Time{}
 	backoff := map[string]time.Duration{}
 	const minDwell = 60 * time.Second
+	// When over budget but already on the fastest available config, re-test the
+	// pool no more often than this — enough to promote a faster config once one
+	// appears, without spamming test traffic while stuck on a uniformly-slow net.
+	const slowRetestEvery = 30 * time.Second
+	// Hard floor between *TUN* switches, regardless of which path triggers them
+	// (forced "Switch now", pool change, or failover). Recreating the WinTUN
+	// adapter + flipping the default route in a tight burst can disrupt
+	// system-wide networking; this bounds the cadence. Proxy switches are cheap
+	// and are not gated. tunSwitchTooSoon() reports when we're inside the floor.
+	const tunSwitchFloor = 4 * time.Second
+	tunSwitchTooSoon := func(mode ConnMode) bool {
+		return mode == ModeTUN && !lastTUNSwitch.IsZero() && time.Since(lastTUNSwitch) < tunSwitchFloor
+	}
 
 	for {
 		select {
@@ -670,12 +722,24 @@ func startAutoSupervisor() {
 		cs := cm.snap()
 		switch cs.Status {
 		case ConnConnecting, ConnDisconnecting:
-			// transient — wait for it to settle
+			// Transient — wait for it to settle. But if a "Switch now" is pending,
+			// retry soon rather than waiting the full 2s tick, so it fires the
+			// instant the connect/disconnect finishes.
+			if forced {
+				autoKickSoon()
+			}
 		case ConnConnected:
 			// "Switch now" — leave the current config (cooled down so we don't
 			// bounce straight back) and grab the next-best, ignoring threshold
 			// and min-dwell. Works for user- and auto-owned connections alike.
 			if forced && autoPoolHasEntries(pool) {
+				// Respect the TUN switch floor even for a forced switch — but keep
+				// autoForce armed and retry soon so it fires the moment the floor
+				// clears (the user still gets their switch, just not a churn burst).
+				if tunSwitchTooSoon(mode) {
+					autoKickSoon()
+					continue
+				}
 				if cm.actionMu.TryLock() {
 					autoForce.Store(false)
 					autoBumpCooldown(cs.ConnRaw, cooldown, backoff)
@@ -686,9 +750,16 @@ func startAutoSupervisor() {
 					lastProbe = time.Now()
 					if ok {
 						lastSwitch = time.Now()
+						if mode == ModeTUN {
+							lastTUNSwitch = time.Now()
+						}
 					} else {
 						nextRetry = time.Now().Add(probeEvery)
 					}
+				} else {
+					// actionMu held by a user connect/disconnect or a probe — retry
+					// shortly instead of waiting out the 2s loop. autoForce stays set.
+					autoKickSoon()
 				}
 				continue
 			}
@@ -712,6 +783,9 @@ func startAutoSupervisor() {
 				lastProbe = time.Now()
 				if ok {
 					lastSwitch = time.Now()
+					if mode == ModeTUN {
+						lastTUNSwitch = time.Now()
+					}
 				} else {
 					nextRetry = time.Now().Add(probeEvery)
 				}
@@ -753,10 +827,8 @@ func startAutoSupervisor() {
 				continue
 			}
 			// A dead probe counts as a failure (any working config beats a broken
-			// one). An over-budget-but-alive probe also counts, but only triggers
-			// a switch when a genuinely faster config exists — see the guard
-			// below — so we never downgrade to a worse config just because the
-			// current one had a latency spike.
+			// one). An over-budget-but-alive probe also counts, but the guard below
+			// keeps us from downgrading to an equal/worse config on a latency spike.
 			failCount++
 			reason := "probe failed"
 			if overBudget {
@@ -768,15 +840,27 @@ func startAutoSupervisor() {
 			if failCount < threshold || time.Since(lastSwitch) < minDwell {
 				continue
 			}
-			// Slow-but-alive: keep the current config unless the pool actually
-			// has a faster one. Otherwise switching would only move us to an
-			// equal-or-worse config. (A dead probe ignores this — it must move.)
+			// Slow-but-alive: only switch when the pool has a genuinely FASTER
+			// candidate than the current live latency. If the current config is
+			// already the fastest available (every other candidate is as slow or
+			// slower), don't flap to an equal/worse one — stay put, but kick a
+			// throttled background re-test of the pool so the next health tick
+			// re-ranks on fresh data; the moment a genuinely faster config shows up
+			// (now, or after the list refreshes and re-tests) we switch to it. A
+			// DEAD probe ignores this — a broken link must move regardless.
 			if overBudget && !autoHasFasterCandidate(pool, cs, cooldown) {
-				failCount = 0 // re-arm; stay on the best-available (slow) config
+				failCount = 0
 				broadcastAuto("health", cs.EntryName, cs.ConnRaw, "slow but best")
-				vlog("info", "auto: %s slow (%dms) but no faster candidate — staying", cs.EntryName, rtt.Milliseconds())
+				if atomic.LoadInt32(&autoPingRunning) == 0 && time.Since(lastSlowRetest) > slowRetestEvery {
+					lastSlowRetest = time.Now()
+					settingsMu.RLock()
+					bySpeed := appSettings.AutoRankBySpeed
+					settingsMu.RUnlock()
+					go autoTestTabs(pool, bySpeed)
+				}
 				continue
 			}
+			// A faster candidate exists → switch to the fastest available below.
 			// Pick the failover target by *fresh* ping ranking. If the pool has no
 			// ping data (e.g. an auto-refresh just reset entries to "pending"),
 			// autoCandidates falls back to tab order — which is the "switched to a
@@ -798,6 +882,9 @@ func startAutoSupervisor() {
 			lastProbe = time.Now()
 			if ok {
 				lastSwitch = time.Now()
+				if mode == ModeTUN {
+					lastTUNSwitch = time.Now()
+				}
 			} else {
 				nextRetry = time.Now().Add(probeEvery)
 			}

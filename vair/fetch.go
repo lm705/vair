@@ -111,12 +111,15 @@ func fetchAndInit() {
 		return
 	}
 
-	// Get main tab's exclude filter
+	// Get main tab's exclude filter (skipped when the filter is toggled off —
+	// the rules persist but aren't applied).
 	state.mu.RLock()
 	var excludeFilter []string
 	for _, t := range state.tabs {
 		if t.IsMain {
-			excludeFilter = t.ExcludeFilter
+			if !t.ExcludeDisabled {
+				excludeFilter = t.ExcludeFilter
+			}
 			break
 		}
 	}
@@ -282,11 +285,47 @@ func fetchGitHubPAT() ([]string, error) {
 	return lines, nil
 }
 
-// parseConfigLines parses vless URLs from a single in-memory text blob.
-// Used for URL responses and pasted text — kept around as a convenience
-// wrapper over parseConfigReader.
+// maybeDecodeBase64Blob handles a paste/body that is one base64 subscription
+// blob rather than already-readable config URLs (no "://" near the start). It
+// tries the four base64 variants and returns the decoded text only when it
+// actually yields config URLs; otherwise the input is returned unchanged.
+func maybeDecodeBase64Blob(text string) string {
+	sample := text
+	if len(sample) > 500 {
+		sample = sample[:500]
+	}
+	if strings.Contains(sample, "://") {
+		return text // already config URLs
+	}
+	cleaned := strings.Map(func(r rune) rune {
+		switch r {
+		case '\n', '\r', ' ', '\t':
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(text))
+	if cleaned == "" {
+		return text
+	}
+	for _, dec := range []func(string) ([]byte, error){
+		base64.StdEncoding.DecodeString,
+		base64.RawStdEncoding.DecodeString,
+		base64.URLEncoding.DecodeString,
+		base64.RawURLEncoding.DecodeString,
+	} {
+		if decoded, err := dec(cleaned); err == nil && strings.Contains(string(decoded), "://") {
+			return string(decoded)
+		}
+	}
+	return text
+}
+
+// parseConfigLines parses node URLs from a single in-memory text blob. Used for
+// URL responses and pasted text — kept around as a convenience wrapper over
+// parseConfigReader. A whole-blob base64 paste (a subscription body) is decoded
+// first.
 func parseConfigLines(text string) []*ConfigEntry {
-	return parseConfigReader(strings.NewReader(text))
+	return parseConfigReader(strings.NewReader(maybeDecodeBase64Blob(text)))
 }
 
 // parseConfigFile streams a file from disk a line at a time. This is the
@@ -320,44 +359,27 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		// Extract a proxy URL from anywhere in the line: scan for the
-		// earliest occurrence of any recognised scheme so lines like
-		// "  <some prefix> trojan://... <suffix>" still parse correctly.
-		bestIdx := -1
-		for _, s := range nodeSchemes {
-			if i := strings.Index(line, s); i >= 0 && (bestIdx < 0 || i < bestIdx) {
-				bestIdx = i
+		// One line may hold several configs glued together without whitespace
+		// (e.g. "ss://…#namevmess://…ss://…"); splitConfigURLs returns each one.
+		for _, cfg := range splitConfigURLs(line) {
+			e := &ConfigEntry{Raw: cfg, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
+			n, parseErr := parseNode(cfg)
+			if parseErr != nil {
+				e.Name = cfg[:minInt(40, len(cfg))]
+				e.PingStatus = StatusFailed
+				e.PingErr = parseErr.Error()
+				e.SpeedStatus = StatusFailed
+				e.SpeedErr = parseErr.Error()
+			} else {
+				e.Name = n.Name
+				e.Host = n.Host
+				e.Port = n.Port
+				e.Network = n.Network
+				e.Security = n.Security
+				e.Protocol = string(n.Kind)
 			}
+			entries = append(entries, e)
 		}
-		if bestIdx < 0 {
-			continue
-		}
-		line = line[bestIdx:]
-		// Trim trailing garbage (spaces, markdown links etc)
-		if sp := strings.IndexAny(line, " \t\r"); sp > 0 {
-			line = line[:sp]
-		}
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		e := &ConfigEntry{Raw: line, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
-		n, parseErr := parseNode(line)
-		if parseErr != nil {
-			e.Name = line[:minInt(40, len(line))]
-			e.PingStatus = StatusFailed
-			e.PingErr = parseErr.Error()
-			e.SpeedStatus = StatusFailed
-			e.SpeedErr = parseErr.Error()
-		} else {
-			e.Name = n.Name
-			e.Host = n.Host
-			e.Port = n.Port
-			e.Network = n.Network
-			e.Security = n.Security
-			e.Protocol = string(n.Kind)
-		}
-		entries = append(entries, e)
 	}
 	if err := scanner.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠ parseConfigReader: %v\n", err)
