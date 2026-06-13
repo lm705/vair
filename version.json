@@ -1,0 +1,6 @@
+{
+  "version": "1.8.0",
+  "url": "https://github.com/lm705/vair/releases/download/v1.8.0/Vair.exe",
+  "sha256": "6882824705c2cab11b4ae2eddf6bb28eb9a9ca6b25037c1d648e149bd5cc20b0",
+  "notes": "Фрагментация TLS (обход DPI), импорт из приватного GitHub (PAT), скан QR с экрана/файла, самообновление, автозапуск с Windows, логи в окне AUTO."
+}
