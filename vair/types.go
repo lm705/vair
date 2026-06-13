@@ -171,6 +171,23 @@ type Tab struct {
 	// or "delete" (server-side removal, not reversible). The Tab.Dedup
 	// boolean from earlier dev builds is auto-migrated to "hide" on load.
 	DedupMode string `json:"dedup_mode,omitempty"`
+	// GitHub private-repo import (per-tab). When GitHubEnabled and owner/repo/
+	// file/PAT are all set, the tab additionally pulls a config file from a
+	// private GitHub repository via the Contents API on every fetch/refresh,
+	// appended after URL + file sources. The PAT is stored in plaintext in
+	// tabs.json (same trust level as the configs themselves).
+	GitHubEnabled bool   `json:"github_enabled,omitempty"`
+	GitHubOwner   string `json:"github_owner,omitempty"`
+	GitHubRepo    string `json:"github_repo,omitempty"`
+	GitHubFile    string `json:"github_file,omitempty"`
+	GitHubPAT     string `json:"github_pat,omitempty"`
+}
+
+// gitHubReady reports whether a tab's GitHub import is enabled and fully
+// configured (owner, repo, file path and PAT all present).
+func (t *Tab) gitHubReady() bool {
+	return t.GitHubEnabled && t.GitHubOwner != "" && t.GitHubRepo != "" &&
+		t.GitHubFile != "" && t.GitHubPAT != ""
 }
 
 type persistedTab struct {
@@ -189,6 +206,12 @@ type persistedTab struct {
 	Dedup     bool     `json:"dedup,omitempty"`
 	DedupMode string   `json:"dedup_mode,omitempty"`
 	Configs   []string `json:"configs,omitempty"`
+	// GitHub private-repo import (see Tab).
+	GitHubEnabled bool   `json:"github_enabled,omitempty"`
+	GitHubOwner   string `json:"github_owner,omitempty"`
+	GitHubRepo    string `json:"github_repo,omitempty"`
+	GitHubFile    string `json:"github_file,omitempty"`
+	GitHubPAT     string `json:"github_pat,omitempty"`
 }
 type persistedData struct {
 	Tabs []persistedTab `json:"tabs"`
@@ -261,6 +284,8 @@ func saveTabs() {
 			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles, RefreshMin: t.RefreshMin,
 			ExcludeFilter: t.ExcludeFilter, ExcludeDisabled: t.ExcludeDisabled,
 			RefreshDisabled: t.RefreshDisabled, DedupMode: t.DedupMode,
+			GitHubEnabled: t.GitHubEnabled, GitHubOwner: t.GitHubOwner,
+			GitHubRepo: t.GitHubRepo, GitHubFile: t.GitHubFile, GitHubPAT: t.GitHubPAT,
 		}
 		if len(t.SourceURLs) == 1 {
 			pt.SourceURL = t.SourceURLs[0]
@@ -329,7 +354,9 @@ func loadTabs() {
 			SourceURLs: urls, SourceFiles: pt.SourceFiles,
 			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter,
 			ExcludeDisabled: pt.ExcludeDisabled, RefreshDisabled: pt.RefreshDisabled,
-			DedupMode: mode,
+			DedupMode:     mode,
+			GitHubEnabled: pt.GitHubEnabled, GitHubOwner: pt.GitHubOwner,
+			GitHubRepo: pt.GitHubRepo, GitHubFile: pt.GitHubFile, GitHubPAT: pt.GitHubPAT,
 		}
 		state.tabs = append(state.tabs, tab)
 		entries := parseConfigLines(strings.Join(pt.Configs, "\n"))

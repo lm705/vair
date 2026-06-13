@@ -21,3 +21,8 @@ func refreshBlockedRuleSets()               {}
 func refreshCustomBlocklist(_ string)       {}
 func ruRuleSetLocalPath(file string) string { return file }
 func customBlocklistPath() string           { return "" }
+
+func applyAutostart(_ bool) error { return nil }
+
+func replaceAndRelaunch(_ string) error { return nil }
+func cleanupUpdateLeftovers()           {}

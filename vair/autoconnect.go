@@ -184,6 +184,30 @@ func autoConnInPool(cs ConnState, pool []string) bool {
 	return false
 }
 
+// autoConnRawPresent reports whether the connected config's raw URL still exists
+// among the pool tabs' current entries. After a list refresh a previously-
+// connected config can vanish from the pool while the tunnel stays up; in that
+// case the over-budget guard must not insist on finding something "faster than
+// the current config" (there's no in-list metric for a config that's gone) — it
+// should just switch to the fastest available. Differs from autoConnInPool,
+// which is satisfied as soon as the connection's TAB is in the pool, regardless
+// of whether the specific config is still listed.
+func autoConnRawPresent(pool []string, raw string) bool {
+	if raw == "" {
+		return false
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, tid := range pool {
+		for _, e := range state.tabEntries[tid] {
+			if e.snap().Raw == raw {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // autoTabExcludeRules returns each pool tab's exclude-filter rules, keyed by
 // tab ID. Caller must hold state.mu (R). Used to defensively re-apply the
 // per-tab exclude filter when auto-connect picks candidates: the fetch paths
@@ -837,28 +861,40 @@ func startAutoSupervisor() {
 			} else {
 				vlog("warning", "auto: health probe failed (%d/%d) for %s", failCount, threshold, cs.EntryName)
 			}
-			if failCount < threshold || time.Since(lastSwitch) < minDwell {
+			if failCount < threshold {
 				continue
 			}
-			// Slow-but-alive: only switch when the pool has a genuinely FASTER
-			// candidate than the current live latency. If the current config is
-			// already the fastest available (every other candidate is as slow or
-			// slower), don't flap to an equal/worse one — stay put, but kick a
-			// throttled background re-test of the pool so the next health tick
-			// re-ranks on fresh data; the moment a genuinely faster config shows up
-			// (now, or after the list refreshes and re-tests) we switch to it. A
-			// DEAD probe ignores this — a broken link must move regardless.
-			if overBudget && !autoHasFasterCandidate(pool, cs, cooldown) {
-				failCount = 0
-				broadcastAuto("health", cs.EntryName, cs.ConnRaw, "slow but best")
-				if atomic.LoadInt32(&autoPingRunning) == 0 && time.Since(lastSlowRetest) > slowRetestEvery {
-					lastSlowRetest = time.Now()
-					settingsMu.RLock()
-					bySpeed := appSettings.AutoRankBySpeed
-					settingsMu.RUnlock()
-					go autoTestTabs(pool, bySpeed)
+			if overBudget {
+				// Slow-but-alive path. The min-dwell only gates THIS case: it stops a
+				// transient latency spike from flapping us off a working config. A DEAD
+				// probe skips this whole block and switches the moment the threshold is
+				// hit, so a broken link never has to wait out the dwell (the
+				// "health probe failed 3/2, 4/2 … no switch" the user reported).
+				if time.Since(lastSwitch) < minDwell {
+					continue
 				}
-				continue
+				// When the connected config is still in the refreshed pool, only switch
+				// if the pool holds a genuinely FASTER candidate than the current live
+				// latency — never flap to an equal/worse one; stay put and kick a
+				// throttled background re-test so the next tick re-ranks on fresh data.
+				// But if the connected config has DROPPED OUT of the pool (a list
+				// refresh removed it while the tunnel stayed up), there's no in-list
+				// metric to compare against, so fall through and switch to the fastest
+				// available rather than re-testing forever waiting for something faster
+				// than a config that's gone (the "France vanished, tests run nonstop"
+				// report).
+				if autoConnRawPresent(pool, cs.ConnRaw) && !autoHasFasterCandidate(pool, cs, cooldown) {
+					failCount = 0
+					broadcastAuto("health", cs.EntryName, cs.ConnRaw, "slow but best")
+					if atomic.LoadInt32(&autoPingRunning) == 0 && time.Since(lastSlowRetest) > slowRetestEvery {
+						lastSlowRetest = time.Now()
+						settingsMu.RLock()
+						bySpeed := appSettings.AutoRankBySpeed
+						settingsMu.RUnlock()
+						go autoTestTabs(pool, bySpeed)
+					}
+					continue
+				}
 			}
 			// A faster candidate exists → switch to the fastest available below.
 			// Pick the failover target by *fresh* ping ranking. If the pool has no

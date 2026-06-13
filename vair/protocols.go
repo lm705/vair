@@ -188,6 +188,30 @@ func looksLikeNodeURL(line string) bool {
 	return false
 }
 
+// schemeProtocol returns the protocol kind implied by a URL's scheme prefix
+// (e.g. "trojan://…" → "trojan"), independent of whether the rest of the URL
+// parses. Used to label configs that FAIL to parse: the scheme is still known,
+// so a broken trojan:// link is tagged "trojan" instead of falling back to the
+// UI's default ("vless"). Returns "" when no recognised scheme matches.
+func schemeProtocol(raw string) string {
+	raw = strings.TrimSpace(raw)
+	switch {
+	case strings.HasPrefix(raw, "vless://"):
+		return string(KindVLESS)
+	case strings.HasPrefix(raw, "vmess://"):
+		return string(KindVMess)
+	case strings.HasPrefix(raw, "trojan://"):
+		return string(KindTrojan)
+	case strings.HasPrefix(raw, "ss://"):
+		return string(KindSS)
+	case strings.HasPrefix(raw, "hysteria2://"), strings.HasPrefix(raw, "hy2://"):
+		return string(KindHysteria2)
+	case strings.HasPrefix(raw, "tuic://"):
+		return string(KindTUIC)
+	}
+	return ""
+}
+
 // parseNode is the dispatcher: it picks the right per-protocol parser based
 // on the URL scheme and returns a unified *Node. Stage 0 only implements
 // VLESS; other schemes return a "not implemented" error. Later stages fill
@@ -1716,7 +1740,64 @@ func buildXrayConfigForNode(n *Node, httpPort, socksPort int, socksUser, socksPa
 	if socksPort > 0 {
 		cfg["routing"] = xrayRoutingForProxy()
 	}
+	applyXrayFragment(cfg)
 	return cfg
+}
+
+// applyXrayFragment rewires the config so the entry outbound dials its server
+// through a local "fragment" freedom outbound that splits the TLS ClientHello —
+// the DPI-evasion knob (Settings → toggle). No-op when the setting is off.
+//
+// The entry outbound is always outbounds[0]: the single proxy in
+// buildXrayConfigForNode, or hop0 (the hop your machine dials directly) in a
+// chain. Inner chain hops are already inside the tunnel, so only the entry —
+// the one your local DPI can see — needs fragmenting. The "tlshello" packet
+// selector means it only touches TLS handshakes; plain-TCP nodes are unaffected.
+func applyXrayFragment(cfg map[string]interface{}) {
+	if cfg == nil || !tlsFragmentEnabled() {
+		return
+	}
+	outs, ok := cfg["outbounds"].([]interface{})
+	if !ok || len(outs) == 0 {
+		return
+	}
+	entry, ok := outs[0].(map[string]interface{})
+	if !ok || entry == nil {
+		return
+	}
+	ss, _ := entry["streamSettings"].(map[string]interface{})
+	if ss == nil {
+		ss = map[string]interface{}{}
+		entry["streamSettings"] = ss
+	}
+	sockopt, _ := ss["sockopt"].(map[string]interface{})
+	if sockopt == nil {
+		sockopt = map[string]interface{}{}
+		ss["sockopt"] = sockopt
+	}
+	// Don't clobber an existing dialerProxy (shouldn't happen for the entry, but
+	// be defensive — a pre-set dialer would otherwise be lost).
+	if _, exists := sockopt["dialerProxy"]; exists {
+		return
+	}
+	sockopt["dialerProxy"] = "fragment"
+	length, interval := currentTLSFragmentParams()
+	fragOut := map[string]interface{}{
+		"tag":      "fragment",
+		"protocol": "freedom",
+		"settings": map[string]interface{}{
+			"domainStrategy": "AsIs",
+			"fragment": map[string]interface{}{
+				"packets":  "tlshello",
+				"length":   length,
+				"interval": interval,
+			},
+		},
+		"streamSettings": map[string]interface{}{
+			"sockopt": map[string]interface{}{"tcpNoDelay": true},
+		},
+	}
+	cfg["outbounds"] = append(outs, fragOut)
 }
 
 // xrayOutboundForNode returns the bare proxy outbound stanza for an
@@ -1813,6 +1894,7 @@ func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int, socksUser, soc
 	if socksPort > 0 {
 		cfg["routing"] = xrayRoutingForProxy()
 	}
+	applyXrayFragment(cfg)
 	return cfg
 }
 

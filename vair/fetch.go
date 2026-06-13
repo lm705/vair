@@ -24,12 +24,14 @@ var sourceDefs = []SourceDef{
 	{"https://raw.githack.com/lm705/vair/main/vless_alive.txt", ""}, // fallback
 }
 
+// Built-in GitHub PAT source for the main "Sources" tab (all empty by default →
+// disabled). Per-tab GitHub imports are configured in the UI and stored on each
+// Tab (GitHubOwner/Repo/File/PAT); both paths share fetchGitHubPATContent.
 const (
-	githubOwner  = ""
-	githubRepo   = ""
-	githubFile   = ""
-	githubPAT    = ""
-	githubAPIURL = "https://api.github.com/repos/" + githubOwner + "/" + githubRepo + "/contents/" + githubFile
+	githubOwner = ""
+	githubRepo  = ""
+	githubFile  = ""
+	githubPAT   = ""
 )
 
 func fetchAndInit() {
@@ -148,6 +150,9 @@ func fetchAndInit() {
 		n, parseErr := parseNode(raw)
 		if parseErr != nil {
 			e.Name = raw[:minInt(40, len(raw))]
+			// Label unparseable configs by their URL scheme so they don't fall
+			// back to the UI's "vless" default (e.g. a broken trojan:// link).
+			e.Protocol = schemeProtocol(raw)
 			e.PingStatus = StatusFailed
 			e.PingErr = parseErr.Error()
 			e.SpeedStatus = StatusFailed
@@ -249,13 +254,33 @@ func fetchGitHubPAT() ([]string, error) {
 	if githubPAT == "" || githubOwner == "" {
 		return nil, nil
 	}
+	return fetchGitHubPATContent(githubOwner, githubRepo, githubFile, githubPAT)
+}
+
+// fetchGitHubPATContent pulls a single file from a (typically private) GitHub
+// repository through the Contents API, authenticating with a personal access
+// token, and returns the proxy-config lines it contains. The API returns the
+// file body base64-encoded; once decoded we also run it through
+// maybeDecodeBase64Blob so a base64 *subscription* committed to the repo is
+// handled like any other base64 source. Used by the built-in source (above) and
+// by each user tab's own GitHub import (see fetchTabURLs).
+func fetchGitHubPATContent(owner, repo, file, pat string) ([]string, error) {
+	owner = strings.TrimSpace(owner)
+	repo = strings.TrimSpace(repo)
+	file = strings.TrimLeft(strings.TrimSpace(file), "/")
+	pat = strings.TrimSpace(pat)
+	if owner == "" || repo == "" || file == "" || pat == "" {
+		return nil, fmt.Errorf("incomplete GitHub config")
+	}
+	apiURL := "https://api.github.com/repos/" + owner + "/" + repo + "/contents/" + file
 	client := &http.Client{Timeout: 15 * time.Second}
-	req, err := http.NewRequest("GET", githubAPIURL, nil)
+	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+githubPAT)
+	req.Header.Set("Authorization", "Bearer "+pat)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -275,8 +300,9 @@ func fetchGitHubPAT() ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("base64: %w", err)
 	}
+	text := maybeDecodeBase64Blob(string(decoded))
 	var lines []string
-	for _, l := range strings.Split(string(decoded), "\n") {
+	for _, l := range strings.Split(text, "\n") {
 		l = strings.TrimSpace(l)
 		if looksLikeNodeURL(l) {
 			lines = append(lines, l)
@@ -366,6 +392,10 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 			n, parseErr := parseNode(cfg)
 			if parseErr != nil {
 				e.Name = cfg[:minInt(40, len(cfg))]
+				// Even when the body is unparseable, the scheme is known — label by
+				// it (e.g. a broken trojan:// link shows "trojan", not the UI's
+				// "vless" fallback for an empty protocol).
+				e.Protocol = schemeProtocol(cfg)
 				e.PingStatus = StatusFailed
 				e.PingErr = parseErr.Error()
 				e.SpeedStatus = StatusFailed

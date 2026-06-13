@@ -215,6 +215,23 @@ type AppSettings struct {
 	// LastConnectedMode records the mode ("proxy"/"tun") of the most
 	// recent connection, so AutoMode="" (remember last) can reuse it.
 	LastConnectedMode string `json:"last_connected_mode,omitempty"`
+
+	// ── TLS fragmentation (DPI evasion) ──────────────────────────────
+	// TLSFragment, when on, routes the xray outbound's connection to its server
+	// through a local "freedom" outbound that splits the TLS ClientHello into
+	// pieces, so a stateful DPI can't match the SNI/handshake in one packet.
+	// Applies only to the xray engine (TCP-family TLS protocols), in proxy and
+	// hybrid-TUN alike (xray makes the real TLS dial in both). Off by default.
+	// Length/Interval are xray's fragment ranges ("min-max" or a single number);
+	// empty falls back to the defaults below.
+	TLSFragment         bool   `json:"tls_fragment,omitempty"`
+	TLSFragmentLength   string `json:"tls_fragment_length,omitempty"`
+	TLSFragmentInterval string `json:"tls_fragment_interval,omitempty"`
+
+	// AutostartEnabled launches Vair at Windows logon (HKCU Run key, started
+	// minimized via the --autostart flag). Off by default. Reconciled with the
+	// registry whenever settings are saved (see applyAutostart).
+	AutostartEnabled bool `json:"autostart_enabled,omitempty"`
 }
 
 const (
@@ -528,6 +545,59 @@ func effectiveProxyDomains() []string {
 		}
 	}
 	return out
+}
+
+// Default xray TLS-fragment ranges. "tlshello" packets are split into chunks
+// of `length` bytes with `interval` ms between them. These mirror the values
+// commonly used in v2rayN/Hiddify and are conservative enough not to break
+// throughput while still defeating one-packet SNI matching.
+const (
+	defaultTLSFragmentLength   = "100-200"
+	defaultTLSFragmentInterval = "10-20"
+)
+
+// tlsFragmentEnabled reports whether TLS ClientHello fragmentation is on.
+func tlsFragmentEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.TLSFragment
+}
+
+// validFragmentSpec accepts xray fragment ranges: a single number ("100") or a
+// "min-max" range ("100-200"), digits only.
+func validFragmentSpec(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	parts := strings.SplitN(s, "-", 2)
+	for _, p := range parts {
+		if p == "" {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// currentTLSFragmentParams returns the validated length/interval ranges, falling
+// back to the defaults when unset or malformed.
+func currentTLSFragmentParams() (length, interval string) {
+	settingsMu.RLock()
+	l := strings.TrimSpace(appSettings.TLSFragmentLength)
+	iv := strings.TrimSpace(appSettings.TLSFragmentInterval)
+	settingsMu.RUnlock()
+	if !validFragmentSpec(l) {
+		l = defaultTLSFragmentLength
+	}
+	if !validFragmentSpec(iv) {
+		iv = defaultTLSFragmentInterval
+	}
+	return l, iv
 }
 
 // blocklistURL returns the trimmed custom blocklist URL ("" = none).
