@@ -19,7 +19,88 @@ import (
 
 	webview "github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
+
+// startMinimized is set from the --autostart command-line flag (written into the
+// HKCU Run key when autostart is enabled). When true, the window starts hidden
+// to tray / minimized instead of grabbing the foreground at logon.
+var startMinimized bool
+
+// autostart registry location: HKCU\…\Run, value "Vair".
+const (
+	autostartRunKey    = `Software\Microsoft\Windows\CurrentVersion\Run`
+	autostartValueName = "Vair"
+)
+
+// applyAutostart writes or removes the HKCU Run-key entry that launches Vair at
+// Windows logon. When enabled the command is the quoted exe path plus
+// --autostart so the boot launch comes up minimized (see openNativeWindow).
+func applyAutostart(enabled bool) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, autostartRunKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	if enabled {
+		exe, err := os.Executable()
+		if err != nil {
+			return err
+		}
+		return k.SetStringValue(autostartValueName, `"`+exe+`" --autostart`)
+	}
+	// Disabled → remove the value; a missing value is not an error.
+	if err := k.DeleteValue(autostartValueName); err != nil && err != registry.ErrNotExist {
+		return err
+	}
+	return nil
+}
+
+// mainHWND is the main window handle, captured in openNativeWindow so a deep-link
+// arriving while we're running can raise the window. 0 until the window exists.
+var mainHWND uintptr
+
+// registerDeepLink registers (or removes) the per-user vair:// URL scheme so a
+// vair://import/<…> link opens this exe with the URL as argv[1].
+func registerDeepLink(enabled bool) error {
+	const base = `Software\Classes\vair`
+	if !enabled {
+		// Delete deepest keys first (DeleteKey refuses keys with subkeys).
+		registry.DeleteKey(registry.CURRENT_USER, base+`\shell\open\command`)
+		registry.DeleteKey(registry.CURRENT_USER, base+`\shell\open`)
+		registry.DeleteKey(registry.CURRENT_USER, base+`\shell`)
+		registry.DeleteKey(registry.CURRENT_USER, base)
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	k, _, err := registry.CreateKey(registry.CURRENT_USER, base, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	k.SetStringValue("", "URL:Vair Protocol")
+	k.SetStringValue("URL Protocol", "")
+	k.Close()
+	ck, _, err := registry.CreateKey(registry.CURRENT_USER, base+`\shell\open\command`, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer ck.Close()
+	return ck.SetStringValue("", `"`+exe+`" "%1"`)
+}
+
+// focusMainWindow restores and foregrounds the main window — used when a deep
+// link is forwarded to this already-running instance.
+func focusMainWindow() {
+	if mainHWND == 0 {
+		return
+	}
+	procShowWindow.Call(mainHWND, swRestore)
+	procSetForegroundWindow.Call(mainHWND)
+	procBringWindowToTop.Call(mainHWND)
+}
 
 // ── Embedded files ────────────────────────────────────────────────────────────
 
@@ -205,6 +286,7 @@ var (
 
 	shell32              = windows.NewLazySystemDLL("shell32.dll")
 	procShellNotifyIconW = shell32.NewProc("Shell_NotifyIconW")
+	procShellExecuteW    = shell32.NewProc("ShellExecuteW")
 
 	// File-open dialog (used by _goPickFiles).
 	comdlg32             = windows.NewLazySystemDLL("comdlg32.dll")
@@ -715,12 +797,9 @@ func openNativeWindow(addr string) {
 	defer w.Destroy()
 
 	hwnd := uintptr(w.Window())
+	mainHWND = hwnd
 	setupWindow(hwnd)
 	setWindowIcon(hwnd)
-
-	// Bring window to foreground so it appears on top (not behind other windows)
-	procSetForegroundWindow.Call(hwnd)
-	procBringWindowToTop.Call(hwnd)
 
 	// Show tray icon if enabled
 	settingsMu.RLock()
@@ -728,6 +807,29 @@ func openNativeWindow(addr string) {
 	settingsMu.RUnlock()
 	if trayOn {
 		addTrayIcon(hwnd, filepath.Join(binDir, "icon.ico"))
+	}
+
+	if startMinimized {
+		// Logon launch: don't steal focus. Hide to tray when the tray icon is on
+		// (added just above), otherwise minimize to the taskbar. Re-applied on a
+		// short delay because go-webview2 shows the window during Run() — the
+		// delayed call lands after that and sticks.
+		hideOrMin := func() {
+			if trayOn {
+				procShowWindow.Call(hwnd, swHide)
+			} else {
+				procShowWindow.Call(hwnd, swMinimize)
+			}
+		}
+		hideOrMin()
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			hideOrMin()
+		}()
+	} else {
+		// Bring window to foreground so it appears on top (not behind other windows)
+		procSetForegroundWindow.Call(hwnd)
+		procBringWindowToTop.Call(hwnd)
 	}
 
 	// Periodically update tray tooltip with connection info
@@ -1007,6 +1109,27 @@ func openNativeWindow(addr string) {
 		return saveJSONFile(hwnd, suggestedName, []byte(content))
 	})
 
+	// QR scan from an image file: native picker → decode → return the payload
+	// (config URL / subscription / base64). "" = cancelled.
+	w.Bind("_goScanQRFile", func() (string, error) {
+		return scanQRFromFile(hwnd)
+	})
+	// QR scan from the screen: minimise our window first so it doesn't cover the
+	// QR (it's usually in another app), grab the desktop, decode, restore.
+	w.Bind("_goScanQRScreen", func() (string, error) {
+		procShowWindow.Call(hwnd, swMinimize)
+		time.Sleep(350 * time.Millisecond)
+		txt, err := scanQRFromScreen()
+		procShowWindow.Call(hwnd, swRestore)
+		procSetForegroundWindow.Call(hwnd)
+		return txt, err
+	})
+	// Open an external link (attribution) in the default browser. The WebView
+	// must never navigate away from the app itself.
+	w.Bind("_goOpenURL", func(u string) {
+		openExternalURL(u)
+	})
+
 	w.Navigate(addr)
 
 	// ── Resize fix: subclass WebView2 child windows ───────────────────────────
@@ -1280,6 +1403,26 @@ func utf16LE(s string) []byte {
 		out = append(out, byte(c), byte(c>>8))
 	}
 	return out
+}
+
+// openExternalURL opens an http(s) link in the user's default browser via
+// ShellExecute. Only http/https are allowed so a crafted value can't launch an
+// arbitrary file or protocol handler.
+func openExternalURL(u string) {
+	u = strings.TrimSpace(u)
+	if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") {
+		return
+	}
+	verb, err := syscall.UTF16PtrFromString("open")
+	if err != nil {
+		return
+	}
+	target, err := syscall.UTF16PtrFromString(u)
+	if err != nil {
+		return
+	}
+	// ShellExecuteW(NULL, "open", url, NULL, NULL, SW_SHOWNORMAL=1)
+	procShellExecuteW.Call(0, uintptr(unsafe.Pointer(verb)), uintptr(unsafe.Pointer(target)), 0, 0, 1)
 }
 
 // openStorageLocation opens the given directory in Explorer (used by the
@@ -1616,6 +1759,26 @@ func setAppUserModelID() {
 }
 
 func standaloneMain() {
+	// Launched at logon via the Run key? Start minimized / to tray instead of
+	// stealing focus. (The Run-key command appends --autostart.) Also pick up a
+	// vair:// deep-link passed as an argument.
+	var deepLinkArg string
+	for _, a := range os.Args[1:] {
+		if a == "--autostart" {
+			startMinimized = true
+		} else if strings.HasPrefix(strings.ToLower(a), "vair://") {
+			deepLinkArg = a
+		}
+	}
+	// If a deep-link was passed and an instance is already running, hand it over
+	// and exit — don't start a duplicate. Otherwise we're the one instance and
+	// will import it once our UI connects (pendingDeepLink → handleSSE).
+	if deepLinkArg != "" {
+		if forwardDeepLink(deepLinkArg) {
+			os.Exit(0)
+		}
+		pendingDeepLink = parseDeepLink(deepLinkArg)
+	}
 	// Must run before any child process is spawned (extractBinaries →
 	// prewarmBinary launches `xray version`), so every descendant lands
 	// inside the job and is grouped with / cleaned up alongside Vair.
@@ -1634,6 +1797,8 @@ func standaloneMain() {
 	if !checkAdmin() {
 		fmt.Println("!! Run as Administrator to enable TUN mode.")
 	}
+	// Remove any leftover <exe>.new / .old from a previous self-update.
+	cleanupUpdateLeftovers()
 	// Recover from a dirty shutdown: if the last session left the Windows
 	// system proxy enabled (pointed at a now-dead localhost port), internet
 	// would be broken until cleared. Do this before anything else network.
@@ -1649,6 +1814,21 @@ func standaloneMain() {
 	registerRoutes()
 	loadTabs()
 	loadSettings()
+	// Register the vair:// scheme if enabled (default on) so deep links work.
+	if deepLinkEnabled() {
+		if err := registerDeepLink(true); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ registerDeepLink: %v\n", err)
+		}
+	}
+	// Self-heal the logon Run key: the path captured when the user enabled
+	// autostart goes stale if they move/rename the exe or run a differently-named
+	// build (a self-update replaces in place, so that path stays valid). Re-point
+	// it at THIS exe every startup so "launch at logon" keeps working.
+	if autostartEnabled() {
+		if err := applyAutostart(true); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ autostart refresh: %v\n", err)
+		}
+	}
 	// Auto-connect now implies connect-on-startup (the separate toggle was
 	// removed): if the feature is on, arm intent so the supervisor connects to
 	// the fastest working config once entries load.

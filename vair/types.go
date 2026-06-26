@@ -149,18 +149,25 @@ type TabFile struct {
 	Path  string `json:"path"`
 	Size  int64  `json:"size,omitempty"`  // last-known size in bytes, informational
 	Mtime int64  `json:"mtime,omitempty"` // last-known mtime (unix seconds), informational
+	// Disabled skips this file on fetch while keeping it in the tab's list (the
+	// same on/off behaviour URL sources have via SourceDisabled).
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 type Tab struct {
-	ID            string    `json:"id"`
-	Name          string    `json:"name"`
-	IsMain        bool      `json:"is_main"`
-	Closable      bool      `json:"closable"`
-	SourceURL     string    `json:"source_url,omitempty"`
-	SourceURLs    []string  `json:"source_urls,omitempty"`
-	SourceFiles   []TabFile `json:"source_files,omitempty"`
-	RefreshMin    int       `json:"refresh_min,omitempty"`
-	ExcludeFilter []string  `json:"exclude_filter,omitempty"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	IsMain     bool     `json:"is_main"`
+	Closable   bool     `json:"closable"`
+	SourceURL  string   `json:"source_url,omitempty"`
+	SourceURLs []string `json:"source_urls,omitempty"`
+	// SourceDisabled lists URL sources the user switched OFF in tab settings.
+	// They stay in SourceURLs (so the row and its subscription info persist) but
+	// are skipped on fetch. Matched by exact URL string.
+	SourceDisabled []string  `json:"source_disabled,omitempty"`
+	SourceFiles    []TabFile `json:"source_files,omitempty"`
+	RefreshMin     int       `json:"refresh_min,omitempty"`
+	ExcludeFilter  []string  `json:"exclude_filter,omitempty"`
 	// ExcludeDisabled / RefreshDisabled turn OFF the exclude filter / auto-refresh
 	// for this tab WITHOUT clearing their values (the filter rules and refresh
 	// interval persist but aren't applied while off). Inverted bool so the JSON
@@ -171,6 +178,15 @@ type Tab struct {
 	// or "delete" (server-side removal, not reversible). The Tab.Dedup
 	// boolean from earlier dev builds is auto-migrated to "hide" on load.
 	DedupMode string `json:"dedup_mode,omitempty"`
+	// AutoRefreshTest runs a background test of the tab's configs after a
+	// SCHEDULED auto-refresh (never on a manual RELOAD): "" (off), "ping"
+	// (ping only), or "speed" (full ping→speed). Independent of AUTO mode.
+	AutoRefreshTest string `json:"auto_refresh_test,omitempty"`
+	// Subs holds subscription metadata (title, traffic quota, expiry, …) parsed on
+	// the last fetch from the response headers / "#"-comments — one entry per
+	// source URL that carried any. Empty when none. Persisted so it shows
+	// immediately on startup before the next re-fetch.
+	Subs []subMeta `json:"subs,omitempty"`
 	// GitHub private-repo import (per-tab). When GitHubEnabled and owner/repo/
 	// file/PAT are all set, the tab additionally pulls a config file from a
 	// private GitHub repository via the Contents API on every fetch/refresh,
@@ -195,6 +211,7 @@ type persistedTab struct {
 	Name            string    `json:"name"`
 	SourceURL       string    `json:"source_url,omitempty"`
 	SourceURLs      []string  `json:"source_urls,omitempty"`
+	SourceDisabled  []string  `json:"source_disabled,omitempty"`
 	SourceFiles     []TabFile `json:"source_files,omitempty"`
 	RefreshMin      int       `json:"refresh_min,omitempty"`
 	ExcludeFilter   []string  `json:"exclude_filter,omitempty"`
@@ -203,9 +220,12 @@ type persistedTab struct {
 	// Two fields cover the migration: old builds wrote `dedup: true` for
 	// what's now `dedup_mode: "hide"`. loadTabs picks DedupMode if set,
 	// otherwise upgrades the legacy bool.
-	Dedup     bool     `json:"dedup,omitempty"`
-	DedupMode string   `json:"dedup_mode,omitempty"`
-	Configs   []string `json:"configs,omitempty"`
+	Dedup           bool      `json:"dedup,omitempty"`
+	DedupMode       string    `json:"dedup_mode,omitempty"`
+	AutoRefreshTest string    `json:"auto_refresh_test,omitempty"`
+	Subs            []subMeta `json:"subs,omitempty"`
+	Sub             *subMeta  `json:"sub,omitempty"` // legacy single-sub form; migrated on load
+	Configs         []string  `json:"configs,omitempty"`
 	// GitHub private-repo import (see Tab).
 	GitHubEnabled bool   `json:"github_enabled,omitempty"`
 	GitHubOwner   string `json:"github_owner,omitempty"`
@@ -215,6 +235,28 @@ type persistedTab struct {
 }
 type persistedData struct {
 	Tabs []persistedTab `json:"tabs"`
+}
+
+// strInSlice reports whether s is present in list (exact match).
+func strInSlice(s string, list []string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
+// subsOf returns a persisted tab's subscription metadata, migrating the legacy
+// single `sub` field to the new `subs` list when an old tabs.json is loaded.
+func (pt persistedTab) subsOf() []subMeta {
+	if len(pt.Subs) > 0 {
+		return pt.Subs
+	}
+	if pt.Sub != nil {
+		return []subMeta{*pt.Sub}
+	}
+	return nil
 }
 
 // ─────────────────────────── SSE / state ─────────────────────────
@@ -240,6 +282,7 @@ type AppState struct {
 	tabs          []Tab
 	tabEntries    map[string][]*ConfigEntry // tab_id -> entries
 	cancelledTabs map[string]bool           // tabs pending cancellation
+	fetching      map[string]bool           // tab_id -> a reload/fetch is in flight
 	activeTab     string
 	xrayBin       string
 	singboxBin    string
@@ -255,6 +298,7 @@ var state = &AppState{
 	conn:          newConnManager(),
 	tabEntries:    make(map[string][]*ConfigEntry),
 	cancelledTabs: make(map[string]bool),
+	fetching:      make(map[string]bool),
 	activeTab:     "main",
 	tabs:          []Tab{{ID: "main", Name: "Sources", IsMain: true, Closable: false}},
 }
@@ -281,9 +325,11 @@ func saveTabs() {
 	for _, t := range state.tabs {
 		pt := persistedTab{
 			ID: t.ID, Name: t.Name,
-			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles, RefreshMin: t.RefreshMin,
+			SourceURLs: t.SourceURLs, SourceDisabled: t.SourceDisabled,
+			SourceFiles: t.SourceFiles, RefreshMin: t.RefreshMin,
 			ExcludeFilter: t.ExcludeFilter, ExcludeDisabled: t.ExcludeDisabled,
 			RefreshDisabled: t.RefreshDisabled, DedupMode: t.DedupMode,
+			AutoRefreshTest: t.AutoRefreshTest, Subs: t.Subs,
 			GitHubEnabled: t.GitHubEnabled, GitHubOwner: t.GitHubOwner,
 			GitHubRepo: t.GitHubRepo, GitHubFile: t.GitHubFile, GitHubPAT: t.GitHubPAT,
 		}
@@ -334,6 +380,8 @@ func loadTabs() {
 					state.tabs[i].RefreshMin = pt.RefreshMin
 					state.tabs[i].ExcludeDisabled = pt.ExcludeDisabled
 					state.tabs[i].RefreshDisabled = pt.RefreshDisabled
+					state.tabs[i].AutoRefreshTest = pt.AutoRefreshTest
+					state.tabs[i].Subs = pt.subsOf()
 					break
 				}
 			}
@@ -351,10 +399,11 @@ func loadTabs() {
 		}
 		tab := Tab{
 			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
-			SourceURLs: urls, SourceFiles: pt.SourceFiles,
+			SourceURLs: urls, SourceDisabled: pt.SourceDisabled, SourceFiles: pt.SourceFiles,
 			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter,
 			ExcludeDisabled: pt.ExcludeDisabled, RefreshDisabled: pt.RefreshDisabled,
-			DedupMode:     mode,
+			DedupMode:       mode,
+			AutoRefreshTest: pt.AutoRefreshTest, Subs: pt.subsOf(),
 			GitHubEnabled: pt.GitHubEnabled, GitHubOwner: pt.GitHubOwner,
 			GitHubRepo: pt.GitHubRepo, GitHubFile: pt.GitHubFile, GitHubPAT: pt.GitHubPAT,
 		}

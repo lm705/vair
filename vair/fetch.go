@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,6 +36,17 @@ const (
 )
 
 func fetchAndInit() {
+	// Mark the Sources tab as fetching so a switch to it shows a spinner; cleared
+	// on every return path.
+	state.mu.Lock()
+	state.fetching["main"] = true
+	state.mu.Unlock()
+	defer func() {
+		state.mu.Lock()
+		delete(state.fetching, "main")
+		state.mu.Unlock()
+	}()
+
 	settingsMu.RLock()
 	sourcesEnabled := appSettings.SourcesEnabled
 	settingsMu.RUnlock()
@@ -56,10 +68,11 @@ func fetchAndInit() {
 		state.broadcast(SSEEvent{Type: "loading", Payload: nil})
 	}
 	var raws []string
+	var subs []subMeta
 
 	// Fetch from sources (with fallback — only skip rest if vless configs were received)
 	for _, src := range sourceDefs {
-		lines, err := fetchURL(src.URL)
+		lines, meta, err := fetchURLMeta(src.URL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "⚠  fetch %s: %v\n", src.URL, err)
 			continue
@@ -80,6 +93,9 @@ func fetchAndInit() {
 		if !hasNode {
 			fmt.Fprintf(os.Stderr, "⚠  fetch %s: no proxy configs in response (%d lines)\n", src.URL, len(lines))
 			continue
+		}
+		if meta != nil { // metadata of the source we actually use (others are fallbacks)
+			subs = append(subs, *meta)
 		}
 		raws = append(raws, lines...)
 		fmt.Printf("ℹ  fetched %d lines from %s\n", len(lines), src.URL)
@@ -152,7 +168,7 @@ func fetchAndInit() {
 			e.Name = raw[:minInt(40, len(raw))]
 			// Label unparseable configs by their URL scheme so they don't fall
 			// back to the UI's "vless" default (e.g. a broken trojan:// link).
-			e.Protocol = schemeProtocol(raw)
+			e.Protocol = internLow(schemeProtocol(raw))
 			e.PingStatus = StatusFailed
 			e.PingErr = parseErr.Error()
 			e.SpeedStatus = StatusFailed
@@ -163,9 +179,9 @@ func fetchAndInit() {
 			e.Name = n.Name
 			e.Host = n.Host
 			e.Port = n.Port
-			e.Network = n.Network
-			e.Security = n.Security
-			e.Protocol = string(n.Kind)
+			e.Network = internLow(n.Network)
+			e.Security = internLow(n.Security)
+			e.Protocol = internLow(string(n.Kind))
 		}
 		entries = append(entries, e)
 	}
@@ -177,6 +193,14 @@ func fetchAndInit() {
 	}
 	state.mu.Lock()
 	state.tabEntries["main"] = entries
+	// Reconcile the Sources tab's subscription info to this fetch (clears it when
+	// no source carried any).
+	for i := range state.tabs {
+		if state.tabs[i].ID == "main" {
+			state.tabs[i].Subs = subs
+			break
+		}
+	}
 	// Only update active entries if main tab is active
 	if state.activeTab == "main" {
 		state.entries = entries
@@ -202,21 +226,79 @@ func fetchAndInit() {
 	debug.FreeOSMemory()
 }
 
+// subMeta holds optional subscription metadata: traffic quota / expiry (from the
+// Subscription-Userinfo response header used by Marzban/3x-ui/Remnawave panels)
+// and title / update-interval / date / count (from those response headers OR the
+// leading "#"-comment lines static raw files embed, since a static file can't set
+// its own HTTP headers). All fields are best-effort — anything missing stays zero.
+type subMeta struct {
+	Title          string   `json:"title,omitempty"`
+	URL            string   `json:"url,omitempty"`   // source URL this metadata came from
+	Error          string   `json:"error,omitempty"` // set by the caller when the source failed to load
+	Upload         int64    `json:"upload,omitempty"`
+	Download       int64    `json:"download,omitempty"`
+	Total          int64    `json:"total,omitempty"`
+	Expire         int64    `json:"expire,omitempty"`
+	UpdateInterval string   `json:"update_interval,omitempty"`
+	Updated        string   `json:"updated,omitempty"`
+	Count          int      `json:"count,omitempty"`
+	Info           string   `json:"info,omitempty"`
+	Notes          []string `json:"notes,omitempty"` // any other leading "#"-comment lines, verbatim
+}
+
+func (m *subMeta) isEmpty() bool {
+	return m.Title == "" && m.Total == 0 && m.Expire == 0 && m.Upload == 0 &&
+		m.Download == 0 && m.UpdateInterval == "" && m.Updated == "" && m.Count == 0 &&
+		m.Info == "" && len(m.Notes) == 0
+}
+
+// fetchURL is the metadata-less entry point kept for callers that only need the
+// config lines.
 func fetchURL(u string) ([]string, error) {
+	lines, _, err := fetchURLMeta(u)
+	return lines, err
+}
+
+// subFetchUserAgent is sent on every subscription fetch. Some panels / hosts
+// reject the Go default "Go-http-client" UA with 403 as an anti-bot measure and
+// only answer a "real" client. Our own "Vair/<version>" passes that and, being
+// unknown to panels, gets the plain URI / base64 list rather than a clash-YAML /
+// sing-box-JSON variant we don't parse. No host is special-cased; we don't
+// impersonate another product.
+const subFetchUserAgent = "Vair/" + appVersion
+
+// fetchURLMeta fetches a subscription URL and returns both its config lines and
+// any subscription metadata found in the response headers or the body's leading
+// "#"-comments. meta is nil when nothing was found.
+func fetchURLMeta(u string) ([]string, *subMeta, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(u)
+	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	req.Header.Set("User-Agent", subFetchUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
+	// Cap the body at 64 MB (~250k configs). The old 10 MB cap silently
+	// truncated very large subscriptions at ~40k configs (10 MB ÷ ~260 B/line).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024*1024))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	text := string(body)
+
+	// Metadata: response headers first (panels), then the leading "#"-comments
+	// (static files). Parse comments from the RAW text — for a base64 body there
+	// are none, and a plaintext body keeps them at the very top.
+	meta := &subMeta{}
+	parseSubHeaders(resp, meta)
+	parseCommentMeta(text, meta)
 
 	// Try to detect base64 subscription:
 	// If the text doesn't contain "://" in the first few hundred chars, try base64 decode
@@ -247,7 +329,122 @@ func fetchURL(u string) ([]string, error) {
 			lines = append(lines, l)
 		}
 	}
-	return lines, nil
+	if meta.isEmpty() {
+		meta = nil
+	} else {
+		meta.URL = u
+		if meta.Count == 0 { // panels don't send a count — show how many we got
+			meta.Count = len(lines)
+		}
+	}
+	return lines, meta, nil
+}
+
+// parseSubHeaders fills meta from the subscription HTTP response headers.
+func parseSubHeaders(resp *http.Response, meta *subMeta) {
+	if ui := resp.Header.Get("Subscription-Userinfo"); ui != "" {
+		// "upload=…; download=…; total=…; expire=…" (bytes; expire is unix seconds)
+		for _, kv := range strings.Split(ui, ";") {
+			kv = strings.TrimSpace(kv)
+			eq := strings.IndexByte(kv, '=')
+			if eq < 0 {
+				continue
+			}
+			key := strings.ToLower(strings.TrimSpace(kv[:eq]))
+			n, _ := strconv.ParseInt(strings.TrimSpace(kv[eq+1:]), 10, 64)
+			switch key {
+			case "upload":
+				meta.Upload = n
+			case "download":
+				meta.Download = n
+			case "total":
+				meta.Total = n
+			case "expire":
+				meta.Expire = n
+			}
+		}
+	}
+	if t := resp.Header.Get("Profile-Title"); t != "" && meta.Title == "" {
+		meta.Title = decodeProfileTitle(t)
+	}
+	if iv := resp.Header.Get("Profile-Update-Interval"); iv != "" && meta.UpdateInterval == "" {
+		meta.UpdateInterval = strings.TrimSpace(iv)
+	}
+}
+
+// decodeProfileTitle handles the "base64:<b64>" form (and bare base64) some
+// panels use for Profile-Title; falls back to the raw value.
+func decodeProfileTitle(s string) string {
+	s = strings.TrimSpace(s)
+	raw := strings.TrimPrefix(s, "base64:")
+	if dec, err := base64.StdEncoding.DecodeString(raw); err == nil && len(dec) > 0 {
+		return strings.TrimSpace(string(dec))
+	}
+	if dec, err := base64.RawStdEncoding.DecodeString(raw); err == nil && len(dec) > 0 {
+		return strings.TrimSpace(string(dec))
+	}
+	return s
+}
+
+// parseCommentMeta scans the leading "#"-comment block of a static subscription
+// file. It recognises a few well-known fields (title / update-interval / date /
+// count) across English and Russian wording, filling only what a header didn't
+// already provide, and collects EVERY other comment line verbatim into Notes —
+// so any description the author wrote is shown, not just hard-coded keys. Stops
+// at the first config line (or after a small cap) so it never walks a huge body.
+func parseCommentMeta(text string, meta *subMeta) {
+	lines := strings.Split(text, "\n")
+	for i, l := range lines {
+		if i > 100 {
+			break
+		}
+		l = strings.TrimSpace(l)
+		if l == "" {
+			continue
+		}
+		if !strings.HasPrefix(l, "#") {
+			if looksLikeNodeURL(l) {
+				break // reached the configs — no more metadata above
+			}
+			continue
+		}
+		// Strip ALL leading '#', then drop pure separator lines ("######",
+		// "# ====", "# ----") which carry no description.
+		body := strings.TrimSpace(strings.TrimLeft(l, "#"))
+		if body == "" || strings.Trim(body, "=-*_~ \t") == "" {
+			continue
+		}
+		key, val := "", body
+		if colon := strings.IndexByte(body, ':'); colon >= 0 {
+			key = strings.ToLower(strings.TrimSpace(body[:colon]))
+			val = strings.TrimSpace(body[colon+1:])
+		}
+		consumed := false
+		switch {
+		case (strings.HasPrefix(key, "profile-title") || key == "title" || key == "название") && val != "" && meta.Title == "":
+			meta.Title, consumed = val, true
+		case strings.HasPrefix(key, "profile-update-interval") && val != "" && meta.UpdateInterval == "":
+			meta.UpdateInterval, consumed = val, true
+		case (strings.HasPrefix(key, "date") || strings.Contains(key, "updated") || strings.Contains(key, "обнов") || key == "дата") && val != "" && meta.Updated == "":
+			meta.Updated, consumed = val, true
+		case (key == "count" || strings.Contains(key, "конфиг") || strings.Contains(key, "config") ||
+			strings.Contains(key, "количеств") || strings.Contains(key, "nodes") ||
+			strings.Contains(key, "servers") || strings.Contains(key, "серверов")) && meta.Count == 0:
+			if f := strings.Fields(val); len(f) > 0 {
+				if n, err := strconv.Atoi(strings.Trim(f[0], ",.")); err == nil {
+					meta.Count, consumed = n, true
+				}
+			}
+		}
+		// Anything not pulled into a structured field is a free-form description
+		// (announcements, usage rules, contacts, …) — keep it so it's shown.
+		if !consumed && len(meta.Notes) < 8 {
+			if len(body) > 300 {
+				body = body[:300]
+			}
+			meta.Notes = append(meta.Notes, body)
+		}
+	}
 }
 
 func fetchGitHubPAT() ([]string, error) {
@@ -373,6 +570,61 @@ func parseConfigFile(path string) ([]*ConfigEntry, error) {
 // upstream — that's the key fix for the "RAM doubles on every RELOAD"
 // leak. The buffer cap is 4 MiB which comfortably handles the longest
 // vless URLs (real ones are typically < 4 KiB).
+// internLow returns a shared (static) backing string for the known
+// low-cardinality transport / security / protocol values, so the thousands of
+// configs that repeat "tcp" / "reality" / "vless" all point at ONE string
+// instead of each carrying a freshly-parsed copy. This trims memory and, more
+// importantly, the allocation churn while parsing a huge list (which is what
+// inflated the heap peak). Unknown values pass through unchanged. Lock-free and
+// bounded — no map, no growth, no behaviour change (the strings are equal).
+func internLow(s string) string {
+	switch s {
+	case "tcp":
+		return "tcp"
+	case "ws":
+		return "ws"
+	case "grpc":
+		return "grpc"
+	case "h2":
+		return "h2"
+	case "http":
+		return "http"
+	case "httpupgrade":
+		return "httpupgrade"
+	case "splithttp":
+		return "splithttp"
+	case "xhttp":
+		return "xhttp"
+	case "kcp":
+		return "kcp"
+	case "quic":
+		return "quic"
+	case "tls":
+		return "tls"
+	case "reality":
+		return "reality"
+	case "xtls":
+		return "xtls"
+	case "none":
+		return "none"
+	case "vless":
+		return "vless"
+	case "vmess":
+		return "vmess"
+	case "trojan":
+		return "trojan"
+	case "ss":
+		return "ss"
+	case "ss2022":
+		return "ss2022"
+	case "hysteria2":
+		return "hysteria2"
+	case "tuic":
+		return "tuic"
+	}
+	return s
+}
+
 func parseConfigReader(r io.Reader) []*ConfigEntry {
 	var entries []*ConfigEntry
 	// NOTE: deliberately no de-duplication here. Dedup is a per-tab setting
@@ -395,7 +647,7 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 				// Even when the body is unparseable, the scheme is known — label by
 				// it (e.g. a broken trojan:// link shows "trojan", not the UI's
 				// "vless" fallback for an empty protocol).
-				e.Protocol = schemeProtocol(cfg)
+				e.Protocol = internLow(schemeProtocol(cfg))
 				e.PingStatus = StatusFailed
 				e.PingErr = parseErr.Error()
 				e.SpeedStatus = StatusFailed
@@ -404,9 +656,9 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 				e.Name = n.Name
 				e.Host = n.Host
 				e.Port = n.Port
-				e.Network = n.Network
-				e.Security = n.Security
-				e.Protocol = string(n.Kind)
+				e.Network = internLow(n.Network)
+				e.Security = internLow(n.Security)
+				e.Protocol = internLow(string(n.Kind))
 			}
 			entries = append(entries, e)
 		}

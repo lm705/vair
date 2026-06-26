@@ -1047,6 +1047,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		Chain: chainLabels, ChainRaws: chainRaws,
 	}
 	cm.mu.Unlock()
+	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig).
 	// last-connected badge → exit hop for a chain, else the single node.
 	if isChain {
 		recordLastConnected(chainRaws[len(chainRaws)-1], ModeTUN)
@@ -1171,6 +1172,7 @@ func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, con
 		StatsUnavailable: true,
 	}
 	cm.mu.Unlock()
+	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig).
 	recordLastConnected(entry.Raw, ModeTUN)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)

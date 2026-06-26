@@ -538,7 +538,15 @@ var autoPingRunning int32
 // given tabs. withSpeed runs the full ping→speed measurement so the supervisor
 // can rank by real download speed (AutoRankBySpeed); otherwise it's ping-only
 // (fast, for connect ordering). See autoPingTabs / the refresh path for callers.
-func autoTestTabs(tabIDs []string, withSpeed bool) {
+// testTabs is the shared background tester: it pings (and, when withSpeed,
+// speed-tests) every config across the given tabs, deduped and respecting each
+// tab's exclude filter. Results broadcast as entry_update (no bulk-progress UI).
+// It yields to any user-initiated bulk test and never overlaps another
+// background sweep (autoPingRunning guard). keepGoing, when non-nil, is checked
+// before each config and stops the sweep early when it returns false — AUTO uses
+// it to bail if auto-connect is switched off mid-sweep; the per-tab
+// "test after auto-refresh" passes nil (always run to completion).
+func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 	if atomic.LoadInt32(&state.pingRunning) == 1 || atomic.LoadInt32(&state.speedRunning) == 1 {
 		return
 	}
@@ -587,14 +595,11 @@ func autoTestTabs(tabIDs []string, withSpeed bool) {
 		if atomic.LoadInt32(&state.pingRunning) == 1 || atomic.LoadInt32(&state.speedRunning) == 1 {
 			break
 		}
-		// Bail if auto was turned off mid-sweep. Otherwise a stale sweep keeps
+		// Bail early when the caller's predicate says so. For AUTO this fires when
+		// auto-connect was turned off mid-sweep — otherwise a stale sweep keeps
 		// autoPingRunning=1 to completion, so a quick disable→enable can't start a
-		// fresh sweep (the CAS fails) and the supervisor waits on the old one —
-		// the "it waits instead of starting" the user reported.
-		settingsMu.RLock()
-		stillOn := appSettings.AutoConnect
-		settingsMu.RUnlock()
-		if !stillOn {
+		// fresh sweep (the CAS fails) and the supervisor waits on the old one.
+		if keepGoing != nil && !keepGoing() {
 			break
 		}
 		sem <- struct{}{}
@@ -620,9 +625,42 @@ func autoTestTabs(tabIDs []string, withSpeed bool) {
 	}
 	wg.Wait()
 	if withSpeed {
-		vlog("info", "auto: refreshed ping+speed for %d candidate config(s)", len(list))
+		vlog("info", "refreshed ping+speed for %d config(s)", len(list))
 	} else {
-		vlog("info", "auto: refreshed ping for %d candidate config(s)", len(list))
+		vlog("info", "refreshed ping for %d config(s)", len(list))
+	}
+}
+
+// autoTestTabs is the AUTO-supervisor entry point: same as testTabs but bails if
+// auto-connect is switched off mid-sweep.
+func autoTestTabs(tabIDs []string, withSpeed bool) {
+	testTabs(tabIDs, withSpeed, func() bool {
+		settingsMu.RLock()
+		on := appSettings.AutoConnect
+		settingsMu.RUnlock()
+		return on
+	})
+}
+
+// runAfterRefreshTest runs the per-tab "test after auto-refresh" (Tab.
+// AutoRefreshTest = "ping" or "speed") if configured. Called only from the
+// auto-refresh path (NOT manual RELOAD), independent of AUTO mode. Shares the
+// background-test guard, so it skips if AUTO is already testing this cycle.
+func runAfterRefreshTest(tabID string) {
+	state.mu.RLock()
+	var mode string
+	for _, t := range state.tabs {
+		if t.ID == tabID {
+			mode = t.AutoRefreshTest
+			break
+		}
+	}
+	state.mu.RUnlock()
+	switch mode {
+	case "ping":
+		testTabs([]string{tabID}, false, nil)
+	case "speed":
+		testTabs([]string{tabID}, true, nil)
 	}
 }
 

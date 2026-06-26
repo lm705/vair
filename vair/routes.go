@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -80,27 +81,51 @@ func startAutoRefresh() {
 			}
 			lastRefresh[t.ID] = time.Now()
 			// fetchAndInit / fetchTabURLs trigger the candidate re-ping
-			// themselves (covers manual refresh and startup too).
+			// themselves (covers manual refresh and startup too). The
+			// per-tab "test after auto-refresh" (runAfterRefreshTest) runs
+			// ONLY here — the auto-refresh path — so a manual RELOAD never
+			// triggers it. Each fetch* call is synchronous, so we run the
+			// test right after it returns (entries are loaded by then).
 			if t.IsMain {
-				go fetchAndInit()
-			} else if len(t.SourceURLs) > 0 || len(t.SourceFiles) > 0 {
-				go fetchTabURLs(t.ID, t.SourceURLs, t.SourceFiles)
+				go func() { fetchAndInit(); runAfterRefreshTest("main") }()
+			} else if len(t.SourceURLs) > 0 || len(t.SourceFiles) > 0 || t.gitHubReady() {
+				id, urls, files := t.ID, t.SourceURLs, t.SourceFiles
+				go func() { fetchTabURLs(id, urls, files); runAfterRefreshTest(id) }()
 			} else {
 				// Pasted-only tab: no source to re-fetch, but the user set a refresh
 				// interval. Honor it by resetting test results (a real reload would),
 				// then re-test if it's an auto-connect candidate. Without this,
 				// RefreshMin was silently ignored for sourceless tabs.
 				tabID := t.ID
-				go refreshSourcelessTab(tabID)
+				go func() { refreshSourcelessTab(tabID); runAfterRefreshTest(tabID) }()
 			}
 		}
 	}
 }
 
+// themedIndexHTML returns the UI with the persisted theme applied to the <body>
+// tag up front. Without this the page first renders with the default dark
+// palette and only switches to light once applyTheme() runs after the async
+// settings fetch — a visible dark flash on launch for light-theme users. The
+// body fills the viewport (height:100%), so seeding its class makes the very
+// first paint use the right background. Dark is the default the static HTML
+// already ships with, so only "light" needs the injection.
+func themedIndexHTML() string {
+	// Inject the running version so the UI can show it without a round-trip.
+	html := strings.Replace(indexHTML, "__APP_VERSION__", appVersion, 1)
+	settingsMu.RLock()
+	light := appSettings.Theme == "light"
+	settingsMu.RUnlock()
+	if light {
+		html = strings.Replace(html, "<body>", `<body class="theme-light">`, 1)
+	}
+	return html
+}
+
 func registerRoutes() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write([]byte(indexHTML))
+		w.Write([]byte(themedIndexHTML()))
 	})
 	http.HandleFunc("/api/stream", handleSSE)
 	http.HandleFunc("/api/connect", handleConnect)
@@ -126,6 +151,7 @@ func registerRoutes() {
 	http.HandleFunc("/api/tab/delete", handleTabDelete)
 	http.HandleFunc("/api/tab/switch", handleTabSwitch)
 	http.HandleFunc("/api/tab/paste", handleTabPaste)
+	http.HandleFunc("/api/tab/add-url", handleTabAddURL)
 	http.HandleFunc("/api/tab/rename", handleTabRename)
 	http.HandleFunc("/api/tab/set-url", handleTabSetURL)
 	http.HandleFunc("/api/tab/delete-entries", handleTabDeleteEntries)
@@ -138,5 +164,8 @@ func registerRoutes() {
 	http.HandleFunc("/api/import", handleSettingsImport)
 	http.HandleFunc("/api/logs", handleLogs)
 	http.HandleFunc("/api/logs/clear", handleLogsClear)
+	http.HandleFunc("/api/update/check", handleUpdateCheck)
+	http.HandleFunc("/api/update/apply", handleUpdateApply)
+	http.HandleFunc("/api/deeplink", handleDeepLink)
 	go logFlushLoop()
 }

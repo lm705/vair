@@ -6,11 +6,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +62,15 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 		"is_admin":          checkAdmin(),
 		"os":                "windows",
 	}})
+	// Deliver a deep-link that arrived before any UI was connected (the app was
+	// launched by a vair:// link). First client to connect gets it, then it's
+	// cleared so a reconnect doesn't re-import.
+	pendingDeepLinkMu.Lock()
+	if pendingDeepLink != "" {
+		send(SSEEvent{Type: "deeplink", Payload: pendingDeepLink})
+		pendingDeepLink = ""
+	}
+	pendingDeepLinkMu.Unlock()
 	ctx := r.Context()
 	for {
 		select {
@@ -820,10 +831,12 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 	tabID := state.activeTab
 	var sourceURLs []string
 	var sourceFiles []TabFile
+	var ghReady bool
 	for _, t := range state.tabs {
 		if t.ID == tabID {
 			sourceURLs = t.SourceURLs
 			sourceFiles = t.SourceFiles
+			ghReady = t.gitHubReady()
 			break
 		}
 	}
@@ -856,7 +869,7 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 
 	if tabID == "main" {
 		go fetchAndInit()
-	} else if len(sourceURLs) > 0 || len(sourceFiles) > 0 {
+	} else if len(sourceURLs) > 0 || len(sourceFiles) > 0 || ghReady {
 		go func() {
 			state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: tabID})
 			fetchTabURLs(tabID, sourceURLs, sourceFiles)
@@ -968,15 +981,110 @@ func handleTabSwitch(w http.ResponseWriter, r *http.Request) {
 	state.activeTab = id
 	entries := state.tabEntries[id]
 	state.entries = entries
+	inFlight := state.fetching[id]
 	state.mu.Unlock()
-	snaps := make([]ConfigEntry, len(entries))
-	for i, e := range entries {
-		snaps[i] = e.snap()
-	}
+	cached := r.URL.Query().Get("cached") == "1"
 	state.broadcast(SSEEvent{Type: "active_tab", Payload: id})
-	state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
+	// A reload is still running for this tab → show the spinner rather than a
+	// stale/empty list; the fetch's completion broadcast will fill it in.
+	if inFlight {
+		state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
+	} else if cached {
+		// The client claims an up-to-date cache for this tab — it marks a tab
+		// dirty on every entry_update/loaded/loading it sees for an inactive tab,
+		// so it only sends cached=1 when nothing changed since it last had the
+		// full list. Skipping the resend (+ its JSON.parse on the client) is what
+		// makes switching to a huge tab instant. Worst case if the client were
+		// wrong: slightly stale ping/speed until the next reload — never wrong
+		// configs (set changes always fire loading/loaded → the client marks dirty).
+	} else {
+		snaps := make([]ConfigEntry, len(entries))
+		for i, e := range entries {
+			snaps[i] = e.snap()
+		}
+		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
+	}
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
+}
+
+// pendingDeepLink holds a vair:// payload received before any UI client was
+// connected (the app was launched by the link). handleSSE delivers it to the
+// first client that connects, then clears it.
+var (
+	pendingDeepLink   string
+	pendingDeepLinkMu sync.Mutex
+)
+
+// parseDeepLink extracts the import payload from a vair:// URL. Supported forms:
+//
+//	vair://import/<url-encoded subscription|config>
+//	vair://import?url=<url-encoded …>
+//
+// Returns "" when raw isn't a vair:// link. Uses PathUnescape (not QueryUnescape)
+// so a '+' inside a base64 config/subscription survives.
+func parseDeepLink(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToLower(raw), "vair://") {
+		return ""
+	}
+	body := raw[len("vair://"):]
+	var payload string
+	if i := strings.IndexByte(body, '?'); i >= 0 {
+		if v, err := url.ParseQuery(body[i+1:]); err == nil {
+			payload = v.Get("url")
+		}
+	}
+	if payload == "" {
+		if i := strings.IndexByte(body, '/'); i >= 0 {
+			payload = body[i+1:]
+		}
+	}
+	if dec, err := url.PathUnescape(payload); err == nil && dec != "" {
+		payload = dec
+	}
+	return strings.TrimSpace(payload)
+}
+
+// handleDeepLink receives a vair:// URL (from a second instance forwarding the
+// link, or local startup), extracts the payload, raises the window, and pushes a
+// "deeplink" SSE event so the connected UI imports it through the same routing as
+// a paste/QR (subscription → tab source, configs → paste).
+func handleDeepLink(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	payload := parseDeepLink(string(body))
+	if payload == "" {
+		http.Error(w, "not a vair:// import link", 400)
+		return
+	}
+	focusMainWindow()
+	state.broadcast(SSEEvent{Type: "deeplink", Payload: payload})
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
+// forwardDeepLink tries to hand a vair:// URL to an already-running instance over
+// its local HTTP server. Returns true when delivered (so the second process can
+// exit instead of starting a duplicate).
+func forwardDeepLink(rawURL string) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d/api/deeplink", webPort),
+		"text/plain", strings.NewReader(rawURL))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200
+}
+
+// isSubscriptionURL reports whether s is a single bare http(s) URL (no spaces,
+// no embedded config) — i.e. a subscription link to fetch rather than parse.
+func isSubscriptionURL(s string) bool {
+	if s == "" || strings.ContainsAny(s, " \t\r\n") {
+		return false
+	}
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
 func handleTabPaste(w http.ResponseWriter, r *http.Request) {
@@ -989,11 +1097,14 @@ func handleTabPaste(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot paste into main tab", 400)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 10*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024*1024)) // ~250k configs; old 10 MB cap truncated big pastes at ~40k
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), 400)
 		return
 	}
+	// A bare subscription URL (from a scanned QR or a pasted link) is NOT parsed
+	// here — the UI routes those to /api/tab/add-url so they're added as a
+	// persistent tab source. This endpoint only ingests actual config lines.
 	newEntries := parseConfigLines(string(body))
 	state.mu.Lock()
 	existing := state.tabEntries[id]
@@ -1040,6 +1151,72 @@ func handleTabPaste(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"added":%d}`, len(newEntries))
 }
 
+// handleTabAddURL appends a subscription URL to a user tab's source list and
+// re-fetches it. Used when a scanned QR (or a pasted link) is a subscription:
+// instead of a one-shot import it becomes a persistent, auto-refreshing source.
+// If the tab already has source URLs, the new one is added alongside them
+// (deduplicated against an exact match). The re-fetch reloads ALL of the tab's
+// sources, so the combined config list reflects every URL.
+func handleTabAddURL(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		id = state.activeTab
+	}
+	if id == "main" {
+		http.Error(w, "cannot add a source to the main tab", 400)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), 400)
+		return
+	}
+	u := strings.TrimSpace(string(body))
+	if !isSubscriptionURL(u) {
+		http.Error(w, "not a subscription URL", 400)
+		return
+	}
+	var urls []string
+	var files []TabFile
+	found, added := false, false
+	state.mu.Lock()
+	for i := range state.tabs {
+		if state.tabs[i].ID != id {
+			continue
+		}
+		found = true
+		dup := false
+		for _, ex := range state.tabs[i].SourceURLs {
+			if ex == u {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			state.tabs[i].SourceURLs = append(state.tabs[i].SourceURLs, u)
+			added = true
+		}
+		urls = append([]string(nil), state.tabs[i].SourceURLs...)
+		files = append([]TabFile(nil), state.tabs[i].SourceFiles...)
+		break
+	}
+	state.mu.Unlock()
+	if !found {
+		http.Error(w, "tab not found", 404)
+		return
+	}
+	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
+	saveTabs()
+	if state.activeTab == id {
+		state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
+	}
+	// Re-fetch with the full (possibly augmented) source set.
+	go fetchTabURLs(id, urls, files)
+	fmt.Fprintf(w, `{"added":%t,"urls":%d}`, added, len(urls))
+}
+
 func handleTabRename(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	id := r.URL.Query().Get("id")
@@ -1081,6 +1258,7 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	type tabSettingsReq struct {
 		URLs            []string  `json:"urls"`
+		DisabledURLs    []string  `json:"disabled_urls"`
 		Files           []TabFile `json:"files"`
 		RefreshMin      int       `json:"refresh_min"`
 		ExcludeFilter   []string  `json:"exclude_filter"`
@@ -1090,6 +1268,14 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		// older clients during the migration window.
 		DedupMode string `json:"dedup_mode"`
 		Dedup     bool   `json:"dedup"`
+		// "" / "ping" / "speed" — test to run after a scheduled auto-refresh.
+		AutoRefreshTest string `json:"auto_refresh_test"`
+		// Per-tab GitHub private-repo import via PAT.
+		GitHubEnabled bool   `json:"github_enabled"`
+		GitHubOwner   string `json:"github_owner"`
+		GitHubRepo    string `json:"github_repo"`
+		GitHubFile    string `json:"github_file"`
+		GitHubPAT     string `json:"github_pat"`
 	}
 	var req tabSettingsReq
 	if r.Body != nil {
@@ -1121,6 +1307,15 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 			cleanURLs = append(cleanURLs, u)
 		}
 	}
+	// Disabled URLs: keep only those still present in the URL list (drop stale
+	// entries for sources the user removed) so SourceDisabled never lingers.
+	var cleanDisabled []string
+	for _, u := range req.DisabledURLs {
+		u = strings.TrimSpace(u)
+		if u != "" && strInSlice(u, cleanURLs) && !strInSlice(u, cleanDisabled) {
+			cleanDisabled = append(cleanDisabled, u)
+		}
+	}
 	// Clean files: every file now needs a Path. Drag-drop is gone, so the
 	// only way files enter the system is the native picker which always
 	// provides a path. We stat each path here to refresh size/mtime for
@@ -1142,6 +1337,21 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		cleanFiles = append(cleanFiles, f)
 	}
 
+	// GitHub import fields: trim, strip a leading "/" off the file path. ghReady
+	// means "fully configured" (used to decide whether this tab has any source to
+	// fetch); the enable flag and raw fields are persisted regardless so a
+	// half-filled form survives a save.
+	ghEnabled := req.GitHubEnabled
+	ghOwner := strings.TrimSpace(req.GitHubOwner)
+	ghRepo := strings.TrimSpace(req.GitHubRepo)
+	ghFile := strings.TrimLeft(strings.TrimSpace(req.GitHubFile), "/")
+	ghPAT := strings.TrimSpace(req.GitHubPAT)
+	ghReady := ghEnabled && ghOwner != "" && ghRepo != "" && ghFile != "" && ghPAT != ""
+	// hasSource: does the tab have anything to fetch (URLs, files, or a ready
+	// GitHub import)? Drives the re-fetch / clear decisions below so a
+	// GitHub-only tab behaves like a URL-only one.
+	hasSource := len(cleanURLs) > 0 || len(cleanFiles) > 0 || ghReady
+
 	var sourcesChanged bool
 	var excludeChanged bool
 	var oldMode string
@@ -1156,18 +1366,38 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 			if !t.IsMain {
 				oldURLs := strings.Join(t.SourceURLs, "|")
 				newURLs := strings.Join(cleanURLs, "|")
+				oldDisabled := strings.Join(t.SourceDisabled, "|")
+				newDisabled := strings.Join(cleanDisabled, "|")
 				oldFilesKey := tabFilesKey(t.SourceFiles)
 				newFilesKey := tabFilesKey(cleanFiles)
-				sourcesChanged = (oldURLs != newURLs) || (oldFilesKey != newFilesKey)
+				oldGH := githubKey(t.GitHubEnabled, t.GitHubOwner, t.GitHubRepo, t.GitHubFile, t.GitHubPAT)
+				newGH := githubKey(ghEnabled, ghOwner, ghRepo, ghFile, ghPAT)
+				// Toggling a source on/off changes what gets fetched, so treat it
+				// like a source change → triggers the rebuild below.
+				sourcesChanged = (oldURLs != newURLs) || (oldDisabled != newDisabled) ||
+					(oldFilesKey != newFilesKey) || (oldGH != newGH)
 				oldMode = t.DedupMode
 				state.tabs[i].SourceURLs = cleanURLs
+				state.tabs[i].SourceDisabled = cleanDisabled
 				state.tabs[i].SourceFiles = cleanFiles
 				state.tabs[i].DedupMode = newMode
+				state.tabs[i].GitHubEnabled = ghEnabled
+				state.tabs[i].GitHubOwner = ghOwner
+				state.tabs[i].GitHubRepo = ghRepo
+				state.tabs[i].GitHubFile = ghFile
+				state.tabs[i].GitHubPAT = ghPAT
 			}
 			state.tabs[i].RefreshMin = req.RefreshMin
 			state.tabs[i].ExcludeFilter = req.ExcludeFilter
 			state.tabs[i].ExcludeDisabled = req.ExcludeDisabled
 			state.tabs[i].RefreshDisabled = req.RefreshDisabled
+			// Normalize the after-auto-refresh test mode; applies to main + user tabs.
+			switch req.AutoRefreshTest {
+			case "ping", "speed":
+				state.tabs[i].AutoRefreshTest = req.AutoRefreshTest
+			default:
+				state.tabs[i].AutoRefreshTest = ""
+			}
 			break
 		}
 	}
@@ -1187,7 +1417,7 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("ok"))
 			return
 		}
-		if len(cleanURLs) > 0 || len(cleanFiles) > 0 {
+		if hasSource {
 			state.mu.Lock()
 			state.tabEntries[id] = nil
 			if state.activeTab == id {
@@ -1225,7 +1455,7 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 		return
 	}
-	if len(cleanURLs) > 0 || len(cleanFiles) > 0 {
+	if hasSource {
 		// Clear old entries before fetching new ones (prevents stale data from removed sources)
 		state.mu.Lock()
 		state.tabEntries[id] = nil
@@ -1238,15 +1468,22 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		}
 		go fetchTabURLs(id, cleanURLs, cleanFiles)
 	} else {
-		// All sources removed — clear entries. We only reach here when
-		// sourcesChanged is true AND there are no remaining sources;
-		// paste-only tabs have sourcesChanged=false and exit above.
+		// All sources removed — clear entries AND the subscription info (this
+		// branch doesn't go through fetchTabURLs, which is where Subs is otherwise
+		// reconciled, so an emptied tab would keep showing stale sub info).
 		state.mu.Lock()
 		state.tabEntries[id] = nil
+		for i := range state.tabs {
+			if state.tabs[i].ID == id {
+				state.tabs[i].Subs = nil
+				break
+			}
+		}
 		if state.activeTab == id {
 			state.entries = nil
 		}
 		state.mu.Unlock()
+		state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 		if state.activeTab == id {
 			state.broadcast(SSEEvent{Type: "loaded", Payload: []ConfigEntry{}, Tab: id})
 		}
@@ -1254,6 +1491,18 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
+}
+
+// githubKey produces a deterministic string for change-detection on a tab's
+// GitHub import config. A disabled import collapses to "" so toggling it off
+// (or editing fields while disabled) is treated as "no GitHub source"; enabling
+// it or changing any field while enabled changes the key and triggers a
+// re-fetch.
+func githubKey(enabled bool, owner, repo, file, pat string) string {
+	if !enabled {
+		return ""
+	}
+	return owner + "\x00" + repo + "\x00" + file + "\x00" + pat
 }
 
 // tabFilesKey produces a deterministic string for change-detection on a list
@@ -1266,6 +1515,9 @@ func tabFilesKey(files []TabFile) string {
 		sb.WriteString(f.Name)
 		sb.WriteByte('|')
 		sb.WriteString(f.Path)
+		if f.Disabled {
+			sb.WriteString("|off") // toggling on/off changes what gets fetched
+		}
 		sb.WriteByte('\n')
 	}
 	return sb.String()
@@ -1279,16 +1531,70 @@ func tabFilesKey(files []TabFile) string {
 // content (and updated mtime) is written back into state.tabs so it gets
 // persisted and the next reload starts from the same baseline.
 func fetchTabURLs(tabID string, urls []string, files []TabFile) {
+	// Mark this tab as fetching so switching to it shows a spinner (not a stale/
+	// empty list), and clear it however we return.
+	state.mu.Lock()
+	state.fetching[tabID] = true
+	state.mu.Unlock()
+	defer func() {
+		state.mu.Lock()
+		delete(state.fetching, tabID)
+		state.mu.Unlock()
+	}()
+
+	// Snapshot which URL sources the user switched off — skipped on fetch.
+	state.mu.RLock()
+	var disabled []string
+	for _, t := range state.tabs {
+		if t.ID == tabID {
+			disabled = t.SourceDisabled
+			break
+		}
+	}
+	state.mu.RUnlock()
+
 	var allEntries []*ConfigEntry
+	// One record per ENABLED URL source: its metadata (with URL + config count) on
+	// success, or {URL, Error} on failure — so the settings modal can show which
+	// link each came from and surface a source that didn't load. Rebuilt every
+	// fetch, so removing/disabling a source drops its record (reconciliation).
+	var subs []subMeta
 	for _, u := range urls {
-		lines, err := fetchURL(u)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "⚠ tab %s fetch %s: %v\n", tabID, u, err)
+		if strInSlice(u, disabled) {
 			continue
 		}
+		lines, meta, err := fetchURLMeta(u)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ tab %s fetch %s: %v\n", tabID, u, err)
+			subs = append(subs, subMeta{URL: u, Error: err.Error()})
+			continue
+		}
+		if len(lines) == 0 {
+			// Reachable but carried no configs (wrong link, HTML error page, …) —
+			// surface it like an unreachable source rather than silently nothing.
+			subs = append(subs, subMeta{URL: u, Error: "no configs found"})
+			continue
+		}
+		rec := subMeta{URL: u}
+		if meta != nil {
+			rec = *meta // already carries URL + Count
+		} else {
+			rec.Count = len(lines) // loaded OK but no metadata
+		}
+		subs = append(subs, rec)
 		entries := parseConfigLines(strings.Join(lines, "\n"))
 		allEntries = append(allEntries, entries...)
 	}
+	// Reconcile subscription info NOW (before any early return) so a tab emptied of
+	// sources, an all-failed fetch, or a disabled source updates the display.
+	state.mu.Lock()
+	for i := range state.tabs {
+		if state.tabs[i].ID == tabID {
+			state.tabs[i].Subs = subs
+			break
+		}
+	}
+	state.mu.Unlock()
 	// Read each file fresh from its on-disk path. Content lives in memory
 	// only for the moment it takes parseConfigLines to walk through it —
 	// after that it's eligible for GC. We refresh size/mtime on the way so
@@ -1302,6 +1608,9 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		if f.Path == "" {
 			fmt.Fprintf(os.Stderr, "⚠ tab %s: file %q has no path, skipping\n", tabID, f.Name)
 			continue
+		}
+		if f.Disabled {
+			continue // user switched this file source off
 		}
 		// Refresh stat info for the UI/persistence (size, mtime).
 		if info, statErr := os.Stat(f.Path); statErr == nil {
@@ -1321,19 +1630,47 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		allEntries = append(allEntries, entries...)
 	}
 
-	// If nothing fetched, keep existing entries
+	// GitHub private-repo import (per-tab, via PAT). Appended after URL + file
+	// sources. Config is read from the live tab so every fetch path (manual
+	// reload, auto-refresh, settings save) picks it up without extra plumbing.
+	state.mu.RLock()
+	var ghOwner, ghRepo, ghFile, ghPAT string
+	var ghReady bool
+	for _, t := range state.tabs {
+		if t.ID == tabID {
+			ghReady = t.gitHubReady()
+			ghOwner, ghRepo, ghFile, ghPAT = t.GitHubOwner, t.GitHubRepo, t.GitHubFile, t.GitHubPAT
+			break
+		}
+	}
+	state.mu.RUnlock()
+	if ghReady {
+		ghLines, err := fetchGitHubPATContent(ghOwner, ghRepo, ghFile, ghPAT)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ tab %s GitHub import: %v\n", tabID, err)
+			vlog("warning", "tab: GitHub import failed (%s/%s): %v", ghOwner, ghRepo, err)
+		} else {
+			entries := parseConfigLines(strings.Join(ghLines, "\n"))
+			allEntries = append(allEntries, entries...)
+			vlog("info", "tab: imported %d config(s) from GitHub %s/%s", len(ghLines), ghOwner, ghRepo)
+		}
+	}
+
+	// If nothing fetched, keep existing entries — but still push the reconciled
+	// subscription info (errors / cleared sources) to the UI.
 	if len(allEntries) == 0 {
 		fmt.Fprintf(os.Stderr, "⚠ tab %s: no configs fetched, keeping existing\n", tabID)
+		state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 		state.mu.RLock()
 		cur := state.tabEntries[tabID]
 		state.mu.RUnlock()
-		if state.activeTab == tabID && cur != nil {
-			snaps := make([]ConfigEntry, len(cur))
-			for i, e := range cur {
-				snaps[i] = e.snap()
-			}
-			state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
+		// Always re-broadcast (tagged) so the tab's spinner clears even when the
+		// fetch finished while the tab was inactive and is now switched back to.
+		snaps := make([]ConfigEntry, len(cur))
+		for i, e := range cur {
+			snaps[i] = e.snap()
 		}
+		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
 		return
 	}
 
@@ -1386,6 +1723,7 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	for i := range state.tabs {
 		if state.tabs[i].ID == tabID {
 			state.tabs[i].SourceFiles = updatedFiles
+			// Subs were reconciled right after the URL loop above.
 			break
 		}
 	}
@@ -1393,13 +1731,15 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		state.entries = allEntries
 	}
 	state.mu.Unlock()
-	if state.activeTab == tabID {
-		snaps := make([]ConfigEntry, len(allEntries))
-		for i, e := range allEntries {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
+	// Always broadcast the result tagged with the tab. The client applies it only
+	// when this tab is active (events are tab-filtered), so a fetch that finishes
+	// after the user switched away — then back — still lands. Without this the
+	// completion was gated on the tab still being active and could be dropped.
+	snaps := make([]ConfigEntry, len(allEntries))
+	for i, e := range allEntries {
+		snaps[i] = e.snap()
 	}
+	state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
 	// Re-ping this tab if it's in the auto-connect pool (entries were rebuilt
@@ -1529,19 +1869,42 @@ func handleSettings(w http.ResponseWriter, r *http.Request) {
 	// would roll them back. Reset goes through a dedicated endpoint.
 	newSettings.StatsTotalUp = appSettings.StatsTotalUp
 	newSettings.StatsTotalDown = appSettings.StatsTotalDown
+	// Only the dedicated AUTO master toggle (POST /api/settings?auto=1) may change
+	// the AUTO state. A generic settings save (autostart, theme, tray, …) carries
+	// the client's whole settings object; if that copy has drifted from the server
+	// (e.g. after an import, or an unreloaded tab) it must NOT flip AUTO on/off as
+	// a side effect — that was the "enabling Launch-at-startup turns AUTO on" bug.
+	// So for non-AUTO saves we keep the server's current AutoConnect value and run
+	// none of the connect/disconnect side effects.
+	autoCtl := r.URL.Query().Get("auto") == "1"
+	if !autoCtl {
+		newSettings.AutoConnect = appSettings.AutoConnect
+	}
 	// Detect the auto-connect master toggle flipping on. When the user enables
 	// it (even while idle and never previously connected), arm autoWant so the
 	// supervisor connects from idle on its next tick. We only act on the
-	// false→true transition so an unrelated settings save (e.g. ping timeout)
-	// after a manual disconnect doesn't silently reconnect.
-	autoEnabledNow := newSettings.AutoConnect && !appSettings.AutoConnect
-	autoDisabledNow := !newSettings.AutoConnect && appSettings.AutoConnect
+	// false→true transition.
+	autoEnabledNow := autoCtl && newSettings.AutoConnect && !appSettings.AutoConnect
+	autoDisabledNow := autoCtl && !newSettings.AutoConnect && appSettings.AutoConnect
 	// Detect rank-by-speed flipping on while auto is already enabled — that needs
 	// a fresh speed test of the pool so the new ranking has data to work with.
-	speedRankEnabledNow := newSettings.AutoConnect && newSettings.AutoRankBySpeed &&
+	speedRankEnabledNow := autoCtl && newSettings.AutoConnect && newSettings.AutoRankBySpeed &&
 		!(appSettings.AutoConnect && appSettings.AutoRankBySpeed) && !autoEnabledNow
+	// Reconcile the Windows logon Run-key only when the toggle actually changed.
+	autostartChanged := newSettings.AutostartEnabled != appSettings.AutostartEnabled
+	deepLinkChanged := newSettings.DeepLinkEnabled != appSettings.DeepLinkEnabled
 	appSettings = newSettings
 	settingsMu.Unlock()
+	if autostartChanged {
+		if err := applyAutostart(newSettings.AutostartEnabled); err != nil {
+			vlog("warning", "autostart: could not update Run key: %v", err)
+		}
+	}
+	if deepLinkChanged {
+		if err := registerDeepLink(newSettings.DeepLinkEnabled); err != nil {
+			vlog("warning", "deeplink: could not update vair:// scheme: %v", err)
+		}
+	}
 	if speedRankEnabledNow {
 		vlog("info", "auto: rank-by-speed enabled — running speed test on candidate pool")
 		go autoTestTabs(autoPool(), true)
@@ -1672,6 +2035,29 @@ func handleLogsClear(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// handleUpdateCheck reports the current version and whether a newer build is
+// published. Only the public fields of updateInfo are serialized (the download
+// URL + checksum stay server-side; apply re-fetches the manifest itself).
+func handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(checkForUpdate())
+}
+
+// handleUpdateApply kicks off the download + verify + replace flow in the
+// background; progress streams over SSE as update_status events. Responds
+// immediately so the UI can start listening.
+func handleUpdateApply(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method != "POST" {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	go runUpdate()
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
 // settingsExport is the on-disk file format produced by /api/export and
 // consumed by /api/import. Schema version is checked on import; bump it
 // whenever a field changes shape so old exports either keep working or
@@ -1697,10 +2083,13 @@ func buildSettingsExport() settingsExport {
 	for _, t := range state.tabs {
 		pt := persistedTab{
 			ID: t.ID, Name: t.Name,
-			SourceURLs: t.SourceURLs, SourceFiles: t.SourceFiles,
+			SourceURLs: t.SourceURLs, SourceDisabled: t.SourceDisabled, SourceFiles: t.SourceFiles,
 			RefreshMin: t.RefreshMin, ExcludeFilter: t.ExcludeFilter,
 			ExcludeDisabled: t.ExcludeDisabled, RefreshDisabled: t.RefreshDisabled,
-			DedupMode: t.DedupMode,
+			DedupMode:       t.DedupMode,
+			AutoRefreshTest: t.AutoRefreshTest, Subs: t.Subs,
+			GitHubEnabled: t.GitHubEnabled, GitHubOwner: t.GitHubOwner,
+			GitHubRepo: t.GitHubRepo, GitHubFile: t.GitHubFile, GitHubPAT: t.GitHubPAT,
 		}
 		if !t.IsMain {
 			// Snapshot the raw config strings for pasted tabs so the import
@@ -1829,10 +2218,13 @@ func handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 		}
 		tab := Tab{
 			ID: pt.ID, Name: pt.Name, IsMain: false, Closable: true,
-			SourceURLs: urls, SourceFiles: pt.SourceFiles,
+			SourceURLs: urls, SourceDisabled: pt.SourceDisabled, SourceFiles: pt.SourceFiles,
 			RefreshMin: pt.RefreshMin, ExcludeFilter: pt.ExcludeFilter,
 			ExcludeDisabled: pt.ExcludeDisabled, RefreshDisabled: pt.RefreshDisabled,
-			DedupMode: mode,
+			DedupMode:       mode,
+			AutoRefreshTest: pt.AutoRefreshTest, Subs: pt.subsOf(),
+			GitHubEnabled: pt.GitHubEnabled, GitHubOwner: pt.GitHubOwner,
+			GitHubRepo: pt.GitHubRepo, GitHubFile: pt.GitHubFile, GitHubPAT: pt.GitHubPAT,
 		}
 		state.tabs = append(state.tabs, tab)
 		state.tabEntries[tab.ID] = parseConfigLines(strings.Join(pt.Configs, "\n"))

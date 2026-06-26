@@ -17,7 +17,7 @@ import (
 // appVersion is the running build's version. Keep in lockstep with
 // versioninfo.json — the self-updater compares it against the published
 // version.json to decide whether a newer build exists.
-const appVersion = "1.8.0"
+const appVersion = "1.9.0"
 
 // updateManifestURLs point at a small JSON describing the latest build. Same
 // raw + githack fallback pattern as the config sources, since for RF users

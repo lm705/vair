@@ -26,3 +26,6 @@ func applyAutostart(_ bool) error { return nil }
 
 func replaceAndRelaunch(_ string) error { return nil }
 func cleanupUpdateLeftovers()           {}
+
+func registerDeepLink(_ bool) error { return nil }
+func focusMainWindow()              {}

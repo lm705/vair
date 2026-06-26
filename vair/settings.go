@@ -228,10 +228,23 @@ type AppSettings struct {
 	TLSFragmentLength   string `json:"tls_fragment_length,omitempty"`
 	TLSFragmentInterval string `json:"tls_fragment_interval,omitempty"`
 
+	// TLSFingerprint is the uTLS ClientHello fingerprint xray mimics for TLS /
+	// Reality nodes (chrome, firefox, safari, ios, edge, random, randomized).
+	// A config's own fp= always wins; this is the fallback when it has none.
+	// Without it xray uses Go's TLS stack, which DPI can fingerprint — so the
+	// default is "chrome" (matches v2rayN/Hiddify). "" → chrome.
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
+
 	// AutostartEnabled launches Vair at Windows logon (HKCU Run key, started
 	// minimized via the --autostart flag). Off by default. Reconciled with the
 	// registry whenever settings are saved (see applyAutostart).
 	AutostartEnabled bool `json:"autostart_enabled,omitempty"`
+
+	// DeepLinkEnabled registers the vair:// URL scheme so clicking a
+	// vair://import/<sub|config> link opens Vair and imports it. ON by default;
+	// no omitempty so an explicit "off" round-trips to disk. Reconciled with the
+	// registry on every settings save (see registerDeepLink).
+	DeepLinkEnabled bool `json:"deep_link_enabled"`
 }
 
 const (
@@ -600,6 +613,25 @@ func currentTLSFragmentParams() (length, interval string) {
 	return l, iv
 }
 
+// validTLSFingerprints are the uTLS fingerprints xray accepts. Kept as a set so
+// a stale/garbage setting can't be injected into the generated config.
+var validTLSFingerprints = map[string]bool{
+	"chrome": true, "firefox": true, "safari": true, "ios": true, "android": true,
+	"edge": true, "360": true, "qq": true, "random": true, "randomized": true,
+}
+
+// currentTLSFingerprint returns the configured uTLS fingerprint, defaulting to
+// "chrome" when unset or invalid.
+func currentTLSFingerprint() string {
+	settingsMu.RLock()
+	fp := strings.TrimSpace(appSettings.TLSFingerprint)
+	settingsMu.RUnlock()
+	if !validTLSFingerprints[fp] {
+		return "chrome"
+	}
+	return fp
+}
+
 // blocklistURL returns the trimmed custom blocklist URL ("" = none).
 func blocklistURL() string {
 	settingsMu.RLock()
@@ -688,7 +720,22 @@ func staticHostsSnapshot() map[string]string {
 // Defaults: DNS leak protection ON, FakeIP OFF (FakeIPDisabled=true) — picked
 // for safer out-of-the-box TUN behaviour (DNS through the tunnel, real DoH
 // rather than FakeIP for app compatibility).
-var appSettings = AppSettings{SourcesEnabled: true, DNSLeakProtection: true, FakeIPDisabled: true, AutoHealthSec: 15, AutoFailThreshold: 2, AutoSwitch: true, AutoPingRefresh: true, AutoMaxLatencyMs: 300}
+var appSettings = AppSettings{SourcesEnabled: true, DNSLeakProtection: true, FakeIPDisabled: true, AutoHealthSec: 15, AutoFailThreshold: 2, AutoSwitch: true, AutoPingRefresh: true, AutoMaxLatencyMs: 300, DeepLinkEnabled: true}
+
+// deepLinkEnabled reports whether the vair:// URL scheme handler is on.
+func deepLinkEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.DeepLinkEnabled
+}
+
+// autostartEnabled reports whether "Launch at Windows startup" is on.
+func autostartEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.AutostartEnabled
+}
+
 var settingsMu sync.RWMutex
 
 func settingsFilePath() string {

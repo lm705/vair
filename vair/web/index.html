@@ -290,6 +290,10 @@ header{
    can't drag the modal wider by accident. */
 textarea.modal-input{resize:vertical;min-width:0}
 .modal-input:focus{border-color:var(--accent)}
+/* GitHub PAT field + its show/hide button on one row. */
+.gh-pat-row{display:flex;gap:6px;align-items:stretch;margin-bottom:12px}
+.gh-pat-row .modal-input{margin-bottom:0;flex:1}
+.gh-view-btn{flex:none;white-space:nowrap}
 .modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
 .modal-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .modal-row-label{font-size:var(--modal-fs-base);color:var(--text)}
@@ -299,16 +303,20 @@ textarea.modal-input{resize:vertical;min-width:0}
 .toggle input:checked+.toggle-track{background:var(--accent)}
 .toggle-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s}
 .toggle input:checked~.toggle-thumb{left:18px}
-.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px}
+/* chip lists allow text selection so entries can be selected + copied. The
+   copy handler reconstructs the selection as a newline column (see
+   chipsColumnFromSelection); the × buttons stay unselectable. */
+.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;user-select:text;-webkit-user-select:text;cursor:text}
 .chip{display:inline-flex;align-items:center;gap:3px;font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
-  padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3)}
+  padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3);
+  user-select:text;-webkit-user-select:text}
 .chip-tag{font-size:calc(var(--modal-fs-base) - 3px);text-transform:uppercase;letter-spacing:.04em;opacity:.85;font-weight:800;margin-right:2px}
 .chip.col-name{background:rgba(232,197,71,.12);color:var(--accent);border-color:rgba(232,197,71,.3)}
 .chip.col-type{background:rgba(96,165,250,.14);color:#7bb6ff;border-color:rgba(96,165,250,.35)}
 .chip.col-host{background:rgba(132,204,22,.14);color:#9fd84a;border-color:rgba(132,204,22,.35)}
 .chip.col-transport{background:rgba(168,85,247,.14);color:#b387f0;border-color:rgba(168,85,247,.35)}
 .chip.col-security{background:rgba(244,114,114,.14);color:#f08a8a;border-color:rgba(244,114,114,.35)}
-.chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px)}.chip-x:hover{opacity:1;color:var(--red)}
+.chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px);user-select:none;-webkit-user-select:none}.chip-x:hover{opacity:1;color:var(--red)}
 .chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:var(--modal-fs-base);outline:none;flex:1;min-width:80px}
 /* Exclude filter — one labelled chip box per column. Values are added with
    Enter (same UX as "Custom domains without VPN"). Labels match the plain
@@ -327,6 +335,30 @@ textarea.modal-input{resize:vertical;min-width:0}
 .settings-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border2)}
 .settings-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
 .section-header{font-size:var(--modal-fs-base);font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+/* Subscription info: compact bar above the table + detailed block in settings. */
+#sub-bar{flex-shrink:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:4px 14px;font-size:11px;color:var(--dim);background:var(--bg2);border-bottom:1px solid var(--border)}
+#sub-bar .sb-item{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+#sub-bar .sb-item:not(:first-child){border-left:1px solid var(--border2);padding-left:10px}
+#sub-bar .sb-title{color:var(--text);font-weight:700}
+#sub-bar .sb-bar{display:inline-block;width:90px;height:5px;background:var(--bg4);border-radius:3px;overflow:hidden;vertical-align:middle}
+#sub-bar .sb-fill{height:100%;background:var(--accent)}
+#sub-bar .sb-warn{color:var(--red);font-weight:700}
+.si-row{font-size:calc(var(--modal-fs-base) + 1px);margin-bottom:5px;color:var(--text)}
+.si-row.si-dim{color:var(--dim)}
+.si-row.si-warn{color:var(--red);font-weight:700}
+.si-block.si-sep{border-top:1px solid var(--border2);margin-top:8px;padding-top:8px}
+.si-row.si-url{font-size:11px;opacity:.7;word-break:break-all;margin-bottom:6px}
+.si-row.si-note{font-style:italic;opacity:.85}
+.si-bar{height:6px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;overflow:hidden;margin-top:3px}
+.si-fill{height:100%;background:var(--accent)}
+/* Self-update download progress bar. */
+.upd-bar{height:6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;overflow:hidden;margin:2px 0 10px}
+.upd-fill{height:100%;width:0;background:var(--accent);transition:width .2s}
+/* Author attribution under the Updates section. */
+.upd-attrib{margin-top:12px;padding-top:8px;border-top:1px solid var(--border2);font-size:11px;color:var(--dim);text-align:center}
+.upd-attrib a{color:var(--accent);text-decoration:none;cursor:pointer}
+.upd-attrib a:hover{text-decoration:underline}
 
 /* Compact numeric input used in Settings (concurrency, refresh interval) */
 .num-input{
@@ -356,6 +388,8 @@ textarea.modal-input{resize:vertical;min-width:0}
 .seg-btn:hover:not(.active){color:var(--text);border-color:var(--dim)}
 .seg-btn.active{color:var(--accent);border-color:var(--accent)}
 .url-row{display:flex;gap:4px;margin-bottom:4px;align-items:center}
+.url-row .ms-url-on{flex:none;width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
+.url-row.src-off .ms-url{opacity:.45;text-decoration:line-through}
 .url-row .modal-input{flex:1;margin-bottom:0}
 .url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:12px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px}
 .url-rm:hover{color:var(--red);background:rgba(248,113,113,.1)}
@@ -384,6 +418,10 @@ textarea.modal-input{resize:vertical;min-width:0}
 .file-row .file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .file-row .file-size{color:var(--dim);font-size:10px;flex-shrink:0;margin-right:2px}
 .file-row.new{border-color:rgba(74,222,128,.35);background:rgba(74,222,128,.05)}
+.file-line{display:flex;gap:4px;align-items:center;margin-bottom:4px}
+.file-line .file-row{flex:1;margin-bottom:0}
+.file-line .ms-url-on{flex:none;width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
+.file-line.src-off .file-name{opacity:.45;text-decoration:line-through}
 
 /* row selection */
 tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px 0 0 var(--accent)}
@@ -499,6 +537,10 @@ tbody tr.row-new{background:rgba(80,200,120,var(--flash-alpha,0))!important;box-
 .auto-cand.current .ac-name{color:var(--accent)}
 .auto-cand .ac-metric{flex:0 0 auto;color:var(--dim);font-size:11px}
 .auto-switch-now{margin-top:10px;display:inline-flex;align-self:flex-start}
+/* Small "recommended" tag appended to a setting label. */
+.rec-badge{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 4px;margin-left:4px;
+  vertical-align:middle;opacity:.85}
 /* Collapsible AUTO settings: a clickable arrow header that toggles the block
    below it. Expanded by default. */
 /* No border-top here: the STATUS section above already draws a divider
@@ -510,6 +552,10 @@ tbody tr.row-new{background:rgba(80,200,120,var(--flash-alpha,0))!important;box-
 .auto-collapse-arrow{display:inline-block;font-size:10px;transition:transform .15s}
 .auto-collapse-head.collapsed .auto-collapse-arrow{transform:rotate(-90deg)}
 .auto-collapse-body.collapsed{display:none}
+/* AUTO panel's own Logs section (mirrors the main dock inside the modal). */
+.auto-log-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.auto-log-head .btn{padding:3px 9px;font-size:10px}
+#auto-log-view{height:200px;min-height:120px;border:1px solid var(--border2);border-radius:3px;margin-bottom:4px;flex:none}
 /* Header row of the AUTO panel: title on the left, Detach button on the right. */
 .auto-title-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px}
 .auto-detach,.auto-return{flex-shrink:0}
@@ -787,6 +833,9 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
   </div>
 </div>
 
+<!-- Compact subscription info for the active tab (filled by updateSubBar). -->
+<div id="sub-bar" style="display:none"></div>
+
 <div class="tw">
   <div class="center-msg" id="msg-area">
     <div class="ico"><span class="spinner"></span></div>
@@ -856,6 +905,8 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
 
 <script>
 // ── state ──────────────────────────────────────────────────────────
+// Injected by the server (themedIndexHTML) — the running build version.
+var APP_VERSION='__APP_VERSION__';
 const entries={};
 let sortMode='idx', filterText='';
 // protoFilter is a Set of selected protocol IDs. Empty Set = "all" (no filter).
@@ -925,6 +976,40 @@ const I18N = {
     "None — no fallback": "Без резерва",
     "Pick \"None\" to disable the retry.": "Выберите «Без резерва», чтобы отключить повтор.",
     "TUN MTU": "TUN MTU",
+    "TLS fragmentation (DPI bypass)": "Фрагментация TLS (обход DPI)",
+    "TLS fingerprint (uTLS)": "Отпечаток TLS (uTLS)",
+    "Which browser's TLS handshake xray imitates (uTLS) when a config has no fp= of its own — without it the connection uses an easily-fingerprinted TLS signature. Applies to TLS/Reality nodes. Default: chrome. Takes effect on next connection.":
+      "Под какой браузер xray маскирует TLS-рукопожатие (uTLS), если в конфиге нет своего fp= — без этого у соединения легко распознаваемый TLS-отпечаток. Действует для узлов TLS/Reality. По умолчанию: chrome. Применяется при следующем подключении.",
+    "Splits the TLS handshake (ClientHello) into pieces so a DPI can't match the connection in a single packet. Helps when the server is alive but the handshake is being reset. xray protocols only (VLESS/VMess/Trojan/SS over TLS). Takes effect on next connection.":
+      "Разбивает рукопожатие TLS (ClientHello) на части, чтобы DPI не мог распознать соединение в одном пакете. Помогает, когда сервер живой, но рукопожатие сбрасывается. Только протоколы xray (VLESS/VMess/Trojan/SS поверх TLS). Применяется при следующем подключении.",
+    "Fragment length": "Длина фрагмента",
+    "Fragment interval (ms)": "Интервал фрагментации (мс)",
+    "Ranges as \"min-max\" (or a single number). Defaults: length 100-200, interval 10-20. Leave empty to use the defaults.":
+      "Диапазоны в виде «min-max» (или одно число). По умолчанию: длина 100-200, интервал 10-20. Оставьте пустым для значений по умолчанию.",
+    "Launch at Windows startup": "Запускать при старте Windows",
+    "Starts Vair automatically when you log in to Windows, minimized to the tray. Off by default.":
+      "Автоматически запускает Vair при входе в Windows, свёрнутым в трей. По умолчанию выключено.",
+    "Handle vair:// links": "Обрабатывать ссылки vair://",
+    "Registers the vair:// scheme so clicking a vair://import/… link (e.g. in a browser or Telegram) opens Vair and adds the subscription or config. On by default.":
+      "Регистрирует схему vair://, чтобы клик по ссылке vair://import/… (например, в браузере или Telegram) открывал Vair и добавлял подписку или конфиг. По умолчанию включено.",
+    "Added from link": "Добавлено по ссылке",
+    "Link has no config or subscription": "В ссылке нет конфига или подписки",
+    "Updates": "Обновления",
+    "Check for updates": "Проверить обновления",
+    "Checks for a newer build and installs it (downloads through the tunnel when connected). The download is verified by checksum before it replaces the app.":
+      "Проверяет наличие новой версии и устанавливает её (при активном подключении скачивает через туннель). Загрузка проверяется по контрольной сумме перед заменой приложения.",
+    "Update now": "Обновить сейчас",
+    "New version": "Новая версия",
+    "Checking…": "Проверка…",
+    "You have the latest version.": "У вас последняя версия.",
+    "Update available": "Доступно обновление",
+    "Could not check for updates": "Не удалось проверить обновления",
+    "Downloading update": "Загрузка обновления",
+    "Verifying…": "Проверка целостности…",
+    "Update ready — restarting…": "Обновление готово — перезапуск…",
+    "Update failed": "Ошибка обновления",
+    "Download and install the update now? Vair will restart.":
+      "Скачать и установить обновление сейчас? Vair перезапустится.",
     "Enable traffic statistics": "Считать трафик",
     "Lifetime total": "Итого за всё время",
     "reset total": "сбросить итог",
@@ -1057,6 +1142,27 @@ const I18N = {
     "Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.":
       "Файлы читаются с диска при каждом RELOAD, так что правки подхватываются без повторного добавления. Без лимита на размер — хранится только путь.",
     "Auto-refresh interval (minutes, 0 = off)": "Интервал автообновления (минуты, 0 = выкл.)",
+    "Test after auto-refresh": "Тест после авто-обновления",
+    "After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.":
+      "После планового авто-обновления (не ручного RELOAD) тестировать конфиги вкладки в фоне — только ping или полный тест скорости.",
+    "off": "выкл.",
+    "Ping only": "Только ping",
+    "Speed test": "Тест скорости",
+    "Subscription info": "Информация о подписке",
+    "Subscription": "Подписка",
+    "Failed to load": "Не удалось загрузить",
+    "no configs found": "конфигурации не найдены",
+    "Enable / disable this source": "Включить / отключить этот источник",
+    "Test ping": "Тест пинга",
+    "Test speed": "Тест скорости",
+    "Traffic": "Трафик",
+    "left": "осталось",
+    "Expires": "Действует до",
+    "days": "дн.",
+    "Configs": "Конфигов",
+    "Updated": "Обновлено",
+    "Update interval": "Интервал обновления",
+    "until": "до",
     "Deduplicate duplicate configs": "Удалять повторяющиеся конфиги",
     "Off": "Выкл.",
     "Hide": "Скрыть",
@@ -1111,6 +1217,16 @@ const I18N = {
     "Switching…": "Переключение…",
     "All candidates are down": "Все кандидаты недоступны",
     "Prefer faster (by speed test)": "Предпочитать быстрые (по тесту скорости)",
+    "recommended": "рекомендуется",
+    "Import from GitHub (private repo)": "Импорт из GitHub (приватный репозиторий)",
+    "Pulls a config file from a private GitHub repository on every reload via a personal access token. Loaded after URLs and files.":
+      "Загружает файл с конфигами из приватного репозитория GitHub при каждом обновлении, используя персональный токен доступа (PAT). Добавляется после URL и файлов.",
+    "owner (user or organization)": "владелец (пользователь или организация)",
+    "repository name": "название репозитория",
+    "path to file, e.g. configs.txt": "путь к файлу, напр. configs.txt",
+    "personal access token (PAT)": "персональный токен доступа (PAT)",
+    "view": "показать",
+    "hide": "скрыть",
     "Rank candidates by measured download speed (Mbps) instead of ping delay. Configs without a speed result fall back to ping order.":
       "Ранжировать кандидатов по измеренной скорости загрузки (Мбит/с), а не по задержке ping. Конфиги без результата скорости упорядочиваются по ping.",
     "Switch now": "Переключить сейчас",
@@ -1133,6 +1249,20 @@ const I18N = {
     "configs": "конфигов",
     "Delete failed ping/speed": "Удалить с ошибкой ping/скорости",
     "Paste configs": "Вставить конфиги",
+    "Scan QR from screen": "Сканировать QR с экрана",
+    "Scan QR from file": "Сканировать QR из файла",
+    "No QR code found": "QR-код не найден",
+    "No QR code found on screen": "QR-код на экране не найден",
+    "Could not read a QR from that image": "Не удалось прочитать QR из изображения",
+    "QR is not a config or subscription": "QR не содержит конфиг или подписку",
+    "Added from QR": "Добавлено из QR",
+    "No configs found in the QR": "В QR не найдено конфигов",
+    "Could not import from QR": "Не удалось импортировать из QR",
+    "Subscription added to tab sources": "Подписка добавлена в источники вкладки",
+    "Subscription already in tab sources": "Подписка уже есть в источниках вкладки",
+    "Could not add subscription": "Не удалось добавить подписку",
+    "Scanning screen…": "Сканирование экрана…",
+    "Not supported here": "Недоступно здесь",
     "Delete tab": "Удалить вкладку",
     "OK": "ОК",
     "Cancel": "Отмена",
@@ -1191,6 +1321,12 @@ es.onmessage=e=>{
   // Filter tab-scoped events: ignore if event belongs to a different tab
   const evTab=ev.tab||'';
   const tabMatch=!evTab||evTab===activeTabId;
+  // Per-tab cache invalidation: any data-change event for a tab we're NOT
+  // currently viewing means our cached snapshot of it is stale, so the next
+  // switch to it must re-fetch instead of rendering the cache (see switchTab).
+  if(evTab && evTab!==activeTabId && (ev.type==='entry_update'||ev.type==='loaded'||ev.type==='loading')){
+    tabDirty[evTab]=true;
+  }
   if     (ev.type==='loading'&&tabMatch)             onLoading();
   else if(ev.type==='loaded'&&tabMatch)              onLoaded(ev.payload);
   else if(ev.type==='entry_update'){
@@ -1204,6 +1340,8 @@ es.onmessage=e=>{
   }
   else if(ev.type==='conn_update')                   onConnUpdate(ev.payload);
   else if(ev.type==='stats_update')                   onStatsUpdate(ev.payload);
+  else if(ev.type==='update_status')                  onUpdateStatus(ev.payload);
+  else if(ev.type==='deeplink')                       handleDeepLinkPayload(ev.payload);
   else if(ev.type==='app_info')                      onAppInfo(ev.payload);
   else if(ev.type==='bulk_ping_start')               startBulk('ping',ev.payload,evTab);
   else if(ev.type==='bulk_ping_progress'&&tabMatch)  progBulk('ping',ev.payload);
@@ -1227,8 +1365,11 @@ let logPanelOpen=false;
 // Severity rank for the "info+ / warn+ / error" filter.
 const LOG_LVL_RANK={raw:0, info:1, warn:2, error:3};
 function logSrcLabel(s){ return s==='singbox'?'sing-box':s; }
-function logPassesFilter(l){
-  var src=document.getElementById('log-src'); var lvl=document.getElementById('log-lvl');
+// logPassesFilterFor checks a log line against a specific pair of source/level
+// <select> elements (by id). Lets the main Logs dock and the AUTO window's own
+// Logs section reuse the same filtering with independent selectors.
+function logPassesFilterFor(l, srcId, lvlId){
+  var src=document.getElementById(srcId); var lvl=document.getElementById(lvlId);
   if(src && src.value && l.src!==src.value) return false;
   if(lvl && lvl.value){
     var min=LOG_LVL_RANK[lvl.value]||0;
@@ -1236,6 +1377,7 @@ function logPassesFilter(l){
   }
   return true;
 }
+function logPassesFilter(l){ return logPassesFilterFor(l,'log-src','log-lvl'); }
 function fmtLogTime(ms){
   var d=new Date(ms||Date.now());
   function p(n){return (n<10?'0':'')+n;}
@@ -1259,6 +1401,10 @@ function onLogBatch(arr){
   if(arr.length===0) return;
   for(var i=0;i<arr.length;i++) logBuf.push(arr[i]);
   if(logBuf.length>LOG_CAP) logBuf=logBuf.slice(logBuf.length-LOG_CAP);
+  // Mirror new lines into the AUTO window's Logs section when it's open. This
+  // runs independently of the main dock (which may be closed/hidden, e.g. in the
+  // detached AUTO window) so its live feed keeps flowing.
+  appendAutoLogs(arr);
   if(!logPanelOpen) return;
   var view=document.getElementById('log-view');
   if(!view) return;
@@ -1656,7 +1802,19 @@ function onLoading(){
 // diff against it and highlight what changed. flashNewIdx holds the indices
 // of just-added configs to flash for a couple of seconds.
 let prevRawsByTab={};
+// Per-tab entries cache (point-1 optimization): switching back to a tab whose
+// data hasn't changed renders from this snapshot instead of re-fetching +
+// re-parsing the whole list (the cause of the 1-2s freeze on huge tabs).
+// tabDirty[id] is set whenever a data-change event arrives for an inactive tab,
+// so a cached render is only used when it's provably current. pendingCacheRender
+// holds the id we're switching to via cache, applied in onActiveTab.
+let tabCache={};
+let tabDirty={};
+let pendingCacheRender=null;
 let flashNewIdx=new Set();
+// Set when adding a subscription source, so the reload it triggers doesn't pop a
+// "+N" delta toast on top of the "Subscription added" one. One-shot.
+var suppressReloadDeltaOnce=false;
 function onLoaded(list){
   Object.keys(entries).forEach(k=>delete entries[k]);
   document.getElementById('tb').innerHTML='';
@@ -1664,7 +1822,13 @@ function onLoaded(list){
   document.getElementById('msg-area').style.display='none';
   document.getElementById('tbl').style.display='';
   selectedRows.clear();
-  recomputeDupIndices();
+  // dupBodyIndices is consulted by matches() ONLY in "hide" mode, and building it
+  // is a sort + per-entry string pass. Computing it on every load made switching
+  // to a huge tab freeze for a second or two. Compute it only when this tab
+  // actually hides duplicates; onTabsUpdate re-runs it if the user flips to hide.
+  var _at=tabsList.find(function(t){return t.id===activeTabId;});
+  if(_at && _at.dedup_mode==='hide') recomputeDupIndices();
+  else dupBodyIndices=new Set();
   // Reset progress bar if we switched to a different tab than the one being tested
   if(bulkProgressTab&&bulkProgressTab!==activeTabId) setBar(0);
 
@@ -1680,10 +1844,14 @@ function onLoaded(list){
     var added=0, removed=0;
     list.forEach(function(e){ if(!prevSet.has(e.raw)){ flashNewIdx.add(e.index); added++; } });
     prev.forEach(function(r){ if(!newSet.has(r)) removed++; });
-    if(added>0||removed>0) showReloadDelta(added,removed);
+    if(added>0||removed>0){
+      if(suppressReloadDeltaOnce) suppressReloadDeltaOnce=false; // adding a subscription shows its own toast
+      else showReloadDelta(added,removed);
+    }
     if(flashNewIdx.size>0) startFlashFade();
   }
   prevRawsByTab[tabKey]=newRaws;
+  tabDirty[tabKey]=false; // freshly loaded from the server → cache is current again
 
   rebuildTable();
 }
@@ -1709,15 +1877,27 @@ function startFlashFade(){
   }
   flashRAF=requestAnimationFrame(step);
 }
+// showToastEl renders a single centered toast, REPLACING any already on screen
+// (they share one fixed position, so without this rapid messages — e.g. pasting
+// configs many times in a row — stack on top of each other). Only the latest
+// shows; its fade/remove timers are tracked on the node and cleared on replace.
+function showToastEl(text){
+  document.querySelectorAll('.reload-toast').forEach(function(el){
+    if(el._t1) clearTimeout(el._t1);
+    if(el._t2) clearTimeout(el._t2);
+    el.remove();
+  });
+  var t=document.createElement('div');
+  t.className='reload-toast';
+  t.textContent=text;
+  document.body.appendChild(t);
+  t._t1=setTimeout(function(){ t.classList.add('fade'); },1900);
+  t._t2=setTimeout(function(){ t.remove(); },2400);
+}
 // toast pops a brief centered message (reuses the reload-toast style).
 function toast(msg){
   if(!msg) return;
-  var t=document.createElement('div');
-  t.className='reload-toast';
-  t.textContent=msg;
-  document.body.appendChild(t);
-  setTimeout(function(){ t.classList.add('fade'); },1900);
-  setTimeout(function(){ t.remove(); },2400);
+  showToastEl(msg);
 }
 
 // showReloadDelta pops a brief toast with how many configs a reload added
@@ -1727,21 +1907,21 @@ function showReloadDelta(added,removed){
   if(added>0)  parts.push('+'+added);
   if(removed>0)parts.push('−'+removed);
   if(parts.length===0)return;
-  var t=document.createElement('div');
-  t.className='reload-toast';
-  t.textContent=parts.join('   ');
-  document.body.appendChild(t);
-  setTimeout(function(){ t.classList.add('fade'); },1900);
-  setTimeout(function(){ t.remove(); },2400);
+  showToastEl(parts.join('   '));
 }
 function onUpdate(e){
   entries[e.index]=e;
-  // Keep sortedList in sync so virtual scroll renders fresh data when scrolling back
-  for(var i=0;i<sortedList.length;i++){
-    if(sortedList[i].index===e.index){ sortedList[i]=e; break; }
-  }
+  // Keep sortedList's object reference fresh (virtual scroll renders from it on
+  // scroll-back) — O(1) via sortedPos instead of an O(n) scan per event. The
+  // index-match guard makes a stale map a no-op rather than a wrong write; the
+  // entry just isn't refreshed in that view until the next rebuild (can't
+  // happen in practice — sortedPos is rebuilt with sortedList).
+  var pos=sortedPos.get(e.index);
+  if(pos!==undefined && sortedList[pos] && sortedList[pos].index===e.index) sortedList[pos]=e;
   updateRow(e.index);
-  recalcStats();
+  // Header counters are coalesced (recomputed once per ~120ms) rather than on
+  // every event — see scheduleRecalcStats.
+  scheduleRecalcStats();
   // If this update is for the connected config, refresh the conn-bar ping chip.
   if(connState&&connState.status==='connected'&&e.raw&&connState.conn_raw===e.raw) updateConnPing();
 }
@@ -1780,13 +1960,33 @@ function recomputeDupIndices(){
 // could see. rebuildTable() populates sortedList and then calls this.
 function recalcStats(){
   const vis = sortedList || [];
+  // Single pass with plain comparisons — no .filter()/.map() allocations and no
+  // Math.min(...arr)/Math.max(...arr) spread (which is O(n) and can blow the
+  // call stack past ~100k elements). Same outputs as before.
+  var ok=0, er=0, minMs=0, haveMs=false, maxSp=0, haveSp=false;
+  for(var i=0;i<vis.length;i++){
+    var e=vis[i];
+    if(e.ping_status==='ok') ok++;
+    else if(e.ping_status==='failed') er++;
+    if(e.delay>0 && (!haveMs || e.delay<minMs)){ minMs=e.delay; haveMs=true; }
+    if(e.speed_mbps>0 && (!haveSp || e.speed_mbps>maxSp)){ maxSp=e.speed_mbps; haveSp=true; }
+  }
   document.getElementById('s-tot').textContent = vis.length;
-  document.getElementById('s-ok').textContent  = vis.filter(e=>e.ping_status==='ok').length;
-  document.getElementById('s-er').textContent  = vis.filter(e=>e.ping_status==='failed').length;
-  const dl = vis.filter(e=>e.delay>0).map(e=>e.delay);
-  const sp = vis.filter(e=>e.speed_mbps>0).map(e=>e.speed_mbps);
-  document.getElementById('s-ms').textContent = dl.length?Math.min(...dl)+'ms':'—';
-  document.getElementById('s-sp').textContent = sp.length?(Math.max(...sp).toFixed(1)+' MB/s'):'—';
+  document.getElementById('s-ok').textContent  = ok;
+  document.getElementById('s-er').textContent  = er;
+  document.getElementById('s-ms').textContent = haveMs?(minMs+'ms'):'—';
+  document.getElementById('s-sp').textContent = haveSp?(maxSp.toFixed(1)+' MB/s'):'—';
+}
+// scheduleRecalcStats coalesces header-counter recomputation. During a bulk
+// test hundreds of entry_update events arrive per second; running recalcStats
+// (a full-list pass) on each one pinned the UI thread. This runs it at most
+// once per ~120 ms (trailing edge), so the final state still lands after the
+// last event. Direct recalcStats() callers (rebuildTable, filter/sort changes)
+// stay immediate.
+let _statsTimer=null;
+function scheduleRecalcStats(){
+  if(_statsTimer) return;
+  _statsTimer=setTimeout(function(){ _statsTimer=null; recalcStats(); }, 120);
 }
 
 function startBulk(id,total,evTab){
@@ -1891,7 +2091,12 @@ function loadProtoFilter(){
 // SS2022 from legacy SS by the cipher prefix. Backend reports both as "ss"
 // because xray's outbound is identical — the split is a UI concern only.
 function chipProto(e){
-  var pr=(e.protocol||'vless').toLowerCase().replace(/[^a-z0-9]/g,'');
+  // Default to 'none' (not 'vless') when the protocol is unknown: an entry only
+  // has an empty protocol when its URL FAILED to parse. The backend now labels
+  // such configs by their scheme (e.g. a broken trojan:// link → "trojan"), so
+  // this fallback only fires for the rare truly-unidentifiable line — tagging it
+  // "vless" was misleading (the (missing '@' in trojan URL) bug report).
+  var pr=(e.protocol||'none').toLowerCase().replace(/[^a-z0-9]/g,'');
   if(pr==='ss' && (e.security||'').indexOf('2022-blake3-')===0) pr='ss2022';
   return pr;
 }
@@ -1971,6 +2176,11 @@ function matches(e){
 // Keeps the full sorted list in sortedList, renders only the window.
 // Top/bottom padding rows maintain correct scroll height.
 let sortedList = [];
+// sortedPos maps an entry's index → its position in sortedList, so onUpdate can
+// replace a row's data in O(1) instead of scanning the whole list per event
+// (the bottleneck that froze the UI during bulk tests on huge lists). Rebuilt
+// alongside sortedList in rebuildTable — the ONLY place sortedList is assigned.
+let sortedPos = new Map();
 let rowHeight = 30; // measured on first render
 let visibleWindow = { start: 0, end: 0 }; // inclusive start, exclusive end
 const VBUFFER = 10; // rows rendered above/below viewport
@@ -2014,6 +2224,8 @@ function rebuildTable(){
     return cmp(a,b);
   });
   sortedList = list;
+  sortedPos = new Map();
+  for(var sp=0;sp<list.length;sp++) sortedPos.set(list[sp].index, sp);
   document.getElementById('fc').textContent=filterText?(list.length+'/'+Object.keys(entries).length):'';
   // Counters are derived from sortedList so any change in visibility — sort,
   // filter, dedup toggle, exclude filter, etc — keeps them in sync.
@@ -2308,6 +2520,15 @@ function bulkTestBody(){
 function doPingAll() {
   fetch('/api/ping/all',{method:'POST',headers:{'Content-Type':'application/json'},body:bulkTestBody()}).catch(console.error);
 }
+// testSelected runs ping (or speed) on just the selected rows — or the
+// right-clicked row when nothing is selected. Reuses the bulk endpoints, which
+// already accept an explicit index list.
+function testSelected(idx,withSpeed){
+  var indices=selectedRows.size>0?[...selectedRows]:[idx];
+  if(indices.length===0) return;
+  var url=withSpeed?'/api/speed/all':'/api/ping/all';
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices:indices})}).catch(console.error);
+}
 function doSpeedAll(){
   fetch('/api/speed/all',{method:'POST',headers:{'Content-Type':'application/json'},body:bulkTestBody()}).catch(console.error);
 }
@@ -2337,8 +2558,15 @@ function onTabsUpdate(tabs){
   var next=tabs.find(function(t){return t.id===activeTabId;});
   var dedupFlipped=prev && next && ((prev.dedup_mode||'')!==(next.dedup_mode||''));
   tabsList=tabs;
+  // Drop cached snapshots for tabs that no longer exist (closed/deleted).
+  var _liveIds={}; tabs.forEach(function(t){_liveIds[t.id]=1;});
+  Object.keys(tabCache).forEach(function(k){ if(!_liveIds[k]){ delete tabCache[k]; delete tabDirty[k]; } });
   renderTabs();
+  updateSubBar();
   if(dedupFlipped){
+    // Entering "hide" needs the dup set built now (onLoaded skips it for
+    // non-hide tabs); leaving it just stops consulting the set.
+    if(next.dedup_mode==='hide') recomputeDupIndices();
     rebuildTable();
   }
 }
@@ -2348,9 +2576,16 @@ function onActiveTab(id){
   // Reset progress bar - only show if the active tab has an ongoing bulk operation
   if(bulkProgressTab!==id) setBar(0);
   renderTabs();
+  updateSubBar();
   // The conn-bar ping chip is scoped to the connected config's tab — refresh
   // it so it hides/shows correctly after a tab switch.
   updateConnPing();
+  // Cached switch: the server sent no "loaded" for this tab, so paint it from our
+  // snapshot now. (For a normal switch the upcoming loaded/loading event paints.)
+  if(pendingCacheRender===id){
+    pendingCacheRender=null;
+    renderFromCache(id);
+  }
 }
 
 function renderTabs(){
@@ -2494,7 +2729,37 @@ function startTabDrag(e,dragId){
 }
 
 function switchTab(id){
-  fetch('/api/tab/switch?id='+id,{method:'POST'}).catch(console.error);
+  if(id===activeTabId) return; // clicking the current tab is a no-op
+  // Snapshot the tab we're leaving so a later return to it is instant. These are
+  // the live entry objects; onUpdate replaces (not mutates) them, so the snapshot
+  // stays a stable point-in-time copy.
+  if(activeTabId) tabCache[activeTabId]=Object.values(entries);
+  // Render from cache only if we have one AND nothing changed there since.
+  var useCache=!!tabCache[id] && !tabDirty[id];
+  pendingCacheRender=useCache?id:null;
+  fetch('/api/tab/switch?id='+id+(useCache?'&cached=1':''),{method:'POST'}).catch(function(){
+    pendingCacheRender=null; // on failure, a retry does a normal server load
+  });
+}
+// renderFromCache repaints the table from a cached snapshot (no server round-trip,
+// no JSON.parse) — the same work as onLoaded minus the fetch + reload-delta.
+function renderFromCache(id){
+  var list=tabCache[id];
+  if(!list){ // cache vanished — fall back to a normal server load
+    fetch('/api/tab/switch?id='+id,{method:'POST'}).catch(console.error);
+    return;
+  }
+  Object.keys(entries).forEach(function(k){delete entries[k];});
+  document.getElementById('tb').innerHTML='';
+  list.forEach(function(e){entries[e.index]=e;});
+  document.getElementById('msg-area').style.display='none';
+  document.getElementById('tbl').style.display='';
+  selectedRows.clear();
+  var _at=tabsList.find(function(t){return t.id===id;});
+  if(_at && _at.dedup_mode==='hide') recomputeDupIndices(); else dupBodyIndices=new Set();
+  // No reload-delta: it's the same data we already had (prevRawsByTab[id] from the
+  // last real load is still valid).
+  rebuildTable();
 }
 
 function addTab(){
@@ -2526,6 +2791,10 @@ function showRowMenu(ev,idx){
   if(selCount>1){
     m.innerHTML+='<div class="ctx-menu-item" onclick="connectChain();closeCtxMenu()">'+t('Connect as chain')+' ('+selCount+')</div>';
   }
+  // Test only the selected configs (or this row when nothing is selected).
+  m.innerHTML+='<div class="ctx-sep"></div>'+
+    '<div class="ctx-menu-item" onclick="testSelected('+idx+',false);closeCtxMenu()">'+t('Test ping')+' — '+label+'</div>'+
+    '<div class="ctx-menu-item" onclick="testSelected('+idx+',true);closeCtxMenu()">'+t('Test speed')+' — '+label+'</div>';
   if(activeTabId!=='main'){
     // Rename — single selection only (renaming many configs to one name is
     // meaningless). Not on Sources: those configs are re-fetched and would lose
@@ -2543,6 +2812,15 @@ function showRowMenu(ev,idx){
       m.innerHTML+='<div class="ctx-menu-item danger" onclick="deleteFailedRows();closeCtxMenu()">'+t('Delete failed ping/speed')+' ('+failed+')</div>';
     }
   }
+  // Tab-level "add configs" actions — also offered from the row menu so they
+  // stay reachable when the table is full and there's no empty area to
+  // right-click (the empty-area menu below only fires on a blank spot).
+  if(activeTabId!=='main'){
+    m.innerHTML+='<div class="ctx-sep"></div>'+
+      '<div class="ctx-menu-item" onclick="pasteFromClipboard();closeCtxMenu()">'+t('Paste configs')+'</div>'+
+      '<div class="ctx-menu-item" onclick="scanQRScreen();closeCtxMenu()">'+t('Scan QR from screen')+'</div>'+
+      '<div class="ctx-menu-item" onclick="scanQRFile();closeCtxMenu()">'+t('Scan QR from file')+'</div>';
+  }
   m.style.left=ev.clientX+'px';m.style.top=ev.clientY+'px';
   document.body.appendChild(m);
   var rect=m.getBoundingClientRect();
@@ -2559,7 +2837,9 @@ document.querySelector('.tw').addEventListener('contextmenu',function(ev){
   closeCtxMenu();
   var m=document.createElement('div');
   m.className='ctx-menu';m.id='ctx-menu';
-  m.innerHTML='<div class="ctx-menu-item" onclick="pasteFromClipboard();closeCtxMenu()">'+t('Paste configs')+'</div>';
+  m.innerHTML='<div class="ctx-menu-item" onclick="pasteFromClipboard();closeCtxMenu()">'+t('Paste configs')+'</div>'+
+    '<div class="ctx-menu-item" onclick="scanQRScreen();closeCtxMenu()">'+t('Scan QR from screen')+'</div>'+
+    '<div class="ctx-menu-item" onclick="scanQRFile();closeCtxMenu()">'+t('Scan QR from file')+'</div>';
   m.style.left=ev.clientX+'px';m.style.top=ev.clientY+'px';
   document.body.appendChild(m);
   setTimeout(()=>document.addEventListener('click',closeCtxMenu,{once:true}),10);
@@ -2579,14 +2859,88 @@ function looksLikeBase64Configs(text){
   var t=(text||'').replace(/\s+/g,'');
   return t.length>=24 && /^[A-Za-z0-9+/_-]+={0,2}$/.test(t);
 }
-// pasteworthy: either readable config URLs or a raw base64 subscription blob.
-function pasteworthy(text){ return containsNodeURL(text)||looksLikeBase64Configs(text); }
+// looksLikeSubURL: a single bare http(s) link — a subscription the server
+// fetches and imports (handleTabPaste). Used for scanned QRs and pasted links.
+function looksLikeSubURL(text){
+  var t=(text||'').trim();
+  return t.indexOf('\n')<0 && /^https?:\/\/\S+$/i.test(t);
+}
+// pasteworthy: config URLs, a raw base64 subscription blob, or a subscription URL.
+function pasteworthy(text){ return containsNodeURL(text)||looksLikeBase64Configs(text)||looksLikeSubURL(text); }
 
 function pasteFromClipboard(){
   navigator.clipboard.readText().then(function(text){
+    var trimmed=(text||'').trim();
+    if(looksLikeSubURL(trimmed)){ addSubToTabSource(activeTabId, trimmed); return; }
     if(!pasteworthy(text))return;
     fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:text}).catch(console.error);
   }).catch(()=>{});
+}
+
+// ── QR scan (from screen / from image file) ─────────────────────────────────
+// The native side decodes the QR and returns its text; we route it through the
+// same paste endpoint as clipboard configs. Only meaningful on a user tab
+// (configs can't be added to Sources), which the context menu already gates.
+// addSubToTabSource appends a subscription URL to a tab's persistent Source URLs
+// (added alongside any existing ones) and the server re-fetches. Used for QR /
+// pasted subscription links.
+function addSubToTabSource(tabId, url){
+  // The add triggers a tab re-fetch → a "loaded" event whose +N delta toast
+  // would otherwise stack on top of our "Subscription added" toast. Suppress
+  // that one delta toast (safety-reset in case the reload never arrives).
+  suppressReloadDeltaOnce=true;
+  setTimeout(function(){ suppressReloadDeltaOnce=false; }, 8000);
+  fetch('/api/tab/add-url?id='+encodeURIComponent(tabId),{method:'POST',body:url})
+    .then(function(r){ return r.ok ? r.json().catch(function(){return {};}) : Promise.reject(); })
+    .then(function(j){ toast(j&&j.added===false ? t('Subscription already in tab sources') : t('Subscription added to tab sources')); })
+    .catch(function(){ suppressReloadDeltaOnce=false; toast(t('Could not add subscription')); });
+}
+// handleDeepLinkPayload imports a vair:// payload (config(s), base64, or a
+// subscription link) — same routing as a paste: a subscription becomes a tab
+// source, configs are pasted. On the Sources tab it creates a new user tab
+// first (configs can't live on Sources).
+function handleDeepLinkPayload(payload){
+  payload=(payload||'').trim();
+  if(!payload) return;
+  var isSub=looksLikeSubURL(payload);
+  if(!isSub && !pasteworthy(payload)){ toast(t('Link has no config or subscription')); return; }
+  if(activeTabId==='main'){
+    fetch('/api/tab/create',{method:'POST'}).then(function(r){return r.json();}).then(function(tab){
+      fetch('/api/tab/switch?id='+tab.id,{method:'POST'}).then(function(){
+        if(isSub){ addSubToTabSource(tab.id, payload); }
+        else { fetch('/api/tab/paste?id='+tab.id,{method:'POST',body:payload}).then(function(){ toast(t('Added from link')); }).catch(function(){}); }
+      });
+    }).catch(console.error);
+    return;
+  }
+  if(isSub){ addSubToTabSource(activeTabId, payload); return; }
+  fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:payload}).then(function(){ toast(t('Added from link')); }).catch(function(){});
+}
+function qrToActiveTab(text){
+  text=(text||'').trim();
+  if(!text){ toast(t('No QR code found')); return; }
+  // A subscription link becomes a persistent tab source rather than a one-shot import.
+  if(looksLikeSubURL(text)){ addSubToTabSource(activeTabId, text); return; }
+  if(!pasteworthy(text)){ toast(t('QR is not a config or subscription')); return; }
+  fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:text})
+    .then(function(r){ return r.ok ? r.json().catch(function(){return {};}) : Promise.reject(); })
+    .then(function(j){
+      var n=(j&&typeof j.added==='number')?j.added:null;
+      if(n===0){ toast(t('No configs found in the QR')); }
+      else { toast(t('Added from QR')+(n!=null?(' ('+n+')'):'')); }
+    })
+    .catch(function(){ toast(t('Could not import from QR')); });
+}
+function scanQRFile(){
+  if(typeof _goScanQRFile!=='function'){ toast(t('Not supported here')); return; }
+  Promise.resolve(_goScanQRFile()).then(qrToActiveTab)
+    .catch(function(){ toast(t('Could not read a QR from that image')); });
+}
+function scanQRScreen(){
+  if(typeof _goScanQRScreen!=='function'){ toast(t('Not supported here')); return; }
+  toast(t('Scanning screen…'));
+  Promise.resolve(_goScanQRScreen()).then(qrToActiveTab)
+    .catch(function(){ toast(t('No QR code found on screen')); });
 }
 
 // gatherSelectedLines collects raw vless URLs for every currently selected
@@ -2697,6 +3051,19 @@ function logsAreTarget(){
   return lastInteract==='logs';
 }
 document.addEventListener('copy',function(e){
+  // Selection inside a chip list (Custom domains without VPN, through VPN, Apps
+  // without VPN, exclude filters, …): copy each selected entry on its own line
+  // (a column), ignoring the × remove buttons. Checked FIRST — before the input
+  // early-return below — because the chip text-input shares the .chips-wrap, so
+  // it may be the activeElement while chips are selected. For a selection that's
+  // purely inside that input (no chip intersected), this returns null and we
+  // fall through to the native input copy.
+  var chipCol=chipsColumnFromSelection();
+  if(chipCol!==null){
+    e.preventDefault();
+    if(e.clipboardData) e.clipboardData.setData('text/plain', chipCol);
+    return;
+  }
   // Inputs and textareas have their own selection — let the native copy
   // handle them so users can still copy text out of the URL/filter fields.
   var ae=document.activeElement;
@@ -2706,6 +3073,8 @@ document.addEventListener('copy',function(e){
   // Only defer to native when there's an actual selection there — a bare click
   // (collapsed) in logs shouldn't block copying the selected table rows.
   if(selectionInLogPanel()) return;
+  // Same deference for the AUTO window's own log view (used when detached).
+  if(selectionInEl(document.getElementById('auto-log-view'))) return;
   if(selectedRows.size===0) return; // no rows selected — fall through to native
   var lines=gatherSelectedLines();
   if(lines.length===0) return;
@@ -2713,6 +3082,39 @@ document.addEventListener('copy',function(e){
   if(e.clipboardData) e.clipboardData.setData('text/plain', lines.join('\n'));
   flashCopySelected();
 });
+
+// chipValue extracts the clean text of one chip — its stored data value when
+// present (domains/apps/exclude rules use data-d/-a/-pd/-v), otherwise the chip
+// text with the × button and any tag stripped off.
+function chipValue(chip){
+  var v=chip.getAttribute('data-d')||chip.getAttribute('data-a')||
+        chip.getAttribute('data-pd')||chip.getAttribute('data-v');
+  if(v) return v;
+  var clone=chip.cloneNode(true);
+  var drop=clone.querySelectorAll('.chip-x,.chip-tag');
+  for(var i=0;i<drop.length;i++) drop[i].remove();
+  return (clone.textContent||'').trim();
+}
+// chipsColumnFromSelection returns the selected chips of a single .chips-wrap as
+// a newline-joined column, or null when the selection isn't in a chip list.
+function chipsColumnFromSelection(){
+  var sel=window.getSelection&&window.getSelection();
+  if(!sel || sel.rangeCount===0 || sel.isCollapsed) return null;
+  var a=sel.anchorNode;
+  var startEl=a && (a.nodeType===1?a:a.parentElement);
+  var wrap=startEl && startEl.closest && startEl.closest('.chips-wrap');
+  if(!wrap) return null;
+  var range=sel.getRangeAt(0);
+  var chips=wrap.querySelectorAll('.chip');
+  var vals=[];
+  for(var i=0;i<chips.length;i++){
+    if(range.intersectsNode(chips[i])){
+      var v=chipValue(chips[i]);
+      if(v) vals.push(v);
+    }
+  }
+  return vals.length?vals.join('\n'):null;
+}
 
 function deleteSelectedRows(){
   if(selectedRows.size===0||activeTabId==='main')return;
@@ -2974,7 +3376,7 @@ function openSettings(){
           '<label class="toggle"><input type="checkbox" id="set-proxy-domains-on" '+(appSettingsJS.proxy_domains_disabled?'':'checked')+' onchange="toggleProxyDomains(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
         '</div>'+
         '<div class="chips-wrap" id="proxy-domain-chips" style="'+(appSettingsJS.proxy_domains_disabled?'opacity:.45':'')+'">'+proxyDomainChipsHtml+
-          '<input class="chip-input" id="proxy-domain-input" placeholder="'+t('e.g. youtube.com, press Enter')+'" onkeydown="proxyDomainChipKey(event)">'+
+          '<input class="chip-input" id="proxy-domain-input" placeholder="'+t('e.g. youtube.com, press Enter')+'" onkeydown="proxyDomainChipKey(event)" onpaste="proxyDomainChipPaste(event)">'+
         '</div>'+
         '<div class="modal-hint">'+t('Domains routed THROUGH the VPN in addition to the built-in blocked-list. Takes effect on next connection.')+'</div>'+
         '<div class="modal-row" style="display:block;margin-top:10px;margin-bottom:4px">'+
@@ -2988,7 +3390,7 @@ function openSettings(){
         '<label class="toggle"><input type="checkbox" id="set-direct-domains-on" '+(appSettingsJS.direct_domains_disabled?'':'checked')+' onchange="toggleDirectDomains(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
       '<div class="chips-wrap" id="domain-chips" style="'+(appSettingsJS.direct_domains_disabled?'opacity:.45':'')+'">'+domainChipsHtml+
-        '<input class="chip-input" id="domain-input" placeholder="'+t('e.g. vk.com, press Enter')+'" onkeydown="domainChipKey(event)">'+
+        '<input class="chip-input" id="domain-input" placeholder="'+t('e.g. vk.com, press Enter')+'" onkeydown="domainChipKey(event)" onpaste="domainChipPaste(event)">'+
       '</div>'+
       '<div class="modal-hint">'+t('Enter a domain — all its subdomains are included automatically. Takes effect on next connection.')+'</div>'+
       '<div class="modal-row" style="margin-top:10px;margin-bottom:4px">'+
@@ -2996,7 +3398,7 @@ function openSettings(){
         '<label class="toggle"><input type="checkbox" id="set-direct-apps-on" '+(appSettingsJS.direct_apps_disabled?'':'checked')+' onchange="toggleDirectApps(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
       '<div class="chips-wrap" id="app-chips" style="'+(appSettingsJS.direct_apps_disabled?'opacity:.45':'')+'">'+appChipsHtml+
-        '<input class="chip-input" id="app-input" placeholder="'+t('e.g. chrome.exe, press Enter')+'" onkeydown="appChipKey(event)">'+
+        '<input class="chip-input" id="app-input" placeholder="'+t('e.g. chrome.exe, press Enter')+'" onkeydown="appChipKey(event)" onpaste="appChipPaste(event)">'+
       '</div>'+
       '<div class="modal-hint">'+t("Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).")+' <a href="#" onclick="openProcessPicker(event)" style="color:var(--accent);text-decoration:underline">'+t('Browse running processes')+'</a>. '+t('Takes effect on next connection.')+'</div>'+
     '</div>'+
@@ -3057,6 +3459,27 @@ function openSettings(){
         '<input class="modal-input num-input" id="set-mtu" type="number" min="576" max="9000" value="'+(appSettingsJS.tun_mtu||9000)+'" onchange="updateMTU(this.value)">'+
       '</div>'+
       '<div class="modal-hint">'+t('Default 9000 (jumbo frames). If you see download stalls or sites hanging, try 1500 or 1408. Takes effect on next connection.')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('TLS fragmentation (DPI bypass)')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-tlsfrag" '+(appSettingsJS.tls_fragment?'checked':'')+' onchange="toggleTLSFragment(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Splits the TLS handshake (ClientHello) into pieces so a DPI can\'t match the connection in a single packet. Helps when the server is alive but the handshake is being reset. xray protocols only (VLESS/VMess/Trojan/SS over TLS). Takes effect on next connection.')+'</div>'+
+      '<div id="tlsfrag-deps" style="'+(appSettingsJS.tls_fragment?'':'display:none')+'">'+
+        '<div class="modal-row">'+
+          '<span class="modal-row-label">'+t('Fragment length')+'</span>'+
+          '<input class="modal-input num-input" id="set-tlsfrag-len" style="width:110px" placeholder="100-200" value="'+x(appSettingsJS.tls_fragment_length||'')+'" onchange="updateTLSFragment(\'length\',this.value)">'+
+        '</div>'+
+        '<div class="modal-row">'+
+          '<span class="modal-row-label">'+t('Fragment interval (ms)')+'</span>'+
+          '<input class="modal-input num-input" id="set-tlsfrag-int" style="width:110px" placeholder="10-20" value="'+x(appSettingsJS.tls_fragment_interval||'')+'" onchange="updateTLSFragment(\'interval\',this.value)">'+
+        '</div>'+
+        '<div class="modal-hint">'+t('Ranges as "min-max" (or a single number). Defaults: length 100-200, interval 10-20. Leave empty to use the defaults.')+'</div>'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('TLS fingerprint (uTLS)')+'</span>'+
+        '<select class="modal-input" id="set-tlsfp" style="width:130px" onchange="updateTLSFingerprint(this.value)">'+tlsFpOptions(appSettingsJS.tls_fingerprint||'chrome')+'</select>'+
+      '</div>'+
+      '<div class="modal-hint">'+t("Which browser's TLS handshake xray imitates (uTLS) when a config has no fp= of its own — without it the connection uses an easily-fingerprinted TLS signature. Applies to TLS/Reality nodes. Default: chrome. Takes effect on next connection.")+'</div>'+
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">'+t('Statistics')+'</div>'+
@@ -3169,6 +3592,16 @@ function openSettings(){
         '<label class="toggle"><input type="checkbox" id="set-tray" '+(appSettingsJS.tray_enabled?'checked':'')+' onchange="toggleTray(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
       '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Launch at Windows startup')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-autostart" '+(appSettingsJS.autostart_enabled?'checked':'')+' onchange="toggleAutostart(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Starts Vair automatically when you log in to Windows, minimized to the tray. Off by default.')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Handle vair:// links')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-deeplink" '+(appSettingsJS.deep_link_enabled!==false?'checked':'')+' onchange="toggleDeepLink(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Registers the vair:// scheme so clicking a vair://import/… link (e.g. in a browser or Telegram) opens Vair and adds the subscription or config. On by default.')+'</div>'+
+      '<div class="modal-row">'+
         '<span class="modal-row-label">'+t('Verbose logs')+'</span>'+
         '<label class="toggle"><input type="checkbox" id="set-verbose-logs" '+(appSettingsJS.verbose_logs?'checked':'')+' onchange="toggleVerboseLogs(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
@@ -3198,6 +3631,20 @@ function openSettings(){
       '</div>'+
       '<input type="file" id="import-file" accept=".json,application/json" style="display:none" onchange="handleImportFile(event)">'+
       '<div class="modal-hint">'+t('Exports tabs, tab settings and app settings to a JSON file. Import replaces the current state — useful when moving Vair to another computer.')+' '+t('Turn the toggle off to import only the app settings and keep your existing tabs.')+'</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">'+t('Updates')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label" id="upd-version">Vair <b>'+x(APP_VERSION)+'</b></span>'+
+        '<button class="btn ghost sm" id="upd-check" onclick="checkUpdate()">'+t('Check for updates')+'</button>'+
+      '</div>'+
+      '<div class="modal-hint" id="upd-msg">'+t('Checks for a newer build and installs it (downloads through the tunnel when connected). The download is verified by checksum before it replaces the app.')+'</div>'+
+      '<div id="upd-progress-wrap" style="display:none"><div class="upd-bar"><div class="upd-fill" id="upd-fill"></div></div></div>'+
+      '<div class="modal-row" id="upd-apply-row" style="display:none">'+
+        '<span class="modal-row-label" id="upd-latest"></span>'+
+        '<button class="btn" id="upd-apply" onclick="applyUpdate()">'+t('Update now')+'</button>'+
+      '</div>'+
+      '<div class="upd-attrib">Vair · by <a onclick="openExtURL(\'https://github.com/lm705/vair\')">lm705</a></div>'+
     '</div>'+
     '<div class="modal-btns">'+
       '<button class="btn ghost" onclick="document.getElementById(\'settings-modal\').remove()">'+t('close')+'</button>'+
@@ -3422,7 +3869,7 @@ function openAuto(){
       '</div>'+
       '<div class="modal-hint">'+t('After a candidate tab refreshes its config list, re-run ping on its configs so failover can rank them by real delay. Adds some test traffic on each refresh.')+'</div>'+
       '<div class="modal-row">'+
-        '<span class="modal-row-label">'+t('Prefer faster (by speed test)')+'</span>'+
+        '<span class="modal-row-label">'+t('Prefer faster (by speed test)')+' <span class="rec-badge">'+t('recommended')+'</span></span>'+
         '<label class="toggle"><input type="checkbox" id="auto-rank-speed" '+(appSettingsJS.auto_rank_by_speed?'checked':'')+' onchange="autoToggle(\'auto_rank_by_speed\',this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
       '</div>'+
       '<div class="modal-hint">'+t('Rank candidates by measured download speed (Mbps) instead of ping delay. Configs without a speed result fall back to ping order.')+'</div>'+
@@ -3434,20 +3881,47 @@ function openAuto(){
       '</div>'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">'+t('Health-check interval (s)')+'</span>'+
-        '<input class="modal-input num-input" id="auto-health" type="number" min="5" max="600" value="'+(appSettingsJS.auto_health_sec||15)+'" onchange="autoNumChanged(\'auto_health_sec\',this.value,5,15)">'+
+        '<input class="modal-input num-input" id="auto-health" type="number" min="5" max="600" value="'+(appSettingsJS.auto_health_sec||15)+'" onchange="autoNumChanged(\'auto_health_sec\',this,5,15)">'+
       '</div>'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">'+t('Failure threshold')+'</span>'+
-        '<input class="modal-input num-input" id="auto-thresh" type="number" min="1" max="10" value="'+(appSettingsJS.auto_fail_threshold||2)+'" onchange="autoNumChanged(\'auto_fail_threshold\',this.value,1,2)">'+
+        '<input class="modal-input num-input" id="auto-thresh" type="number" min="1" max="10" value="'+(appSettingsJS.auto_fail_threshold||2)+'" onchange="autoNumChanged(\'auto_fail_threshold\',this,1,2)">'+
       '</div>'+
       '<div class="modal-hint">'+t('How often the live connection is probed, and how many checks in a row must fail before switching. Defaults: 15 s, 2.')+'</div>'+
       '<div class="modal-row">'+
         '<span class="modal-row-label">'+t('Max latency (ms, 0 = off)')+'</span>'+
-        '<input class="modal-input num-input" id="auto-maxlat" type="number" min="0" max="10000" value="'+(appSettingsJS.auto_max_latency_ms||0)+'" onchange="autoNumChanged(\'auto_max_latency_ms\',this.value,0,0)">'+
+        '<input class="modal-input num-input" id="auto-maxlat" type="number" min="0" max="10000" value="'+(appSettingsJS.auto_max_latency_ms||0)+'" onchange="autoNumChanged(\'auto_max_latency_ms\',this,0,0)">'+
       '</div>'+
       '<div class="modal-hint">'+t('Treat the current config as failing when the live probe is slower than this, then switch to the fastest available config. 0 disables the speed check.')+'</div>'+
     '</div>'+
     '</div>'+ // /auto-collapse-body
+    // Logs section: collapsible like Settings but collapsed by default. Source
+    // filter defaults to "vair". Labels stay English (logs are English-only).
+    '<div class="auto-collapse-head collapsed" id="auto-logs-toggle" onclick="toggleAutoLogs()" title="Show / hide logs">'+
+      '<span class="auto-collapse-arrow">▾</span><span>Logs</span>'+
+    '</div>'+
+    '<div class="auto-collapse-body collapsed" id="auto-logs-body">'+
+      '<div class="auto-log-head">'+
+        '<select class="log-sel" id="auto-log-src" onchange="renderAutoLogs()">'+
+          '<option value="">all</option>'+
+          '<option value="xray">xray</option>'+
+          '<option value="singbox">sing-box</option>'+
+          '<option value="vair" selected>vair</option>'+
+          '<option value="test">test</option>'+
+        '</select>'+
+        '<select class="log-sel" id="auto-log-lvl" onchange="renderAutoLogs()">'+
+          '<option value="">all</option>'+
+          '<option value="info">info+</option>'+
+          '<option value="warn">warn+</option>'+
+          '<option value="error">error</option>'+
+        '</select>'+
+        '<label class="log-auto"><input type="checkbox" id="auto-log-autoscroll" checked> auto-scroll</label>'+
+        '<div class="spacer" style="flex:1"></div>'+
+        '<button class="btn ghost" onclick="copyAutoLogs()">copy</button>'+
+        '<button class="btn ghost" onclick="clearAutoLogs()">clear</button>'+
+      '</div>'+
+      '<div class="log-view" id="auto-log-view"></div>'+
+    '</div>'+
     '<div class="modal-btns">'+
       '<button class="btn ghost auto-close-btn" onclick="closeAuto()">'+t('close')+'</button>'+
     '</div>'+
@@ -3461,6 +3935,18 @@ function openAuto(){
     var ab=document.getElementById('auto-settings-body');
     if(ah) ah.classList.add('collapsed');
     if(ab) ab.classList.add('collapsed');
+  }
+  // Logs section is collapsed by default (HTML ships with the class). If the
+  // user had expanded it before a re-render, restore that and fill the view.
+  if(autoLogsExpanded){
+    var lh=document.getElementById('auto-logs-toggle');
+    var lb=document.getElementById('auto-logs-body');
+    if(lh) lh.classList.remove('collapsed');
+    if(lb) lb.classList.remove('collapsed');
+    fetch('/api/logs').then(function(r){return r.json();}).then(function(arr){
+      if(Array.isArray(arr)) logBuf=arr.slice(-LOG_CAP);
+      renderAutoLogs();
+    }).catch(function(){ renderAutoLogs(); });
   }
   renderAutoStatus();
   loadAutoCands();
@@ -3479,6 +3965,77 @@ function toggleAutoSettings(){
   if(body) body.classList.toggle('collapsed',!autoSettingsExpanded);
   // In the detached window, re-fit the OS window to the new panel height.
   if(autoStandalone) resizeWindowToAutoPanel();
+}
+
+// ── AUTO window Logs section ──────────────────────────────────────────────
+// A second collapsible block under Settings, mirroring the main Logs dock but
+// living inside the AUTO panel (so the detached/standalone window has logs too).
+// Collapsed by default; the source filter defaults to "vair". It reuses the
+// shared logBuf + logLineHTML; only the view element and selectors are its own.
+var autoLogsExpanded=false;
+// selectionInEl: true when there's a live (non-collapsed) text selection inside
+// the given element — so a live log batch doesn't wipe a copy-in-progress.
+function selectionInEl(el){
+  if(!el) return false;
+  var sel=window.getSelection&&window.getSelection();
+  if(!sel || sel.rangeCount===0 || sel.isCollapsed) return false;
+  return el.contains(sel.anchorNode);
+}
+// renderAutoLogs rebuilds the AUTO log view from the buffer (open + filter change).
+function renderAutoLogs(){
+  var view=document.getElementById('auto-log-view');
+  if(!view) return;
+  var html='';
+  for(var i=0;i<logBuf.length;i++){ if(logPassesFilterFor(logBuf[i],'auto-log-src','auto-log-lvl')) html+=logLineHTML(logBuf[i]); }
+  view.innerHTML=html || '<div class="log-empty">No logs yet — connect to a config to see core output.</div>';
+  var auto=document.getElementById('auto-log-autoscroll');
+  if(!auto || auto.checked) view.scrollTop=view.scrollHeight;
+}
+// appendAutoLogs adds just the new batch to the AUTO log view (called from
+// onLogBatch). No-op unless the section is open and present.
+function appendAutoLogs(arr){
+  if(!autoLogsExpanded) return;
+  var view=document.getElementById('auto-log-view');
+  if(!view || selectionInEl(view)) return;
+  var auto=document.getElementById('auto-log-autoscroll');
+  var atBottom=view.scrollHeight-view.scrollTop-view.clientHeight < 40;
+  var html='';
+  for(var j=0;j<arr.length;j++){ if(logPassesFilterFor(arr[j],'auto-log-src','auto-log-lvl')) html+=logLineHTML(arr[j]); }
+  if(html){
+    view.insertAdjacentHTML('beforeend', html);
+    while(view.childElementCount>LOG_CAP) view.removeChild(view.firstChild);
+  }
+  if((!auto || auto.checked) && atBottom) view.scrollTop=view.scrollHeight;
+}
+function toggleAutoLogs(){
+  autoLogsExpanded=!autoLogsExpanded;
+  var head=document.getElementById('auto-logs-toggle');
+  var body=document.getElementById('auto-logs-body');
+  if(head) head.classList.toggle('collapsed',!autoLogsExpanded);
+  if(body) body.classList.toggle('collapsed',!autoLogsExpanded);
+  if(autoLogsExpanded){
+    // Refill from the server so lines emitted while collapsed aren't missed.
+    fetch('/api/logs').then(function(r){return r.json();}).then(function(arr){
+      if(Array.isArray(arr)) logBuf=arr.slice(-LOG_CAP);
+      renderAutoLogs();
+    }).catch(function(){ renderAutoLogs(); });
+  }
+  if(autoStandalone) resizeWindowToAutoPanel();
+}
+function copyAutoLogs(){
+  var lines=[];
+  for(var i=0;i<logBuf.length;i++){
+    var l=logBuf[i];
+    if(!logPassesFilterFor(l,'auto-log-src','auto-log-lvl')) continue;
+    lines.push(fmtLogTime(l.t)+' ['+logSrcLabel(l.src||'vair')+'] '+(l.msg||''));
+  }
+  navigator.clipboard.writeText(lines.join('\n')).catch(function(){});
+}
+function clearAutoLogs(){
+  logBuf=[];
+  renderAutoLogs();
+  if(typeof renderLogs==='function') renderLogs();
+  fetch('/api/logs/clear',{method:'POST'}).catch(function(){});
 }
 
 // autoConnectCand connects to a specific candidate the user clicked in the
@@ -3548,7 +4105,15 @@ function resizeWindowToAutoPanel(){
 
 function autoToggle(field,on){
   appSettingsJS[field]=on;
-  saveAppSettings();
+  // Only the AUTO master toggle may flip auto-connect on the server. It posts
+  // with ?auto=1 so the server applies the connect/disconnect side effects; a
+  // plain settings save (autostart, theme, …) never changes the AUTO state even
+  // if the client copy has drifted.
+  if(field==='auto_connect'){
+    fetch('/api/settings?auto=1',{method:'POST',body:JSON.stringify(appSettingsJS)}).catch(console.error);
+  } else {
+    saveAppSettings();
+  }
   refreshAutoBtn();
   renderAutoStatus();
 }
@@ -3569,10 +4134,11 @@ function autoModeChanged(v){
   saveAppSettings();
 }
 
-function autoNumChanged(field,raw,min,def){
-  var n=parseInt(raw,10);
-  if(isNaN(n)||n<min) n=def;
+function autoNumChanged(field,el,min,def){
+  var n=parseInt(el.value,10);
+  if(isNaN(n)||n<min) n=def; // blank / below-min restores the default
   appSettingsJS[field]=n;
+  el.value=n;                // snap the field back so the default is visible
   saveAppSettings();
 }
 
@@ -3733,6 +4299,102 @@ function toggleLogTests(on){
   appSettingsJS.log_tests=on;
   saveAppSettings();
 }
+// TLS fragmentation toggle + its length/interval params. Toggling reveals the
+// param fields. Takes effect on the next connection.
+function toggleTLSFragment(on){
+  appSettingsJS.tls_fragment=on;
+  var d=document.getElementById('tlsfrag-deps');
+  if(d) d.style.display=on?'':'none';
+  saveAppSettings();
+}
+function updateTLSFragment(which,v){
+  v=(v||'').trim();
+  if(which==='length') appSettingsJS.tls_fragment_length=v;
+  else appSettingsJS.tls_fragment_interval=v;
+  saveAppSettings();
+}
+// uTLS ClientHello fingerprint xray mimics for TLS/Reality (fallback when a
+// config has no fp= of its own). Default chrome; takes effect next connection.
+function tlsFpOptions(cur){
+  var opts=['chrome','firefox','safari','ios','android','edge','random','randomized'];
+  var html='';
+  for(var i=0;i<opts.length;i++){
+    html+='<option value="'+opts[i]+'"'+(opts[i]===cur?' selected':'')+'>'+opts[i]+'</option>';
+  }
+  return html;
+}
+function updateTLSFingerprint(v){
+  appSettingsJS.tls_fingerprint=v;
+  saveAppSettings();
+}
+// Autostart: persisted in settings; the server reconciles the Windows Run-key
+// (see applyAutostart) whenever settings are saved.
+function toggleAutostart(on){
+  appSettingsJS.autostart_enabled=on;
+  saveAppSettings();
+}
+// Deep-link scheme: persisted in settings; the server registers/removes the
+// vair:// registry entry (registerDeepLink) on save.
+function toggleDeepLink(on){
+  appSettingsJS.deep_link_enabled=on;
+  saveAppSettings();
+}
+
+// ── Self-update ─────────────────────────────────────────────────────────────
+function checkUpdate(){
+  var msg=document.getElementById('upd-msg');
+  var btn=document.getElementById('upd-check');
+  var applyRow=document.getElementById('upd-apply-row');
+  if(msg) msg.textContent=t('Checking…');
+  if(btn) btn.disabled=true;
+  fetch('/api/update/check').then(function(r){return r.json();}).then(function(j){
+    if(btn) btn.disabled=false;
+    var vr=document.getElementById('upd-version'); if(vr&&j.current) vr.innerHTML='Vair <b>'+x(j.current)+'</b>';
+    if(j.error){ if(msg) msg.textContent=t('Could not check for updates')+': '+x(j.error); return; }
+    if(j.available){
+      if(msg) msg.innerHTML=t('Update available')+': <b>'+x(j.latest)+'</b>'+(j.notes?(' — '+x(j.notes)):'');
+      if(applyRow){
+        applyRow.style.display='';
+        var lt=document.getElementById('upd-latest'); if(lt) lt.textContent=t('New version')+': '+j.latest;
+      }
+    } else {
+      if(msg) msg.textContent=t('You have the latest version.');
+      if(applyRow) applyRow.style.display='none';
+    }
+  }).catch(function(){ if(btn) btn.disabled=false; if(msg) msg.textContent=t('Could not check for updates'); });
+}
+function applyUpdate(){
+  if(!confirm(t('Download and install the update now? Vair will restart.'))) return;
+  var ab=document.getElementById('upd-apply'); if(ab) ab.disabled=true;
+  fetch('/api/update/apply',{method:'POST'}).catch(console.error);
+}
+// openExtURL opens a link in the user's default browser via the native binding
+// (the WebView itself must never navigate away from the app).
+function openExtURL(url){
+  if(typeof _goOpenURL==='function') _goOpenURL(url);
+  else { try{ window.open(url,'_blank'); }catch(e){} }
+}
+// onUpdateStatus renders the live progress of an in-flight update (SSE).
+function onUpdateStatus(p){
+  if(!p) return;
+  var msg=document.getElementById('upd-msg');
+  var wrap=document.getElementById('upd-progress-wrap');
+  var fill=document.getElementById('upd-fill');
+  var btn=document.getElementById('upd-check');
+  if(!msg) return; // Settings closed — nothing to render
+  switch(p.state){
+    case 'checking':    msg.textContent=t('Checking…'); break;
+    case 'downloading':
+      if(wrap) wrap.style.display='';
+      if(fill) fill.style.width=(p.pct||0)+'%';
+      msg.textContent=t('Downloading update')+' '+(p.msg||'')+' — '+(p.pct||0)+'%';
+      break;
+    case 'verifying':   msg.textContent=t('Verifying…'); break;
+    case 'ready':       msg.textContent=t('Update ready — restarting…'); break;
+    case 'uptodate':    if(wrap) wrap.style.display='none'; msg.textContent=t('You have the latest version.'); if(btn) btn.disabled=false; break;
+    case 'error':       if(wrap) wrap.style.display='none'; msg.textContent=t('Update failed')+': '+(p.msg||''); if(btn) btn.disabled=false; break;
+  }
+}
 
 // openStorageLocation asks the server to open %LOCALAPPDATA%\\vair in
 // Explorer — that's where tabs.json, settings.json and the extracted
@@ -3821,49 +4483,41 @@ function handleImportFile(ev){
 // Server clamps again on receive (defensive), but we mirror the bounds here
 // so the visible input value stays sensible if the user types past them.
 function updateConcurrency(kind, raw){
-  var v=parseInt(raw,10);
-  if(isNaN(v) || v<1) v=1;
-  if(kind==='ping'){
-    if(v>200) v=200;
-    appSettingsJS.ping_concurrency=v;
-    var inp=document.getElementById('set-ping-conc'); if(inp) inp.value=v;
-  } else {
-    if(v>100) v=100;
-    appSettingsJS.speed_concurrency=v;
-    var inp=document.getElementById('set-speed-conc'); if(inp) inp.value=v;
-  }
+  if(kind==='ping') appSettingsJS.ping_concurrency=clampNumSetting(raw,1,200,10,'set-ping-conc');
+  else appSettingsJS.speed_concurrency=clampNumSetting(raw,1,100,5,'set-speed-conc');
   saveAppSettings();
 }
 
+// clampNumSetting parses a numeric settings field. A BLANK or non-numeric value
+// restores the DEFAULT (so clearing a field reverts it to its default, not to
+// the minimum — the old behaviour); a valid value is clamped to [min,max]. The
+// resolved value is written back into the input (id) so the field visibly snaps
+// to it. Server-side accessors still re-validate, so this is purely UX.
+function clampNumSetting(raw,min,max,def,id){
+  raw=(raw==null?'':String(raw)).trim();
+  var v;
+  if(raw==='') v=def;
+  else { v=parseInt(raw,10); if(isNaN(v)) v=def; else if(v<min) v=min; else if(v>max) v=max; }
+  if(id){ var inp=document.getElementById(id); if(inp) inp.value=v; }
+  return v;
+}
 // updatePingTimeout / updateSpeedDuration store the test-duration knobs.
 // Bounds mirror minPingTimeoutMs / maxPingTimeoutMs / minSpeedDurationSec /
 // maxSpeedDurationSec on the Go side; out-of-range values fall back to the
 // compile-time defaults (1500 ms ping, 4 s speed) at measurement time.
 function updatePingTimeout(raw){
-  var v=parseInt(raw,10);
-  if(isNaN(v) || v<200) v=200;
-  if(v>10000) v=10000;
-  appSettingsJS.ping_timeout_ms=v;
-  var inp=document.getElementById('set-ping-timeout'); if(inp) inp.value=v;
+  appSettingsJS.ping_timeout_ms=clampNumSetting(raw,200,10000,1500,'set-ping-timeout');
   saveAppSettings();
 }
 // updateWarmupTimeout stores the warm-up request timeout. Bounds mirror
 // minWarmupTimeoutMs / maxWarmupTimeoutMs on the Go side; out-of-range falls
 // back to the compile-time default (4000 ms) at measurement time.
 function updateWarmupTimeout(raw){
-  var v=parseInt(raw,10);
-  if(isNaN(v) || v<200) v=200;
-  if(v>20000) v=20000;
-  appSettingsJS.warmup_timeout_ms=v;
-  var inp=document.getElementById('set-warmup-timeout'); if(inp) inp.value=v;
+  appSettingsJS.warmup_timeout_ms=clampNumSetting(raw,200,20000,4000,'set-warmup-timeout');
   saveAppSettings();
 }
 function updateSpeedDuration(raw){
-  var v=parseInt(raw,10);
-  if(isNaN(v) || v<1) v=1;
-  if(v>60) v=60;
-  appSettingsJS.speed_duration_sec=v;
-  var inp=document.getElementById('set-speed-duration'); if(inp) inp.value=v;
+  appSettingsJS.speed_duration_sec=clampNumSetting(raw,1,60,4,'set-speed-duration');
   saveAppSettings();
 }
 
@@ -3873,11 +4527,7 @@ function updateSpeedDuration(raw){
 // applyUIPrefs: 9–20 px, default 11. Out-of-range values fall back to
 // the default at apply time.
 function updateModalFontSize(raw){
-  var v=parseInt(raw,10);
-  if(isNaN(v) || v<9) v=9;
-  if(v>20) v=20;
-  appSettingsJS.modal_font_size=v;
-  var inp=document.getElementById('set-modal-fs'); if(inp) inp.value=v;
+  appSettingsJS.modal_font_size=clampNumSetting(raw,9,20,11,'set-modal-fs');
   applyUIPrefs();
   saveAppSettings();
 }
@@ -3892,11 +4542,7 @@ function updateTheme(v){
 // Windows build, re-applies it to the current monitor immediately (no-op while
 // maximized). On launch the Go side reads the saved value.
 function updateWindowSize(raw){
-  var v=parseInt(raw,10);
-  if(isNaN(v)||v<40) v=40;
-  if(v>100) v=100;
-  appSettingsJS.window_size_pct=v;
-  var inp=document.getElementById('set-win-size'); if(inp) inp.value=v;
+  appSettingsJS.window_size_pct=clampNumSetting(raw,40,100,80,'set-win-size');
   saveAppSettings(function(){
     if(typeof _goApplyWindowSize==='function') _goApplyWindowSize();
   });
@@ -4244,30 +4890,59 @@ function updateStaticHosts(raw){
 
 
 
+// ── chip-list helpers (shared by domains / proxy-domains / apps / exclude) ──
+// splitPasted breaks a pasted blob into entries on newlines, commas, semicolons
+// and tabs — the separators produced by the "copy as column" feature — but NOT
+// spaces (so paths like "C:\Program Files\app.exe" survive). One token → empty
+// so a single-value paste falls through to native editing.
+function splitPasted(text){
+  return (text||'').split(/[\r\n,;\t]+/).map(function(s){return s.trim();}).filter(Boolean);
+}
+function normDomain(v){ return (v||'').trim().toLowerCase().replace(/^https?:\/\//,'').replace(/\/.*$/,''); }
+function normApp(v){
+  var leaf=(v||'').trim().replace(/[\/\\]+$/,'');
+  var sep=Math.max(leaf.lastIndexOf('\\'), leaf.lastIndexOf('/'));
+  if(sep>=0) leaf=leaf.substring(sep+1);
+  return leaf.toLowerCase();
+}
+// chipPasteList handles a paste into an array-backed chip input: split, add each
+// (addFn returns true when it actually added), then save + re-render once. A
+// single-token paste is left to the native handler so the user can edit it.
+function chipPasteList(ev, addFn, renderFn){
+  var cd=ev.clipboardData||window.clipboardData;
+  var toks=splitPasted(cd?cd.getData('text'):'');
+  if(toks.length<2) return;
+  ev.preventDefault();
+  var any=false;
+  for(var i=0;i<toks.length;i++){ if(addFn(toks[i])) any=true; }
+  ev.target.value='';
+  if(any) saveAppSettings(renderFn);
+}
+
+function addDirectDomainValue(v){
+  v=normDomain(v); if(!v) return false;
+  if(!appSettingsJS.direct_domains)appSettingsJS.direct_domains=[];
+  for(var i=0;i<appSettingsJS.direct_domains.length;i++){ if(appSettingsJS.direct_domains[i].toLowerCase()===v) return false; }
+  appSettingsJS.direct_domains.push(v); return true;
+}
+function renderDomainChips(){
+  var wrap=document.getElementById('domain-chips'); var inp=document.getElementById('domain-input');
+  if(!wrap||!inp)return;
+  wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
+  for(var i=0;i<appSettingsJS.direct_domains.length;i++){
+    var sp=document.createElement('span');
+    sp.className='chip';sp.setAttribute('data-d',appSettingsJS.direct_domains[i]);
+    sp.innerHTML=x(appSettingsJS.direct_domains[i])+'<span class="chip-x" onclick="removeDomainChip(this)">x</span>';
+    wrap.insertBefore(sp,inp);
+  }
+}
 function domainChipKey(ev){
   if(ev.key!=='Enter')return;
   ev.preventDefault();
-  var val=ev.target.value.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/.*$/, '');
-  if(!val)return;
-  if(!appSettingsJS.direct_domains)appSettingsJS.direct_domains=[];
-  for(var i=0;i<appSettingsJS.direct_domains.length;i++){
-    if(appSettingsJS.direct_domains[i].toLowerCase()===val)return;
-  }
-  appSettingsJS.direct_domains.push(val);
+  if(addDirectDomainValue(ev.target.value)) saveAppSettings(renderDomainChips);
   ev.target.value='';
-  saveAppSettings(function(){
-    var wrap=document.getElementById('domain-chips');
-    var inp=document.getElementById('domain-input');
-    var chips=wrap.querySelectorAll('.chip');
-    chips.forEach(function(c){c.remove();});
-    for(var i=0;i<appSettingsJS.direct_domains.length;i++){
-      var sp=document.createElement('span');
-      sp.className='chip';sp.setAttribute('data-d',appSettingsJS.direct_domains[i]);
-      sp.innerHTML=x(appSettingsJS.direct_domains[i])+'<span class="chip-x" onclick="removeDomainChip(this)">x</span>';
-      wrap.insertBefore(sp,inp);
-    }
-  });
 }
+function domainChipPaste(ev){ chipPasteList(ev, addDirectDomainValue, renderDomainChips); }
 
 function removeDomainChip(el){
   var chip=el.parentElement;
@@ -4290,28 +4965,30 @@ function toggleProxyDomains(on){
   var w=document.getElementById('proxy-domain-chips'); if(w) w.style.opacity=on?'':'0.45';
   saveAppSettings();
 }
+function addProxyDomainValue(v){
+  v=normDomain(v); if(!v) return false;
+  if(!appSettingsJS.proxy_domains)appSettingsJS.proxy_domains=[];
+  for(var i=0;i<appSettingsJS.proxy_domains.length;i++){ if(appSettingsJS.proxy_domains[i].toLowerCase()===v) return false; }
+  appSettingsJS.proxy_domains.push(v); return true;
+}
+function renderProxyDomainChips(){
+  var wrap=document.getElementById('proxy-domain-chips'); var inp=document.getElementById('proxy-domain-input');
+  if(!wrap||!inp)return;
+  wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
+  for(var i=0;i<appSettingsJS.proxy_domains.length;i++){
+    var sp=document.createElement('span');
+    sp.className='chip';sp.setAttribute('data-pd',appSettingsJS.proxy_domains[i]);
+    sp.innerHTML=x(appSettingsJS.proxy_domains[i])+'<span class="chip-x" onclick="removeProxyDomainChip(this)">x</span>';
+    wrap.insertBefore(sp,inp);
+  }
+}
 function proxyDomainChipKey(ev){
   if(ev.key!=='Enter')return;
   ev.preventDefault();
-  var val=ev.target.value.trim().toLowerCase().replace(/^https?:\/\//,'').replace(/\/.*$/,'');
-  if(!val)return;
-  if(!appSettingsJS.proxy_domains)appSettingsJS.proxy_domains=[];
-  for(var i=0;i<appSettingsJS.proxy_domains.length;i++){ if(appSettingsJS.proxy_domains[i].toLowerCase()===val)return; }
-  appSettingsJS.proxy_domains.push(val);
+  if(addProxyDomainValue(ev.target.value)) saveAppSettings(renderProxyDomainChips);
   ev.target.value='';
-  saveAppSettings(function(){
-    var wrap=document.getElementById('proxy-domain-chips');
-    var inp=document.getElementById('proxy-domain-input');
-    if(!wrap||!inp)return;
-    wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
-    for(var i=0;i<appSettingsJS.proxy_domains.length;i++){
-      var sp=document.createElement('span');
-      sp.className='chip';sp.setAttribute('data-pd',appSettingsJS.proxy_domains[i]);
-      sp.innerHTML=x(appSettingsJS.proxy_domains[i])+'<span class="chip-x" onclick="removeProxyDomainChip(this)">x</span>';
-      wrap.insertBefore(sp,inp);
-    }
-  });
 }
+function proxyDomainChipPaste(ev){ chipPasteList(ev, addProxyDomainValue, renderProxyDomainChips); }
 function removeProxyDomainChip(el){
   var chip=el.parentElement;
   var d=chip.getAttribute('data-pd');
@@ -4326,37 +5003,30 @@ function updateBlocklistURL(v){
 }
 
 // Apps without VPN — process names matched by sing-box (TUN mode only).
+function addDirectAppValue(v){
+  var leaf=normApp(v); if(!leaf) return false;
+  if(!appSettingsJS.direct_apps)appSettingsJS.direct_apps=[];
+  for(var i=0;i<appSettingsJS.direct_apps.length;i++){ if(appSettingsJS.direct_apps[i].toLowerCase()===leaf) return false; }
+  appSettingsJS.direct_apps.push(leaf); return true;
+}
+function renderAppChips(){
+  var wrap=document.getElementById('app-chips'); var inp=document.getElementById('app-input');
+  if(!wrap||!inp)return;
+  wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
+  for(var i=0;i<appSettingsJS.direct_apps.length;i++){
+    var sp=document.createElement('span');
+    sp.className='chip';sp.setAttribute('data-a',appSettingsJS.direct_apps[i]);
+    sp.innerHTML=x(appSettingsJS.direct_apps[i])+'<span class="chip-x" onclick="removeAppChip(this)">x</span>';
+    wrap.insertBefore(sp,inp);
+  }
+}
 function appChipKey(ev){
   if(ev.key!=='Enter')return;
   ev.preventDefault();
-  // Strip whitespace + path; keep just the executable name. Case-insensitive.
-  var raw=ev.target.value.trim();
-  if(!raw)return;
-  // If user pastes a full path like C:\Program Files\Foo\foo.exe, take the leaf.
-  var leaf=raw.replace(/[\/\\]+$/,'');
-  var sep=Math.max(leaf.lastIndexOf('\\'), leaf.lastIndexOf('/'));
-  if(sep>=0) leaf=leaf.substring(sep+1);
-  leaf=leaf.toLowerCase();
-  if(!leaf)return;
-  if(!appSettingsJS.direct_apps)appSettingsJS.direct_apps=[];
-  for(var i=0;i<appSettingsJS.direct_apps.length;i++){
-    if(appSettingsJS.direct_apps[i].toLowerCase()===leaf)return;
-  }
-  appSettingsJS.direct_apps.push(leaf);
+  if(addDirectAppValue(ev.target.value)) saveAppSettings(renderAppChips);
   ev.target.value='';
-  saveAppSettings(function(){
-    var wrap=document.getElementById('app-chips');
-    var inp=document.getElementById('app-input');
-    if(!wrap||!inp)return;
-    wrap.querySelectorAll('.chip').forEach(function(c){c.remove();});
-    for(var i=0;i<appSettingsJS.direct_apps.length;i++){
-      var sp=document.createElement('span');
-      sp.className='chip';sp.setAttribute('data-a',appSettingsJS.direct_apps[i]);
-      sp.innerHTML=x(appSettingsJS.direct_apps[i])+'<span class="chip-x" onclick="removeAppChip(this)">x</span>';
-      wrap.insertBefore(sp,inp);
-    }
-  });
 }
+function appChipPaste(ev){ chipPasteList(ev, addDirectAppValue, renderAppChips); }
 
 function removeAppChip(el){
   var chip=el.parentElement;
@@ -4381,6 +5051,7 @@ function openSourcesSettings(){
   ov.innerHTML=
     '<div class="modal-box" id="tab-modal-box">'+
       '<div class="modal-title">'+t('Sources Settings')+'</div>'+
+      subInfoHtml(tab&&tab.subs)+
       '<div class="settings-section">'+
         '<div class="modal-label">'+t('Source URL (read-only)')+'</div>'+
         '<div id="src-url-list" class="modal-hint" style="margin:0">'+t('Loading…')+'</div>'+
@@ -4392,6 +5063,11 @@ function openSourcesSettings(){
         '</div>'+
         '<input class="modal-input" id="ms-src-refresh" type="number" min="0" value="'+(tab&&tab.refresh_min||0)+'" style="width:80px;'+(tab&&tab.refresh_disabled?'opacity:.45':'')+'">'+
         '<div class="modal-hint">'+t('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')+'</div>'+
+        '<div class="modal-row" style="margin-top:8px">'+
+          '<span class="modal-row-label">'+t('Test after auto-refresh')+'</span>'+
+          renderRefreshTestSel((tab&&tab.auto_refresh_test)||'','ms-src-refresh-test')+
+        '</div>'+
+        '<div class="modal-hint">'+t('After a scheduled auto-refresh (not a manual RELOAD), test the tab\'s configs in the background — ping only, or a full speed test.')+'</div>'+
       '</div>'+
       '<div class="settings-section">'+
         '<div class="modal-row" style="margin-bottom:6px">'+
@@ -4431,10 +5107,12 @@ function saveSourcesSettings(){
   var ef=collectExcludeFilter();
   var refreshDisabled=!document.getElementById('ms-src-refresh-on').checked;
   var excludeDisabled=!document.getElementById('ms-src-exclude-on').checked;
+  var refreshTestEl=document.getElementById('ms-src-refresh-test');
+  var refreshTest=refreshTestEl?refreshTestEl.value:'';
   document.getElementById('tab-modal').remove();
   fetch('/api/tab/set-url?id=main',{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({refresh_min:refreshMin,exclude_filter:ef,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled})
+    body:JSON.stringify({refresh_min:refreshMin,exclude_filter:ef,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled,auto_refresh_test:refreshTest})
   }).then(function(){rebuildTable();}).catch(console.error);
 }
 
@@ -4459,6 +5137,89 @@ function fmtBytes(n){
   return s+' '+units[i];
 }
 
+// ── Subscription info (Feature: parsed from sub headers / #-comments) ────────
+function fmtDateDM(unixSec){
+  var d=new Date(unixSec*1000);
+  function p(n){return (n<10?'0':'')+n;}
+  return p(d.getDate())+'.'+p(d.getMonth()+1)+'.'+d.getFullYear();
+}
+function subDaysLeft(unixSec){ return Math.ceil((unixSec*1000 - Date.now())/86400000); }
+// subLabel names a subscription for display: its title, else the host of its
+// source URL, else a generic fallback.
+function subLabel(sub){
+  if(sub.title) return sub.title;
+  if(sub.url){ try{ return new URL(sub.url).hostname; }catch(e){} }
+  return t('Subscription');
+}
+// subHasInfo reports whether a sub record is worth a block (any source with a
+// URL shows — so you can see which link loaded and which failed).
+function subHasInfo(s){ return !!(s && (s.url||s.title||s.total>0||s.expire>0||s.count>0||s.updated||s.update_interval||s.error||(s.notes&&s.notes.length))); }
+// subRows renders the detailed rows for ONE subscription (settings modal),
+// including the source URL it came from and a load error if the fetch failed.
+function subRows(sub){
+  var rows='';
+  if(sub.title) rows+='<div class="si-row"><b>'+x(sub.title)+'</b></div>';
+  if(sub.url) rows+='<div class="si-row si-dim si-url" title="'+x(sub.url)+'">'+x(sub.url)+'</div>';
+  if(sub.error){
+    return rows+'<div class="si-row si-warn">'+t('Failed to load')+': '+x(t(sub.error))+'</div>';
+  }
+  if(sub.total>0){
+    var used=(sub.upload||0)+(sub.download||0);
+    var pct=Math.min(100,Math.round(used/sub.total*100));
+    rows+='<div class="si-row">'+t('Traffic')+': '+x(fmtBytes(used))+' / '+x(fmtBytes(sub.total))+' ('+Math.max(0,100-pct)+'% '+t('left')+')'+
+      '<div class="si-bar"><div class="si-fill" style="width:'+pct+'%"></div></div></div>';
+  }
+  if(sub.expire>0){
+    var dl=subDaysLeft(sub.expire);
+    rows+='<div class="si-row'+(dl<=7?' si-warn':'')+'">'+t('Expires')+': '+fmtDateDM(sub.expire)+' ('+dl+' '+t('days')+')</div>';
+  }
+  if(sub.count>0) rows+='<div class="si-row si-dim">'+t('Configs')+': '+sub.count+'</div>';
+  if(sub.updated) rows+='<div class="si-row si-dim">'+t('Updated')+': '+x(sub.updated)+'</div>';
+  if(sub.update_interval) rows+='<div class="si-row si-dim">'+t('Update interval')+': '+x(sub.update_interval)+'</div>';
+  if(sub.notes&&sub.notes.length){
+    for(var k=0;k<sub.notes.length;k++) rows+='<div class="si-row si-dim si-note">'+x(sub.notes[k])+'</div>';
+  }
+  return rows;
+}
+// subInfoHtml renders the read-only block for the settings modals — one
+// sub-block per subscription (a tab can have several source URLs).
+function subInfoHtml(subs){
+  if(!subs||!subs.length) return '';
+  var blocks='';
+  for(var i=0;i<subs.length;i++){
+    if(!subHasInfo(subs[i])) continue;
+    blocks+='<div class="si-block'+(blocks?' si-sep':'')+'">'+subRows(subs[i])+'</div>';
+  }
+  if(!blocks) return '';
+  var n=subs.filter(subHasInfo).length;
+  return '<div class="settings-section"><div class="section-header">'+t('Subscription info')+(n>1?' ('+n+')':'')+'</div>'+blocks+'</div>';
+}
+// subBarSegment renders one subscription compactly for the bar above the table.
+function subBarSegment(sub){
+  var parts=['<span class="sb-title">'+x(subLabel(sub))+'</span>'];
+  if(sub.total>0){
+    var used=(sub.upload||0)+(sub.download||0);
+    var pct=Math.min(100,Math.round(used/sub.total*100));
+    parts.push('<span>'+x(fmtBytes(used))+' / '+x(fmtBytes(sub.total))+'</span>'+
+      '<span class="sb-bar"><span class="sb-fill" style="width:'+pct+'%"></span></span>');
+  }
+  if(sub.expire>0){
+    var dl=subDaysLeft(sub.expire);
+    parts.push('<span'+(dl<=7?' class="sb-warn"':'')+'>'+t('until')+' '+fmtDateDM(sub.expire)+' ('+dl+' '+t('days')+')</span>');
+  }
+  return parts.join('<span style="opacity:.4">·</span>');
+}
+// updateSubBar fills the compact bar above the table from the active tab's subs.
+function updateSubBar(){
+  var bar=document.getElementById('sub-bar');
+  if(!bar) return;
+  var tab=tabsList.find(function(t){return t.id===activeTabId;});
+  var subs=((tab&&tab.subs)||[]).filter(function(s){return s.title||s.total>0||s.expire>0;});
+  if(subs.length===0){ bar.style.display='none'; bar.innerHTML=''; return; }
+  bar.innerHTML=subs.map(function(s){return '<span class="sb-item">'+subBarSegment(s)+'</span>';}).join('');
+  bar.style.display='';
+}
+
 function renderFileList(){
   var wrap=document.getElementById('ms-files');
   if(!wrap) return;
@@ -4471,14 +5232,24 @@ function renderFileList(){
     var f=modalFiles[i];
     var pathTitle=f.path||f.name;
     var sz=typeof f.size==='number'?f.size:0;
-    html+='<div class="file-row'+(f.isNew?' new':'')+'" title="'+x(pathTitle)+'">'+
-      '<span class="file-ico">📄</span>'+
-      '<span class="file-name">'+x(f.name)+'</span>'+
-      '<span class="file-size">'+fmtBytes(sz)+'</span>'+
+    html+='<div class="file-line'+(f.disabled?' src-off':'')+'">'+
+      '<input type="checkbox" class="ms-url-on" '+(f.disabled?'':'checked')+' onchange="toggleModalFile(this,'+i+')" title="'+t('Enable / disable this source')+'">'+
+      '<div class="file-row'+(f.isNew?' new':'')+'" title="'+x(pathTitle)+'">'+
+        '<span class="file-ico">📄</span>'+
+        '<span class="file-name">'+x(f.name)+'</span>'+
+        '<span class="file-size">'+fmtBytes(sz)+'</span>'+
+      '</div>'+
       '<button class="url-rm" onclick="removeModalFile('+i+')" title="Remove">x</button>'+
       '</div>';
   }
   wrap.innerHTML=html;
+}
+// toggleModalFile flips a file source on/off (parallels the URL-row toggle).
+function toggleModalFile(cb,i){
+  if(i<0||i>=modalFiles.length) return;
+  modalFiles[i].disabled=!cb.checked;
+  var row=cb.closest('.file-line');
+  if(row) row.classList.toggle('src-off', !cb.checked);
 }
 
 function removeModalFile(i){
@@ -4524,11 +5295,12 @@ function openTabSettings(tabId){
   if(!tab)return;
   var urls=tab.source_urls||[];
   if(urls.length===0&&tab.source_url) urls=[tab.source_url];
+  var disabledUrls=tab.source_disabled||[];
   var urlsHtml='';
   for(var i=0;i<urls.length;i++){
-    urlsHtml+=urlRowHtml(urls[i]);
+    urlsHtml+=urlRowHtml(urls[i], disabledUrls.indexOf(urls[i])>=0);
   }
-  if(urls.length===0) urlsHtml=urlRowHtml('');
+  if(urls.length===0) urlsHtml=urlRowHtml('',false);
 
   var ef=tab.exclude_filter||[];
   var efFieldsHtml=renderExcludeFields(ef);
@@ -4544,6 +5316,7 @@ function openTabSettings(tabId){
       path: existing[i].path||'',
       size: typeof existing[i].size==='number'?existing[i].size:0,
       mtime: typeof existing[i].mtime==='number'?existing[i].mtime:0,
+      disabled: !!existing[i].disabled,
       isNew: false
     });
   }
@@ -4558,6 +5331,7 @@ function openTabSettings(tabId){
         '<div class="modal-label">'+t('Name')+'</div>'+
         '<input class="modal-input" id="ms-name" value="'+x(tab.name)+'" maxlength="40" style="margin-bottom:0">'+
       '</div>'+
+      subInfoHtml(tab.subs)+
       '<div class="settings-section">'+
         '<div class="modal-label">'+t('Source URLs (raw links, base64 subscriptions)')+'</div>'+
         '<div id="ms-urls">'+urlsHtml+'</div>'+
@@ -4569,11 +5343,32 @@ function openTabSettings(tabId){
       '</div>'+
       '<div class="settings-section">'+
         '<div class="modal-row" style="margin-bottom:6px">'+
+          '<span class="modal-label" style="margin:0">'+t('Import from GitHub (private repo)')+'</span>'+
+          '<label class="toggle"><input type="checkbox" id="ms-gh-on" '+(tab.github_enabled?'checked':'')+' onchange="ghToggleFields(this)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+        '</div>'+
+        '<div class="modal-hint">'+t('Pulls a config file from a private GitHub repository on every reload via a personal access token. Loaded after URLs and files.')+'</div>'+
+        '<div id="ms-gh-fields" style="'+(tab.github_enabled?'':'display:none')+'">'+
+          '<input class="modal-input" id="ms-gh-owner" placeholder="'+t('owner (user or organization)')+'" value="'+x(tab.github_owner||'')+'" autocomplete="off" autocapitalize="off" spellcheck="false">'+
+          '<input class="modal-input" id="ms-gh-repo" placeholder="'+t('repository name')+'" value="'+x(tab.github_repo||'')+'" autocomplete="off" autocapitalize="off" spellcheck="false">'+
+          '<input class="modal-input" id="ms-gh-file" placeholder="'+t('path to file, e.g. configs.txt')+'" value="'+x(tab.github_file||'')+'" autocomplete="off" autocapitalize="off" spellcheck="false">'+
+          '<div class="gh-pat-row">'+
+            '<input class="modal-input" id="ms-gh-pat" type="password" placeholder="'+t('personal access token (PAT)')+'" value="'+x(tab.github_pat||'')+'" autocomplete="off" autocapitalize="off" spellcheck="false">'+
+            '<button type="button" class="btn ghost gh-view-btn" id="ms-gh-view" onclick="ghTogglePatView()">'+t('view')+'</button>'+
+          '</div>'+
+        '</div>'+
+      '</div>'+
+      '<div class="settings-section">'+
+        '<div class="modal-row" style="margin-bottom:6px">'+
           '<span class="modal-label" style="margin:0">'+t('Auto-refresh interval (minutes, 0 = off)')+'</span>'+
           '<label class="toggle"><input type="checkbox" id="ms-refresh-on" '+(tab.refresh_disabled?'':'checked')+' onchange="dimToggle(this,\'ms-refresh\')"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
         '</div>'+
         '<input class="modal-input" id="ms-refresh" type="number" min="0" value="'+(tab.refresh_min||0)+'" style="width:80px;'+(tab.refresh_disabled?'opacity:.45':'')+'">'+
         '<div class="modal-hint">'+t('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')+'</div>'+
+        '<div class="modal-row" style="margin-top:8px">'+
+          '<span class="modal-row-label">'+t('Test after auto-refresh')+'</span>'+
+          renderRefreshTestSel(tab.auto_refresh_test||'')+
+        '</div>'+
+        '<div class="modal-hint">'+t('After a scheduled auto-refresh (not a manual RELOAD), test the tab\'s configs in the background — ping only, or a full speed test.')+'</div>'+
       '</div>'+
       '<div class="settings-section">'+
         '<div class="modal-row" style="align-items:flex-end">'+
@@ -4610,6 +5405,15 @@ function efChipHtml(v){
 // pressing Enter (same UX as "Custom domains without VPN"); each chip has an
 // x to remove it. saveTabSettings / saveSourcesSettings read the chips back
 // into "col:value" rules. Legacy bare name rules parse into the Name column.
+// renderRefreshTestSel builds the "Test after auto-refresh" dropdown (off / ping
+// / speed). id defaults to 'ms-refresh-test' (user tab); SOURCES passes its own.
+function renderRefreshTestSel(val, id){
+  id = id || 'ms-refresh-test';
+  function opt(v,label){ return '<option value="'+v+'"'+(val===v?' selected':'')+'>'+x(label)+'</option>'; }
+  return '<select class="modal-input num-input" id="'+id+'" style="width:auto;margin-bottom:0">'+
+    opt('', t('off'))+opt('ping', t('Ping only'))+opt('speed', t('Speed test'))+
+    '</select>';
+}
 function renderExcludeFields(rules){
   var byCol={name:[],type:[],host:[],transport:[],security:[]};
   if(rules && rules.length){
@@ -4629,7 +5433,7 @@ function renderExcludeFields(rules){
     html+='<div class="ef-field" data-col="'+col+'">'+
       '<div class="ef-field-tag">'+label+'</div>'+
       '<div class="chips-wrap" data-col="'+col+'">'+chips+
-        '<input class="chip-input ef-chip-input" data-col="'+col+'" placeholder="'+x(EXCLUDE_PLACEHOLDERS[col])+'" onkeydown="efChipKey(event)">'+
+        '<input class="chip-input ef-chip-input" data-col="'+col+'" placeholder="'+x(EXCLUDE_PLACEHOLDERS[col])+'" onkeydown="efChipKey(event)" onpaste="efChipPaste(event)">'+
       '</div>'+
     '</div>';
   }
@@ -4637,19 +5441,32 @@ function renderExcludeFields(rules){
 }
 // efChipKey turns the typed value into a chip on Enter. Modal-local only —
 // nothing is persisted until the user presses Save (which reads the chips).
-function efChipKey(ev){
-  if(ev.key!=='Enter')return;
-  ev.preventDefault();
-  var inp=ev.target;
-  var val=inp.value.trim();
-  if(!val)return;
+// efAddValue inserts one exclude-filter chip before the input (DOM-backed; the
+// values are read on save by collectExcludeFilter). Dedups case-insensitively.
+function efAddValue(inp, val){
+  val=(val||'').trim();
+  if(!val) return false;
   var wrap=inp.parentElement;
   var existing=wrap.querySelectorAll('.chip');
   for(var i=0;i<existing.length;i++){
-    if((existing[i].getAttribute('data-v')||'').toLowerCase()===val.toLowerCase()){ inp.value=''; return; }
+    if((existing[i].getAttribute('data-v')||'').toLowerCase()===val.toLowerCase()) return false;
   }
   inp.insertAdjacentHTML('beforebegin', efChipHtml(val));
-  inp.value='';
+  return true;
+}
+function efChipKey(ev){
+  if(ev.key!=='Enter')return;
+  ev.preventDefault();
+  efAddValue(ev.target, ev.target.value);
+  ev.target.value='';
+}
+function efChipPaste(ev){
+  var cd=ev.clipboardData||window.clipboardData;
+  var toks=splitPasted(cd?cd.getData('text'):'');
+  if(toks.length<2) return;
+  ev.preventDefault();
+  for(var i=0;i<toks.length;i++){ efAddValue(ev.target, toks[i]); }
+  ev.target.value='';
 }
 function removeEfChip(el){
   var chip=el.parentElement;
@@ -4678,14 +5495,21 @@ function collectExcludeFilter(){
   return ef;
 }
 // urlRowHtml renders one editable source-URL row for the tab settings modal:
-// the input, a QR button (encodes whatever's currently typed), and the remove
-// (x) button. Shared by the initial render and addURLRow so they stay in sync.
-function urlRowHtml(val){
-  return '<div class="url-row">'+
+// an enable/disable checkbox, the input, a QR button (encodes whatever's
+// currently typed), and the remove (x) button. Shared by the initial render and
+// addURLRow so they stay in sync.
+function urlRowHtml(val,disabled){
+  return '<div class="url-row'+(disabled?' src-off':'')+'">'+
+    '<input type="checkbox" class="ms-url-on" '+(disabled?'':'checked')+' onchange="toggleUrlRow(this)" title="'+t('Enable / disable this source')+'">'+
     '<input class="modal-input ms-url" value="'+x(val||'')+'" placeholder="https://raw.githubusercontent.com/...">'+
     '<button class="url-qr" onclick="qrFromRow(this)" title="'+t('QR')+'">QR</button>'+
     '<button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button>'+
   '</div>';
+}
+// toggleUrlRow dims a source row when its enable checkbox is cleared.
+function toggleUrlRow(cb){
+  var row=cb.closest('.url-row');
+  if(row) row.classList.toggle('src-off', !cb.checked);
 }
 // qrFromRow shows a QR of the URL currently typed in this row's input.
 function qrFromRow(btn){
@@ -4698,12 +5522,9 @@ function addURLRow(){
   var wrap=document.getElementById('ms-urls');
   if(!wrap)return;
   var div=document.createElement('div');
-  div.className='url-row';
-  div.innerHTML='<input class="modal-input ms-url" value="" placeholder="https://raw.githubusercontent.com/...">'+
-    '<button class="url-qr" onclick="qrFromRow(this)" title="'+t('QR')+'">QR</button>'+
-    '<button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button>';
-  wrap.appendChild(div);
-  div.querySelector('input').focus();
+  div.innerHTML=urlRowHtml('',false);
+  div=wrap.appendChild(div.firstChild);
+  div.querySelector('.ms-url').focus();
 }
 
 // renderDedupSeg returns HTML for the 3-state dedup selector shown in
@@ -4737,6 +5558,23 @@ function selectDedupMode(btn){
   btn.classList.add('active');
 }
 
+// ghToggleFields shows/hides the GitHub import inputs as the toggle flips, so
+// the fields only appear once the user opts in.
+function ghToggleFields(cb){
+  var f=document.getElementById('ms-gh-fields');
+  if(f) f.style.display=cb.checked?'':'none';
+}
+// ghTogglePatView flips the PAT field between hidden (password) and visible
+// (plain text). The token is masked by default; "view" reveals it, "hide"
+// re-masks.
+function ghTogglePatView(){
+  var inp=document.getElementById('ms-gh-pat');
+  var btn=document.getElementById('ms-gh-view');
+  if(!inp) return;
+  var show=inp.type==='password';
+  inp.type=show?'text':'password';
+  if(btn) btn.textContent=show?t('hide'):t('view');
+}
 function saveTabSettings(tabId){
   var name=document.getElementById('ms-name').value.trim();
   var refreshMin=parseInt(document.getElementById('ms-refresh').value)||0;
@@ -4748,11 +5586,15 @@ function saveTabSettings(tabId){
   var dedupMode='';
   var activeSeg=document.querySelector('#ms-dedup-seg .seg-btn.active');
   if(activeSeg) dedupMode=activeSeg.getAttribute('data-mode')||'';
-  var urlInputs=document.querySelectorAll('#ms-urls .ms-url');
-  var urls=[];
-  urlInputs.forEach(function(inp){
-    var v=inp.value.trim();
-    if(v) urls.push(v);
+  var urlRows=document.querySelectorAll('#ms-urls .url-row');
+  var urls=[], disabledUrls=[];
+  urlRows.forEach(function(row){
+    var inp=row.querySelector('.ms-url');
+    var v=inp?inp.value.trim():'';
+    if(!v) return;
+    urls.push(v);
+    var cb=row.querySelector('.ms-url-on');
+    if(cb && !cb.checked) disabledUrls.push(v);
   });
   // Exclude filter: chips added via Enter, read back into "col:value" rules.
   var ef=collectExcludeFilter();
@@ -4762,7 +5604,15 @@ function saveTabSettings(tabId){
   // wire — the server reads from disk on every fetch.
   var files=modalFiles
     .filter(function(f){ return !!f.path; })
-    .map(function(f){ return {name:f.name, path:f.path}; });
+    .map(function(f){ return {name:f.name, path:f.path, disabled:!!f.disabled}; });
+  // GitHub private-repo import fields.
+  var ghOnEl=document.getElementById('ms-gh-on');
+  var ghEnabled=ghOnEl?ghOnEl.checked:false;
+  function ghVal(id){ var el=document.getElementById(id); return el?el.value.trim():''; }
+  var ghOwner=ghVal('ms-gh-owner'), ghRepo=ghVal('ms-gh-repo');
+  var ghFile=ghVal('ms-gh-file'), ghPat=ghVal('ms-gh-pat');
+  var refreshTestEl=document.getElementById('ms-refresh-test');
+  var refreshTest=refreshTestEl?refreshTestEl.value:'';
   document.getElementById('tab-modal').remove();
   modalFiles=[];
   if(name){
@@ -4770,7 +5620,9 @@ function saveTabSettings(tabId){
   }
   fetch('/api/tab/set-url?id='+encodeURIComponent(tabId),{method:'POST',
     headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({urls:urls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup_mode:dedupMode,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled})
+    body:JSON.stringify({urls:urls,disabled_urls:disabledUrls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup_mode:dedupMode,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled,
+      auto_refresh_test:refreshTest,
+      github_enabled:ghEnabled,github_owner:ghOwner,github_repo:ghRepo,github_file:ghFile,github_pat:ghPat})
   }).then(function(){rebuildTable();}).catch(console.error);
 }
 
@@ -4845,15 +5697,19 @@ function toggleRowSelect(idx,e){
 document.addEventListener('paste', function(e){
   if(document.activeElement&&(document.activeElement.tagName==='INPUT'||document.activeElement.tagName==='TEXTAREA'))return;
   const text=(e.clipboardData||window.clipboardData).getData('text');
-  if(!pasteworthy(text))return;
+  var trimmed=(text||'').trim();
+  var isSub=looksLikeSubURL(trimmed);
+  if(!isSub && !pasteworthy(text))return;
   if(activeTabId==='main'){
     fetch('/api/tab/create',{method:'POST'}).then(r=>r.json()).then(tab=>{
       fetch('/api/tab/switch?id='+tab.id,{method:'POST'}).then(()=>{
-        fetch('/api/tab/paste?id='+tab.id,{method:'POST',body:text}).catch(console.error);
+        if(isSub) addSubToTabSource(tab.id, trimmed);
+        else fetch('/api/tab/paste?id='+tab.id,{method:'POST',body:text}).catch(console.error);
       });
     }).catch(console.error);
     return;
   }
+  if(isSub){ addSubToTabSource(activeTabId, trimmed); return; }
   fetch('/api/tab/paste?id='+activeTabId,{method:'POST',body:text}).catch(console.error);
 });
 

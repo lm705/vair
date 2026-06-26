@@ -1467,12 +1467,16 @@ func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, 
 		}
 		stream["xhttpSettings"] = sh
 	}
+	// Fall back to the configured uTLS fingerprint (default "chrome") when the
+	// config carries no fp=. Without a fingerprint xray uses Go's TLS stack,
+	// which DPI can fingerprint; chrome ClientHello camouflage is what
+	// v2rayN/Hiddify default to. A config's explicit fp= still wins.
+	if fingerprint == "" {
+		fingerprint = currentTLSFingerprint()
+	}
 	switch security {
 	case "tls":
-		tls := map[string]interface{}{"serverName": sni, "allowInsecure": allowInsecure}
-		if fingerprint != "" {
-			tls["fingerprint"] = fingerprint
-		}
+		tls := map[string]interface{}{"serverName": sni, "allowInsecure": allowInsecure, "fingerprint": fingerprint}
 		if alpn != "" {
 			tls["alpn"] = strings.Split(alpn, ",")
 		}
