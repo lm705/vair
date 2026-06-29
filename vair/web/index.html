@@ -468,7 +468,10 @@ tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px
 .sort-btn:hover{color:var(--text);border-color:var(--dim)}
 .sort-btn.active{color:var(--accent);border-color:var(--accent)}
 
-.tw{flex:1;overflow-y:auto}
+/* scrollbar-gutter:stable reserves the scrollbar's space permanently (with
+   overflow:auto, not scroll), so the sticky header columns don't jump sideways
+   when the scrollbar appears/disappears during a virtual-scroll rebuild. */
+.tw{flex:1;overflow-y:auto;scrollbar-gutter:stable}
 table{width:100%;border-collapse:collapse;table-layout:fixed}
 /* virtual scroll spacer rows — no borders, no hover */
 tbody tr.vspacer{background:transparent!important;border:0!important;pointer-events:none}
@@ -497,6 +500,11 @@ tbody tr.row-ct{background:var(--row-ct)!important;box-shadow:inset 3px 0 0 var(
 tbody tr.row-new{background:rgba(80,200,120,var(--flash-alpha,0))!important;box-shadow:inset 3px 0 0 var(--green)}
 .reload-toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 16px;font-size:13px;font-weight:800;letter-spacing:.04em;color:var(--text);z-index:9999;box-shadow:0 4px 16px rgba(0,0,0,.45);transition:opacity .45s;opacity:1;pointer-events:none}
 .reload-toast.fade{opacity:0}
+/* Startup "new version available" banner — a centered card below the title/conn
+   bar (not full-width, so it never covers the window controls). */
+.upd-banner{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:10000;display:flex;align-items:center;gap:14px;max-width:90%;padding:8px 14px;background:var(--bg2);border:1px solid var(--accent);border-radius:8px;color:var(--text);font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.5)}
+.upd-banner-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw}
+.upd-banner-btns{display:flex;gap:8px;align-items:center;flex-shrink:0}
 /* ── Logs dock panel ── */
 #log-panel{position:relative;flex-shrink:0;height:30vh;min-height:120px;display:flex;flex-direction:column;border-top:2px solid var(--border);background:var(--bg2)}
 .log-resize{position:absolute;top:-3px;left:0;right:0;height:6px;cursor:ns-resize;z-index:10}
@@ -579,6 +587,7 @@ body.auto-standalone header,
 body.auto-standalone .prog-area,
 body.auto-standalone .toolbar,
 body.auto-standalone .tw,
+body.auto-standalone #sub-bar,
 body.auto-standalone #conn-bar,
 body.auto-standalone #log-panel{display:none!important}
 /* The overlay becomes a normal flex item BENEATH the title bar (so the Vair
@@ -728,7 +737,7 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
   width:34px;height:34px;flex-shrink:0;
   display:flex;align-items:center;justify-content:center;
 }
-.tb-logo img{width:32px;height:32px;object-fit:contain;display:block;pointer-events:none;image-rendering:crisp-edges;}
+.tb-logo img{width:32px;height:32px;object-fit:contain;display:block;pointer-events:none;image-rendering:auto;}
 .tb-appname{
   font-size:13px;font-weight:700;color:var(--dim);
   letter-spacing:.05em;white-space:nowrap;
@@ -811,7 +820,7 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
   </div>
   <div class="toolbar-right">
     <span class="tl tl-lbl">filter</span>
-    <input class="finput" id="fi" placeholder="name / host / type / transport…" oninput="applyFilter()">
+    <input class="finput" id="fi" placeholder="name / host / type / transport…" title="Filter by name, host, type, transport or security. + combines conditions: germany+ws+tls needs all three (name, transport, security); germany+poland matches either (same column). Use field: to target a column, e.g. name:russia." oninput="applyFilter()">
     <span id="fc" style="font-size:11px;color:var(--dim)"></span>
     <span class="tl tl-lbl" style="margin-left:6px">type</span>
     <div class="proto-group" title="Click to filter by one type. Ctrl+click to multi-select.">
@@ -935,6 +944,11 @@ const I18N = {
     // stay visually consistent across languages.
     "Routing": "Маршрутизация",
     "Testing": "Тестирование",
+    "Ports": "Порты",
+    "HTTP proxy port": "Порт HTTP-прокси",
+    "SOCKS proxy port": "Порт SOCKS-прокси",
+    "Allow LAN access": "Доступ из локальной сети",
+    "Local proxy ports apps connect to. Defaults: HTTP 10819, SOCKS 10818. Allow LAN access lets other devices on your network use the proxy (binds 0.0.0.0 instead of 127.0.0.1) — only on a trusted network; SOCKS keeps its password, HTTP has none. Takes effect on next connection.": "Локальные порты прокси, к которым подключаются приложения. По умолчанию: HTTP 10819, SOCKS 10818. «Доступ из локальной сети» разрешает другим устройствам в твоей сети пользоваться прокси (слушает 0.0.0.0 вместо 127.0.0.1) — только в доверенной сети; SOCKS защищён паролем, HTTP — нет. Применяется при следующем подключении.",
     "Network": "Сеть",
     "Statistics": "Статистика",
     "Security": "Безопасность",
@@ -1003,6 +1017,10 @@ const I18N = {
     "Checking…": "Проверка…",
     "You have the latest version.": "У вас последняя версия.",
     "Update available": "Доступно обновление",
+    "New version available": "Доступна новая версия",
+    "Update": "Обновить",
+    "Don't show again": "Больше не показывать",
+    "Close": "Закрыть",
     "Could not check for updates": "Не удалось проверить обновления",
     "Downloading update": "Загрузка обновления",
     "Verifying…": "Проверка целостности…",
@@ -1249,6 +1267,7 @@ const I18N = {
     "configs": "конфигов",
     "Delete failed ping/speed": "Удалить с ошибкой ping/скорости",
     "Paste configs": "Вставить конфиги",
+    "Select all": "Выделить все",
     "Scan QR from screen": "Сканировать QR с экрана",
     "Scan QR from file": "Сканировать QR из файла",
     "No QR code found": "QR-код не найден",
@@ -1283,7 +1302,11 @@ const I18N = {
     "auto-connected": "авто-подключение",
 
     "cancel": "отмена",
-    "save": "сохранить"
+    "save": "сохранить",
+    "Loading configs…": "Загрузка конфигов…",
+    "Deleting configs…": "Удаление конфигов…",
+    "Changes apply automatically.": "Изменения применяются автоматически.",
+    "Filter by name, host, type, transport or security. + combines conditions: germany+ws+tls needs all three (name, transport, security); germany+poland matches either (same column). Use field: to target a column, e.g. name:russia.": "Фильтр по name, host, type, transport или security. + объединяет условия: germany+ws+tls требует все три (имя, транспорт, защита); germany+poland — любое из (один столбец). Префикс поле: задаёт столбец, например name:russia."
   }
 };
 
@@ -1318,17 +1341,14 @@ let selectedMode='proxy';
 const es=new EventSource('/api/stream');
 es.onmessage=e=>{
   const ev=JSON.parse(e.data);
-  // Filter tab-scoped events: ignore if event belongs to a different tab
+  // Filter tab-scoped events: ignore if event belongs to a different tab. (The
+  // per-tab snapshot cache is gone — switching a tab re-fetches its window, so
+  // there's nothing to invalidate for inactive tabs.)
   const evTab=ev.tab||'';
   const tabMatch=!evTab||evTab===activeTabId;
-  // Per-tab cache invalidation: any data-change event for a tab we're NOT
-  // currently viewing means our cached snapshot of it is stale, so the next
-  // switch to it must re-fetch instead of rendering the cache (see switchTab).
-  if(evTab && evTab!==activeTabId && (ev.type==='entry_update'||ev.type==='loaded'||ev.type==='loading')){
-    tabDirty[evTab]=true;
-  }
-  if     (ev.type==='loading'&&tabMatch)             onLoading();
-  else if(ev.type==='loaded'&&tabMatch)              onLoaded(ev.payload);
+  if     (ev.type==='loading'){ if(evTab) fetchingTabs.add(evTab); if(tabMatch) onLoading(ev.payload); }
+  else if(ev.type==='loaded'){ if(evTab) fetchingTabs.delete(evTab); if(tabMatch) onLoaded(ev.payload); }
+  else if(ev.type==='reload_delta'&&tabMatch)        onReloadDelta(ev.payload);
   else if(ev.type==='entry_update'){
     // Capture the connected config's ping for the conn-bar chip even when
     // this update is for a non-active tab; only feed the table on a match.
@@ -1355,6 +1375,9 @@ es.onmessage=e=>{
   else if(ev.type==='auto_update')                   onAutoUpdate(ev.payload);
 };
 loadAppSettings();
+// Quiet startup update check — shows the banner only when a newer build is
+// published AND the user hasn't dismissed it (server computes j.notify).
+setTimeout(checkUpdateStartup, 4000);
 
 // ── Logs panel ─────────────────────────────────────────────────────
 // Client-side ring of recent log lines (mirrors the server cap). Fed live
@@ -1523,7 +1546,7 @@ function onAppInfo(info){
     tunBtn.classList.remove('off');
     tip.style.display='none';
   }
-  rebuildTable();
+  renderVisibleRows();
 }
 
 function setMode(m){
@@ -1537,7 +1560,7 @@ function setMode(m){
   document.getElementById('mp-proxy').className='mpill'+(m==='proxy'?' sel-proxy':'');
   document.getElementById('mp-tun').className  ='mpill'+(m==='tun'?' sel-tun':'')
     +(!appInfo.singbox_available||!appInfo.is_admin?' off':'');
-  rebuildTable();
+  renderVisibleRows();
 }
 
 // ── connection bar ─────────────────────────────────────────────────
@@ -1643,19 +1666,19 @@ function onConnUpdate(cs){
     ports.style.display='none'; btnDc.style.display='none';
   }
 
-  // highlight row — findConnIdx matches by raw within the active tab, so the
-  // connected row lights up on any tab that contains this config (-1 when it
-  // isn't present here), not only the tab it was connected from.
-  // Chain: every hop row is highlighted (matched by raw against chain_raws),
-  // not just the entry — so the user sees the whole path lit up.
+  // highlight row — findConnIdx matches by body (raw without the #name), so the
+  // row lights up on any tab that contains this config even under a different
+  // name (-1 when it isn't present here). Chain: every hop row is highlighted.
   document.querySelectorAll('tbody tr.row-cp,tbody tr.row-ct').forEach(r=>{r.classList.remove('row-cp','row-ct')});
   if(cs.status==='connected'||cs.status==='connecting'){
     const cls=cs.mode==='tun'?'row-ct':'row-cp';
     if(cs.chain_raws&&cs.chain_raws.length){
-      // Light up each hop present on the active tab.
+      // Light up each hop present on the active tab (by body, so a differently
+      // named copy of a hop still lights).
       cs.chain_raws.forEach(function(raw){
+        var rb=rawBody(raw);
         for(var i=0;i<sortedList.length;i++){
-          if(sortedList[i].raw===raw){ var rw=document.getElementById('r'+sortedList[i].index); if(rw)rw.classList.add(cls); break; }
+          if(sortedList[i]&&rawBody(sortedList[i].raw)===rb){ var rw=document.getElementById('r'+sortedList[i].index); if(rw)rw.classList.add(cls); break; }
         }
       });
     } else {
@@ -1677,7 +1700,7 @@ function onConnUpdate(cs){
   const sig = cs.status+'|'+cs.mode+'|'+cs.entry_index+'|'+(cs.conn_tab||'')+'|'+(cs.conn_raw||'')+'|'+((cs.chain_raws||[]).join(','));
   if(sig !== prevConnSig){
     prevConnSig = sig;
-    rebuildTable();
+    renderVisibleRows();
   }
   updateConnPing();
   // Keep the Auto panel status block in sync with the live connection (e.g.
@@ -1793,89 +1816,188 @@ function onStatsUpdate(s){
 }
 
 // ── data ───────────────────────────────────────────────────────────
-function onLoading(){
+function onLoading(payload){
   document.getElementById('msg-area').style.display='flex';
   document.getElementById('tbl').style.display='none';
-  document.getElementById('msg-area').innerHTML='<div class="ico"><span class="spinner"></span></div><p>Loading configs…</p>';
+  var msg=(payload&&payload.op==='delete')?t('Deleting configs…'):t('Loading configs…');
+  document.getElementById('msg-area').innerHTML='<div class="ico"><span class="spinner"></span></div><p>'+msg+'</p>';
 }
-// prevRawsByTab remembers the raw set last seen for each tab so a RELOAD can
-// diff against it and highlight what changed. flashNewIdx holds the indices
-// of just-added configs to flash for a couple of seconds.
-let prevRawsByTab={};
-// Per-tab entries cache (point-1 optimization): switching back to a tab whose
-// data hasn't changed renders from this snapshot instead of re-fetching +
-// re-parsing the whole list (the cause of the 1-2s freeze on huge tabs).
-// tabDirty[id] is set whenever a data-change event arrives for an inactive tab,
-// so a cached render is only used when it's provably current. pendingCacheRender
-// holds the id we're switching to via cache, applied in onActiveTab.
-let tabCache={};
-let tabDirty={};
-let pendingCacheRender=null;
-let flashNewIdx=new Set();
-// Set when adding a subscription source, so the reload it triggers doesn't pop a
-// "+N" delta toast on top of the "Subscription added" one. One-shot.
+// ── Windowed table state ───────────────────────────────────────────────────
+// The client no longer holds the whole config list. The store (SQLite) serves
+// windows via /api/tab/window with server-side sort/filter/proto/dedup/favorites.
+// sortedList (declared below) is SPARSE — length = totalRows, only loaded windows
+// are populated; the rest render as light placeholders until scrolled into view.
+let totalRows=0;            // total rows in the current filtered view (from server)
+let tabTotal=0;             // total configs in the tab, unfiltered (for "matching / total")
+let posByIndex=new Map();   // entry index → position in sortedList (loaded rows only)
+let selData={};             // entry index → raw, captured at selection (cross-window copy/chain)
+let winFetching={};         // window index → true while its fetch is in flight
+let viewSeq=0;              // bumped on every reloadView; stale window responses are dropped
+let winStats={total:0,ok:0,err:0,min_ping:0,max_speed:0};
+const WIN=800;             // rows fetched per window (bigger = fewer fetches while scrolling)
+let flashNewIdx=new Set();  // indices of rows added by the last reload; buildRow lights them while the flash fades
+let fetchingTabs=new Set(); // tab IDs with a reload in flight — switching back to one keeps the spinner (set/cleared by loading/loaded events)
+// Set when adding a subscription source. The reload-delta toast is gone under
+// windowing, but the flag is still set/cleared by addSubscription — harmless.
 var suppressReloadDeltaOnce=false;
-function onLoaded(list){
-  Object.keys(entries).forEach(k=>delete entries[k]);
-  document.getElementById('tb').innerHTML='';
-  list.forEach(e=>entries[e.index]=e);
-  document.getElementById('msg-area').style.display='none';
-  document.getElementById('tbl').style.display='';
-  selectedRows.clear();
-  // dupBodyIndices is consulted by matches() ONLY in "hide" mode, and building it
-  // is a sort + per-entry string pass. Computing it on every load made switching
-  // to a huge tab freeze for a second or two. Compute it only when this tab
-  // actually hides duplicates; onTabsUpdate re-runs it if the user flips to hide.
-  var _at=tabsList.find(function(t){return t.id===activeTabId;});
-  if(_at && _at.dedup_mode==='hide') recomputeDupIndices();
-  else dupBodyIndices=new Set();
-  // Reset progress bar if we switched to a different tab than the one being tested
-  if(bulkProgressTab&&bulkProgressTab!==activeTabId) setBar(0);
 
-  // RELOAD change highlight: compare against this tab's previous raw set.
-  // First time a tab is loaded in a session there's no baseline (no flash);
-  // a later reload of the same tab flashes added rows and toasts +N/−M.
-  var tabKey=activeTabId;
-  var newRaws=list.map(function(e){return e.raw;});
-  var prev=prevRawsByTab[tabKey];
-  flashNewIdx=new Set();
-  if(prev){
-    var prevSet=new Set(prev), newSet=new Set(newRaws);
-    var added=0, removed=0;
-    list.forEach(function(e){ if(!prevSet.has(e.raw)){ flashNewIdx.add(e.index); added++; } });
-    prev.forEach(function(r){ if(!newSet.has(r)) removed++; });
-    if(added>0||removed>0){
-      if(suppressReloadDeltaOnce) suppressReloadDeltaOnce=false; // adding a subscription shows its own toast
-      else showReloadDelta(added,removed);
-    }
-    if(flashNewIdx.size>0) startFlashFade();
-  }
-  prevRawsByTab[tabKey]=newRaws;
-  tabDirty[tabKey]=false; // freshly loaded from the server → cache is current again
+function clearEntries(){ for(var k in entries) delete entries[k]; }
 
-  rebuildTable();
+// winQuery builds the shared query string for the active tab's window/stats.
+function winQuery(extra){
+  var p='id='+encodeURIComponent(activeTabId||'')+'&sort='+encodeURIComponent(sortMode||'idx');
+  if(filterText) p+='&filter='+encodeURIComponent(filterText);
+  if(protoFilter && protoFilter.size>0) p+='&proto='+encodeURIComponent([...protoFilter].join(','));
+  return p+(extra||'');
 }
-// startFlashFade animates the global --flash-alpha from a peak down to 0 over
-// ~2.6s. Because the rows read this variable (rather than running their own
-// animation), the glow stays in sync across all flashed rows and does not
-// restart when a row is re-created during virtual scrolling. At the end it
-// clears the flash set and rebuilds once so the class is dropped.
-let flashRAF=0;
-function startFlashFade(){
-  if(flashRAF) cancelAnimationFrame(flashRAF);
-  var start=Date.now(), dur=2600, peak=0.28;
-  var root=document.documentElement;
-  function step(){
-    var t=(Date.now()-start)/dur;
-    if(t>=1){
-      root.style.setProperty('--flash-alpha','0');
-      flashRAF=0; flashNewIdx=new Set(); rebuildTable();
-      return;
-    }
-    root.style.setProperty('--flash-alpha', (peak*(1-t)).toFixed(3));
-    flashRAF=requestAnimationFrame(step);
+
+// applyStats writes the five header counters from a server stats object.
+function applyStats(s){
+  s=s||{}; winStats=s;
+  document.getElementById('s-tot').textContent=s.total||0;
+  document.getElementById('s-ok').textContent =s.ok||0;
+  document.getElementById('s-er').textContent =s.err||0;
+  var mp=s.min_ping||0, sp=s.max_speed||0;
+  document.getElementById('s-ms').textContent=mp>0?(mp+'ms'):'—';
+  document.getElementById('s-sp').textContent=sp>0?(sp.toFixed(1)+' MB/s'):'—';
+}
+
+// fillWindow stores a fetched window's rows into the sparse list + lookups, and
+// bumps _dataVer so renderVisibleRows can't skip the repaint that shows them.
+function fillWindow(offset, rows){
+  for(var i=0;i<rows.length;i++){
+    var e=rows[i], pos=offset+i;
+    sortedList[pos]=e;
+    posByIndex.set(e.index,pos);
+    entries[e.index]=e;
   }
-  flashRAF=requestAnimationFrame(step);
+  if(rows.length) _dataVer++;
+}
+
+// reloadView is the single entry point for "the view changed" (tab switch,
+// sort/filter/proto/dedup/favorites change, or a server 'loaded' signal). It
+// re-fetches the window covering the current scroll position plus total + stats,
+// dropping windows loaded for the previous view. resetScroll=true jumps to the
+// top (fresh tab/sort/filter); false keeps the scroll (live re-sort during a test).
+function reloadView(resetScroll){
+  var seq=++viewSeq;
+  var tw=document.querySelector('.tw');
+  if(resetScroll && tw) tw.scrollTop=0;
+  var first=0;
+  if(tw && !resetScroll) first=Math.max(0, Math.floor(tw.scrollTop/rowHeight)-VBUFFER);
+  var off=Math.floor(first/WIN)*WIN;
+  // Fetch total+stats (full-table aggregate) only on a fresh view or when the
+  // total is unknown. A live re-sort during a test (resetScroll=false) keeps the
+  // existing total and lets scheduleStatsRefresh update counters — so it doesn't
+  // full-scan the tab every 250 ms.
+  var wantMeta=resetScroll||totalRows<=0;
+  fetch('/api/tab/window?'+winQuery((wantMeta?'&meta=1':'')+'&offset='+off+'&limit='+WIN)).then(r=>r.json()).then(function(d){
+    if(seq!==viewSeq) return; // superseded by a newer reload
+    winFetching={};
+    allIndices=null; allPos=null; // the order changed — drop the cached full index list
+    if(wantMeta){ totalRows=d.total||0; tabTotal=(typeof d.tab_total==='number'?d.tab_total:totalRows); applyStats(d.stats); }
+    if(off>totalRows) off=0;  // view shrank past our scroll → fall back to top
+    sortedList=new Array(totalRows);
+    posByIndex=new Map();
+    clearEntries();
+    fillWindow(off, d.rows||[]);
+    document.getElementById('msg-area').style.display='none';
+    document.getElementById('tbl').style.display='';
+    var filtering=!!(filterText||(protoFilter&&protoFilter.size>0));
+    // While filtering, show "matching / total" (total = all configs in the tab).
+    document.getElementById('fc').textContent=filtering?(totalRows+' / '+tabTotal):'';
+    visibleWindow={start:0,end:0};
+    // Fresh view (tab switch / sort / filter change) → wipe the tbody for a clean
+    // slate at the top. A KEEP-SCROLL re-render (live re-sort during a test) must
+    // NOT wipe it: clearing the tbody collapses the scroll height to 0, which
+    // makes the browser clamp scrollTop to 0 — that's the "list keeps jumping back
+    // to the top while a ping/speed test runs" bug. renderVisibleRows reconciles
+    // the existing rows in place and keeps the spacers (so scrollTop survives).
+    if(resetScroll) resetRender();
+    renderVisibleRows();
+  }).catch(function(err){ if(seq===viewSeq) console.error('reloadView',err); });
+}
+
+// ensureWindow fetches any not-yet-loaded windows covering [first,last) then
+// re-renders. Dedup'd via winFetching; stale responses dropped via viewSeq.
+// Called only from the throttled scheduleEnsure — never per scroll frame — so a
+// fast fling doesn't fire a fetch (+ fillWindow of 400 rows + re-render) for every
+// window it flies past; we load the window you actually land on / pause over.
+function ensureWindow(first,last){
+  if(totalRows<=0) return;
+  var w0=Math.floor(first/WIN), w1=Math.floor(Math.max(first,last-1)/WIN);
+  for(var w=w0;w<=w1;w++){
+    var off=w*WIN;
+    if(winFetching[w]) continue;
+    if(sortedList[off]!==undefined) continue; // window already loaded
+    (function(wi,offset){
+      winFetching[wi]=true;
+      var seq=viewSeq;
+      fetch('/api/tab/window?'+winQuery('&offset='+offset+'&limit='+WIN)).then(r=>r.json()).then(function(d){
+        delete winFetching[wi];
+        if(seq!==viewSeq) return;
+        fillWindow(offset, d.rows||[]);
+        // Only repaint if this window is actually on screen now; a window that
+        // finished loading after the user scrolled past it needs no paint.
+        if(offset < visibleWindow.end && offset+WIN > visibleWindow.start) renderVisibleRows();
+      }).catch(function(){ delete winFetching[wi]; });
+    })(w,off);
+  }
+}
+
+// ensureVisible loads the window(s) under the CURRENT scroll position, and
+// PREFETCHES the adjacent windows so scrolling into them is instant (no
+// placeholder flash) — the "loads instantly" feel. Already-loaded / in-flight
+// windows are skipped inside ensureWindow, so the prefetch is cheap.
+function ensureVisible(){
+  var tw=document.querySelector('.tw');
+  if(!tw||totalRows<=0) return;
+  var first,last;
+  if(totalRows<=100){ first=0; last=totalRows; }
+  else {
+    first=Math.max(0, Math.floor(tw.scrollTop/rowHeight)-VBUFFER);
+    last=Math.min(totalRows, Math.ceil((tw.scrollTop+tw.clientHeight)/rowHeight)+VBUFFER);
+  }
+  ensureWindow(first,last);
+  if(!_scrollFast){ // don't prefetch windows we're only flying past
+    ensureWindow(last, Math.min(totalRows, last+WIN));   // next window ahead
+    ensureWindow(Math.max(0, first-WIN), first);          // previous window
+  }
+}
+// scheduleEnsure throttles window loading to ~once/100ms (leading + trailing), so
+// continuous scrolling still loads incrementally but a fast fling collapses to a
+// handful of fetches instead of one per window crossed.
+let _ensureTimer=null,_ensureLast=0;
+function scheduleEnsure(){
+  var now=Date.now(), since=now-_ensureLast;
+  if(since>=45){ _ensureLast=now; ensureVisible(); }
+  else if(!_ensureTimer){
+    _ensureTimer=setTimeout(function(){ _ensureTimer=null; _ensureLast=Date.now(); ensureVisible(); }, 45-since);
+  }
+}
+
+// scheduleStatsRefresh debounces a stats-only re-fetch (used while a test streams
+// entry_update events — the counters live on the server now).
+let _statsTimer=null;
+function scheduleStatsRefresh(){
+  if(_statsTimer) return;
+  _statsTimer=setTimeout(function(){
+    _statsTimer=null;
+    var seq=viewSeq;
+    fetch('/api/tab/window?'+winQuery('&meta=1&offset=0&limit=1')).then(r=>r.json()).then(function(d){
+      if(seq===viewSeq) applyStats(d.stats);
+    }).catch(function(){});
+  },700); // stats are a full-table aggregate; during a test they compete with
+          // result writes, so coalesce a bit more loosely than the row updates.
+}
+// onLoaded is now a lightweight trigger: the server stopped pushing the full
+// list (payload is null), so we just re-fetch the active tab's first window.
+// The reload-delta flash (+N/−M) is dropped — diffing a full list is
+// incompatible with windowing; the server could return added/removed later.
+function onLoaded(payload){
+  selectedRows.clear(); selData={};
+  if(bulkProgressTab&&bulkProgressTab!==activeTabId) setBar(0);
+  reloadView(true);
 }
 // showToastEl renders a single centered toast, REPLACING any already on screen
 // (they share one fixed position, so without this rapid messages — e.g. pasting
@@ -1909,84 +2031,71 @@ function showReloadDelta(added,removed){
   if(parts.length===0)return;
   showToastEl(parts.join('   '));
 }
+// onReloadDelta shows the "+N −M" toast the server computes on a RELOAD (added /
+// removed configs vs the previous set). Suppressed once right after adding a
+// subscription, which shows its own toast.
+function onReloadDelta(p){
+  if(!p) return;
+  if(suppressReloadDeltaOnce){ suppressReloadDeltaOnce=false; return; }
+  showReloadDelta(p.added||0, p.removed||0);
+  // Flash the freshly-added rows green as they scroll into view. We hold the new
+  // indices and re-render the window so any currently visible new rows light up;
+  // the rest light up when scrolled to, until the glow fades.
+  if(p.idx && p.idx.length){
+    flashNewIdx=new Set(p.idx);
+    reloadView(true);
+    animateFlash();
+  }
+}
+// animateFlash drives the single global --flash-alpha from a visible green down
+// to 0 over ~1.8s (see the .row-new rule). Reading one variable — rather than a
+// per-row CSS keyframe — means rows re-rendered mid-scroll show the current alpha
+// instead of restarting the glow. When it ends we drop flashNewIdx and repaint so
+// the rows lose the highlight class.
+let _flashRAF=0;
+function animateFlash(){
+  if(_flashRAF) cancelAnimationFrame(_flashRAF);
+  var start=performance.now(),dur=1800;
+  function step(now){
+    var k=Math.min(1,(now-start)/dur);
+    document.documentElement.style.setProperty('--flash-alpha',(0.28*(1-k)).toFixed(3));
+    if(k<1){ _flashRAF=requestAnimationFrame(step); }
+    else{
+      _flashRAF=0;
+      document.documentElement.style.setProperty('--flash-alpha','0');
+      flashNewIdx.clear();
+      renderVisibleRows();
+    }
+  }
+  _flashRAF=requestAnimationFrame(step);
+}
 function onUpdate(e){
-  entries[e.index]=e;
-  // Keep sortedList's object reference fresh (virtual scroll renders from it on
-  // scroll-back) — O(1) via sortedPos instead of an O(n) scan per event. The
-  // index-match guard makes a stale map a no-op rather than a wrong write; the
-  // entry just isn't refreshed in that view until the next rebuild (can't
-  // happen in practice — sortedPos is rebuilt with sortedList).
-  var pos=sortedPos.get(e.index);
-  if(pos!==undefined && sortedList[pos] && sortedList[pos].index===e.index) sortedList[pos]=e;
-  updateRow(e.index);
-  // Header counters are coalesced (recomputed once per ~120ms) rather than on
-  // every event — see scheduleRecalcStats.
-  scheduleRecalcStats();
+  // A rename changes the raw (the name lives in the URL fragment). Favorites are
+  // keyed by body now, so they're unaffected; the "last" badge is keyed by the
+  // full raw, so migrate it (the server migrates its own copy).
+  var prev=entries[e.index];
+  if(prev && prev.raw && e.raw && prev.raw!==e.raw && lastConnectedRaw===prev.raw){
+    lastConnectedRaw=e.raw;
+  }
+  // Update the row in place if its config is in a loaded window; otherwise the
+  // change is picked up when that window is (re)fetched on scroll.
+  var pos=posByIndex.get(e.index);
+  if(pos!==undefined){
+    if(sortedList[pos] && sortedList[pos].index===e.index) sortedList[pos]=e;
+    entries[e.index]=e;
+    updateRow(e.index);
+  }
+  // Header counters live on the server now — refresh them (debounced).
+  scheduleStatsRefresh();
+  // In a sorted view a finished row may need to move; re-sort (debounced, keeps
+  // scroll) only once it reaches a terminal status — same rule as before. This
+  // covers off-window rows too (they may sort into view).
+  if(sortMode!=='idx'){
+    var stillTesting=e.ping_status==='testing_ping'||e.speed_status==='testing_speed';
+    if(!stillTesting) scheduleResort();
+  }
   // If this update is for the connected config, refresh the conn-bar ping chip.
   if(connState&&connState.status==='connected'&&e.raw&&connState.conn_raw===e.raw) updateConnPing();
-}
-
-// dupBodyIndices is the set of entry indices whose vless "body" (everything
-// before the '#' fragment) was already seen at a smaller index. This is the
-// view filter the per-tab dedup toggle drives — toggling it on hides these
-// rows; toggling it off shows them again. Server keeps every entry.
-let dupBodyIndices=new Set();
-
-function vlessBodyJS(raw){
-  if(!raw) return '';
-  var i=raw.lastIndexOf('#');
-  return i>=0 ? raw.substring(0,i) : raw;
-}
-
-function recomputeDupIndices(){
-  dupBodyIndices=new Set();
-  // Walk in entry-index order so "first occurrence" is stable: it doesn't
-  // shift with the user's sort choice, so toggling dedup with different
-  // sort modes hides the same rows.
-  var ordered=Object.values(entries).slice().sort(function(a,b){return a.index-b.index;});
-  var seen=new Set();
-  for(var i=0;i<ordered.length;i++){
-    var body=vlessBodyJS(ordered[i].raw);
-    if(seen.has(body)) dupBodyIndices.add(ordered[i].index);
-    else seen.add(body);
-  }
-}
-
-// recalcStats updates the five header counters from sortedList, which is
-// the list of rows currently visible on screen (after FILTER, exclude
-// filter, and dedup view filter are applied). The previous version walked
-// every entry — that surprised users when enabling dedup or filtering: the
-// "configs" counter would stay at the total instead of matching what they
-// could see. rebuildTable() populates sortedList and then calls this.
-function recalcStats(){
-  const vis = sortedList || [];
-  // Single pass with plain comparisons — no .filter()/.map() allocations and no
-  // Math.min(...arr)/Math.max(...arr) spread (which is O(n) and can blow the
-  // call stack past ~100k elements). Same outputs as before.
-  var ok=0, er=0, minMs=0, haveMs=false, maxSp=0, haveSp=false;
-  for(var i=0;i<vis.length;i++){
-    var e=vis[i];
-    if(e.ping_status==='ok') ok++;
-    else if(e.ping_status==='failed') er++;
-    if(e.delay>0 && (!haveMs || e.delay<minMs)){ minMs=e.delay; haveMs=true; }
-    if(e.speed_mbps>0 && (!haveSp || e.speed_mbps>maxSp)){ maxSp=e.speed_mbps; haveSp=true; }
-  }
-  document.getElementById('s-tot').textContent = vis.length;
-  document.getElementById('s-ok').textContent  = ok;
-  document.getElementById('s-er').textContent  = er;
-  document.getElementById('s-ms').textContent = haveMs?(minMs+'ms'):'—';
-  document.getElementById('s-sp').textContent = haveSp?(maxSp.toFixed(1)+' MB/s'):'—';
-}
-// scheduleRecalcStats coalesces header-counter recomputation. During a bulk
-// test hundreds of entry_update events arrive per second; running recalcStats
-// (a full-list pass) on each one pinned the UI thread. This runs it at most
-// once per ~120 ms (trailing edge), so the final state still lands after the
-// last event. Direct recalcStats() callers (rebuildTable, filter/sort changes)
-// stay immediate.
-let _statsTimer=null;
-function scheduleRecalcStats(){
-  if(_statsTimer) return;
-  _statsTimer=setTimeout(function(){ _statsTimer=null; recalcStats(); }, 120);
 }
 
 function startBulk(id,total,evTab){
@@ -2017,7 +2126,7 @@ function setBtn(id,dis,txt){ const b=document.getElementById(id); b.disabled=dis
 function setSort(m){
   sortMode=m;
   ['idx','ping','speed'].forEach(s=>document.getElementById('sort-'+s).classList.toggle('active',s===m));
-  rebuildTable();
+  reloadView(true);
 }
 // Ordered list of pill IDs; "" represents the "all" pill (empty selection).
 const PROTO_PILLS=['','vless','vmess','trojan','ss','ss2022','hysteria2','tuic'];
@@ -2038,7 +2147,7 @@ function onProtoBtnClick(ev, p){
   }
   saveProtoFilter();
   renderProtoPills();
-  rebuildTable();
+  reloadView(true);
 }
 function renderProtoPills(){
   for(var i=0;i<PROTO_PILLS.length;i++){
@@ -2060,7 +2169,7 @@ function setProtoFilter(p){
   if(p) protoFilter.add(p);
   saveProtoFilter();
   renderProtoPills();
-  rebuildTable();
+  reloadView(true);
 }
 // protoFilter persistence — survives reloads so the user's type-filter
 // selection (incl. multi-select) sticks. localStorage can throw in some
@@ -2131,124 +2240,104 @@ var EXCLUDE_PLACEHOLDERS={
   transport:'e.g. tcp',
   security:'e.g. tls'
 };
-function applyFilter(){ filterText=document.getElementById('fi').value.toLowerCase(); rebuildTable(); }
-function matches(e){
-  // Per-tab dedup view filter — hide rows whose vless body appeared at an
-  // earlier index. Only applies in "hide" mode; "delete" mode has already
-  // removed those entries server-side, so they're not in the entries map.
-  var tab=tabsList.find(function(t){return t.id===activeTabId;});
-  if(tab && tab.dedup_mode==='hide' && dupBodyIndices.has(e.index)) return false;
-  // Per-tab exclude filter — rules are "column:value" strings (legacy bare
-  // strings are treated as name-column). Match is case-insensitive substring.
-  // Skipped when the filter's toggle is off (exclude_disabled) — the rules stay
-  // saved but aren't applied, so previously-hidden configs reappear. (This is
-  // the view side; the server also stops dropping them and re-fetches the tab.)
-  var ef=(tab && !tab.exclude_disabled && tab.exclude_filter)?tab.exclude_filter:[];
-  if(ef.length>0){
-    var fields={
-      name:(e.name||'').toLowerCase(),
-      type:chipProto(e),
-      host:(e.host||'').toLowerCase(),
-      transport:(e.network||'').toLowerCase(),
-      security:(e.security||'').toLowerCase()
-    };
-    for(var i=0;i<ef.length;i++){
-      var r=parseExcludeRule(ef[i]);
-      if(!r.value) continue;
-      var hay=fields[r.column]||fields.name;
-      if(hay.indexOf(r.value)>=0) return false;
-    }
-  }
-  // Type pill filter — empty Set means "all". Multi-select: row passes when
-  // its chipProto is in the selected set. chipProto handles the SS / SS2022
-  // split so the filter agrees with the chip the user sees.
-  if(protoFilter && protoFilter.size>0){
-    if(!protoFilter.has(chipProto(e))) return false;
-  }
-  if(!filterText)return true;
-  return(e.name||'').toLowerCase().includes(filterText)||(e.host||'').toLowerCase().includes(filterText)
-    ||(e.network||'').toLowerCase().includes(filterText)||(e.security||'').toLowerCase().includes(filterText)
-    ||(e.protocol||'').toLowerCase().includes(filterText);
+function applyFilter(){ filterText=document.getElementById('fi').value.toLowerCase(); reloadView(true); }
+// applyFilterHint sets the filter box's hover tooltip in the current UI language.
+function applyFilterHint(){
+  var fi=document.getElementById('fi');
+  if(fi) fi.title=t('Filter by name, host, type, transport or security. + combines conditions: germany+ws+tls needs all three (name, transport, security); germany+poland matches either (same column). Use field: to target a column, e.g. name:russia.');
 }
 
 // ── table ──────────────────────────────────────────────────────────
-// Virtual scroll: only renders visible rows + buffer. Works for 10,000+ configs.
-// Keeps the full sorted list in sortedList, renders only the window.
-// Top/bottom padding rows maintain correct scroll height.
+// Server-backed virtual scroll: sortedList is SPARSE (length = totalRows). Only
+// loaded windows hold rows; the rest are placeholders until scrolled into view.
+// Sort / filter / proto / dedup / favorites are all computed server-side by
+// /api/tab/window, so the client never holds the whole list.
 let sortedList = [];
-// sortedPos maps an entry's index → its position in sortedList, so onUpdate can
-// replace a row's data in O(1) instead of scanning the whole list per event
-// (the bottleneck that froze the UI during bulk tests on huge lists). Rebuilt
-// alongside sortedList in rebuildTable — the ONLY place sortedList is assigned.
-let sortedPos = new Map();
 let rowHeight = 30; // measured on first render
 let visibleWindow = { start: 0, end: 0 }; // inclusive start, exclusive end
 const VBUFFER = 10; // rows rendered above/below viewport
 
-function rebuildTable(){
-  let list=Object.values(entries).filter(matches);
-  // Per-mode comparator. The favorites-first wrapper below applies it within
-  // each group, so favorites always sit on top but are still ordered by the
-  // active sort (and so are the non-favorites beneath them).
-  var cmp;
-  if(sortMode==='ping'){
-    cmp=function(a,b){if(a.delay>0&&b.delay>0)return a.delay-b.delay;if(a.delay>0)return -1;if(b.delay>0)return 1;return a.index-b.index;};
-  }else if(sortMode==='speed'){
-    // 1. Speed OK: sorted by speed descending
-    // 2. Ping OK but speed failed/skipped: sorted by ping ascending
-    // 3. Currently testing
-    // 4. Ping failed: sorted by index
-    var speedRank=function(e){
-      if(e.speed_status==='ok' && e.speed_mbps>0) return 0;
-      if(e.ping_status==='ok' && e.delay>0) return 1;
-      if(e.speed_status==='testing_speed'||e.ping_status==='testing_ping') return 2;
-      if(e.ping_status==='failed') return 3;
-      return 4;
-    };
-    cmp=function(a,b){
-      const ra=speedRank(a),rb=speedRank(b);
-      if(ra!==rb) return ra-rb;
-      if(ra===0) return b.speed_mbps-a.speed_mbps;
-      if(ra===1) return a.delay-b.delay;
-      return a.index-b.index;
-    };
-  }else{
-    cmp=function(a,b){return a.index-b.index;};
-  }
-  // Favorites always float to the top — in EVERY sort mode — and are sorted
-  // among themselves by the active comparator; non-favorites follow, also
-  // sorted by it.
-  list.sort(function(a,b){
-    var fa=isFav(a.raw)?0:1, fb=isFav(b.raw)?0:1;
-    if(fa!==fb) return fa-fb;
-    return cmp(a,b);
+// rebuildTable is kept as a thin alias: any data-changing caller re-fetches the
+// active tab's window (server does the sort/filter). Selection-only refreshes
+// call renderVisibleRows() directly so they don't reset scroll or re-fetch.
+function rebuildTable(){ reloadView(true); }
+
+// placeholderRow renders a light row for a slot whose window hasn't loaded yet.
+// It uses the SAME 9 column cells as a real row (not a colSpan) so the fixed
+// table layout keeps every column aligned — a colSpan filler could nudge the
+// sticky header sideways. Replaced by a real row when the window arrives.
+function placeholderRow(){
+  const tr=document.createElement('tr');
+  tr.className='vrow-pending';
+  tr.innerHTML='<td class="ci" style="height:'+rowHeight+'px"></td><td class="cpr"></td><td class="cn" style="opacity:.35">…</td>'+
+    '<td class="ch"></td><td class="ct"></td><td class="cs"></td>'+
+    '<td class="cp2"></td><td class="csp"></td><td class="ca"></td>';
+  return tr;
+}
+function rowAt(i,pos){
+  const e=sortedList[i];
+  return e ? buildRow(e,pos) : placeholderRow();
+}
+
+let _dataVer=0; // bumped by fillWindow (kept for compatibility with old callers)
+// rowEls maps a position index i → the <tr> currently in the DOM for it. The
+// large-list path renders INCREMENTALLY against this map: rows that stay visible
+// are kept (so a scroll only adds/removes the few rows entering/leaving the
+// viewport, not all ~40) — this is the cheap, :hover-stable, recycled render.
+let rowEls = new Map();
+function resetRender(){
+  rowEls.clear();
+  const tb=document.getElementById('tb');
+  if(tb) tb.innerHTML='';
+}
+// syncRowStates fixes selection + connected-row highlight on the currently
+// rendered rows. With incremental rendering rows persist across scrolls, so these
+// view-only states (which change without the row's data changing) are toggled
+// here instead of by rebuilding the row.
+function syncRowStates(){
+  const connActive=connState&&(connState.status==='connected'||connState.status==='connecting');
+  const tun=connState&&connState.mode==='tun';
+  rowEls.forEach(function(tr,i){
+    const e=sortedList[i];
+    if(!e) return;
+    tr.classList.toggle('selected', selectedRows.has(e.index));
+    const lit=connActive && connRowLit(e);
+    tr.classList.toggle('row-cp', lit && !tun);
+    tr.classList.toggle('row-ct', lit && tun);
   });
-  sortedList = list;
-  sortedPos = new Map();
-  for(var sp=0;sp<list.length;sp++) sortedPos.set(list[sp].index, sp);
-  document.getElementById('fc').textContent=filterText?(list.length+'/'+Object.keys(entries).length):'';
-  // Counters are derived from sortedList so any change in visibility — sort,
-  // filter, dedup toggle, exclude filter, etc — keeps them in sync.
-  recalcStats();
-  visibleWindow = { start: 0, end: 0 }; // force full redraw
-  renderVisibleRows();
 }
 
 function renderVisibleRows(){
   const tw = document.querySelector('.tw');
   const tb = document.getElementById('tb');
   if(!tw || !tb) return;
-  const total = sortedList.length;
+  const total = totalRows;
 
-  // Small list: render everything (no virtualization overhead)
+  // Small list: render everything (no spacers/virtualization needed). Cheap at ≤100.
   if(total <= 100){
-    tb.innerHTML = '';
+    scheduleEnsure();
+    resetRender();
     const frag = document.createDocumentFragment();
-    for(let i=0;i<total;i++) frag.appendChild(buildRow(sortedList[i], i+1));
+    for(let i=0;i<total;i++){
+      const tr=rowAt(i,i+1);
+      tr._key = sortedList[i] ? ('r'+sortedList[i].index) : ('p'+i);
+      rowEls.set(i,tr);
+      frag.appendChild(tr);
+    }
     tb.appendChild(frag);
     visibleWindow = { start: 0, end: total };
-    restoreConnHighlight();
+    syncRowStates();
     return;
+  }
+
+  // Spacer scaffold: a top + bottom <tr> whose heights position the visible block.
+  // (Re)create it if missing — e.g. after a small-list render wiped the tbody.
+  let top=document.getElementById('vtop'), bot=document.getElementById('vbot');
+  if(!top || top.parentNode!==tb || !bot || bot.parentNode!==tb){
+    tb.innerHTML=''; rowEls.clear();
+    top=document.createElement('tr'); top.id='vtop'; top.className='vspacer';
+    bot=document.createElement('tr'); bot.id='vbot'; bot.className='vspacer';
+    tb.appendChild(top); tb.appendChild(bot);
   }
 
   const scrollTop = tw.scrollTop;
@@ -2256,51 +2345,70 @@ function renderVisibleRows(){
   const firstVisible = Math.max(0, Math.floor(scrollTop / rowHeight) - VBUFFER);
   const lastVisible = Math.min(total, Math.ceil((scrollTop + viewH) / rowHeight) + VBUFFER);
 
-  tb.innerHTML = '';
-  const frag = document.createDocumentFragment();
+  scheduleEnsure();
 
-  // Top spacer
-  if(firstVisible > 0){
-    const sp = document.createElement('tr');
-    sp.style.height = (firstVisible * rowHeight) + 'px';
-    sp.className = 'vspacer';
-    frag.appendChild(sp);
-  }
-  // Visible rows
+  // Drop rows that scrolled out of the window.
+  rowEls.forEach(function(tr,i){ if(i<firstVisible || i>=lastVisible){ tr.remove(); rowEls.delete(i); } });
+  // Position the visible block.
+  top.style.height = (firstVisible*rowHeight) + 'px';
+  bot.style.height = (Math.max(0,total-lastVisible)*rowHeight) + 'px';
+  // Add rows entering the window (and replace a placeholder once its window
+  // loaded), keeping DOM order. Rows already present + current are left untouched.
+  let prev=top;
   for(let i=firstVisible; i<lastVisible; i++){
-    frag.appendChild(buildRow(sortedList[i], i+1));
-  }
-  // Bottom spacer
-  if(lastVisible < total){
-    const sp = document.createElement('tr');
-    sp.style.height = ((total - lastVisible) * rowHeight) + 'px';
-    sp.className = 'vspacer';
-    frag.appendChild(sp);
-  }
-  tb.appendChild(frag);
-  visibleWindow = { start: firstVisible, end: lastVisible };
-
-  // Measure actual row height on first render for accuracy
-  if(total > 0 && lastVisible > firstVisible){
-    const firstRow = tb.querySelector('tr:not(.vspacer)');
-    if(firstRow){
-      const h = firstRow.offsetHeight;
-      if(h > 0 && Math.abs(h - rowHeight) > 2){
-        rowHeight = h;
-      }
+    const e=sortedList[i];
+    const key = e ? ('r'+e.index) : ('p'+i);
+    let tr=rowEls.get(i);
+    if(!tr || tr._key!==key){
+      const nr=rowAt(i,i+1); nr._key=key;
+      if(tr) tr.replaceWith(nr); else prev.after(nr);
+      rowEls.set(i,nr); tr=nr;
     }
+    prev=tr;
   }
-  restoreConnHighlight();
+  visibleWindow = { start: firstVisible, end: lastVisible };
+  syncRowStates();
+
+  // Measure actual row height once (skip placeholders).
+  if(lastVisible > firstVisible){
+    const fr=tb.querySelector('tr:not(.vspacer):not(.vrow-pending)');
+    if(fr){ const h=fr.offsetHeight; if(h>0 && Math.abs(h-rowHeight)>2) rowHeight=h; }
+  }
+}
+
+// connRowLit reports whether row e should show the connected highlight. The
+// connected config is matched by IDENTITY (chain raws, then conn_raw), so it
+// lights up on EVERY tab that holds that exact config — the same config copied
+// into several tabs lights in all of them. The bare-index fallback (only when
+// there's no raw to match by) applies just on the tab the connection was made
+// from: indices don't line up across tabs, so using it elsewhere lit a DIFFERENT
+// config at the same row position (the reported bug).
+// rawBody strips the #name fragment so two copies of the same config that differ
+// only by their display name compare equal — the connected config then lights up
+// on every tab that holds it regardless of how it's named there.
+function rawBody(raw){ var i=(raw||'').lastIndexOf('#'); return i>=0?raw.slice(0,i):(raw||''); }
+function connRowLit(e){
+  if(!e || !connState || (connState.status!=='connected' && connState.status!=='connecting')) return false;
+  var eb=rawBody(e.raw);
+  var chainRaws=connState.chain_raws||null;
+  if(chainRaws && eb){ for(var i=0;i<chainRaws.length;i++){ if(rawBody(chainRaws[i])===eb) return true; } }
+  if(connState.conn_raw) return rawBody(connState.conn_raw)===eb;
+  return connState.conn_tab===activeTabId && connState.entry_index===e.index;
 }
 
 function findConnIdx(){
-  // Find entry index matching the connected config's raw URL (survives reload)
-  if(!connState.conn_raw) return connState.entry_index;
-  var vals=Object.values(entries);
-  for(var i=0;i<vals.length;i++){
-    if(vals[i].raw===connState.conn_raw) return vals[i].index;
+  // Match by raw on whatever tab is showing (the config lights up wherever it
+  // lives); fall back to the entry index only on the tab it was connected from.
+  if(connState.conn_raw){
+    var cb=rawBody(connState.conn_raw);
+    var vals=Object.values(entries);
+    for(var i=0;i<vals.length;i++){
+      if(rawBody(vals[i].raw)===cb) return vals[i].index;
+    }
+    return -1;
   }
-  return -1; // not found in current tab
+  if(connState.conn_tab===activeTabId && connState.entry_index!=null) return connState.entry_index;
+  return -1;
 }
 
 function restoreConnHighlight(){
@@ -2313,15 +2421,32 @@ function restoreConnHighlight(){
   }
 }
 
-// Scroll listener for virtual window updates
+// _scrollFast is true mid-fling (big jump per frame): renders are throttled and
+// prefetch is suppressed (see ensureVisible) so a fast fling doesn't burn CPU on
+// per-frame rebuilds + windows it flies past.
+let _scrollFast=false;
+// Scroll listener for virtual window updates.
 (function attachVScroll(){
   const tw = document.querySelector('.tw');
   if(!tw) { setTimeout(attachVScroll, 100); return; }
-  let scrollTimer = null;
+  let scrollTimer=null, lastST=0, lastRender=0, settleT=null;
   tw.addEventListener('scroll', ()=>{
     if(scrollTimer) return;
     scrollTimer = requestAnimationFrame(()=>{
       scrollTimer = null;
+      const st=tw.scrollTop;
+      const fast=Math.abs(st-lastST) > rowHeight*8; // >~8 rows/frame = a fling
+      lastST=st;
+      _scrollFast=fast;
+      // Re-arm a trailing "landed" handler ~45ms after scrolling stops: it renders
+      // the final position AND fetches its window IMMEDIATELY (ensureVisible bypasses
+      // the scheduleEnsure throttle), so the window you land on after a fast scroll
+      // loads right away instead of waiting out the throttle (~the perceived lag).
+      if(settleT) clearTimeout(settleT);
+      settleT=setTimeout(()=>{ settleT=null; _scrollFast=false; lastRender=performance.now(); renderVisibleRows(); ensureVisible(); }, 45);
+      const now=performance.now();
+      if(fast && now-lastRender<30) return; // throttle fling frames to ~30fps
+      lastRender=now;
       renderVisibleRows();
     });
   }, {passive: true});
@@ -2331,57 +2456,34 @@ function restoreConnHighlight(){
   });
 })();
 
-// pendingResort coalesces re-sort requests during bulk tests. While
-// running ping all / speed all with sort = ping or speed, every row
-// finishing its test would otherwise trigger a full rebuildTable — and
-// since rebuildTable wipes the tbody, the :hover on whatever row the
-// cursor was on flickered on each rebuild. Debouncing collapses N row
-// finishes into one rebuild ~250 ms after the first; rows themselves
-// have already been updated in-place by then, so the user sees fresh
-// numbers immediately and only the positions catch up shortly after.
+// scheduleResort coalesces re-sort requests during bulk tests. In a sorted view
+// (ping/speed) a finished row may need to move; instead of re-fetching the window
+// on every entry_update, we debounce one reloadView(false) ~250 ms after the
+// first finish. resetScroll=false keeps the user's scroll position; the visible
+// window is re-fetched in the new order. Rows have already been updated in place
+// by then (updateRow), so numbers are fresh immediately; only positions catch up.
 let pendingResort = null;
 function scheduleResort(){
   if(pendingResort) return;
   pendingResort = setTimeout(function(){
     pendingResort = null;
-    rebuildTable();
+    reloadView(false);
   }, 250);
 }
 
+// updateRow refreshes a single visible <tr> in place (never destroys the node,
+// which keeps :hover stable during a test). Only loaded+rendered rows reach here;
+// re-sort scheduling for off-window rows is handled in onUpdate.
 function updateRow(idx){
   const e=entries[idx]; if(!e)return;
   const old=document.getElementById('r'+idx);
-  if(!old){
-    // Row is outside the virtual window. In sorted mode a finishing row
-    // may need to be brought into view — schedule a debounced resort,
-    // but only when the row has reached a terminal status (same rule
-    // applied below for visible rows).
-    if(sortMode!=='idx'){
-      const stillTesting = e.ping_status==='testing_ping' || e.speed_status==='testing_speed';
-      if(!stillTesting) scheduleResort();
-    }
-    return;
-  }
-  // In-place update of the row's contents — never destroys the <tr>
-  // node itself, which is what kept :hover stable in idx mode (fix #3).
-  // We extend the same approach to sorted modes here so live-speed
-  // ticks and ping pill changes during a test stop flickering the
-  // cursor row.
+  if(!old) return; // loaded but scrolled out of the rendered window
   const pos=parseInt(old.cells[0].textContent)||idx+1;
   const nr=buildRow(e,pos);
   old.className = nr.className;
   old.replaceChildren(...nr.childNodes);
   if((connState.status==='connected'||connState.status==='connecting')&&findConnIdx()===idx)
     old.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
-  // In sorted modes the row's position may have to change, but only
-  // when its status is final — re-sorting on every live_speed progress
-  // tick (~400 ms cadence) was the cause of the hover flicker before.
-  // Debounced so a flurry of finishes during bulk tests collapses to
-  // one rebuild.
-  if(sortMode!=='idx'){
-    const stillTesting = e.ping_status==='testing_ping' || e.speed_status==='testing_speed';
-    if(!stillTesting) scheduleResort();
-  }
 }
 
 function buildRow(e,pos){
@@ -2404,9 +2506,9 @@ function buildRow(e,pos){
   tr.oncontextmenu=(ev)=>{
     ev.preventDefault();
     if(!selectedRows.has(e.index)){
-      selectedRows.clear();
-      selectedRows.add(e.index);
-      rebuildTable();
+      selectedRows.clear(); selData={};
+      selectedRows.add(e.index); selData[e.index]=e.raw;
+      renderVisibleRows();
     }
     showRowMenu(ev,e.index);
   };
@@ -2426,25 +2528,20 @@ function buildRow(e,pos){
   else if(e.speed_status==='skipped'){sp='pill skipped';st='—';}
 
   const nc=(e.network||'tcp').toLowerCase().replace(/[^a-z]/g,'');
-  // Connected highlight + disconnect button show on EVERY tab that holds
-  // this config (matched by raw), not just the tab it was connected from.
-  // Falling back to entry_index only makes sense within the connected tab
-  // (indices aren't comparable across tabs), so that legacy branch keeps
-  // the tab guard.
-  // Chain: every hop row is highlighted (matched against chain_raws), but the
-  // disconnect button sits ONLY on the exit hop (last in chain_raws) — the
-  // chain is one connection, so one disconnect control, placed on the egress.
+  // Connected highlight: lit by IDENTITY (raw/chain), so the same config lights
+  // on every tab that holds it; the bare-index fallback (no raw) only fires on
+  // the connected tab — see connRowLit. The disconnect button sits ONLY on the
+  // exit hop of a chain (last in chain_raws): one connection, one control.
   const chainRaws=(connState&&connState.chain_raws)||null;
   const inChain=!!(chainRaws&&e.raw&&chainRaws.indexOf(e.raw)>=0);
   const isChainExit=!!(chainRaws&&chainRaws.length>0&&e.raw===chainRaws[chainRaws.length-1]);
-  const isConn=connState&&connState.status==='connected'&&(inChain||(connState.conn_raw?connState.conn_raw===e.raw:(connState.entry_index===e.index&&(!connState.conn_tab||connState.conn_tab===activeTabId))));
+  const rowLit=connRowLit(e);
+  const isConn=rowLit&&connState.status==='connected';
   // Apply the connected highlight HERE (in buildRow) rather than only via the
   // external onConnUpdate pass: for a chain that pass matched the entry hop
   // only, so the second hop's green/blue flickered on every rebuild. Setting it
   // on the row at build time makes every render path consistent. "connecting"
-  // also lights up (matches restoreConnHighlight's behaviour for single nodes).
-  const connActive=connState&&(connState.status==='connected'||connState.status==='connecting');
-  const rowLit=connActive&&(inChain||(connState.conn_raw?connState.conn_raw===e.raw:(connState.entry_index===e.index&&(!connState.conn_tab||connState.conn_tab===activeTabId))));
+  // also lights up (connRowLit returns true for it too).
   if(rowLit) tr.classList.add(connState.mode==='tun'?'row-ct':'row-cp');
 
   let connectBtn;
@@ -2503,22 +2600,18 @@ function doConnect(idx){
 function doDisconnect(){ fetch('/api/disconnect',{method:'POST'}).catch(console.error); }
 function pingOne(idx)   { fetch('/api/ping/one?idx='+idx,{method:'POST'}).catch(console.error); }
 function speedOne(idx)  { fetch('/api/speed/one?idx='+idx,{method:'POST'}).catch(console.error); }
-// Collect indices of currently visible entries in on-screen (sortedList)
-// order. sortedList is the result of matches() + the active sort, so the
-// server tests rows in the same order the user sees them — including the
-// default (idx) sort, which is what "test in the order on screen" means.
-function visibleIndices(){
-  return sortedList.map(function(e){ return e.index; });
-}
-// When sending bulk-test requests, restrict to currently visible entries so
-// that running ping/speed all while a filter is active only tests the
-// configs the user can see. Sending the indices is harmless when nothing is
-// hidden — it just lists every entry.
-function bulkTestBody(){
-  return JSON.stringify({indices: visibleIndices()});
+// runBulkAll fetches the FULL set of matching indices in screen order from the
+// store (server applies the same sort/filter/proto/dedup the table shows), then
+// posts them to the bulk endpoint. This tests the whole filtered set even though
+// the windowed client only holds the visible rows.
+function runBulkAll(url){
+  fetch('/api/tab/indices?'+winQuery('')).then(r=>r.json()).then(function(d){
+    var idx=(d&&d.idx)||[];
+    fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices:idx})}).catch(console.error);
+  }).catch(console.error);
 }
 function doPingAll() {
-  fetch('/api/ping/all',{method:'POST',headers:{'Content-Type':'application/json'},body:bulkTestBody()}).catch(console.error);
+  runBulkAll('/api/ping/all');
 }
 // testSelected runs ping (or speed) on just the selected rows — or the
 // right-clicked row when nothing is selected. Reuses the bulk endpoints, which
@@ -2530,7 +2623,7 @@ function testSelected(idx,withSpeed){
   fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({indices:indices})}).catch(console.error);
 }
 function doSpeedAll(){
-  fetch('/api/speed/all',{method:'POST',headers:{'Content-Type':'application/json'},body:bulkTestBody()}).catch(console.error);
+  runBulkAll('/api/speed/all');
 }
 function doReload(){
   fetch('/api/tests/cancel?tab='+encodeURIComponent(activeTabId),{method:'POST'}).then(function(){
@@ -2547,32 +2640,19 @@ let selectedRows=new Set(); // selected config indices for deletion
 let bulkProgressTab=''; // which tab the current bulk operation belongs to
 
 function onTabsUpdate(tabs){
-  // Detect a change to the active tab's dedup mode so we can refresh the
-  // visible rows without waiting for a manual sort/filter event. Toggling
-  // dedup is intended to be instantaneous from the user's perspective.
-  // Note: "delete" mode causes a "loaded" event with a smaller entries
-  // list, which itself triggers a rebuild via onLoaded — but we still
-  // rebuild here to cover the "off"⇄"hide" transition where the entries
-  // map doesn't change but the view filter does.
+  // Detect a change to the active tab's dedup mode so we refresh the view
+  // immediately (dedup is now a server-side WHERE — re-fetch the window).
   var prev=tabsList.find(function(t){return t.id===activeTabId;});
   var next=tabs.find(function(t){return t.id===activeTabId;});
   var dedupFlipped=prev && next && ((prev.dedup_mode||'')!==(next.dedup_mode||''));
   tabsList=tabs;
-  // Drop cached snapshots for tabs that no longer exist (closed/deleted).
-  var _liveIds={}; tabs.forEach(function(t){_liveIds[t.id]=1;});
-  Object.keys(tabCache).forEach(function(k){ if(!_liveIds[k]){ delete tabCache[k]; delete tabDirty[k]; } });
   renderTabs();
   updateSubBar();
-  if(dedupFlipped){
-    // Entering "hide" needs the dup set built now (onLoaded skips it for
-    // non-hide tabs); leaving it just stops consulting the set.
-    if(next.dedup_mode==='hide') recomputeDupIndices();
-    rebuildTable();
-  }
+  if(dedupFlipped) reloadView(true);
 }
 function onActiveTab(id){
   activeTabId=id;
-  selectedRows.clear();
+  selectedRows.clear(); selData={};
   // Reset progress bar - only show if the active tab has an ongoing bulk operation
   if(bulkProgressTab!==id) setBar(0);
   renderTabs();
@@ -2580,12 +2660,12 @@ function onActiveTab(id){
   // The conn-bar ping chip is scoped to the connected config's tab — refresh
   // it so it hides/shows correctly after a tab switch.
   updateConnPing();
-  // Cached switch: the server sent no "loaded" for this tab, so paint it from our
-  // snapshot now. (For a normal switch the upcoming loaded/loading event paints.)
-  if(pendingCacheRender===id){
-    pendingCacheRender=null;
-    renderFromCache(id);
-  }
+  // If this tab still has a reload in flight, keep the spinner instead of
+  // flashing a stale window then losing it — the 'loaded' event reloadViews when
+  // the fetch finishes. (The server also re-sends 'loading' on switch.)
+  if(fetchingTabs.has(id)){ totalRows=0; onLoading(); return; }
+  // Load the new tab's first window from the store (server-side sort/filter).
+  reloadView(true);
 }
 
 function renderTabs(){
@@ -2730,36 +2810,10 @@ function startTabDrag(e,dragId){
 
 function switchTab(id){
   if(id===activeTabId) return; // clicking the current tab is a no-op
-  // Snapshot the tab we're leaving so a later return to it is instant. These are
-  // the live entry objects; onUpdate replaces (not mutates) them, so the snapshot
-  // stays a stable point-in-time copy.
-  if(activeTabId) tabCache[activeTabId]=Object.values(entries);
-  // Render from cache only if we have one AND nothing changed there since.
-  var useCache=!!tabCache[id] && !tabDirty[id];
-  pendingCacheRender=useCache?id:null;
-  fetch('/api/tab/switch?id='+id+(useCache?'&cached=1':''),{method:'POST'}).catch(function(){
-    pendingCacheRender=null; // on failure, a retry does a normal server load
-  });
-}
-// renderFromCache repaints the table from a cached snapshot (no server round-trip,
-// no JSON.parse) — the same work as onLoaded minus the fetch + reload-delta.
-function renderFromCache(id){
-  var list=tabCache[id];
-  if(!list){ // cache vanished — fall back to a normal server load
-    fetch('/api/tab/switch?id='+id,{method:'POST'}).catch(console.error);
-    return;
-  }
-  Object.keys(entries).forEach(function(k){delete entries[k];});
-  document.getElementById('tb').innerHTML='';
-  list.forEach(function(e){entries[e.index]=e;});
-  document.getElementById('msg-area').style.display='none';
-  document.getElementById('tbl').style.display='';
-  selectedRows.clear();
-  var _at=tabsList.find(function(t){return t.id===id;});
-  if(_at && _at.dedup_mode==='hide') recomputeDupIndices(); else dupBodyIndices=new Set();
-  // No reload-delta: it's the same data we already had (prevRawsByTab[id] from the
-  // last real load is still valid).
-  rebuildTable();
+  // The server broadcasts active_tab → onActiveTab → reloadView, which fetches
+  // the tab's first window. No client-side snapshot cache anymore (windows + the
+  // store replace it).
+  fetch('/api/tab/switch?id='+id,{method:'POST'}).catch(console.error);
 }
 
 function addTab(){
@@ -2781,6 +2835,9 @@ function showRowMenu(ev,idx){
   // Localized "config" / "N configs" noun for the Copy/Delete labels.
   var label=selCount>1?(selCount+' '+t('configs')):t('config');
   m.innerHTML='<div class="ctx-menu-item" onclick="copySelected();closeCtxMenu()">'+t('Copy')+' '+label+'</div>';
+  // Select all rows of the current filtered view (whole set, not just loaded
+  // windows) so the next Copy / Test / Delete covers everything.
+  m.innerHTML+='<div class="ctx-menu-item" onclick="selectAllInView();closeCtxMenu()">'+t('Select all')+'</div>';
   // Show QR — single selection only; works on any tab (incl. SOURCES) since it
   // just reads the config's raw URL.
   if(selCount<=1){
@@ -2803,10 +2860,9 @@ function showRowMenu(ev,idx){
       m.innerHTML+='<div class="ctx-menu-item" onclick="renameEntry('+idx+');closeCtxMenu()">'+t('Rename')+'</div>';
     }
     m.innerHTML+='<div class="ctx-menu-item danger" onclick="deleteSelectedRows();closeCtxMenu()">'+t('Delete')+' '+label+'</div>';
-    // Count entries that failed ping or speed so the user knows how many the
-    // bulk-delete will remove before clicking.
-    var failed=0;
-    Object.values(entries).forEach(function(en){ if(en.ping_status==='failed'||en.speed_status==='failed') failed++; });
+    // Failed-ping count comes from the server stats (the whole filtered set), not
+    // just the loaded window. deleteFailedRows deletes them server-side.
+    var failed=winStats.err||0;
     if(failed>0){
       m.innerHTML+='<div class="ctx-sep"></div>';
       m.innerHTML+='<div class="ctx-menu-item danger" onclick="deleteFailedRows();closeCtxMenu()">'+t('Delete failed ping/speed')+' ('+failed+')</div>';
@@ -2943,13 +2999,11 @@ function scanQRScreen(){
     .catch(function(){ toast(t('No QR code found on screen')); });
 }
 
-// gatherSelectedLines collects raw vless URLs for every currently selected
-// row, in on-screen (sortedList) order so the clipboard order matches what
-// the user sees. selectedRows stores entry.index values, which are stable
-// across sorts — clicking the visually-first row in speed sort stores that
-// entry's index, then we look it up here. Anything still in selectedRows
-// but missing from sortedList (shouldn't happen, but guard anyway) is
-// appended at the end via the entries map.
+// gatherSelectedLines collects raw vless URLs for every selected row, in
+// on-screen (sortedList) order so the clipboard order matches what the user
+// sees. selectedRows stores entry.index values; selData[idx] caches each
+// selected row's raw at selection time, so rows scrolled out of the loaded
+// window (or never in it) still contribute their config.
 function gatherSelectedLines(){
   if(selectedRows.size===0) return [];
   var lines=[],seen=new Set();
@@ -2959,8 +3013,8 @@ function gatherSelectedLines(){
   }
   selectedRows.forEach(function(idx){
     if(seen.has(idx)) return;
-    var e=entries[idx];
-    if(e && e.raw) lines.push(e.raw);
+    var raw=selData[idx]||(entries[idx]&&entries[idx].raw);
+    if(raw) lines.push(raw);
   });
   return lines;
 }
@@ -3119,25 +3173,27 @@ function chipsColumnFromSelection(){
 function deleteSelectedRows(){
   if(selectedRows.size===0||activeTabId==='main')return;
   var indices=[...selectedRows];
-  selectedRows.clear();
+  selectedRows.clear(); selData={};
   fetch('/api/tab/delete-entries?id='+activeTabId,{method:'POST',body:JSON.stringify(indices)}).catch(console.error);
 }
 
-// isFav / toggleFav: per-config favorites, keyed by raw URL so they survive
-// reloads and re-sorts. Persisted in app settings; starred rows float to the
-// top in the default sort order.
+// isFav / toggleFav: per-config favorites, keyed by BODY (raw without the #name)
+// so a config stays starred under any name and across tabs. Persisted in app
+// settings; starred rows float to the top in the default sort order.
 function isFav(raw){
-  return !!(raw && appSettingsJS.favorites && appSettingsJS.favorites.indexOf(raw)>=0);
+  return !!(raw && appSettingsJS.favorites && appSettingsJS.favorites.indexOf(rawBody(raw))>=0);
 }
 function toggleFav(idx){
   var e=entries[idx];
   if(!e||!e.raw)return;
   if(!appSettingsJS.favorites) appSettingsJS.favorites=[];
-  var i=appSettingsJS.favorites.indexOf(e.raw);
+  var body=rawBody(e.raw);
+  var i=appSettingsJS.favorites.indexOf(body);
   if(i>=0) appSettingsJS.favorites.splice(i,1);
-  else appSettingsJS.favorites.push(e.raw);
-  saveAppSettings();
-  rebuildTable();
+  else appSettingsJS.favorites.push(body);
+  // Re-sort only AFTER the server has the new favorites (the window query reads
+  // them server-side), else the refetch races the save.
+  saveAppSettings(function(){ reloadView(false); });
 }
 
 // renameEntry opens a styled (in-app) dialog for a new display name and asks
@@ -3268,13 +3324,10 @@ function promptModal(title,label,initial,onOk){
 // re-fetched, so deletions there wouldn't stick.
 function deleteFailedRows(){
   if(activeTabId==='main')return;
-  var indices=[];
-  Object.values(entries).forEach(function(e){
-    if(e.ping_status==='failed'||e.speed_status==='failed') indices.push(e.index);
-  });
-  if(indices.length===0)return;
-  selectedRows.clear();
-  fetch('/api/tab/delete-entries?id='+activeTabId,{method:'POST',body:JSON.stringify(indices)}).catch(console.error);
+  // Done server-side over the whole tab (the windowed client doesn't hold every
+  // row). The server re-indexes + broadcasts loaded → the view refreshes.
+  selectedRows.clear(); selData={};
+  fetch('/api/tab/delete-failed?id='+encodeURIComponent(activeTabId),{method:'POST'}).catch(console.error);
 }
 
 function showTabMenu(e,tab){
@@ -3303,9 +3356,17 @@ function closeCtxMenu(){
 function loadAppSettings(){
   fetch('/api/settings').then(r=>r.json()).then(s=>{
     appSettingsJS=s;
+    // Normalize favorites to bodies (older settings stored full raws) + dedup, so
+    // isFav/toggleFav and the server's body-keyed sort agree.
+    if(Array.isArray(appSettingsJS.favorites)){
+      var fb=[],seen={};
+      appSettingsJS.favorites.forEach(function(f){ var b=rawBody(f); if(b&&!seen[b]){seen[b]=1;fb.push(b);} });
+      appSettingsJS.favorites=fb;
+    }
     if(s.last_connected_raw) lastConnectedRaw=s.last_connected_raw;
     applyUIPrefs();
     applyLogI18n();
+    applyFilterHint();
     refreshAutoBtn();
     rebuildTable();
   }).catch(()=>{});
@@ -3401,6 +3462,22 @@ function openSettings(){
         '<input class="chip-input" id="app-input" placeholder="'+t('e.g. chrome.exe, press Enter')+'" onkeydown="appChipKey(event)" onpaste="appChipPaste(event)">'+
       '</div>'+
       '<div class="modal-hint">'+t("Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).")+' <a href="#" onclick="openProcessPicker(event)" style="color:var(--accent);text-decoration:underline">'+t('Browse running processes')+'</a>. '+t('Takes effect on next connection.')+'</div>'+
+    '</div>'+
+    '<div class="settings-section">'+
+      '<div class="section-header">'+t('Ports')+'</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('HTTP proxy port')+'</span>'+
+        '<input class="modal-input num-input" id="set-http-port" type="number" min="1" max="65535" value="'+(appSettingsJS.http_port||10819)+'" onchange="updateProxyPort(\'http\',this.value)">'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('SOCKS proxy port')+'</span>'+
+        '<input class="modal-input num-input" id="set-socks-port" type="number" min="1" max="65535" value="'+(appSettingsJS.socks_port||10818)+'" onchange="updateProxyPort(\'socks\',this.value)">'+
+      '</div>'+
+      '<div class="modal-row">'+
+        '<span class="modal-row-label">'+t('Allow LAN access')+'</span>'+
+        '<label class="toggle"><input type="checkbox" id="set-proxy-lan" '+(appSettingsJS.proxy_allow_lan?'checked':'')+' onchange="toggleProxyLAN(this.checked)"><span class="toggle-track"></span><span class="toggle-thumb"></span></label>'+
+      '</div>'+
+      '<div class="modal-hint">'+t('Local proxy ports apps connect to. Defaults: HTTP 10819, SOCKS 10818. Allow LAN access lets other devices on your network use the proxy (binds 0.0.0.0 instead of 127.0.0.1) — only on a trusted network; SOCKS keeps its password, HTTP has none. Takes effect on next connection.')+'</div>'+
     '</div>'+
     '<div class="settings-section">'+
       '<div class="section-header">'+t('Testing')+'</div>'+
@@ -4368,6 +4445,34 @@ function applyUpdate(){
   var ab=document.getElementById('upd-apply'); if(ab) ab.disabled=true;
   fetch('/api/update/apply',{method:'POST'}).catch(console.error);
 }
+// ── Startup "new version" banner ─────────────────────────────────────────────
+// Shown once per launch when the server says a newer build is published and the
+// user hasn't picked "Don't show again" for it. Buttons: Update (opens Settings
+// → the existing update flow), Close (hide for this launch), Don't show again
+// (persist server-side until something newer ships).
+function checkUpdateStartup(){
+  fetch('/api/update/check').then(function(r){return r.json();}).then(function(j){
+    if(j && j.notify) showUpdateBanner(j);
+  }).catch(function(){});
+}
+function showUpdateBanner(j){
+  if(document.getElementById('upd-banner')) return;
+  var b=document.createElement('div');
+  b.id='upd-banner'; b.className='upd-banner';
+  b.innerHTML='<span class="upd-banner-txt">'+t('New version available')+': <b>'+x(j.latest)+'</b>'+(j.notes?(' — '+x(j.notes)):'')+'</span>'+
+    '<span class="upd-banner-btns">'+
+      '<button class="btn sm" onclick="bannerUpdate()">'+t('Update')+'</button>'+
+      '<button class="btn ghost sm" onclick="bannerDismiss(\''+x(j.latest)+'\')">'+t("Don't show again")+'</button>'+
+      '<button class="btn ghost sm" onclick="bannerClose()" title="'+t('Close')+'">✕</button>'+
+    '</span>';
+  document.body.appendChild(b);
+}
+function bannerClose(){ var b=document.getElementById('upd-banner'); if(b) b.remove(); }
+function bannerDismiss(v){
+  fetch('/api/update/dismiss?version='+encodeURIComponent(v),{method:'POST'}).catch(function(){});
+  bannerClose();
+}
+function bannerUpdate(){ bannerClose(); openSettings(); }
 // openExtURL opens a link in the user's default browser via the native binding
 // (the WebView itself must never navigate away from the app).
 function openExtURL(url){
@@ -4520,6 +4625,22 @@ function updateSpeedDuration(raw){
   appSettingsJS.speed_duration_sec=clampNumSetting(raw,1,60,4,'set-speed-duration');
   saveAppSettings();
 }
+// updateProxyPort stores the local HTTP / SOCKS listen ports. 1–65535; the Go
+// side (currentProxyPorts) further rejects the web-UI port and de-conflicts the
+// two, falling back to the defaults (HTTP 10819 / SOCKS 10818). Applies on the
+// next connection.
+function updateProxyPort(kind,raw){
+  if(kind==='http') appSettingsJS.http_port=clampNumSetting(raw,1,65535,10819,'set-http-port');
+  else appSettingsJS.socks_port=clampNumSetting(raw,1,65535,10818,'set-socks-port');
+  saveAppSettings();
+}
+
+// toggleProxyLAN binds the proxy listeners to 0.0.0.0 (LAN-reachable) when on,
+// else 127.0.0.1 (local only). Applies on the next connection.
+function toggleProxyLAN(on){
+  appSettingsJS.proxy_allow_lan=!!on;
+  saveAppSettings();
+}
 
 // updateModalFontSize / updateLanguage — Appearance controls. Both apply
 // only to .modal-* DOM (Settings + Tab settings); the main window keeps
@@ -4559,6 +4680,7 @@ function updateLanguage(code){
     // on its own next open.
     var m=document.getElementById('settings-modal');
     if(m){ m.remove(); openSettings(); }
+    applyFilterHint(); // relocalize the filter tooltip
   });
 }
 
@@ -5077,11 +5199,13 @@ function openSourcesSettings(){
         '<div class="modal-hint ef-hint">'+t('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')+'</div>'+
         '<div class="ef-fields" id="tab-filter-fields" style="'+(tab&&tab.exclude_disabled?'opacity:.45':'')+'">'+efFieldsHtml+'</div>'+
       '</div>'+
+      '<div class="modal-hint" style="margin-bottom:8px">'+t('Changes apply automatically.')+'</div>'+
       '<div class="modal-btns">'+
-        '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">'+t('cancel')+'</button>'+
-        '<button class="btn ghost" onclick="saveSourcesSettings()">'+t('save')+'</button>'+
+        '<button class="btn ghost" onclick="closeTabModal()">'+t('Close')+'</button>'+
       '</div>'+
     '</div>';
+  ov.onclick=function(ev){if(ev.target===ov)closeTabModal();};
+  ov.addEventListener('change', scheduleTabApply); // live apply on committed edits
   document.body.appendChild(ov);
   // Built-in SOURCES URLs are compiled in (not editable) — fetch and show them
   // read-only, each with a copy button.
@@ -5102,18 +5226,20 @@ function openSourcesSettings(){
     var box=document.getElementById('src-url-list'); if(box) box.textContent=t('Failed to load.');
   });
 }
-function saveSourcesSettings(){
+// applySourcesSettings pushes the Sources (main tab) settings modal live. Guarded
+// by #ms-src-refresh so it only acts while that modal is open.
+function applySourcesSettings(){
+  if(!document.getElementById('ms-src-refresh')) return;
   var refreshMin=parseInt(document.getElementById('ms-src-refresh').value)||0;
   var ef=collectExcludeFilter();
   var refreshDisabled=!document.getElementById('ms-src-refresh-on').checked;
   var excludeDisabled=!document.getElementById('ms-src-exclude-on').checked;
   var refreshTestEl=document.getElementById('ms-src-refresh-test');
   var refreshTest=refreshTestEl?refreshTestEl.value:'';
-  document.getElementById('tab-modal').remove();
   fetch('/api/tab/set-url?id=main',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({refresh_min:refreshMin,exclude_filter:ef,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled,auto_refresh_test:refreshTest})
-  }).then(function(){rebuildTable();}).catch(console.error);
+  }).then(function(){ if(activeTabId==='main') reloadView(true); }).catch(console.error);
 }
 
 // modalFiles holds the set of files (existing + newly added) for the
@@ -5256,6 +5382,7 @@ function removeModalFile(i){
   if(i<0||i>=modalFiles.length) return;
   modalFiles.splice(i,1);
   renderFileList();
+  scheduleTabApply();
 }
 
 // pickModalFiles opens the native Windows file dialog through the Go-side
@@ -5284,6 +5411,7 @@ function pickModalFiles(){
       });
     }
     renderFileList();
+    scheduleTabApply();
   }).catch(function(err){
     console.error('native picker failed:', err);
   });
@@ -5293,6 +5421,7 @@ function openTabSettings(tabId){
   closeCtxMenu();
   const tab=tabsList.find(t=>t.id===tabId);
   if(!tab)return;
+  tabModalId=tabId; tabModalName=tab.name||''; // live-apply target (no Save button)
   var urls=tab.source_urls||[];
   if(urls.length===0&&tab.source_url) urls=[tab.source_url];
   var disabledUrls=tab.source_disabled||[];
@@ -5385,11 +5514,15 @@ function openTabSettings(tabId){
         '<div class="modal-hint ef-hint">'+t('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')+'</div>'+
         '<div class="ef-fields" id="tab-filter-fields" style="'+(tab.exclude_disabled?'opacity:.45':'')+'">'+efFieldsHtml+'</div>'+
       '</div>'+
+      '<div class="modal-hint" style="margin-bottom:8px">'+t('Changes apply automatically.')+'</div>'+
       '<div class="modal-btns">'+
-        '<button class="btn ghost" onclick="document.getElementById(\'tab-modal\').remove()">'+t('cancel')+'</button>'+
-        '<button class="btn ghost" onclick="saveTabSettings(\''+tabId+'\')">'+t('save')+'</button>'+
+        '<button class="btn ghost" onclick="closeTabModal()">'+t('Close')+'</button>'+
       '</div>'+
     '</div>';
+  ov.onclick=(e)=>{if(e.target===ov)closeTabModal();}; // apply pending edit, then close
+  // Live apply: any committed field change (blur for text/number, toggle for
+  // checkboxes, select change) pushes the whole modal to the server — debounced.
+  ov.addEventListener('change', scheduleTabApply);
   document.body.appendChild(ov);
   renderFileList();
   document.getElementById('ms-name').focus();
@@ -5457,7 +5590,7 @@ function efAddValue(inp, val){
 function efChipKey(ev){
   if(ev.key!=='Enter')return;
   ev.preventDefault();
-  efAddValue(ev.target, ev.target.value);
+  if(efAddValue(ev.target, ev.target.value)) scheduleTabApply();
   ev.target.value='';
 }
 function efChipPaste(ev){
@@ -5467,10 +5600,12 @@ function efChipPaste(ev){
   ev.preventDefault();
   for(var i=0;i<toks.length;i++){ efAddValue(ev.target, toks[i]); }
   ev.target.value='';
+  scheduleTabApply();
 }
 function removeEfChip(el){
   var chip=el.parentElement;
   if(chip) chip.remove();
+  scheduleTabApply();
 }
 // collectExcludeFilter reads every chip (plus any half-typed leftover in the
 // inputs) back into the stored "col:value" rule list, de-duplicated and in
@@ -5503,8 +5638,15 @@ function urlRowHtml(val,disabled){
     '<input type="checkbox" class="ms-url-on" '+(disabled?'':'checked')+' onchange="toggleUrlRow(this)" title="'+t('Enable / disable this source')+'">'+
     '<input class="modal-input ms-url" value="'+x(val||'')+'" placeholder="https://raw.githubusercontent.com/...">'+
     '<button class="url-qr" onclick="qrFromRow(this)" title="'+t('QR')+'">QR</button>'+
-    '<button class="url-rm" onclick="this.parentElement.remove()" title="Remove">x</button>'+
+    '<button class="url-rm" onclick="removeUrlRow(this)" title="Remove">x</button>'+
   '</div>';
+}
+// removeUrlRow drops a source-URL row and applies live (no 'change' fires for a
+// row removal).
+function removeUrlRow(btn){
+  var row=btn.closest('.url-row');
+  if(row) row.remove();
+  scheduleTabApply();
 }
 // toggleUrlRow dims a source row when its enable checkbox is cleared.
 function toggleUrlRow(cb){
@@ -5556,6 +5698,7 @@ function selectDedupMode(btn){
   var group=btn.parentElement;
   group.querySelectorAll('.seg-btn').forEach(function(b){ b.classList.remove('active'); });
   btn.classList.add('active');
+  scheduleTabApply(); // seg buttons don't fire 'change' — apply explicitly
 }
 
 // ghToggleFields shows/hides the GitHub import inputs as the toggle flips, so
@@ -5575,8 +5718,50 @@ function ghTogglePatView(){
   inp.type=show?'text':'password';
   if(btn) btn.textContent=show?t('hide'):t('view');
 }
-function saveTabSettings(tabId){
-  var name=document.getElementById('ms-name').value.trim();
+// ── Tab / Sources settings: live apply (no Save button) ─────────────────────
+// tabModalId/tabModalName track the open Tab Settings modal so edits push to the
+// server as they're committed (mirrors the global Settings). tabModalName guards
+// the rename call so it only fires when the name actually changes.
+var tabModalId='', tabModalName='', _tabApplyTimer=0;
+
+// scheduleTabApply debounces the live apply so a burst of edits (typing across
+// fields, toggling) coalesces into a single set-url instead of one per event.
+// Bound to each modal's change events + the custom widgets (chips, dedup seg,
+// file/url add-remove).
+function scheduleTabApply(){
+  if(_tabApplyTimer) clearTimeout(_tabApplyTimer);
+  _tabApplyTimer=setTimeout(function(){ _tabApplyTimer=0; flushTabApply(); },250);
+}
+
+// flushTabApply dispatches to whichever settings modal is open (the user-tab one
+// has #ms-urls; the Sources one has #ms-src-refresh).
+function flushTabApply(){
+  if(document.getElementById('ms-urls')) applyTabSettings();
+  else if(document.getElementById('ms-src-refresh')) applySourcesSettings();
+}
+
+// closeTabModal flushes any pending edit, then closes — so a value typed but not
+// yet debounced isn't lost on close. Used by both settings modals.
+function closeTabModal(){
+  if(_tabApplyTimer){ clearTimeout(_tabApplyTimer); _tabApplyTimer=0; }
+  flushTabApply();
+  var m=document.getElementById('tab-modal'); if(m) m.remove();
+  modalFiles=[]; tabModalId='';
+}
+
+// applyTabSettings reads the open user-tab settings modal and pushes it live.
+// Source changes trigger a re-fetch server-side; non-source changes
+// (dedup/exclude/refresh) apply without one. The modal stays open; SSE events
+// refresh the table underneath.
+function applyTabSettings(){
+  var tabId=tabModalId;
+  if(!tabId || !document.getElementById('ms-urls')) return; // user-tab modal only
+  var nameEl=document.getElementById('ms-name');
+  var name=nameEl?nameEl.value.trim():'';
+  if(name && name!==tabModalName){ // rename only when it actually changed
+    tabModalName=name;
+    fetch('/api/tab/rename?id='+encodeURIComponent(tabId)+'&name='+encodeURIComponent(name),{method:'POST'}).catch(console.error);
+  }
   var refreshMin=parseInt(document.getElementById('ms-refresh').value)||0;
   var refreshOnEl=document.getElementById('ms-refresh-on');
   var excludeOnEl=document.getElementById('ms-exclude-on');
@@ -5596,12 +5781,9 @@ function saveTabSettings(tabId){
     var cb=row.querySelector('.ms-url-on');
     if(cb && !cb.checked) disabledUrls.push(v);
   });
-  // Exclude filter: chips added via Enter, read back into "col:value" rules.
+  // Exclude filter: chips read back into "col:value" rules. Files: only the
+  // metadata the server needs (content is read from disk on every fetch).
   var ef=collectExcludeFilter();
-  // Send only the file metadata the server needs to find and read each
-  // file. Strip isNew (client-only) and size/mtime (server re-stats on
-  // save anyway, so what we'd send is stale). Content is never on the
-  // wire — the server reads from disk on every fetch.
   var files=modalFiles
     .filter(function(f){ return !!f.path; })
     .map(function(f){ return {name:f.name, path:f.path, disabled:!!f.disabled}; });
@@ -5613,17 +5795,12 @@ function saveTabSettings(tabId){
   var ghFile=ghVal('ms-gh-file'), ghPat=ghVal('ms-gh-pat');
   var refreshTestEl=document.getElementById('ms-refresh-test');
   var refreshTest=refreshTestEl?refreshTestEl.value:'';
-  document.getElementById('tab-modal').remove();
-  modalFiles=[];
-  if(name){
-    fetch('/api/tab/rename?id='+encodeURIComponent(tabId)+'&name='+encodeURIComponent(name),{method:'POST'}).catch(console.error);
-  }
   fetch('/api/tab/set-url?id='+encodeURIComponent(tabId),{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({urls:urls,disabled_urls:disabledUrls,files:files,refresh_min:refreshMin,exclude_filter:ef,dedup_mode:dedupMode,refresh_disabled:refreshDisabled,exclude_disabled:excludeDisabled,
       auto_refresh_test:refreshTest,
       github_enabled:ghEnabled,github_owner:ghOwner,github_repo:ghRepo,github_file:ghFile,github_pat:ghPat})
-  }).then(function(){rebuildTable();}).catch(console.error);
+  }).then(function(){ if(tabId===activeTabId) reloadView(true); }).catch(console.error); // reflect exclude/refresh changes (source changes also push 'loaded')
 }
 
 // ── Row selection + delete ───────────────────────────────────────────────────
@@ -5651,9 +5828,7 @@ document.addEventListener('keydown',function(e){
     }
     e.preventDefault();
     e.stopPropagation();
-    selectedRows.clear();
-    sortedList.forEach(en=>selectedRows.add(en.index));
-    rebuildTable();
+    selectAllInView();
     return;
   }
   // Ctrl+C is handled by the 'copy' event listener — see above.
@@ -5668,28 +5843,82 @@ document.addEventListener('keydown',function(e){
     deleteSelectedRows();
   }
   if(e.key==='Escape'){
-    if(document.getElementById('tab-modal'))document.getElementById('tab-modal').remove();
-    if(selectedRows.size>0){selectedRows.clear();rebuildTable();}
+    if(document.getElementById('tab-modal'))closeTabModal(); // flush pending edit, then close
+    if(selectedRows.size>0){selectedRows.clear();selData={};renderVisibleRows();}
   }
 },true);
 
 function toggleRowSelect(idx,e){
+  var raw=entries[idx]&&entries[idx].raw;
   if(e&&e.shiftKey&&selectedRows.size>0){
-    // Range select using current visual order (sortedList)
-    const idxs=sortedList.map(en=>en.index);
-    const lastSel=[...selectedRows].pop();
-    const from=idxs.indexOf(lastSel),to=idxs.indexOf(idx);
-    if(from>=0&&to>=0){
+    // Range select over the FULL ordered set (allPos), so a span crossing
+    // windows the client never loaded still selects every row in between — not
+    // just the loaded ones. Raws for the span are fetched so copy is complete.
+    const anchor=[...selectedRows].pop();
+    ensureAllIndices(function(idxList){
+      const from=allPos&&allPos.get(anchor), to=allPos&&allPos.get(idx);
+      if(from===undefined || to===undefined){ // anchor/target not in current order — keep just the click
+        selectedRows.add(idx); if(raw) selData[idx]=raw; renderVisibleRows(); return;
+      }
       const lo=Math.min(from,to),hi=Math.max(from,to);
-      for(let i=lo;i<=hi;i++) selectedRows.add(idxs[i]);
-    }
+      const range=idxList.slice(lo,hi+1);
+      range.forEach(function(ix){ selectedRows.add(ix); });
+      renderVisibleRows();      // show the selection immediately
+      fillSelData(range, null); // pull raws for copy in the background
+    });
+    return;
   } else if(e&&e.ctrlKey){
-    if(selectedRows.has(idx)) selectedRows.delete(idx); else selectedRows.add(idx);
+    if(selectedRows.has(idx)){ selectedRows.delete(idx); delete selData[idx]; }
+    else { selectedRows.add(idx); if(raw) selData[idx]=raw; }
   } else {
-    if(selectedRows.has(idx)&&selectedRows.size===1) selectedRows.clear();
-    else { selectedRows.clear(); selectedRows.add(idx); }
+    if(selectedRows.has(idx)&&selectedRows.size===1){ selectedRows.clear(); selData={}; }
+    else { selectedRows.clear(); selData={}; selectedRows.add(idx); if(raw) selData[idx]=raw; }
   }
-  rebuildTable();
+  renderVisibleRows();
+}
+
+// allIndices/allPos cache the FULL ordered index list of the current view (every
+// matching row, not just loaded windows). Fetched on demand for shift-range and
+// select-all; dropped whenever the view changes (see reloadView).
+var allIndices=null, allPos=null;
+function ensureAllIndices(cb){
+  if(allIndices){ cb(allIndices); return; }
+  fetch('/api/tab/indices?'+winQuery('')).then(r=>r.json()).then(function(d){
+    allIndices=(d&&d.idx)||[];
+    allPos=new Map();
+    for(var i=0;i<allIndices.length;i++) allPos.set(allIndices[i],i);
+    cb(allIndices);
+  }).catch(function(){ cb(allIndices||[]); });
+}
+
+// fillSelData fetches raw URLs for selected rows we haven't loaded a window for,
+// so copy/chain over a large selection isn't limited to the visible rows. Only
+// the missing indices are requested.
+function fillSelData(indices, cb){
+  var need=[];
+  for(var i=0;i<indices.length;i++){ if(selData[indices[i]]===undefined) need.push(indices[i]); }
+  if(need.length===0){ if(cb)cb(); return; }
+  fetch('/api/tab/raws?id='+encodeURIComponent(activeTabId||''),{
+    method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(need)
+  }).then(r=>r.json()).then(function(d){
+    var raw=(d&&d.raw)||[];
+    for(var i=0;i<need.length;i++){ if(raw[i]) selData[need[i]]=raw[i]; }
+    if(cb)cb();
+  }).catch(function(){ if(cb)cb(); });
+}
+
+// selectAllInView selects every row of the current filtered/sorted view and
+// pulls all their raws in one request, so Delete / test / copy all cover the
+// whole set even though the client only ever rendered a few windows. Backs both
+// Ctrl+A and the right-click "Select all".
+function selectAllInView(){
+  fetch('/api/tab/raws?all=1&'+winQuery('')).then(r=>r.json()).then(function(d){
+    selectedRows.clear(); selData={};
+    var idx=(d&&d.idx)||[], raw=(d&&d.raw)||[];
+    allIndices=idx; allPos=new Map();
+    for(var i=0;i<idx.length;i++){ selectedRows.add(idx[i]); allPos.set(idx[i],i); if(raw[i]) selData[idx[i]]=raw[i]; }
+    renderVisibleRows();
+  }).catch(console.error);
 }
 
 
