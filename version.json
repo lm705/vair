@@ -1,6 +1,6 @@
 {
   "version": "1.10.0",
-  "url": "https://github.com/lm705/vair/releases/download/v1.9.0/Vair.exe",
+  "url": "https://github.com/lm705/vair/releases/download/v1.10.0/Vair.exe",
   "sha256": "948663540116409a0d37825db904925e572209a170d81925a2291453dd76a812",
   "notes": "Переход на SQLite, переработка фильтра, настраиваемые порты, обновлённый логотип."
 }
