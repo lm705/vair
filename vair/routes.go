@@ -150,6 +150,10 @@ func registerRoutes() {
 	http.HandleFunc("/api/tab/create", handleTabCreate)
 	http.HandleFunc("/api/tab/delete", handleTabDelete)
 	http.HandleFunc("/api/tab/switch", handleTabSwitch)
+	http.HandleFunc("/api/tab/window", handleTabWindow)
+	http.HandleFunc("/api/tab/indices", handleTabIndices)
+	http.HandleFunc("/api/tab/raws", handleTabRaws)
+	http.HandleFunc("/api/tab/delete-failed", handleTabDeleteFailed)
 	http.HandleFunc("/api/tab/paste", handleTabPaste)
 	http.HandleFunc("/api/tab/add-url", handleTabAddURL)
 	http.HandleFunc("/api/tab/rename", handleTabRename)
@@ -166,6 +170,7 @@ func registerRoutes() {
 	http.HandleFunc("/api/logs/clear", handleLogsClear)
 	http.HandleFunc("/api/update/check", handleUpdateCheck)
 	http.HandleFunc("/api/update/apply", handleUpdateApply)
+	http.HandleFunc("/api/update/dismiss", handleUpdateDismiss)
 	http.HandleFunc("/api/deeplink", handleDeepLink)
 	go logFlushLoop()
 }

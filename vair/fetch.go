@@ -52,21 +52,16 @@ func fetchAndInit() {
 	settingsMu.RUnlock()
 
 	if !sourcesEnabled {
-		state.mu.Lock()
-		state.tabEntries["main"] = nil
-		if state.activeTab == "main" {
-			state.entries = nil
-		}
-		state.mu.Unlock()
-		if state.activeTab == "main" {
-			state.broadcast(SSEEvent{Type: "loaded", Payload: []ConfigEntry{}})
-		}
+		storeReplace("main", nil) // Sources disabled → clear the store
+		loadedSignal("main")
 		return
 	}
 
-	if state.activeTab == "main" {
-		state.broadcast(SSEEvent{Type: "loading", Payload: nil})
-	}
+	// Tag with "main" (sent even when another tab is active) so the client tracks
+	// the Sources tab as fetching and re-shows the spinner if the user switches
+	// back to it before the fetch finishes; the spinner itself only renders when
+	// main is the active tab (the client filters by tab).
+	state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: "main"})
 	var raws []string
 	var subs []subMeta
 
@@ -116,16 +111,7 @@ func fetchAndInit() {
 	// If nothing fetched, keep existing entries
 	if len(raws) == 0 {
 		fmt.Fprintf(os.Stderr, "⚠  no configs fetched, keeping existing\n")
-		state.mu.RLock()
-		cur := state.tabEntries["main"]
-		state.mu.RUnlock()
-		if state.activeTab == "main" && cur != nil {
-			snaps := make([]ConfigEntry, len(cur))
-			for i, e := range cur {
-				snaps[i] = e.snap()
-			}
-			state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
-		}
+		loadedSignal("main") // keep existing rows; client re-fetches its window
 		return
 	}
 
@@ -192,7 +178,6 @@ func fetchAndInit() {
 		e.Index = i
 	}
 	state.mu.Lock()
-	state.tabEntries["main"] = entries
 	// Reconcile the Sources tab's subscription info to this fetch (clears it when
 	// no source carried any).
 	for i := range state.tabs {
@@ -201,19 +186,11 @@ func fetchAndInit() {
 			break
 		}
 	}
-	// Only update active entries if main tab is active
-	if state.activeTab == "main" {
-		state.entries = entries
-	}
 	state.mu.Unlock()
-	// Only broadcast loaded data if main tab is active
-	if state.activeTab == "main" {
-		snaps := make([]ConfigEntry, len(entries))
-		for i, e := range entries {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
-	}
+	addedN, removedN, addedIdx := reloadDelta("main", entries) // before storeReplace overwrites
+	storeReplace("main", entries)                              // persist to the store (outside the lock — DB write can be slow)
+	loadedSignal("main")                                       // client re-fetches its window from the store
+	broadcastReloadDelta("main", addedN, removedN, addedIdx)
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	// A refresh rebuilds entries with no ping data. If this tab is part of the
 	// auto-connect pool, re-ping it so the supervisor can rank by real delay
@@ -704,35 +681,68 @@ func dedupByBody(entries []*ConfigEntry) []*ConfigEntry {
 // are recomputed; names are *not* re-disambiguated because the existing
 // names were already computed against the pre-dedup index order and
 // re-running would produce double-suffix names like "USA - 1 - 1".
+// reloadDelta computes how many configs a reload added / removed for a tab,
+// comparing the new set against what the store currently holds. Returns (0,0) on
+// the first load (nothing to diff). Call BEFORE storeReplace overwrites the old
+// rows. Drives the "+N −M" toast on RELOAD.
+func reloadDelta(tabID string, entries []*ConfigEntry) (added, removed int, addedIdx []int) {
+	if store == nil {
+		return 0, 0, nil
+	}
+	old, err := store.tabRawSet(tabID)
+	if err != nil || len(old) == 0 {
+		return 0, 0, nil
+	}
+	newSet := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		newSet[e.Raw] = struct{}{}
+	}
+	// Per-entry indices of rows whose raw wasn't there before — the client flashes
+	// these when they scroll into view. Capped so a huge reload doesn't bloat the
+	// event; the count below stays exact regardless.
+	for _, e := range entries {
+		if _, isOld := old[e.Raw]; !isOld && len(addedIdx) < flashIdxCap {
+			addedIdx = append(addedIdx, e.Index)
+		}
+	}
+	for r := range newSet {
+		if _, ok := old[r]; !ok {
+			added++
+		}
+	}
+	for r := range old {
+		if _, ok := newSet[r]; !ok {
+			removed++
+		}
+	}
+	return added, removed, addedIdx
+}
+
+const flashIdxCap = 20000
+
+// broadcastReloadDelta fires the reload_delta event when a reload changed the set.
+func broadcastReloadDelta(tabID string, added, removed int, addedIdx []int) {
+	if added > 0 || removed > 0 {
+		state.broadcast(SSEEvent{Type: "reload_delta", Payload: map[string]interface{}{"added": added, "removed": removed, "idx": addedIdx}, Tab: tabID})
+	}
+}
+
 func applyDeleteDedupInPlace(tabID string) {
-	state.mu.Lock()
-	entries := state.tabEntries[tabID]
+	entries := loadTabEntries(tabID)
 	if len(entries) == 0 {
-		state.mu.Unlock()
 		saveTabs()
 		return
 	}
 	deduped := dedupByBody(entries)
 	if len(deduped) == len(entries) {
-		state.mu.Unlock()
 		saveTabs()
 		return
 	}
 	for i, e := range deduped {
 		e.Index = i
 	}
-	state.tabEntries[tabID] = deduped
-	if state.activeTab == tabID {
-		state.entries = deduped
-	}
-	state.mu.Unlock()
-	if state.activeTab == tabID {
-		snaps := make([]ConfigEntry, len(deduped))
-		for i, e := range deduped {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
-	}
+	storeReplace(tabID, deduped) // SQLite is the source of truth now
+	loadedSignal(tabID)
 	saveTabs()
 }
 

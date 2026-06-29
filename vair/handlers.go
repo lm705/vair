@@ -37,19 +37,14 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	state.addClient(ch)
 	defer state.removeClient(ch)
 	send := func(ev SSEEvent) { data, _ := json.Marshal(ev); fmt.Fprintf(w, "data: %s\n\n", data); flusher.Flush() }
-	state.mu.RLock()
-	if len(state.entries) > 0 {
-		snaps := make([]ConfigEntry, len(state.entries))
-		for i, e := range state.entries {
-			snaps[i] = e.snap()
-		}
-		state.mu.RUnlock()
-		send(SSEEvent{Type: "loaded", Payload: snaps})
-	} else {
-		state.mu.RUnlock()
-	}
+	// Tell the freshly-connected client to load the active tab's first window
+	// (it fetches rows via /api/tab/window; the full list isn't pushed).
 	send(SSEEvent{Type: "conn_update", Payload: state.conn.snap()})
 	send(SSEEvent{Type: "tabs_update", Payload: state.tabs})
+	// Sync the client to the server's active tab, then have it load that tab's
+	// first window (the full list isn't pushed — the client fetches it).
+	send(SSEEvent{Type: "active_tab", Payload: state.activeTab})
+	send(SSEEvent{Type: "loaded", Payload: nil, Tab: state.activeTab})
 	// Send initial stats so the freshly-loaded UI shows lifetime totals
 	// without waiting for the first ticker pulse (which only fires while
 	// connected). We pass the live counter if a session is in progress.
@@ -82,6 +77,19 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// activeTabID reads the active tab id under the state lock.
+func activeTabID() string {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.activeTab
+}
+
+// activeEntry returns entry idx of the active tab from the in-memory store.
+// The returned *ConfigEntry is the live working copy.
+func activeEntry(idx int) (*ConfigEntry, bool) {
+	return memEntry(activeTabID(), idx)
+}
+
 func handleConnect(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	idx, err := strconv.Atoi(r.URL.Query().Get("idx"))
@@ -90,14 +98,11 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mode := r.URL.Query().Get("mode")
-	state.mu.RLock()
-	if idx < 0 || idx >= len(state.entries) {
-		state.mu.RUnlock()
+	entry, ok := activeEntry(idx)
+	if !ok {
 		http.Error(w, "not found", 404)
 		return
 	}
-	entry := state.entries[idx]
-	state.mu.RUnlock()
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
 	// User explicitly connected → arm auto (keep alive / failover on death),
@@ -125,29 +130,30 @@ func handleConnectChain(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(raw, ",")
 	var entries []*ConfigEntry
 	var nodes []*Node
-	state.mu.RLock()
+	tab := activeTabID()
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
 		i, err := strconv.Atoi(p)
-		if err != nil || i < 0 || i >= len(state.entries) {
-			state.mu.RUnlock()
+		if err != nil {
 			http.Error(w, "bad idx", 400)
 			return
 		}
-		e := state.entries[i]
+		e, ok := memEntry(tab, i)
+		if !ok {
+			http.Error(w, "bad idx", 400)
+			return
+		}
 		n, perr := parseNode(e.Raw)
 		if perr != nil {
-			state.mu.RUnlock()
 			http.Error(w, "chain: unparseable config in selection", 400)
 			return
 		}
 		entries = append(entries, e)
 		nodes = append(nodes, n)
 	}
-	state.mu.RUnlock()
 
 	if len(entries) < 2 {
 		http.Error(w, "a chain needs at least 2 configs", 400)
@@ -234,14 +240,12 @@ func handleQR(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad idx", 400)
 		return
 	}
-	state.mu.RLock()
-	if idx < 0 || idx >= len(state.entries) {
-		state.mu.RUnlock()
+	entry, ok := activeEntry(idx)
+	if !ok {
 		http.Error(w, "not found", 404)
 		return
 	}
-	raw := state.entries[idx].Raw
-	state.mu.RUnlock()
+	raw := entry.Raw
 	if raw == "" {
 		http.Error(w, "empty config", 400)
 		return
@@ -392,15 +396,12 @@ func handlePingOne(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad idx", 400)
 		return
 	}
-	state.mu.RLock()
-	if idx < 0 || idx >= len(state.entries) {
-		state.mu.RUnlock()
+	tabID := activeTabID()
+	entry, ok := activeEntry(idx)
+	if !ok {
 		http.Error(w, "not found", 404)
 		return
 	}
-	entry := state.entries[idx]
-	tabID := state.activeTab
-	state.mu.RUnlock()
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
 	// Register a cancel channel so RELOAD on this tab can stop this manual ping.
@@ -438,6 +439,7 @@ func handlePingOne(w http.ResponseWriter, r *http.Request) {
 			entry.Delay = -1
 		}
 		entry.mu.Unlock()
+		mirrorPingResult(tabID, entry) // persist so a tab switch-back reads it
 		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
 	}()
 }
@@ -455,31 +457,7 @@ func handlePingConnected(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("not connected"))
 		return
 	}
-	state.mu.RLock()
-	var entry *ConfigEntry
-	var tabID string
-	if ents, ok := state.tabEntries[cs.ConnTab]; ok {
-		for _, e := range ents {
-			if e.Raw == cs.ConnRaw {
-				entry, tabID = e, cs.ConnTab
-				break
-			}
-		}
-	}
-	if entry == nil {
-		for tid, ents := range state.tabEntries {
-			for _, e := range ents {
-				if e.Raw == cs.ConnRaw {
-					entry, tabID = e, tid
-					break
-				}
-			}
-			if entry != nil {
-				break
-			}
-		}
-	}
-	state.mu.RUnlock()
+	entry, tabID, _ := memEntryByRaw(cs.ConnTab, cs.ConnRaw)
 	if entry == nil {
 		w.WriteHeader(200)
 		w.Write([]byte("entry not found"))
@@ -513,6 +491,7 @@ func handlePingConnected(w http.ResponseWriter, r *http.Request) {
 			entry.Delay = -1
 		}
 		entry.mu.Unlock()
+		mirrorPingResult(tabID, entry) // persist so a tab switch-back reads it
 		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
 	}()
 }
@@ -627,35 +606,28 @@ func handleRenameEntry(w http.ResponseWriter, r *http.Request) {
 		name = name[:120]
 	}
 
-	state.mu.Lock()
-	if state.activeTab == "main" {
-		state.mu.Unlock()
+	tabID := activeTabID()
+	if tabID == "main" {
 		http.Error(w, "rename is not available on the Sources tab", 400)
 		return
 	}
-	if idx < 0 || idx >= len(state.entries) {
-		state.mu.Unlock()
+	entry, ok := activeEntry(idx)
+	if !ok {
 		http.Error(w, "not found", 404)
 		return
 	}
-	entry := state.entries[idx]
-	tabID := state.activeTab
 	oldRaw := entry.Raw
 	newRaw := setNodeName(oldRaw, name)
-	entry.mu.Lock()
 	entry.Raw = newRaw
 	entry.Name = name
-	entry.mu.Unlock()
-	state.mu.Unlock()
+	if store != nil {
+		store.updateName(tabID, idx, name, newRaw)
+	}
 
-	// Migrate raw-keyed references so the rename is transparent.
+	// Migrate raw-keyed references so the rename is transparent. (Favorites are
+	// keyed by body, which a rename doesn't change, so they need no migration.)
 	if oldRaw != newRaw {
 		settingsMu.Lock()
-		for i, fav := range appSettings.Favorites {
-			if fav == oldRaw {
-				appSettings.Favorites[i] = newRaw
-			}
-		}
 		if appSettings.LastConnectedRaw == oldRaw {
 			appSettings.LastConnectedRaw = newRaw
 		}
@@ -689,15 +661,12 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad idx", 400)
 		return
 	}
-	state.mu.RLock()
-	if idx < 0 || idx >= len(state.entries) {
-		state.mu.RUnlock()
+	tabID := activeTabID()
+	entry, ok := activeEntry(idx)
+	if !ok {
 		http.Error(w, "not found", 404)
 		return
 	}
-	entry := state.entries[idx]
-	tabID := state.activeTab
-	state.mu.RUnlock()
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
 	// Register a cancel channel so RELOAD on this tab can stop this manual speed
@@ -753,6 +722,7 @@ func handleSpeedOne(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		entry.mu.Unlock()
+		mirrorSpeedResult(tabID, entry) // persist so a tab switch-back reads it
 		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
 	}()
 }
@@ -875,29 +845,10 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 			fetchTabURLs(tabID, sourceURLs, sourceFiles)
 		}()
 	} else {
-		// No URL: reset all test results for this tab
+		// No URL: reset all test results for this tab (memory + store).
 		go func() {
-			state.mu.Lock()
-			entries := state.tabEntries[tabID]
-			for _, e := range entries {
-				e.mu.Lock()
-				e.PingStatus = StatusPending
-				e.Delay = -1
-				e.PingErr = ""
-				e.SpeedStatus = StatusPending
-				e.SpeedMBps = 0
-				e.SpeedLive = 0
-				e.SpeedErr = ""
-				e.mu.Unlock()
-			}
-			state.mu.Unlock()
-			if state.activeTab == tabID {
-				snaps := make([]ConfigEntry, len(entries))
-				for i, e := range entries {
-					snaps[i] = e.snap()
-				}
-				state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
-			}
+			resetTabResultsMem(tabID)
+			loadedSignal(tabID)
 		}()
 	}
 	w.WriteHeader(200)
@@ -919,7 +870,6 @@ func handleTabCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	state.mu.Lock()
 	state.tabs = append(state.tabs, tab)
-	state.tabEntries[tab.ID] = nil
 	delete(state.cancelledTabs, tab.ID) // clear stale cancellation from deleted tab with same ID
 	state.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
@@ -939,27 +889,167 @@ func handleTabDelete(w http.ResponseWriter, r *http.Request) {
 	for i, t := range state.tabs {
 		if t.ID == id {
 			state.tabs = append(state.tabs[:i], state.tabs[i+1:]...)
-			delete(state.tabEntries, id)
 			break
 		}
 	}
+	delete(state.tabEntries, id) // drop the closed tab's in-memory configs
 	if state.activeTab == id {
 		state.activeTab = "main"
 		state.entries = state.tabEntries["main"]
 	}
 	state.mu.Unlock()
+	memInvalidate(id)
+	// The tab's already gone from memory — tell the UI now so a big tab disappears
+	// instantly, and drop its DB rows in the background (a single DELETE on 200k
+	// rows can take a second+). Orphaned rows from a crash mid-delete are swept on
+	// the next startup (sweepOrphanTabRows).
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
-	state.mu.RLock()
-	snaps := make([]ConfigEntry, len(state.entries))
-	for i, e := range state.entries {
-		snaps[i] = e.snap()
-	}
-	state.mu.RUnlock()
 	state.broadcast(SSEEvent{Type: "active_tab", Payload: state.activeTab})
-	state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
+	loadedSignal("main")
 	saveTabs()
+	if store != nil {
+		go store.deleteTabRows(id)
+	}
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
+}
+
+// loadedSignal tells connected clients that a tab's config set changed; they
+// re-fetch the visible window via /api/tab/window. The full list is no longer
+// pushed over SSE (that serialization + the client-side JSON.parse of the whole
+// list was the freeze on large tabs). Tagged with the tab so the client applies
+// it only when that tab is active.
+func loadedSignal(tabID string) {
+	state.broadcast(SSEEvent{Type: "loaded", Payload: nil, Tab: tabID})
+}
+
+// windowQueryFromReq parses the shared window query params (sort/filter/proto/
+// offset/limit) and resolves the tab's dedup mode + the favorites list. Used by
+// both handleTabWindow and handleTabIndices.
+func windowQueryFromReq(r *http.Request) (string, windowQuery) {
+	q := r.URL.Query()
+	id := q.Get("id")
+	if id == "" {
+		id = state.activeTab
+	}
+	state.mu.RLock()
+	dedupHide := false
+	for _, t := range state.tabs {
+		if t.ID == id {
+			dedupHide = t.DedupMode == "hide"
+			break
+		}
+	}
+	state.mu.RUnlock()
+	settingsMu.RLock()
+	favs := append([]string(nil), appSettings.Favorites...)
+	settingsMu.RUnlock()
+	var proto []string
+	if p := strings.TrimSpace(q.Get("proto")); p != "" {
+		proto = strings.Split(p, ",")
+	}
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 {
+		limit = 200
+	}
+	return id, windowQuery{
+		sort: q.Get("sort"), filter: q.Get("filter"), proto: proto, dedupHide: dedupHide,
+		favorites: favs, offset: offset, limit: limit,
+	}
+}
+
+// handleTabWindow serves a window of a tab's configs from the IN-MEMORY store
+// with sort / filter / dedup / favorites + header counters. The
+// windowed client holds only the visible rows. Query: id, sort(idx|ping|speed),
+// filter, proto, offset, limit. meta=1 also returns total + the header stats.
+func handleTabWindow(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	id, wq := windowQueryFromReq(r)
+	meta := r.URL.Query().Get("meta") == "1"
+	rows, total, st := memWindow(id, wq, wq.favorites, meta)
+	resp := map[string]interface{}{"rows": rows, "offset": wq.offset}
+	if meta {
+		resp["total"] = total
+		resp["tab_total"] = memTabCount(id) // unfiltered count → "matching / total"
+		resp["stats"] = map[string]interface{}{"total": st.total, "ok": st.ok, "err": st.fail, "min_ping": st.minPing, "max_speed": st.maxSpeed}
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// handleTabIndices returns every matching entry index in screen order. The
+// windowed client uses it for "ping/speed all" so a bulk test covers the whole
+// filtered set without the client holding the full list.
+func handleTabIndices(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	id, wq := windowQueryFromReq(r)
+	idxs := memIndices(id, wq, wq.favorites)
+	if idxs == nil {
+		idxs = []int{}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"idx": idxs})
+}
+
+// handleTabRaws returns raw config URLs in screen order so the windowed client
+// can copy rows it never loaded. With all=1 it returns every matching row's
+// index + raw (Ctrl+A / "select all" → copy the whole filtered set). Otherwise
+// it reads a JSON array of indices from the body and returns their raws in the
+// same order (shift-range copy).
+func handleTabRaws(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Query().Get("all") == "1" {
+		id, wq := windowQueryFromReq(r)
+		idx, raw := memRawsOrdered(id, wq, wq.favorites)
+		if idx == nil {
+			idx = []int{}
+		}
+		if raw == nil {
+			raw = []string{}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"idx": idx, "raw": raw})
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		id = state.activeTab
+	}
+	var idxs []int
+	json.NewDecoder(r.Body).Decode(&idxs)
+	raw := memRawsForIndices(id, idxs)
+	if raw == nil {
+		raw = []string{}
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{"raw": raw})
+}
+
+// handleTabDeleteFailed removes every config whose ping OR speed test failed.
+// Done server-side (over the whole tab) so it works regardless of which rows the
+// windowed client currently holds. No-op on main (its entries are re-fetched).
+func handleTabDeleteFailed(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	id := r.URL.Query().Get("id")
+	if id == "" || id == "main" {
+		w.WriteHeader(200)
+		w.Write([]byte(`{"remaining":0}`))
+		return
+	}
+	var kept []*ConfigEntry
+	for _, e := range loadTabEntries(id) {
+		if e.PingStatus != StatusFailed && e.SpeedStatus != StatusFailed {
+			kept = append(kept, e)
+		}
+	}
+	for i, e := range kept {
+		e.Index = i
+	}
+	storeReplace(id, kept) // re-indexed; SQLite is the source of truth
+	loadedSignal(id)
+	saveTabs()
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"remaining":%d}`, len(kept))
 }
 
 func handleTabSwitch(w http.ResponseWriter, r *http.Request) {
@@ -979,30 +1069,13 @@ func handleTabSwitch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state.activeTab = id
-	entries := state.tabEntries[id]
-	state.entries = entries
 	inFlight := state.fetching[id]
 	state.mu.Unlock()
-	cached := r.URL.Query().Get("cached") == "1"
 	state.broadcast(SSEEvent{Type: "active_tab", Payload: id})
-	// A reload is still running for this tab → show the spinner rather than a
-	// stale/empty list; the fetch's completion broadcast will fill it in.
+	// The client loads the tab's first window on active_tab. If a reload is still
+	// running, show the spinner instead; loadedSignal on completion re-triggers.
 	if inFlight {
 		state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
-	} else if cached {
-		// The client claims an up-to-date cache for this tab — it marks a tab
-		// dirty on every entry_update/loaded/loading it sees for an inactive tab,
-		// so it only sends cached=1 when nothing changed since it last had the
-		// full list. Skipping the resend (+ its JSON.parse on the client) is what
-		// makes switching to a huge tab instant. Worst case if the client were
-		// wrong: slightly stale ping/speed until the next reload — never wrong
-		// configs (set changes always fire loading/loaded → the client marks dirty).
-	} else {
-		snaps := make([]ConfigEntry, len(entries))
-		for i, e := range entries {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
 	}
 	w.WriteHeader(200)
 	w.Write([]byte("ok"))
@@ -1097,6 +1170,19 @@ func handleTabPaste(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot paste into main tab", 400)
 		return
 	}
+	// Mark the tab as fetching + show the spinner: parsing a big paste (hundreds
+	// of thousands of configs) takes a moment, and a switch back to the tab during
+	// it should keep the spinner (same as a reload). Cleared via loadedSignal +
+	// the defer below.
+	state.mu.Lock()
+	state.fetching[id] = true
+	state.mu.Unlock()
+	state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
+	defer func() {
+		state.mu.Lock()
+		delete(state.fetching, id)
+		state.mu.Unlock()
+	}()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024*1024)) // ~250k configs; old 10 MB cap truncated big pastes at ~40k
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), 400)
@@ -1106,20 +1192,18 @@ func handleTabPaste(w http.ResponseWriter, r *http.Request) {
 	// here — the UI routes those to /api/tab/add-url so they're added as a
 	// persistent tab source. This endpoint only ingests actual config lines.
 	newEntries := parseConfigLines(string(body))
-	state.mu.Lock()
-	existing := state.tabEntries[id]
+	existing := loadTabEntries(id)
 	baseIdx := len(existing)
 	for i, e := range newEntries {
 		e.Index = baseIdx + i
 	}
 	existing = append(existing, newEntries...)
 
-	// Apply server-side dedup in-place when the tab is in "delete" mode.
-	// Without this, dupes pasted into a delete-mode tab silently accumulated
-	// because "delete" was only ever applied during fetchTabURLs / explicit
-	// mode transition — paste went straight through. "hide" mode kept working
-	// because it's a JS view filter, evaluated on every render.
+	// Apply server-side dedup when the tab is in "delete" mode. Without this,
+	// dupes pasted into a delete-mode tab silently accumulated because "delete"
+	// was only ever applied during fetchTabURLs / explicit mode transition.
 	// Re-index so positions are contiguous after dedup.
+	state.mu.RLock()
 	var dedupMode string
 	for _, t := range state.tabs {
 		if t.ID == id {
@@ -1127,6 +1211,7 @@ func handleTabPaste(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	state.mu.RUnlock()
 	if dedupMode == "delete" {
 		existing = dedupByBody(existing)
 		for i, e := range existing {
@@ -1134,18 +1219,8 @@ func handleTabPaste(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	state.tabEntries[id] = existing
-	if state.activeTab == id {
-		state.entries = existing
-	}
-	state.mu.Unlock()
-	if state.activeTab == id {
-		snaps := make([]ConfigEntry, len(existing))
-		for i, e := range existing {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
-	}
+	storeReplace(id, existing) // SQLite is the source of truth now
+	loadedSignal(id)
 	saveTabs()
 	w.WriteHeader(200)
 	fmt.Fprintf(w, `{"added":%d}`, len(newEntries))
@@ -1418,12 +1493,7 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if hasSource {
-			state.mu.Lock()
-			state.tabEntries[id] = nil
-			if state.activeTab == id {
-				state.entries = nil
-			}
-			state.mu.Unlock()
+			// The upcoming fetch replaces the store; the spinner covers the gap.
 			if state.activeTab == id {
 				state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
 			}
@@ -1436,9 +1506,10 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 
 	// "delete" mode requested AND mode has actually transitioned into delete
 	// AND sources didn't change → apply server-side dedup to the current
-	// entries in place. (When sources changed we re-fetch below, and that
-	// path applies delete-dedup via fetchTabURLs.)
-	if !sourcesChanged && id != "main" && newMode == "delete" && oldMode != "delete" {
+	// entries in place, so duplicates disappear on the switch instead of only
+	// after the next reload. Applies to the main tab too. (When sources
+	// changed we re-fetch below, and that path dedups via fetchTabURLs.)
+	if !sourcesChanged && newMode == "delete" && oldMode != "delete" {
 		applyDeleteDedupInPlace(id)
 		w.WriteHeader(200)
 		w.Write([]byte("ok"))
@@ -1456,37 +1527,25 @@ func handleTabSetURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if hasSource {
-		// Clear old entries before fetching new ones (prevents stale data from removed sources)
-		state.mu.Lock()
-		state.tabEntries[id] = nil
-		if state.activeTab == id {
-			state.entries = nil
-		}
-		state.mu.Unlock()
+		// The upcoming fetch replaces the store; the spinner covers the gap.
 		if state.activeTab == id {
 			state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: id})
 		}
 		go fetchTabURLs(id, cleanURLs, cleanFiles)
 	} else {
-		// All sources removed — clear entries AND the subscription info (this
-		// branch doesn't go through fetchTabURLs, which is where Subs is otherwise
-		// reconciled, so an emptied tab would keep showing stale sub info).
+		// All sources removed — clear the subscription info too (this branch
+		// doesn't go through fetchTabURLs, where Subs is otherwise reconciled).
 		state.mu.Lock()
-		state.tabEntries[id] = nil
 		for i := range state.tabs {
 			if state.tabs[i].ID == id {
 				state.tabs[i].Subs = nil
 				break
 			}
 		}
-		if state.activeTab == id {
-			state.entries = nil
-		}
 		state.mu.Unlock()
+		storeReplace(id, nil) // all sources removed, no re-fetch → clear the store now
 		state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
-		if state.activeTab == id {
-			state.broadcast(SSEEvent{Type: "loaded", Payload: []ConfigEntry{}, Tab: id})
-		}
+		loadedSignal(id)
 		saveTabs()
 	}
 	w.WriteHeader(200)
@@ -1661,16 +1720,9 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	if len(allEntries) == 0 {
 		fmt.Fprintf(os.Stderr, "⚠ tab %s: no configs fetched, keeping existing\n", tabID)
 		state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
-		state.mu.RLock()
-		cur := state.tabEntries[tabID]
-		state.mu.RUnlock()
-		// Always re-broadcast (tagged) so the tab's spinner clears even when the
+		// Always re-signal (tagged) so the tab's spinner clears even when the
 		// fetch finished while the tab was inactive and is now switched back to.
-		snaps := make([]ConfigEntry, len(cur))
-		for i, e := range cur {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
+		loadedSignal(tabID)
 		return
 	}
 
@@ -1716,10 +1768,8 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		e.Index = i
 	}
 	state.mu.Lock()
-	state.tabEntries[tabID] = allEntries
 	// Persist any updated file content/mtime back to the tab so it survives
-	// restart and the next RELOAD doesn't have to detect changes from
-	// scratch.
+	// restart and the next RELOAD doesn't have to detect changes from scratch.
 	for i := range state.tabs {
 		if state.tabs[i].ID == tabID {
 			state.tabs[i].SourceFiles = updatedFiles
@@ -1727,19 +1777,14 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 			break
 		}
 	}
-	if state.activeTab == tabID {
-		state.entries = allEntries
-	}
 	state.mu.Unlock()
-	// Always broadcast the result tagged with the tab. The client applies it only
-	// when this tab is active (events are tab-filtered), so a fetch that finishes
-	// after the user switched away — then back — still lands. Without this the
-	// completion was gated on the tab still being active and could be dropped.
-	snaps := make([]ConfigEntry, len(allEntries))
-	for i, e := range allEntries {
-		snaps[i] = e.snap()
-	}
-	state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
+	addedN, removedN, addedIdx := reloadDelta(tabID, allEntries) // before storeReplace overwrites
+	storeReplace(tabID, allEntries)                              // persist to the store (outside the lock — DB write can be slow)
+	// Always signal tagged with the tab. The client applies it only when this tab
+	// is active (events are tab-filtered), so a fetch that finishes after the user
+	// switched away — then back — still lands.
+	loadedSignal(tabID)
+	broadcastReloadDelta(tabID, addedN, removedN, addedIdx)
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	saveTabs()
 	// Re-ping this tab if it's in the auto-connect pool (entries were rebuilt
@@ -1761,7 +1806,9 @@ func handleTabDeleteEntries(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot delete from main tab", 400)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1*1024*1024))
+	// 16 MB covers "select all → delete" on a huge tab (a JSON array of a few
+	// hundred thousand ints).
+	body, err := io.ReadAll(io.LimitReader(r.Body, 16*1024*1024))
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), 400)
 		return
@@ -1771,34 +1818,48 @@ func handleTabDeleteEntries(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad JSON: "+err.Error(), 400)
 		return
 	}
+	// Deleting a big selection writes thousands of rows — show the spinner while it
+	// runs (the DB delete stays synchronous so the removal is persisted before we
+	// confirm; loadedSignal below clears the spinner). Skipped for small deletes,
+	// which are instant.
+	if len(indices) > 2000 {
+		state.mu.Lock()
+		state.fetching[id] = true
+		state.mu.Unlock()
+		state.broadcast(SSEEvent{Type: "loading", Payload: map[string]string{"op": "delete"}, Tab: id})
+		defer func() {
+			state.mu.Lock()
+			delete(state.fetching, id)
+			state.mu.Unlock()
+		}()
+	}
 	toRemove := make(map[int]bool, len(indices))
 	for _, idx := range indices {
 		toRemove[idx] = true
 	}
+	// Drop the rows from the in-memory store IN PLACE. Survivors keep their idx —
+	// we deliberately do NOT re-index: every consumer looks entries up by idx
+	// (not array position), so gaps are harmless, and this lets us delete only the
+	// removed rows from SQLite instead of rewriting the whole tab. For a few rows
+	// out of hundreds of thousands that's near-instant vs a multi-second replace.
 	state.mu.Lock()
-	old := state.tabEntries[id]
-	var kept []*ConfigEntry
-	for _, e := range old {
+	src := state.tabEntries[id]
+	kept := make([]*ConfigEntry, 0, len(src))
+	for _, e := range src {
 		if !toRemove[e.Index] {
 			kept = append(kept, e)
 		}
-	}
-	// Re-index
-	for i, e := range kept {
-		e.Index = i
 	}
 	state.tabEntries[id] = kept
 	if state.activeTab == id {
 		state.entries = kept
 	}
 	state.mu.Unlock()
-	if state.activeTab == id {
-		snaps := make([]ConfigEntry, len(kept))
-		for i, e := range kept {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps})
+	memInvalidate(id)
+	if store != nil {
+		store.deleteEntriesByIdx(id, indices) // incremental DB delete (only the removed rows)
 	}
+	loadedSignal(id)
 	saveTabs()
 	w.WriteHeader(200)
 	fmt.Fprintf(w, `{"remaining":%d}`, len(kept))
@@ -2058,6 +2119,19 @@ func handleUpdateApply(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+// handleUpdateDismiss records "don't show again" for ?version=, so the startup
+// banner stays hidden until a strictly newer version ships.
+func handleUpdateDismiss(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if r.Method != "POST" {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	dismissUpdateVersion(r.URL.Query().Get("version"))
+	w.WriteHeader(200)
+	w.Write([]byte("ok"))
+}
+
 // settingsExport is the on-disk file format produced by /api/export and
 // consumed by /api/import. Schema version is checked on import; bump it
 // whenever a field changes shape so old exports either keep working or
@@ -2092,11 +2166,11 @@ func buildSettingsExport() settingsExport {
 			GitHubRepo: t.GitHubRepo, GitHubFile: t.GitHubFile, GitHubPAT: t.GitHubPAT,
 		}
 		if !t.IsMain {
-			// Snapshot the raw config strings for pasted tabs so the import
-			// on another machine sees the same configs without needing the
-			// original source URL to be reachable.
+			// Snapshot the raw config strings for pasted tabs (from memory; we
+			// already hold state.mu.RLock) so the import on another machine sees the
+			// same configs without needing the original source URL to be reachable.
 			for _, e := range state.tabEntries[t.ID] {
-				if e != nil && e.Raw != "" {
+				if e.Raw != "" {
 					pt.Configs = append(pt.Configs, e.Raw)
 				}
 			}
@@ -2193,8 +2267,9 @@ func handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 	// instead of tabs.json.
 	state.mu.Lock()
 	state.tabs = []Tab{{ID: "main", Name: "Sources", IsMain: true, Closable: false}}
-	state.tabEntries = make(map[string][]*ConfigEntry)
+	state.tabEntries = make(map[string][]*ConfigEntry) // wipe in-memory configs (rebuilt below)
 	state.entries = nil
+	imported := map[string][]*ConfigEntry{} // tabID → parsed configs, written to the store after unlock
 	for _, pt := range imp.Tabs {
 		if pt.ID == "main" {
 			for i, t := range state.tabs {
@@ -2227,7 +2302,7 @@ func handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 			GitHubRepo: pt.GitHubRepo, GitHubFile: pt.GitHubFile, GitHubPAT: pt.GitHubPAT,
 		}
 		state.tabs = append(state.tabs, tab)
-		state.tabEntries[tab.ID] = parseConfigLines(strings.Join(pt.Configs, "\n"))
+		imported[tab.ID] = parseConfigLines(strings.Join(pt.Configs, "\n"))
 	}
 	// Make sure the active tab still exists; if the imported set dropped it,
 	// fall back to "main".
@@ -2241,22 +2316,21 @@ func handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 	if !activeOK {
 		state.activeTab = "main"
 	}
-	state.entries = state.tabEntries[state.activeTab]
 	state.mu.Unlock()
+	// Import rebuilds everything: wipe the store, then write each tab's configs.
+	if store != nil {
+		store.deleteAll()
+		for tid, ents := range imported {
+			storeReplace(tid, ents)
+		}
+	}
 	saveTabs()
 
-	// Push the new tab list, active tab, and a "loaded" snapshot of the
-	// active tab's entries so every connected client refreshes without
-	// needing a page reload.
+	// Push the new tab list + active tab; the client re-fetches the active tab's
+	// window (the full list isn't pushed over SSE anymore).
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 	state.broadcast(SSEEvent{Type: "active_tab", Payload: state.activeTab})
-	if cur := state.entries; cur != nil {
-		snaps := make([]ConfigEntry, len(cur))
-		for i, e := range cur {
-			snaps[i] = e.snap()
-		}
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: state.activeTab})
-	}
+	loadedSignal(state.activeTab)
 
 	w.WriteHeader(200)
 	fmt.Fprintf(w, `{"tabs":%d}`, len(imp.Tabs))

@@ -277,12 +277,17 @@ type SSEEvent struct {
 }
 
 type AppState struct {
-	mu            sync.RWMutex
-	entries       []*ConfigEntry // active tab entries
+	mu sync.RWMutex
+	// In-memory working copy of all configs: reads (window/sort/filter,
+	// index handlers, tests, AUTO) are served from here for speed; SQLite is the
+	// durable backing store (loaded into memory at startup, written through on
+	// changes). The UI still windows, so WebView2 stays light. tabEntries is keyed
+	// by tab_id and ordered by entry Index; entries is the active tab's slice.
+	tabEntries    map[string][]*ConfigEntry
+	entries       []*ConfigEntry
 	tabs          []Tab
-	tabEntries    map[string][]*ConfigEntry // tab_id -> entries
-	cancelledTabs map[string]bool           // tabs pending cancellation
-	fetching      map[string]bool           // tab_id -> a reload/fetch is in flight
+	cancelledTabs map[string]bool // tabs pending cancellation
+	fetching      map[string]bool // tab_id -> a reload/fetch is in flight
 	activeTab     string
 	xrayBin       string
 	singboxBin    string
@@ -315,8 +320,68 @@ func tabsDir() string {
 	return "."
 }
 
+// The data dir is organized into subfolders: data/ (durable user data — db, tabs,
+// settings), runtime/ (transient engine state regenerated each run), bin/
+// (engine binaries). dataPath also falls back to the legacy flat layout so an
+// upgrade never loses a file that hasn't been moved yet (see migrateDataLayout).
+func dataDirPath() string { d := filepath.Join(tabsDir(), "data"); os.MkdirAll(d, 0755); return d }
+func runtimeDirPath() string {
+	d := filepath.Join(tabsDir(), "runtime")
+	os.MkdirAll(d, 0755)
+	return d
+}
+
+// dataPath returns the path of a durable data file, preferring data/ but using
+// the legacy root location if the file still lives there (migration not yet run).
+func dataPath(name string) string {
+	np := filepath.Join(dataDirPath(), name)
+	if _, err := os.Stat(np); err == nil {
+		return np
+	}
+	if old := filepath.Join(tabsDir(), name); fileExists(old) {
+		return old
+	}
+	return np
+}
+
+// runtimePath returns the path of a transient runtime file under runtime/.
+func runtimePath(name string) string { return filepath.Join(runtimeDirPath(), name) }
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
+
+// migrateDataLayout moves files from the legacy flat %LOCALAPPDATA%\vair layout
+// into data/ and runtime/ subfolders, once. Called at startup BEFORE anything
+// opens them. Safe on upgrade: each move only happens if the source exists and
+// the destination doesn't (rename = atomic on the same volume); a failure leaves
+// the file in place and dataPath()'s fallback still finds it.
+func migrateDataLayout() {
+	root := tabsDir()
+	dataDirPath()    // ensure dirs exist
+	runtimeDirPath() //
+	move := func(name, sub string) {
+		old := filepath.Join(root, name)
+		if !fileExists(old) {
+			return
+		}
+		dst := filepath.Join(root, sub, name)
+		if fileExists(dst) {
+			return // already migrated; leave the stray legacy file alone
+		}
+		if err := os.Rename(old, dst); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ migrate %s → %s: %v\n", name, sub, err)
+		}
+	}
+	for _, n := range []string{"configs.db", "tabs.json", "settings.json"} {
+		move(n, "data")
+	}
+	for _, n := range []string{"proxy.active", "last-singbox.log",
+		"last-singbox-proxy.json", "last-singbox-hybrid.json", "last-singbox-tun.json", "last-xray-hybrid.json"} {
+		move(n, "runtime")
+	}
+}
+
 func tabsFilePath() string {
-	return filepath.Join(tabsDir(), "tabs.json")
+	return dataPath("tabs.json")
 }
 
 func saveTabs() {
@@ -336,14 +401,9 @@ func saveTabs() {
 		if len(t.SourceURLs) == 1 {
 			pt.SourceURL = t.SourceURLs[0]
 		}
-		// Don't persist configs for main tab (fetched on startup)
-		if !t.IsMain {
-			if entries, ok := state.tabEntries[t.ID]; ok {
-				for _, e := range entries {
-					pt.Configs = append(pt.Configs, e.Raw)
-				}
-			}
-		}
+		// Configs are NOT written here anymore — they live in the SQLite store
+		// (configs.db), which is the persistence. tabs.json holds only metadata.
+		// (Export still snapshots configs from the store; see buildSettingsExport.)
 		pd.Tabs = append(pd.Tabs, pt)
 	}
 	state.mu.RUnlock()
@@ -408,8 +468,16 @@ func loadTabs() {
 			GitHubRepo: pt.GitHubRepo, GitHubFile: pt.GitHubFile, GitHubPAT: pt.GitHubPAT,
 		}
 		state.tabs = append(state.tabs, tab)
-		entries := parseConfigLines(strings.Join(pt.Configs, "\n"))
-		state.tabEntries[tab.ID] = entries
+		// One-time migration: older tabs.json embedded the configs (pt.Configs).
+		// Seed the store from them ONLY if the store has none for this tab. Write
+		// straight to SQLite (NOT storeReplace — we already hold state.mu, and
+		// storeReplace would re-take it → deadlock); loadConfigsIntoMemory() loads
+		// it into memory right after loadTabs returns.
+		if len(pt.Configs) > 0 && store != nil {
+			if n, _ := store.tabCount(tab.ID); n == 0 {
+				store.replaceTabConfigs(tab.ID, parseConfigLines(strings.Join(pt.Configs, "\n")))
+			}
+		}
 	}
 }
 

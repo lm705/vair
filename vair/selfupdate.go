@@ -17,7 +17,7 @@ import (
 // appVersion is the running build's version. Keep in lockstep with
 // versioninfo.json — the self-updater compares it against the published
 // version.json to decide whether a newer build exists.
-const appVersion = "1.9.0"
+const appVersion = "1.10.0"
 
 // updateManifestURLs point at a small JSON describing the latest build. Same
 // raw + githack fallback pattern as the config sources, since for RF users
@@ -41,8 +41,12 @@ type updateInfo struct {
 	Current   string `json:"current"`
 	Latest    string `json:"latest,omitempty"`
 	Available bool   `json:"available"`
-	Notes     string `json:"notes,omitempty"`
-	Error     string `json:"error,omitempty"`
+	// Notify is Available AND the user hasn't picked "don't show again" for this
+	// (or a newer) version. Drives the startup banner; the manual Settings check
+	// uses Available so it always reports the truth.
+	Notify bool   `json:"notify,omitempty"`
+	Notes  string `json:"notes,omitempty"`
+	Error  string `json:"error,omitempty"`
 	// URL/SHA are not exposed to the UI — apply re-fetches the manifest server
 	// side so the client can't be tricked into pointing the updater elsewhere.
 	url    string
@@ -141,7 +145,26 @@ func checkForUpdate() updateInfo {
 	info.url = man.URL
 	info.sha256 = man.SHA256
 	info.Available = semverNewer(man.Version, appVersion)
+	if info.Available {
+		settingsMu.RLock()
+		dismissed := appSettings.UpdateDismissedVersion
+		settingsMu.RUnlock()
+		// Show the banner unless the user dismissed this exact-or-newer version.
+		info.Notify = dismissed == "" || semverNewer(man.Version, dismissed)
+	}
 	return info
+}
+
+// dismissUpdateVersion records "don't show again" for the given version so the
+// startup banner stays hidden until something strictly newer ships.
+func dismissUpdateVersion(version string) {
+	if version == "" {
+		return
+	}
+	settingsMu.Lock()
+	appSettings.UpdateDismissedVersion = version
+	settingsMu.Unlock()
+	saveSettings()
 }
 
 // broadcastUpdate pushes an update_status event (state ∈ checking / downloading

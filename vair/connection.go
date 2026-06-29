@@ -189,7 +189,7 @@ func withEngine(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Trans
 // enabled. Written when we set it, removed when we unset it. If it survives
 // to the next startup, the app was killed / the PC shut down without a
 // clean disconnect — see clearStaleProxy.
-func proxyLockPath() string { return filepath.Join(tabsDir(), "proxy.active") }
+func proxyLockPath() string { return runtimePath("proxy.active") }
 
 // appliedProxyPort is the local port the Windows system proxy currently points
 // at, as set by us (0 = not set). It lets setSystemProxy skip the WinINET
@@ -428,7 +428,7 @@ func startProxyConnectionXray(cm *connManager, entry *ConfigEntry, n *Node, conn
 // ConnState. entry is the representative entry (the chain's entry hop) used for
 // index/raw/error reporting; name is what the conn-bar shows.
 func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab string, chain, chainRaws []string, build func(intHTTPPort, intSOCKSPort int) map[string]interface{}) {
-	httpPort, socksPort := connHTTPPort, connSOCKSPort
+	httpPort, socksPort := currentProxyPorts()
 	if !portFree(httpPort) {
 		if pf, e := findFreePort(); e == nil {
 			httpPort = pf
@@ -564,14 +564,15 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 
 	counter := &trafficCounter{}
 	fwdCtx, fwdCancel := context.WithCancel(context.Background())
-	if _, err := startCountingForwarder(fwdCtx, httpPort, intHTTPPort, counter, "proxy-http"); err != nil {
+	bindHost := proxyBindHost() // 127.0.0.1, or 0.0.0.0 when "allow LAN" is on
+	if _, err := startCountingForwarder(fwdCtx, bindHost, httpPort, intHTTPPort, counter, "proxy-http"); err != nil {
 		fwdCancel()
 		mainCancel()
 		os.Remove(tmpPath)
 		setConnError(cm, entry, "proxy http counter: "+err.Error())
 		return
 	}
-	if _, err := startCountingForwarder(fwdCtx, socksPort, intSOCKSPort, counter, "proxy-socks"); err != nil {
+	if _, err := startCountingForwarder(fwdCtx, bindHost, socksPort, intSOCKSPort, counter, "proxy-socks"); err != nil {
 		fwdCancel()
 		mainCancel()
 		os.Remove(tmpPath)
@@ -623,7 +624,7 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 // The byte counters work here exactly as in the xray path: proxy mode has a
 // real local HTTP/SOCKS hop to instrument (unlike pure-sing-box TUN).
 func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, connTab string) {
-	httpPort, socksPort := connHTTPPort, connSOCKSPort
+	httpPort, socksPort := currentProxyPorts()
 	if !portFree(httpPort) {
 		if pf, e := findFreePort(); e == nil {
 			httpPort = pf
@@ -655,8 +656,7 @@ func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, c
 		setConnError(cm, entry, err.Error())
 		return
 	}
-	if debugPath := filepath.Join(tabsDir(), "last-singbox-proxy.json"); true {
-		os.MkdirAll(tabsDir(), 0755)
+	if debugPath := runtimePath("last-singbox-proxy.json"); true {
 		data, _ := json.MarshalIndent(cfg, "", "  ")
 		os.WriteFile(debugPath, data, 0644)
 	}
@@ -878,8 +878,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		return
 	}
 	// Save debug copy
-	if debugPath := filepath.Join(tabsDir(), "last-xray-hybrid.json"); true {
-		os.MkdirAll(tabsDir(), 0755)
+	if debugPath := runtimePath("last-xray-hybrid.json"); true {
 		data, _ := json.MarshalIndent(xrayCfg, "", "  ")
 		os.WriteFile(debugPath, data, 0644)
 	}
@@ -915,7 +914,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	// stats with no protocol-specific code.
 	counter := &trafficCounter{}
 	fwdCtx, fwdCancel := context.WithCancel(context.Background())
-	counterSocksPort, err := startCountingForwarder(fwdCtx, 0, xraySocksPort, counter, "tun-socks")
+	counterSocksPort, err := startCountingForwarder(fwdCtx, "127.0.0.1", 0, xraySocksPort, counter, "tun-socks")
 	if err != nil {
 		fwdCancel()
 		xrayCmd.Process.Kill() //nolint:errcheck
@@ -940,8 +939,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	}
 	fmt.Printf("ℹ  sing-box hybrid config: %s\n", tmpPath)
 	// Save debug copy
-	if debugPath := filepath.Join(tabsDir(), "last-singbox-hybrid.json"); true {
-		os.MkdirAll(tabsDir(), 0755)
+	if debugPath := runtimePath("last-singbox-hybrid.json"); true {
 		data, _ := json.MarshalIndent(cfg, "", "  ")
 		os.WriteFile(debugPath, data, 0644)
 	}
@@ -968,8 +966,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	var stderrLines []string
 	var stderrMu sync.Mutex
 	// Write all sing-box stderr to a log file for debugging
-	logPath := filepath.Join(tabsDir(), "last-singbox.log")
-	os.MkdirAll(tabsDir(), 0755)
+	logPath := runtimePath("last-singbox.log")
 	logFile, _ := os.Create(logPath)
 	go func() {
 		if stderrPipe == nil {
@@ -1077,8 +1074,7 @@ func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, con
 		return
 	}
 	fmt.Printf("ℹ  pure sing-box TUN config: %s\n", tmpPath)
-	if debugPath := filepath.Join(tabsDir(), "last-singbox-tun.json"); true {
-		os.MkdirAll(tabsDir(), 0755)
+	if debugPath := runtimePath("last-singbox-tun.json"); true {
 		data, _ := json.MarshalIndent(cfg, "", "  ")
 		os.WriteFile(debugPath, data, 0644)
 	}
@@ -1100,8 +1096,7 @@ func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, con
 	go func() { exitCh <- cmd.Wait() }()
 	var stderrLines []string
 	var stderrMu sync.Mutex
-	logPath := filepath.Join(tabsDir(), "last-singbox.log")
-	os.MkdirAll(tabsDir(), 0755)
+	logPath := runtimePath("last-singbox.log")
 	logFile, _ := os.Create(logPath)
 	go func() {
 		if stderrPipe == nil {

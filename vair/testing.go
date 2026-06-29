@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +13,11 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// round2 trims a MB/s value to 2 decimals — the UI only shows 2, so storing more
+// is just noise (a float64 is 8 bytes either way, so this is for tidiness, not
+// size).
+func round2(f float64) float64 { return math.Round(f*100) / 100 }
 
 // ─────────────────────────── ping / speed ────────────────────────
 
@@ -226,7 +232,7 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 		}
 		now := time.Now()
 		if onProgress != nil && now.Sub(lastReport) >= 400*time.Millisecond && total > 0 {
-			onProgress(float64(total) / now.Sub(start).Seconds() / 1024 / 1024)
+			onProgress(round2(float64(total) / now.Sub(start).Seconds() / 1024 / 1024))
 			lastReport = now
 		}
 		if rerr != nil {
@@ -253,7 +259,7 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 	if secs < 0.001 {
 		secs = 0.001
 	}
-	return float64(total) / secs / 1024 / 1024, nil
+	return round2(float64(total) / secs / 1024 / 1024), nil
 }
 
 // ─────────────────────────── entry runners ───────────────────────
@@ -675,10 +681,62 @@ func cancelTestsOnTab(tabID string) bool {
 	return cancelled
 }
 
+// mirrorPingResult / mirrorSpeedResult write an entry's terminal test result to
+// the SQLite store (best-effort). Without this, a tab switched away from during a
+// test reads stale (pre-test) rows from the store on return — the windowed read
+// path no longer sees the in-memory live results. Called at the terminal
+// entry_update broadcast so only final states (not live ticks) hit the DB.
+func mirrorPingResult(tabID string, e *ConfigEntry) {
+	if store == nil {
+		return
+	}
+	e.mu.Lock()
+	delay, status, errMsg := e.Delay, string(e.PingStatus), e.PingErr
+	e.mu.Unlock()
+	store.queuePing(tabID, e.Index, delay, status, errMsg) // batched flush
+}
+func mirrorSpeedResult(tabID string, e *ConfigEntry) {
+	if store == nil {
+		return
+	}
+	e.mu.Lock()
+	delay, ps, perr := e.Delay, string(e.PingStatus), e.PingErr
+	mbps, ss, serr, live := e.SpeedMBps, string(e.SpeedStatus), e.SpeedErr, e.SpeedLive
+	e.mu.Unlock()
+	store.queueSpeed(tabID, e.Index, delay, ps, perr, mbps, ss, serr, live) // batched flush
+}
+
+// loadTestEntries loads the entries a bulk test should run from the in-memory
+// store: the onlyIndices subset (in the given order) when non-nil,
+// else the whole tab in idx order. The returned *ConfigEntry are the LIVE working
+// copies — the test mutates them in place (the window reads see it immediately);
+// mirrorPing/SpeedResult persists to SQLite in batches.
+func loadTestEntries(tabID string, onlyIndices []int) []*ConfigEntry {
+	state.mu.RLock()
+	src := state.tabEntries[tabID]
+	if onlyIndices == nil {
+		out := append([]*ConfigEntry(nil), src...)
+		state.mu.RUnlock()
+		return out
+	}
+	byIdx := make(map[int]*ConfigEntry, len(src))
+	for _, e := range src {
+		byIdx[e.Index] = e
+	}
+	state.mu.RUnlock()
+	out := make([]*ConfigEntry, 0, len(onlyIndices))
+	for _, i := range onlyIndices {
+		if e, ok := byIdx[i]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // runPingAll runs ping tests against entries. If `onlyIndices` is non-nil,
 // onlyIndices is an ordered list of entry indices to test, in the exact
 // order they should be processed (typically the on-screen sortedList).
-// Pass nil to test every entry in state.entries order.
+// Pass nil to test every entry of the active tab (loaded from the store).
 func runPingAll(onlyIndices []int) {
 	// If speed is running, cancel it only (don't start ping)
 	if atomic.LoadInt32(&state.speedRunning) == 1 {
@@ -698,28 +756,11 @@ func runPingAll(onlyIndices []int) {
 	cancelCh := pingCancelCh
 	testMu.Unlock()
 	defer atomic.StoreInt32(&state.pingRunning, 0)
-	state.mu.RLock()
-	allEntries := make([]*ConfigEntry, len(state.entries))
-	copy(allEntries, state.entries)
-	tabID := state.activeTab
-	state.mu.RUnlock()
-
-	// Restrict to onlyIndices, preserving the client-supplied order so that
-	// tests fire in the exact order the rows appear on screen.
-	var entries []*ConfigEntry
-	if onlyIndices != nil {
-		byIdx := make(map[int]*ConfigEntry, len(allEntries))
-		for _, e := range allEntries {
-			byIdx[e.Index] = e
-		}
-		for _, idx := range onlyIndices {
-			if e, ok := byIdx[idx]; ok {
-				entries = append(entries, e)
-			}
-		}
-	} else {
-		entries = allEntries
-	}
+	// Load the entries to test from the store (transient *ConfigEntry, mutated
+	// during the test and persisted back via mirrorPingResult). onlyIndices
+	// preserves the client-supplied (on-screen) order; nil = the whole tab.
+	tabID := activeTabID()
+	entries := loadTestEntries(tabID, onlyIndices)
 
 	testMu.Lock()
 	testingTab = tabID
@@ -763,6 +804,7 @@ func runPingAll(onlyIndices []int) {
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
 			runPingForEntry(ent, cancelCh)
 			n := atomic.AddInt64(&done, 1)
+			mirrorPingResult(tabID, ent) // persist final result so a tab switch-back reads it
 			// Terminal entry update — reliable (this is the row's final
 			// status; missing it leaves the UI on a stale "testing" pill).
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
@@ -789,6 +831,7 @@ func runPingAll(onlyIndices []int) {
 	if !isTestCancelled(cancelCh) {
 		reconcileBulkResults(entries, tabID, false)
 	}
+	store.flushResults() // persist the test's batched results immediately
 	state.broadcast(SSEEvent{Type: "bulk_ping_done", Tab: tabID})
 }
 
@@ -813,26 +856,8 @@ func runSpeedAll(onlyIndices []int) {
 	cancelCh := speedCancelCh
 	testMu.Unlock()
 	defer atomic.StoreInt32(&state.speedRunning, 0)
-	state.mu.RLock()
-	allEntries := make([]*ConfigEntry, len(state.entries))
-	copy(allEntries, state.entries)
-	tabID := state.activeTab
-	state.mu.RUnlock()
-
-	var entries []*ConfigEntry
-	if onlyIndices != nil {
-		byIdx := make(map[int]*ConfigEntry, len(allEntries))
-		for _, e := range allEntries {
-			byIdx[e.Index] = e
-		}
-		for _, idx := range onlyIndices {
-			if e, ok := byIdx[idx]; ok {
-				entries = append(entries, e)
-			}
-		}
-	} else {
-		entries = allEntries
-	}
+	tabID := activeTabID()
+	entries := loadTestEntries(tabID, onlyIndices)
 
 	testMu.Lock()
 	testingTab = tabID
@@ -896,6 +921,7 @@ func runSpeedAll(onlyIndices []int) {
 			}
 			ent.mu.Unlock()
 			n := atomic.AddInt64(&done, 1)
+			mirrorSpeedResult(tabID, ent) // persist final result so a tab switch-back reads it
 			// Terminal entry update — reliable. This is the very fix point
 			// for the "connecting…" / "ping" stuck-pill class of bugs.
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
@@ -912,6 +938,7 @@ func runSpeedAll(onlyIndices []int) {
 	if !isTestCancelled(cancelCh) {
 		reconcileBulkResults(entries, tabID, true)
 	}
+	store.flushResults() // persist the test's batched results immediately
 	state.broadcast(SSEEvent{Type: "bulk_speed_done", Tab: tabID})
 }
 

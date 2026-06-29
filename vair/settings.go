@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +65,10 @@ type AppSettings struct {
 	// Favorite configs, keyed by their raw URL (stable across reload/sort).
 	// Starred rows sort to the top in the default order.
 	Favorites []string `json:"favorites,omitempty"`
+	// UpdateDismissedVersion is the newest version the user chose "don't show
+	// again" for on the startup update banner. The banner stays hidden until a
+	// version strictly newer than this is published (see checkForUpdate.Notify).
+	UpdateDismissedVersion string `json:"update_dismissed_version,omitempty"`
 	// VerboseLogs raises the xray/sing-box log level from warning→info so the
 	// Logs panel shows the detailed per-connection lines (like v2rayN). Takes
 	// effect on the next connection.
@@ -89,6 +92,18 @@ type AppSettings struct {
 	// / out-of-range → the built-in warmupTimeout default. Clamped in
 	// currentWarmupTimeout.
 	WarmupTimeoutMs int `json:"warmup_timeout_ms,omitempty"`
+	// Local proxy listen ports that other apps / the system proxy connect to
+	// (they bind 127.0.0.1). Zero / unset / out-of-range → the built-in defaults
+	// (connHTTPPort / connSOCKSPort). De-conflicted in currentProxyPorts; a change
+	// takes effect on the next connection.
+	HttpPort  int `json:"http_port,omitempty"`
+	SocksPort int `json:"socks_port,omitempty"`
+	// ProxyAllowLAN binds the HTTP/SOCKS proxy listeners to 0.0.0.0 (reachable
+	// from other devices on the local network) instead of 127.0.0.1 (this machine
+	// only). Off by default. SOCKS stays protected by its random per-launch
+	// credentials; HTTP has none, so only enable on a trusted network. Applies on
+	// the next connection. See proxyBindHost.
+	ProxyAllowLAN bool `json:"proxy_allow_lan,omitempty"`
 	// UI scale and language for the Settings / Tab settings dialogs.
 	// Both apply to those modals only — the main window (tabs, table,
 	// connection bar, title bar) is intentionally not affected, since
@@ -257,6 +272,40 @@ const (
 // currentPingConcurrency returns the user's chosen ping concurrency, clamped
 // to [1, maxPingConcurrency]. Used by runPingAll instead of a const so the
 // setting is honored without a restart.
+// currentProxyPorts returns the local HTTP/SOCKS proxy listen ports, falling back
+// to the built-in defaults for unset/invalid values. The two are forced distinct
+// and never collide with the web-UI port; on a conflict the offending one reverts
+// to its default. Read on every connect, so a change applies on the next one.
+func currentProxyPorts() (httpPort, socksPort int) {
+	settingsMu.RLock()
+	hp, sp := appSettings.HttpPort, appSettings.SocksPort
+	settingsMu.RUnlock()
+	valid := func(p int) bool { return p >= 1 && p <= 65535 && p != webPort }
+	if !valid(hp) {
+		hp = connHTTPPort
+	}
+	if !valid(sp) {
+		sp = connSOCKSPort
+	}
+	if hp == sp { // can't share one port
+		hp, sp = connHTTPPort, connSOCKSPort
+	}
+	return hp, sp
+}
+
+// proxyBindHost is the address the HTTP/SOCKS proxy listeners bind to: 0.0.0.0
+// (LAN-reachable) when the user opted in, else 127.0.0.1 (local only). Read on
+// every connect, so a change applies on the next one.
+func proxyBindHost() string {
+	settingsMu.RLock()
+	lan := appSettings.ProxyAllowLAN
+	settingsMu.RUnlock()
+	if lan {
+		return "0.0.0.0"
+	}
+	return "127.0.0.1"
+}
+
 func currentPingConcurrency() int {
 	settingsMu.RLock()
 	n := appSettings.PingConcurrency
@@ -739,7 +788,7 @@ func autostartEnabled() bool {
 var settingsMu sync.RWMutex
 
 func settingsFilePath() string {
-	return filepath.Join(tabsDir(), "settings.json")
+	return dataPath("settings.json")
 }
 
 func loadSettings() {

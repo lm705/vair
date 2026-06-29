@@ -167,7 +167,15 @@ func splitConfigURLs(line string) []string {
 			end = starts[k+1]
 		}
 		seg := line[st:end]
-		if sp := strings.IndexAny(seg, " \t\r\n"); sp > 0 {
+		// A config URL has no whitespace before its '#name' fragment, but the name
+		// itself may contain spaces (e.g. "vless://…#By Ebra Sha 🧪"). So only cut
+		// trailing whitespace-separated junk in the part BEFORE the fragment; keep
+		// spaces inside the name. The TrimSpace below drops any trailing run.
+		cut := seg
+		if h := strings.IndexByte(seg, '#'); h >= 0 {
+			cut = seg[:h]
+		}
+		if sp := strings.IndexAny(cut, " \t\r\n"); sp >= 0 {
 			seg = seg[:sp]
 		}
 		if seg = strings.TrimSpace(seg); seg != "" {

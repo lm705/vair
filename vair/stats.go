@@ -57,17 +57,18 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// startCountingForwarder accepts connections on listenPort and forwards
+// startCountingForwarder accepts connections on bindHost:listenPort and forwards
 // them to 127.0.0.1:targetPort, counting bytes in both directions into
-// the counter. listenPort==0 lets the OS pick a free port.
+// the counter. listenPort==0 lets the OS pick a free port. bindHost is
+// "127.0.0.1" for local-only listeners or "0.0.0.0" to expose on the LAN.
 //
 // Returns the actual listen port (useful when listenPort was 0) and an
 // error. The returned cancel context, when cancelled, closes the listener
 // and stops accepting new connections; existing relays drain naturally.
-func startCountingForwarder(ctx context.Context, listenPort, targetPort int, counter *trafficCounter, label string) (int, error) {
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", listenPort))
+func startCountingForwarder(ctx context.Context, bindHost string, listenPort, targetPort int, counter *trafficCounter, label string) (int, error) {
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindHost, listenPort))
 	if err != nil {
-		return 0, fmt.Errorf("listen on %d: %w", listenPort, err)
+		return 0, fmt.Errorf("listen on %s:%d: %w", bindHost, listenPort, err)
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 	go func() {

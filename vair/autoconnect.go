@@ -124,6 +124,16 @@ func autoPool() []string {
 	return pool
 }
 
+// loadTabEntries returns a COPY of a tab's in-memory config slice, in
+// idx order. A copy so callers that append / re-index / dedup then storeReplace
+// don't mutate the shared backing array out from under a concurrent window read.
+// (The entry pointers are shared; result fields are read via e.snap().)
+func loadTabEntries(tabID string) []*ConfigEntry {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return append([]*ConfigEntry(nil), state.tabEntries[tabID]...)
+}
+
 // autoPoolHasEntries reports whether any pool tab currently has configs loaded.
 func autoPoolHasEntries(pool []string) bool {
 	state.mu.RLock()
@@ -617,8 +627,10 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 			if withSpeed {
 				// runSpeedForEntry does ping→speed in one engine session.
 				runSpeedForEntry(ent, tab, nil)
+				mirrorSpeedResult(tab, ent)
 			} else {
 				runPingForEntry(ent, nil)
+				mirrorPingResult(tab, ent)
 			}
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tab})
 		}(item.e, item.tab)
@@ -698,31 +710,9 @@ func autoPingAfterRefresh(tabID string) {
 // feature. If the tab is also in the auto-connect pool, autoPingAfterRefresh
 // then re-tests it so the cleared rows get fresh data.
 func refreshSourcelessTab(tabID string) {
-	state.mu.Lock()
-	entries := state.tabEntries[tabID]
-	for _, e := range entries {
-		e.mu.Lock()
-		e.PingStatus = StatusPending
-		e.Delay = -1
-		e.PingErr = ""
-		e.SpeedStatus = StatusPending
-		e.SpeedMBps = 0
-		e.SpeedLive = 0
-		e.SpeedErr = ""
-		e.mu.Unlock()
-	}
-	active := state.activeTab == tabID
-	state.mu.Unlock()
-	if active {
-		state.mu.RLock()
-		snaps := make([]ConfigEntry, len(entries))
-		for i, e := range entries {
-			snaps[i] = e.snap()
-		}
-		state.mu.RUnlock()
-		state.broadcast(SSEEvent{Type: "loaded", Payload: snaps, Tab: tabID})
-	}
-	vlog("info", "auto-refresh: reset test results for %d config(s) in sourceless tab", len(entries))
+	n := resetTabResultsMem(tabID) // reset ping/speed in memory + SQLite
+	loadedSignal(tabID)
+	vlog("info", "auto-refresh: reset test results for %d config(s) in sourceless tab", n)
 	// If this tab feeds auto-connect, re-test the cleared rows so they're ranked.
 	autoPingAfterRefresh(tabID)
 }
