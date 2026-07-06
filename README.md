@@ -59,8 +59,8 @@ GUI клиент для проверки и подключения к VPN-кон
 ![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
 <a href="https://www.star-history.com/?repos=lm705%2Fvair&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&theme=dark&legend=top-left&sealed_token=pC5CEIXECYQyNulxzTDCj888tUy0cu7Nd1uualBjIBJ8d5P9GQLIBCgClq4V02c7dek2kqYvCbl4QCONkRRwVSVvlgDLfGlQ-cwAIZXLBGUnUXeAfPEledNkPJ7D52GVjNQAD_hyGhegbI1Yzjib5kLrdzjUo82xnvZfK6BO7e1ZJWFqx2eGkiWORrfP" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left&sealed_token=pC5CEIXECYQyNulxzTDCj888tUy0cu7Nd1uualBjIBJ8d5P9GQLIBCgClq4V02c7dek2kqYvCbl4QCONkRRwVSVvlgDLfGlQ-cwAIZXLBGUnUXeAfPEledNkPJ7D52GVjNQAD_hyGhegbI1Yzjib5kLrdzjUo82xnvZfK6BO7e1ZJWFqx2eGkiWORrfP" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=lm705/vair&type=date&legend=top-left&sealed_token=pC5CEIXECYQyNulxzTDCj888tUy0cu7Nd1uualBjIBJ8d5P9GQLIBCgClq4V02c7dek2kqYvCbl4QCONkRRwVSVvlgDLfGlQ-cwAIZXLBGUnUXeAfPEledNkPJ7D52GVjNQAD_hyGhegbI1Yzjib5kLrdzjUo82xnvZfK6BO7e1ZJWFqx2eGkiWORrfP" />
  </picture>
 </a>
