@@ -1,6 +1,6 @@
 {
-  "version": "1.10.0",
-  "url": "https://github.com/lm705/vair/releases/download/v1.10.0/Vair.exe",
-  "sha256": "948663540116409a0d37825db904925e572209a170d81925a2291453dd76a812",
-  "notes": "Переход на SQLite, переработка фильтра, настраиваемые порты, обновлённый логотип."
+  "version": "2.0.0",
+  "url": "https://github.com/lm705/vair/releases/download/v2.0.0/Vair.exe",
+  "sha256": "4293b26adc10488ec3fafaa69c6bac83d7a2d27bbca8d27a99173b91cf58fa4c",
+  "notes": "Vair 2.0.0 — новая основа: нативное окно и переписанный интерфейс, управление с телефона, AUTO в отдельном окне. Все возможности 1.10 на месте, приложение отзывчивее."
 }
