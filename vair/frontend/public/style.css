@@ -1,0 +1,888 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+/* Country-flag emoji. Windows/Segoe UI Emoji renders regional-indicator pairs as
+   plain letters (US, RU, …) instead of flags — a Windows platform choice. This
+   small self-hosted subset of Twemoji Mozilla (flag glyphs only) makes them draw
+   as flags in the app too; it's first in --font so flag chars use it and every
+   other character falls through to JetBrains Mono. Twemoji graphics: CC-BY 4.0
+   (Twitter), font subset via country-flag-emoji-polyfill (MIT). */
+@font-face{
+  font-family:'Twemoji Country Flags';
+  src:url('/TwemojiCountryFlags.woff2') format('woff2');
+  font-display:swap;
+  unicode-range:U+1F1E6-1F1FF; /* regional indicator symbols only */
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0c0c0c;--bg2:#111;--bg3:#181818;--bg4:#1e1e1e;
+  --border:#222;--border2:#2a2a2a;
+  --text:#c8c8c8;--dim:#4a4a4a;--dim2:#303030;
+  --accent:#e8c547;--green:#4ade80;--red:#f87171;
+  --blue:#60a5fa;--orange:#fb923c;--purple:#c084fc;--teal:#2dd4bf;
+  --font:'Twemoji Country Flags','JetBrains Mono',Consolas,monospace;
+  /* Connection-bar state tints + row highlights. Defined as variables so the
+     light theme can override them (the dark defaults are near-black greens/blues
+     that look wrong on a light background). */
+  --cbar-cp:#071a09;--cbar-cp-bd:#1a3a20;
+  --cbar-tun:#060f1f;--cbar-tun-bd:#1a2a40;
+  --cbar-cc:#12120a;--cbar-cc-bd:#2a2a12;
+  --cbar-ce:#1a0707;--cbar-ce-bd:#3a1212;
+  --row-cp:#071a09;--row-ct:#060f1f;
+  --shadow:rgba(0,0,0,.5);--overlay:rgba(0,0,0,.55);
+}
+/* ── Light theme ──────────────────────────────────────────────────────────
+   Applied when <body class="theme-light">. Overrides only the palette tokens;
+   every component reads them through var(), so the whole UI re-tints. Chosen
+   for comfortable contrast on a light background (dark text on near-white). */
+body.theme-light{
+  --bg:#f4f4f5;--bg2:#ffffff;--bg3:#ececef;--bg4:#e2e2e6;
+  --border:#d4d4d8;--border2:#c4c4c8;
+  --text:#1d1d20;--dim:#8a8a90;--dim2:#c8c8cc;
+  --accent:#b8860b;--green:#15803d;--red:#dc2626;
+  --blue:#2563eb;--orange:#ea580c;--purple:#9333ea;--teal:#0d9488;
+  --cbar-cp:#dcf5e2;--cbar-cp-bd:#a8d8b4;
+  --cbar-tun:#dde9fb;--cbar-tun-bd:#a8c2e8;
+  --cbar-cc:#f7f2d8;--cbar-cc-bd:#e0d49a;
+  --cbar-ce:#fbe0e0;--cbar-ce-bd:#e8a8a8;
+  --row-cp:#e6f6ea;--row-ct:#e6effb;
+  --shadow:rgba(0,0,0,.18);--overlay:rgba(0,0,0,.35);
+}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.4;user-select:none;-webkit-user-select:none}
+/* The header (stats + controls) and conn-bar need ~960px to lay out in one
+   row. Below that the flex-wrap used to break them onto a second line and the
+   layout "collapsed". min-width pins the whole app to that floor; if the CSS
+   viewport is narrower (small window, or a high-DPI laptop where the CSS px
+   count is well under the physical pixels), the WINDOW scrolls horizontally
+   instead of the content overlapping. The @media block further down trims the
+   header on narrow widths so this floor stays low. */
+html{overflow-x:auto;overflow-y:hidden}
+body{display:flex;flex-direction:column;height:100vh;overflow:hidden;min-width:960px}
+input,textarea{user-select:text;-webkit-user-select:text}
+
+/* ── connection bar ── */
+#conn-bar{
+  flex-shrink:0;border-top:2px solid var(--border);
+  padding:0 16px;display:flex;align-items:center;gap:10px;flex-wrap:nowrap;
+  background:var(--bg2);transition:background .3s,border-color .3s;
+  min-height:38px;overflow:visible;
+}
+#conn-bar.cp{background:var(--cbar-cp);border-top-color:var(--cbar-cp-bd)}
+#conn-bar.conn-tun{background:var(--cbar-tun);border-top-color:var(--cbar-tun-bd)}
+#conn-bar.cc{background:var(--cbar-cc);border-top-color:var(--cbar-cc-bd)}
+#conn-bar.ce{background:var(--cbar-ce);border-top-color:var(--cbar-ce-bd)}
+/* Ping chip in the connection bar — shows the connected config's latest
+   delay; click to re-ping it. Colour mirrors the table ping pills. */
+.cping{flex-shrink:0;cursor:pointer;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
+.cping:hover{border-color:var(--accent);color:var(--accent)}
+.cping.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
+.cping.failed{color:var(--red);border-color:rgba(220,80,80,.4)}
+.cping.testing{color:var(--accent);border-color:rgba(232,197,71,.4)}
+.cexit{flex-shrink:0;cursor:pointer;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
+.cexit:hover{border-color:var(--accent);color:var(--accent)}
+.cexit.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
+.cexit.failed{color:var(--red);border-color:rgba(220,80,80,.4)}
+.cexit.testing{color:var(--accent);border-color:rgba(232,197,71,.4)}
+
+.cdot{width:8px;height:8px;min-width:8px;max-width:8px;border-radius:50%;flex-shrink:0;align-self:center;background:var(--dim2);transition:background .3s}
+.cdot.cp{background:var(--green);animation:pulse 2s infinite}
+.cdot.conn-tun{background:var(--blue);animation:pulse 2s infinite}
+.cdot.cc{background:var(--accent);animation:blink .7s infinite}
+.cdot.ce{background:var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+
+#clabel{font-size:11px;font-weight:700;letter-spacing:.07em;color:var(--dim);white-space:nowrap;min-width:88px;flex-shrink:0}
+#clabel.cp{color:var(--green)}
+#clabel.conn-tun{color:var(--blue)}
+#clabel.cc{color:var(--accent)}
+#clabel.ce{color:var(--red)}
+#cdetail{font-size:11px;color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+#cdetail span{color:var(--text)}
+#cports{display:none;gap:6px;align-items:center;flex-shrink:0}
+.pchip{
+  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  padding:2px 7px;font-size:10px;cursor:pointer;transition:border-color .15s;white-space:nowrap;
+}
+.pchip:hover{border-color:var(--accent)}.pchip b{color:var(--accent)}
+
+
+/* mode pills */
+.mode-wrap{display:flex;gap:4px;align-items:center;flex-shrink:0;white-space:nowrap}
+.mpill{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
+  padding:3px 10px;border-radius:3px;text-transform:uppercase;letter-spacing:.07em;
+  border:1px solid var(--border2);color:var(--dim);transition:all .15s;white-space:nowrap;
+}
+.mpill:hover{color:var(--text);border-color:var(--dim)}
+.mpill.sel-proxy{color:var(--green);border-color:var(--green);background:rgba(74,222,128,.08)}
+.mpill.sel-tun  {color:var(--blue); border-color:var(--blue); background:rgba(96,165,250,.08)}
+.mpill.off{opacity:1;cursor:pointer;color:var(--dim);border-color:var(--border2)}
+.mpill.off:hover{color:var(--text);border-color:var(--dim)}
+.mode-wrap .mtip{
+  font-size:10px;color:var(--accent);border:1px solid rgba(232,197,71,.3);border-radius:3px;
+  padding:2px 7px;background:rgba(232,197,71,.06);white-space:nowrap;cursor:pointer;
+  transition:all .15s;
+}
+.mode-wrap .mtip:hover{background:rgba(232,197,71,.12);border-color:rgba(232,197,71,.5)}
+
+/* header */
+header{
+  flex-shrink:0;background:var(--bg2);
+  padding:9px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.stats{display:flex;gap:14px;align-items:center}
+.stat{display:flex;flex-direction:column;align-items:flex-end;gap:1px}
+.sv{font-size:16px;font-weight:700;line-height:1}
+.sl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
+.sv.ok{color:var(--green)}.sv.err{color:var(--red)}.sv.ms{color:var(--accent)}.sv.sp{color:var(--teal)}
+.sv.tx{color:var(--teal);font-variant-numeric:tabular-nums;font-size:12px;line-height:1.1}
+.stat.traf{margin-left:8px;padding-left:14px;border-left:1px solid var(--border2)}
+.stat.traf .sv{white-space:nowrap}
+.spacer{flex:1}
+.ctrls{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+.btn{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:11px;font-weight:700;
+  padding:5px 11px;border-radius:3px;letter-spacing:.07em;text-transform:uppercase;
+  display:inline-flex;align-items:center;gap:5px;transition:opacity .15s;white-space:nowrap;
+  border:1px solid transparent;
+}
+.btn:hover{opacity:.8}.btn:active{opacity:.55}
+.btn.ghost  {background:transparent;         color:var(--text);  border-color:var(--border2)}
+.btn.red    {background:rgba(248,113,113,.12);color:var(--red);  border-color:rgba(248,113,113,.35)}
+.btn.sm     {padding:3px 8px;font-size:10px;letter-spacing:.05em}
+.btn.sm-disc{padding:3px 9px;font-size:10px;background:rgba(248,113,113,.1);color:var(--red);border-color:rgba(248,113,113,.3)}
+.chain-hop-tag{display:inline-flex;align-items:center;justify-content:center;min-width:24px;font-size:12px;color:var(--green);opacity:.85;cursor:default}
+.btn:disabled{opacity:.22;pointer-events:none}
+/* Narrow-window compaction. Below ~1080 CSS px the header (stats + 6 control
+   buttons) starts to crowd; tighten gaps, shrink the stat numbers, and drop the
+   tiny uppercase stat labels (the numbers + colour still convey everything) so
+   it stays on one row down to the body min-width (960px). Keeps the layout from
+   wrapping/collapsing on small or low-percentage windows. */
+@media (max-width:1080px){
+  header{gap:8px;padding:8px 12px}
+  .stats{gap:9px}
+  .stat .sl{display:none}
+  .stat .sv{font-size:14px}
+  .stat.traf{margin-left:4px;padding-left:8px}
+  .ctrls{gap:4px}
+  .btn{padding:5px 8px;letter-spacing:.04em}
+  #conn-bar{gap:7px;padding:0 12px}
+}
+.btn.dim-btn{opacity:.4;color:var(--dim)}
+.btn.dim-btn:hover{opacity:.6}
+
+.prog-area{flex-shrink:0}
+.pbar-row{height:2px;background:var(--dim2);position:relative}
+.pbar-fill{height:100%;transition:width .22s ease;width:0;position:absolute;inset:0}
+.pbar-ping{background:var(--accent)}
+
+/* tabs — live in the toolbar next to filter/type/sort. The toolbar uses
+   align-items:flex-start (see .toolbar below) so when the tab-bar grows
+   taller (extra rows of tabs wrap downward), the filter/type/sort
+   controls stay anchored at the top-right of the toolbar — only the
+   tab-bar's slot grows; the other controls don't shift down with it.
+   flex:0 1 auto = take exactly the natural max-content width when tabs
+   fit (so the last tab sits flush against the 10px gap before the
+   filter label — no empty trailing space inside the tab-bar's slot),
+   but allow shrinking when over-full so the INTERNAL flex-wrap kicks
+   in and tabs flow onto new rows downward instead of pushing the
+   right-side controls off the row. */
+.tab-bar{display:flex;gap:2px;align-items:center;flex-wrap:wrap;row-gap:3px;flex:0 1 auto;min-width:0}
+.tab-btn{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
+  box-sizing:border-box;height:22px;padding:0 7px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
+  transition:all .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em;
+  display:inline-flex;align-items:center;gap:3px;
+}
+.tab-btn:hover{color:var(--text);border-color:var(--dim)}
+.tab-btn.active{color:var(--accent);border-color:var(--accent)}
+.tab-add{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
+  box-sizing:border-box;height:22px;padding:0;min-width:20px;display:flex;align-items:center;justify-content:center;
+  border-radius:3px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;flex-shrink:0;
+}
+.tab-add:hover{color:var(--accent);border-color:var(--accent)}
+.tab-btn.dragging{opacity:.4}
+.tab-btn.drag-over{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+
+/* Compact tabs (responsive). When the tab buttons would wrap onto a second
+   row, updateTabLayout() adds .compact to .tab-bar: the individual tab
+   buttons hide, and a single dropdown trigger (active tab name + ▾) takes
+   their place. The + button stays. This keeps the toolbar to one row on
+   narrow widths / many tabs. */
+.tab-dd-trigger{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
+  box-sizing:border-box;height:22px;padding:0 6px 0 8px;border-radius:3px;
+  color:var(--accent);border:1px solid var(--accent);transition:all .15s;
+  display:none;align-items:center;gap:5px;max-width:200px;flex-shrink:1;min-width:0;
+  text-transform:uppercase;letter-spacing:.05em;
+}
+.tab-dd-trigger:hover{background:rgba(232,197,71,.08)}
+.tab-dd-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.tab-dd-caret{font-size:8px;opacity:.8;flex-shrink:0}
+/* In compact mode: show the trigger, hide the per-tab buttons. */
+.tab-bar.compact .tab-dd-trigger{display:inline-flex}
+.tab-bar.compact .tab-btn{display:none}
+/* Hide the filter/type/sort word-labels in compact mode to reclaim width;
+   the controls themselves stay. */
+.toolbar.compact .tl-lbl{display:none}
+
+/* Tab dropdown list (compact-mode tab switcher). Reuses ctx-menu look. */
+.tab-dd-menu{
+  position:fixed;z-index:9999;background:var(--bg3);border:1px solid var(--border2);
+  border-radius:5px;padding:4px 0;min-width:160px;max-height:60vh;overflow-y:auto;
+  box-shadow:0 6px 20px rgba(0,0,0,.5);font-family:var(--font);font-size:11px;
+}
+.tab-dd-item{
+  padding:6px 14px;color:var(--text);cursor:pointer;transition:background .08s;
+  display:flex;align-items:center;gap:8px;white-space:nowrap;
+}
+.tab-dd-item:hover{background:var(--bg4)}
+.tab-dd-item.active{color:var(--accent)}
+.tab-dd-item.active::before{content:'●';font-size:8px}
+.tab-dd-item:not(.active)::before{content:'';width:8px;display:inline-block}
+
+/* tab context menu */
+.ctx-menu{
+  position:fixed;z-index:9999;background:var(--bg3);border:1px solid var(--border2);
+  border-radius:5px;padding:4px 0;min-width:180px;box-shadow:0 6px 20px rgba(0,0,0,.5);
+  font-family:var(--font);font-size:11px;
+}
+.ctx-menu-item{
+  padding:6px 14px;color:var(--text);cursor:pointer;transition:background .08s;
+  display:flex;align-items:center;gap:8px;
+}
+.ctx-menu-item:hover{background:var(--bg4)}
+.ctx-menu-item.danger{color:var(--red)}
+.ctx-menu-item.danger:hover{background:rgba(248,113,113,.1)}
+.ctx-sep{height:1px;background:var(--border2);margin:3px 0}
+
+/* tab settings modal */
+.modal-overlay{
+  position:fixed;inset:0;z-index:9998;background:var(--overlay);
+  display:flex;align-items:center;justify-content:center;
+}
+/* Modal text scale.
+ * A single CSS variable on :root drives every font-size in the Settings
+ * and Tab settings modals. The user can grow or shrink modal typography
+ * from one input; the main window (table, header, conn bar, title bar)
+ * does NOT use these classes, so it stays at its original sizes
+ * regardless. Default 11px matches what the program shipped with. */
+:root{ --modal-fs-base: 11px; }
+.modal-box{
+  background:var(--bg2);border:1px solid var(--border2);border-radius:6px;
+  padding:18px 22px;
+  /* One consistent width for every modal in the app (Settings, Tab
+     Settings, Sources, Running Processes). 560px is comfortable for
+     long DNS URLs and the static hosts textarea without being absurd.
+     min(...) keeps the modal inside the program window when it's
+     dragged narrow — 92vw means ≤92% of the webview width, so a
+     500px-wide window still gets a 460px-wide modal. */
+  width:min(560px, 92vw);
+  /* Cap to viewport so long settings don't push the close button off-screen.
+     Falling back to scroll keeps the close button reachable on any window
+     size — including small mobile-style aspect ratios. */
+  max-height:85vh;overflow-y:auto;
+}
+.modal-title{font-size:calc(var(--modal-fs-base) + 2px);font-weight:700;color:var(--accent);margin-bottom:14px;text-transform:uppercase;letter-spacing:.06em}
+.modal-label{font-size:calc(var(--modal-fs-base) - 1px);color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
+.modal-input{
+  width:100%;box-sizing:border-box;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  color:var(--text);font-family:var(--font);font-size:calc(var(--modal-fs-base) + 1px);padding:6px 10px;outline:none;
+  margin-bottom:12px;
+}
+/* Textareas inherit modal-input width but the browser default min-width
+   would otherwise track the textarea's intrinsic content size. Force
+   100% with box-sizing, and only allow vertical resize so the user
+   can't drag the modal wider by accident. */
+textarea.modal-input{resize:vertical;min-width:0}
+.modal-input:focus{border-color:var(--accent)}
+/* GitHub PAT field + its show/hide button on one row. */
+.gh-pat-row{display:flex;gap:6px;align-items:stretch;margin-bottom:12px}
+.gh-pat-row .modal-input{margin-bottom:0;flex:1}
+.gh-view-btn{flex:none;white-space:nowrap}
+.modal-btns{display:flex;gap:8px;justify-content:flex-end;margin-top:6px}
+.modal-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.modal-row-label{font-size:var(--modal-fs-base);color:var(--text)}
+.toggle{position:relative;width:36px;height:20px;cursor:pointer;flex-shrink:0}
+.toggle input{display:none}
+.toggle-track{position:absolute;inset:0;background:var(--dim2);border-radius:10px;transition:.2s}
+.toggle input:checked+.toggle-track{background:var(--accent)}
+.toggle-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s}
+.toggle input:checked~.toggle-thumb{left:18px}
+/* chip lists allow text selection so entries can be selected + copied. The
+   copy handler reconstructs the selection as a newline column (see
+   chipsColumnFromSelection); the × buttons stay unselectable. */
+.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;user-select:text;-webkit-user-select:text;cursor:text}
+.chip{display:inline-flex;align-items:center;gap:3px;font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
+  padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3);
+  user-select:text;-webkit-user-select:text}
+.chip-tag{font-size:calc(var(--modal-fs-base) - 3px);text-transform:uppercase;letter-spacing:.04em;opacity:.85;font-weight:800;margin-right:2px}
+.chip.col-name{background:rgba(232,197,71,.12);color:var(--accent);border-color:rgba(232,197,71,.3)}
+.chip.col-type{background:rgba(96,165,250,.14);color:#7bb6ff;border-color:rgba(96,165,250,.35)}
+.chip.col-host{background:rgba(132,204,22,.14);color:#9fd84a;border-color:rgba(132,204,22,.35)}
+.chip.col-transport{background:rgba(168,85,247,.14);color:#b387f0;border-color:rgba(168,85,247,.35)}
+.chip.col-security{background:rgba(244,114,114,.14);color:#f08a8a;border-color:rgba(244,114,114,.35)}
+.chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px);user-select:none;-webkit-user-select:none}.chip-x:hover{opacity:1;color:var(--red)}
+.chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:var(--modal-fs-base);outline:none;flex:1;min-width:80px}
+/* Exclude filter — one labelled chip box per column. Values are added with
+   Enter (same UX as "Custom domains without VPN"). Labels match the plain
+   "Deduplicate duplicate configs" style (no caps, no per-column palette). */
+.ef-fields{display:flex;flex-direction:column;gap:12px}
+.ef-field{display:flex;flex-direction:column;gap:4px}
+.ef-field-tag{font-size:var(--modal-fs-base);color:var(--text)}
+.ef-field .chips-wrap{margin-bottom:0}
+.modal-hint{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-top:-6px;margin-bottom:10px}
+/* The exclude-filter intro hint sits below a label, so the global -6px pull
+   would clip it onto the label above. Reset it to a small positive gap. */
+.modal-hint.ef-hint{margin-top:2px;margin-bottom:12px}
+/* Tab-settings modal: render the all-caps section labels in the same plain
+   style as the "Deduplicate duplicate configs" row label. */
+#tab-modal-box .modal-label{text-transform:none;letter-spacing:0;color:var(--text);font-size:var(--modal-fs-base)}
+.settings-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border2)}
+.settings-section:last-child{border-bottom:0;margin-bottom:0;padding-bottom:0}
+.section-header{font-size:var(--modal-fs-base);font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px}
+/* Subscription info: compact bar above the table + detailed block in settings. */
+#sub-bar{flex-shrink:0;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:4px 14px;font-size:11px;color:var(--dim);background:var(--bg2);border-bottom:1px solid var(--border)}
+#sub-bar .sb-item{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+#sub-bar .sb-item:not(:first-child){border-left:1px solid var(--border2);padding-left:10px}
+#sub-bar .sb-title{color:var(--text);font-weight:700}
+#sub-bar .sb-bar{display:inline-block;width:90px;height:5px;background:var(--bg4);border-radius:3px;overflow:hidden;vertical-align:middle}
+#sub-bar .sb-fill{height:100%;background:var(--accent)}
+#sub-bar .sb-warn{color:var(--red);font-weight:700}
+.si-row{font-size:calc(var(--modal-fs-base) + 1px);margin-bottom:5px;color:var(--text)}
+.si-row.si-dim{color:var(--dim)}
+.si-row.si-warn{color:var(--red);font-weight:700}
+.si-block.si-sep{border-top:1px solid var(--border2);margin-top:8px;padding-top:8px}
+.si-row.si-url{font-size:11px;opacity:.7;word-break:break-all;margin-bottom:6px}
+.si-row.si-note{font-style:italic;opacity:.85}
+.si-bar{height:6px;background:var(--bg4);border:1px solid var(--border2);border-radius:3px;overflow:hidden;margin-top:3px}
+.si-fill{height:100%;background:var(--accent)}
+/* Self-update download progress bar. */
+.upd-bar{height:6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;overflow:hidden;margin:2px 0 10px}
+.upd-fill{height:100%;width:0;background:var(--accent);transition:width .2s}
+/* Author attribution under the Updates section. */
+.upd-attrib{margin-top:12px;padding-top:8px;border-top:1px solid var(--border2);font-size:11px;color:var(--dim);text-align:center}
+.upd-attrib a{color:var(--accent);text-decoration:none;cursor:pointer}
+.upd-attrib a:hover{text-decoration:underline}
+
+/* Compact numeric input used in Settings (concurrency, refresh interval) */
+.num-input{
+  width:70px;margin-bottom:0;padding:4px 8px;font-size:var(--modal-fs-base);text-align:right;
+}
+/* hide spinners on Firefox / WebView2 - they look out of place in this UI */
+.num-input::-webkit-inner-spin-button,.num-input::-webkit-outer-spin-button{
+  -webkit-appearance:none;margin:0;
+}
+.num-input{-moz-appearance:textfield}
+
+/* Segmented selector (Off / Hide / Delete for dedup mode). Each button is
+ * a standalone ghost-style chip — same border/typography as the add-url /
+ * add-file buttons in the same modal. The active option lights up amber
+ * (text + border), mirroring the active-tab treatment in .tab-btn.active.
+ * A small left margin keeps the group from crowding the row label. */
+.seg-group{
+  display:inline-flex;gap:4px;margin-left:12px;
+}
+.seg-btn{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
+  padding:3px 7px;border-radius:3px;
+  color:var(--dim);border:1px solid var(--border2);
+  text-transform:uppercase;letter-spacing:.05em;
+  transition:color .15s, border-color .15s;
+}
+.seg-btn:hover:not(.active){color:var(--text);border-color:var(--dim)}
+.seg-btn.active{color:var(--accent);border-color:var(--accent)}
+.url-row{display:flex;gap:4px;margin-bottom:4px;align-items:center}
+.url-row .ms-url-on{flex:none;width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
+.url-row.src-off .ms-url{opacity:.45;text-decoration:line-through}
+.url-row .modal-input{flex:1;margin-bottom:0}
+.url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:12px;width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px}
+.url-rm:hover{color:var(--red);background:rgba(248,113,113,.1)}
+.url-qr{all:unset;cursor:pointer;color:var(--dim);font-size:10px;font-weight:700;padding:0 6px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px;text-transform:uppercase;letter-spacing:.03em}
+.url-qr:hover{color:var(--accent);background:rgba(232,197,71,.1)}
+/* Read-only SOURCES URL rows (built-in, copy-only). COPY/QR use the same
+   borderless .url-qr style as the user-tab QR button, vertically centered next
+   to the URL field. */
+.src-url-row{display:flex;gap:4px;align-items:center;margin-bottom:6px}
+.src-url-row:last-child{margin-bottom:0}
+.src-url{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;padding:5px 8px;
+  color:var(--text);font-size:11px;user-select:text}
+.btn.sm{padding:3px 9px;font-size:10px}
+/* QR modal — always white quiet-zone behind the code so it scans on any theme. */
+.qr-wrap{display:inline-block;background:#fff;padding:12px;border-radius:6px}
+.qr-img{display:block;width:260px;height:260px;image-rendering:pixelated}
+
+/* file rows in tab settings */
+.file-row{
+  display:flex;gap:6px;margin-bottom:4px;align-items:center;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  padding:5px 10px;font-size:11px;color:var(--text);
+}
+.file-row .file-ico{color:var(--dim);flex-shrink:0;font-size:12px}
+.file-row .file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-row .file-size{color:var(--dim);font-size:10px;flex-shrink:0;margin-right:2px}
+.file-row.new{border-color:rgba(74,222,128,.35);background:rgba(74,222,128,.05)}
+.file-line{display:flex;gap:4px;align-items:center;margin-bottom:4px}
+.file-line .file-row{flex:1;margin-bottom:0}
+.file-line .ms-url-on{flex:none;width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
+.file-line.src-off .file-name{opacity:.45;text-decoration:line-through}
+
+/* row selection */
+tbody tr.selected{background:rgba(232,197,71,.08)!important;box-shadow:inset 3px 0 0 var(--accent)}
+
+.toolbar{
+  flex-shrink:0;background:var(--bg2);border-bottom:1px solid var(--border);
+  padding:5px 16px;display:flex;align-items:flex-start;gap:10px;flex-wrap:nowrap;
+}
+/* The right-side controls live inside a single flex item that aligns to
+   the TOP of the toolbar (matching the first row of tabs). Internally
+   it stays display:flex/align-items:center so the labels (.tl) and the
+   filter input — which have different heights — line up neatly with each
+   other. flex-shrink:0 keeps it from getting squeezed; the tab-bar
+   (flex:0 1 auto) absorbs horizontal slack and overflows downward via
+   its own flex-wrap, leaving this block parked at the top-right of the
+   toolbar even when tabs grow into several rows below.
+   margin-left:auto pins this block to the RIGHT edge of the toolbar so
+   it never slides left when the tab count shrinks — it stays parked at
+   top-right exactly as it did originally. The auto margin soaks up all
+   horizontal slack when tabs are few (big gap, right-anchored); when
+   tabs fill the row the slack is 0 and the toolbar's own 10px flex gap
+   provides the separation (≈ the filter→type inter-control gap).
+   Every interactive control (.tab-btn/.tab-add on the left, .finput/
+   .proto-btn/.sort-btn here) is locked to the same 22px box height, so
+   with the toolbar top-aligned the first tab row and this block share
+   the exact same top AND bottom edge. */
+.toolbar-right{
+  display:flex;align-items:center;gap:10px;flex-shrink:0;flex-wrap:nowrap;
+  margin-left:auto;
+}
+.tl{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}
+.finput{
+  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  color:var(--text);font-family:var(--font);font-size:12px;padding:0 9px;width:180px;outline:none;
+  box-sizing:border-box;height:22px;
+}
+.finput:focus{border-color:var(--accent)}
+.sort-group{display:flex;gap:4px}
+.sort-btn{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;
+  box-sizing:border-box;height:22px;display:inline-flex;align-items:center;justify-content:center;
+  padding:0 8px;border-radius:2px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;
+}
+.sort-btn:hover{color:var(--text);border-color:var(--dim)}
+.sort-btn.active{color:var(--accent);border-color:var(--accent)}
+
+/* scrollbar-gutter:stable reserves the scrollbar's space permanently (with
+   overflow:auto, not scroll), so the sticky header columns don't jump sideways
+   when the scrollbar appears/disappears during a virtual-scroll rebuild. */
+/* margin-right insets the table's scrollbar from the window edge: the Wails
+   runtime's invisible in-content resize zone (SM_CXSIZEFRAME = 4px at every
+   edge) owns that gap, so edge-resize and scrollbar drags never fight (the
+   Claude Desktop pattern). Kept to the exact zone width so the gap is barely
+   visible. The header (.thw) pads by margin+gutter to keep columns aligned. */
+.tw{flex:1;overflow-y:auto;scrollbar-gutter:stable;margin-right:4px}
+table{width:100%;border-collapse:collapse;table-layout:fixed}
+/* virtual scroll spacer rows — no borders, no hover */
+tbody tr.vspacer{background:transparent!important;border:0!important;pointer-events:none}
+tbody tr.vspacer:hover{background:transparent!important}
+tbody tr.vspacer td{border:0!important;padding:0!important}
+thead{position:sticky;top:0;z-index:10;background:var(--bg2)}
+thead th{
+  padding:6px 10px;text-align:left;font-size:9px;text-transform:uppercase;
+  letter-spacing:.12em;color:var(--dim);border-bottom:1px solid var(--border);white-space:nowrap;
+}
+thead th.cpr{text-align:center}
+thead th.ct {text-align:center}
+thead th.cs {text-align:center}
+thead th.cp2{text-align:center}
+thead th.csp{text-align:center}
+thead th.ca {text-align:center}
+tbody tr{border-bottom:1px solid var(--border);transition:background .08s}
+tbody tr:hover{background:var(--bg3)}
+tbody tr.row-cp{background:var(--row-cp)!important;box-shadow:inset 3px 0 0 var(--green)}
+tbody tr.row-ct{background:var(--row-ct)!important;box-shadow:inset 3px 0 0 var(--blue)}
+/* RELOAD highlight: newly-added configs glow green and fade out. The fade is
+   driven by a single global --flash-alpha variable (animated in JS), NOT a
+   per-row CSS animation — so re-rendering a row while scrolling reads the
+   current alpha instead of restarting the animation (which made the glow
+   "re-ignite" on scroll). */
+/* Left green bar only here; the full-row green fade is the flashNew animation
+   appended at the end of this file. (The 1.10 original animated a --flash-alpha
+   var in the background with !important — but an !important background beats a
+   CSS animation in the cascade, so it would have suppressed the fade. Dropping
+   the background from this rule lets the animation show.) */
+tbody tr.row-new{box-shadow:inset 3px 0 0 var(--green)}
+.reload-toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 16px;font-size:13px;font-weight:800;letter-spacing:.04em;color:var(--text);z-index:9999;box-shadow:0 4px 16px rgba(0,0,0,.45);transition:opacity .45s;opacity:1;pointer-events:none}
+.reload-toast.fade{opacity:0}
+/* Startup "new version available" banner — a centered card below the title/conn
+   bar (not full-width, so it never covers the window controls). */
+.upd-banner{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:10000;display:flex;align-items:center;gap:14px;max-width:90%;padding:8px 14px;background:var(--bg2);border:1px solid var(--accent);border-radius:8px;color:var(--text);font-size:13px;box-shadow:0 6px 20px rgba(0,0,0,.5)}
+.upd-banner-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw}
+.upd-banner-btns{display:flex;gap:8px;align-items:center;flex-shrink:0}
+/* ── Logs dock panel ── */
+#log-panel{position:relative;flex-shrink:0;height:30vh;min-height:120px;display:flex;flex-direction:column;border-top:2px solid var(--border);background:var(--bg2)}
+.log-resize{position:absolute;top:-3px;left:0;right:0;height:6px;cursor:ns-resize;z-index:10}
+.log-resize:hover,.log-resize.dragging{background:var(--accent)}
+.log-head{flex-shrink:0;display:flex;align-items:center;gap:8px;padding:5px 12px;border-bottom:1px solid var(--border2)}
+.log-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--accent)}
+.log-head .spacer{flex:1}
+.log-sel{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:10px;border-radius:3px;padding:1px 4px;outline:none;cursor:pointer}
+.log-auto{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;cursor:pointer;user-select:none}
+.log-head .btn{padding:3px 9px;font-size:10px}
+.log-view{flex:1;overflow-y:auto;padding:6px 12px;font-family:var(--font);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:var(--bg);user-select:text;-webkit-user-select:text;cursor:text}
+.log-line{display:block}
+.log-line .lt{color:var(--dim2)}
+.log-line .ls{font-weight:700;margin:0 6px}
+.log-line.lvl-error{color:#f08a8a}
+.log-line.lvl-warn{color:var(--accent)}
+.log-line.lvl-info{color:var(--dim)}
+.log-line.lvl-raw{color:var(--text)}
+.log-line .ls.src-xray{color:#7bb6ff}
+.log-line .ls.src-singbox{color:#b387f0}
+.log-line .ls.src-vair{color:#9fd84a}
+.log-empty{color:var(--dim);font-style:italic}
+#btn-logs.on{color:var(--accent);border-color:var(--accent)}
+#btn-auto.on{color:var(--accent);border-color:var(--accent)}
+#btn-auto.switching{color:#f0b429;border-color:#f0b429}
+.auto-status{font-size:12px;line-height:1.5;padding:8px 10px;border:1px solid var(--border2);border-radius:4px;background:var(--bg2)}
+.auto-status .as-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;background:var(--dim);vertical-align:middle}
+.auto-status.ok .as-dot{background:var(--accent)}
+.auto-status.ok.m-proxy .as-dot{background:var(--green)}
+.auto-status.ok.m-tun .as-dot{background:var(--blue)}
+.auto-status.warn .as-dot{background:#f0b429}
+.auto-status.down .as-dot{background:#e5484d}
+.auto-cands{margin-top:8px;display:flex;flex-direction:column;gap:2px;max-height:168px;overflow-y:auto}
+.auto-cand{display:flex;align-items:center;gap:8px;font-size:12px;padding:4px 8px;border:1px solid var(--border2);border-radius:4px;background:var(--bg2);cursor:pointer;transition:border-color .12s,background .12s}
+.auto-cand:hover{border-color:var(--dim);background:var(--bg3)}
+.auto-cand.current{border-color:var(--accent);background:rgba(232,197,71,.08)}
+.auto-cand.current:hover{border-color:var(--accent)}
+.auto-cand .ac-rank{flex:0 0 auto;width:18px;text-align:center;color:var(--dim);font-size:11px}
+.auto-cand .ac-name{flex:1 1 auto;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.auto-cand.current .ac-name{color:var(--accent)}
+.auto-cand .ac-metric{flex:0 0 auto;color:var(--dim);font-size:11px}
+.auto-switch-now{margin-top:10px;display:inline-flex;align-self:flex-start}
+/* Small "recommended" tag appended to a setting label. */
+.rec-badge{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+  color:var(--green);border:1px solid var(--green);border-radius:3px;padding:0 4px;margin-left:4px;
+  vertical-align:middle;opacity:.85}
+/* Collapsible AUTO settings: a clickable arrow header that toggles the block
+   below it. Expanded by default. */
+/* No border-top here: the STATUS section above already draws a divider
+   (its border-bottom), so adding one here would show two stacked lines. */
+.auto-collapse-head{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;
+  font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
+  padding:2px 0 9px}
+.auto-collapse-head:hover{color:var(--text)}
+.auto-collapse-arrow{display:inline-block;font-size:10px;transition:transform .15s}
+.auto-collapse-head.collapsed .auto-collapse-arrow{transform:rotate(-90deg)}
+.auto-collapse-body.collapsed{display:none}
+/* AUTO panel's own Logs section (mirrors the main dock inside the modal). */
+.auto-log-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
+.auto-log-head .btn{padding:3px 9px;font-size:10px}
+#auto-log-view{height:200px;min-height:120px;border:1px solid var(--border2);border-radius:3px;margin-bottom:4px;flex:none}
+/* Header row of the AUTO panel: title on the left, Detach button on the right. */
+.auto-title-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px}
+.auto-detach,.auto-return{flex-shrink:0}
+/* Detach and Back-to-app share the same spot in the title row: exactly one is
+   rendered at a time (React swaps them on the main window's visibility), so the
+   title row always has two flex children — title + one button — and
+   space-between keeps the button pinned to the right. */
+body.auto-standalone .auto-close-btn{display:none}
+/* Standalone AUTO view: hide the whole app body, keep only the title bar (for
+   window move/min/max/close) and the AUTO panel. The OS window is resized 1:1
+   to the panel (see _goDetachResize), and the panel scrolls internally past the
+   window height — exactly like the normal modal. */
+/* A compact detached window may be narrower than the app's 960px min-width;
+   drop that floor so the window can shrink to the panel's ~600px. */
+body.auto-standalone{min-width:0}
+body.auto-standalone header,
+body.auto-standalone .prog-area,
+body.auto-standalone .toolbar,
+body.auto-standalone .thw,
+body.auto-standalone .tw,
+body.auto-standalone #sub-bar,
+body.auto-standalone #conn-bar,
+body.auto-standalone #log-panel{display:none!important}
+/* The overlay becomes a normal flex item BENEATH the title bar (so the Vair
+   title bar with minimize/maximize/close stays visible at the top), fills the
+   remaining height, and centers the panel. No dim backdrop and NO outer padding
+   — the panel reads as the window body itself, flush to the edges. min-height:0
+   lets it shrink so the panel can scroll inside it. */
+body.auto-standalone #auto-modal{
+  position:relative;inset:auto;z-index:auto;
+  flex:1 1 auto;min-height:0;
+  background:var(--bg);
+  display:flex;align-items:flex-start;justify-content:center;
+  /* 4px right padding = the runtime's edge resize zone, so the panel's own
+     scrollbar (modal-box overflow-y) sits inset from the window edge and
+     grabbing the right edge resizes the window instead of the scrollbar —
+     same treatment as the main table (.tw margin-right). */
+  padding:0 4px 0 0;box-sizing:border-box;overflow:hidden;
+}
+/* Frameless: drop the box border/radius and match the window background so the
+   panel doesn't look like a window-inside-a-window. It fills the window width
+   (no side gap) and scrolls internally past the window height (max-height:100%
+   of the overlay + the inherited overflow-y:auto). The box's own padding stays
+   for readable content margins, like the rest of the app. */
+body.auto-standalone #auto-modal .modal-box{
+  /* Fill the window: the panel adapts to whatever size the user resizes the
+     AUTO window to (was width:min(560px,100%) — fixed and centered). */
+  width:100%;max-width:none;max-height:100%;margin:0;
+  border:none;border-radius:0;background:var(--bg);
+}
+.auto-tabs-wrap{display:flex;flex-wrap:wrap;gap:6px;margin-top:2px;margin-bottom:14px}
+.auto-tab-pill{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:11px;
+  box-sizing:border-box;min-height:24px;display:inline-flex;align-items:center;
+  padding:0 11px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
+  background:var(--bg2);transition:all .15s;max-width:100%;
+}
+.auto-tab-pill:hover{color:var(--text);border-color:var(--dim)}
+.auto-tab-pill.active{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+.auto-tab-pill .atp-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
+td{padding:5px 10px;vertical-align:middle;font-size:12px}
+.ci{width:38px;color:var(--dim);font-size:11px;text-align:left}
+.cpr{width:64px;text-align:center}
+.cn{min-width:150px;max-width:210px;text-align:left}
+.ch{max-width:155px;text-align:left;overflow:hidden}.ct{width:88px;text-align:center}.cs{width:72px;text-align:center}
+.cp2{width:110px;text-align:center}
+.csp{width:130px;text-align:center}
+.ca{width:220px;text-align:right}
+
+.nc{display:flex;flex-direction:column;gap:2px}
+/* name + "last" badge on one row: name flexes/ellipsises, badge stays fixed
+   and is pushed to the right edge (next to the host column). */
+.nm-row{display:flex;align-items:center;gap:6px;min-width:0}
+/* Favorite star — fixed at the left of the name row. */
+.fav{flex:0 0 auto;cursor:pointer;color:var(--dim2);font-size:13px;line-height:1;user-select:none;transition:color .15s}
+.fav:hover{color:var(--accent)}
+.fav.on{color:var(--accent)}
+.nm{flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+/* display:block so the cell width (table-layout:fixed) actually constrains the
+   host text — an inline span ignores overflow/width, so on small monitors a long
+   host overflowed and collided with the transport column. Full value on hover. */
+.nh{display:block;max-width:100%;color:var(--dim);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* "last connected" badge — fixed size at the end of the name column; the
+   adjacent name clips before it instead of overlapping. */
+.last-badge{flex:0 0 auto;font-size:8px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);background:rgba(232,197,71,.14);border:1px solid rgba(232,197,71,.35);border-radius:3px;padding:0 3px;line-height:13px}
+.et{font-size:10px;color:var(--red);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:205px}
+
+.vc{display:flex;align-items:center;justify-content:center;gap:5px}
+.pill{font-size:10px;font-weight:700;padding:2px 7px;border-radius:99px;min-width:66px;max-width:110px;text-align:center;letter-spacing:.02em;border:1px solid;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill.pending  {color:var(--dim);border-color:var(--dim2);background:transparent}
+.pill.tp       {color:var(--orange);border-color:rgba(251,146,60,.4);background:rgba(251,146,60,.07);animation:blink .9s infinite}
+.pill.ts       {color:var(--teal);border-color:rgba(45,212,191,.4);background:rgba(45,212,191,.07);animation:blink .9s infinite}
+
+.pill.ok-fast  {color:var(--green); border-color:rgba(74,222,128,.4);  background:rgba(74,222,128,.08)}
+.pill.ok-ping  {color:var(--accent);border-color:rgba(232,197,71,.4);  background:rgba(232,197,71,.07)}
+.pill.ok-speed {color:var(--teal);border-color:rgba(45,212,191,.3);background:rgba(45,212,191,.07)}
+.pill.failed   {color:var(--red);border-color:rgba(248,113,113,.3);background:rgba(248,113,113,.07)}
+.pill.skipped  {color:var(--dim);border-color:var(--dim2);background:transparent;font-style:italic}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+
+.nb{font-size:10px;padding:1px 5px;border-radius:2px;border:1px solid var(--border);color:var(--dim)}
+.nb.ws{color:#818cf8;border-color:rgba(129,140,248,.4)}
+.nb.grpc{color:var(--orange);border-color:rgba(251,146,60,.4)}
+.nb.h2{color:var(--blue);border-color:rgba(96,165,250,.4)}
+.nb.tcp{color:var(--green);border-color:rgba(74,222,128,.4)}
+.nb.httpupgrade,.nb.splithttp,.nb.xhttp{color:var(--purple);border-color:rgba(192,132,252,.4)}
+.sb{font-size:10px;padding:1px 5px;border-radius:2px;color:var(--dim);
+  display:inline-block;max-width:60px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
+.sb.tls{color:var(--blue)}.sb.reality{color:var(--purple);font-weight:700}
+
+.pb{font-size:10px;padding:1px 5px;border-radius:2px;border:1px solid var(--border);color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em;display:inline-block;max-width:54px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
+.pb.vless{color:var(--accent);border-color:rgba(232,197,71,.4)}
+.pb.vmess{color:#818cf8;border-color:rgba(129,140,248,.4)}
+.pb.trojan{color:var(--red);border-color:rgba(248,113,113,.4)}
+.pb.ss{color:var(--teal);border-color:rgba(45,212,191,.4)}
+.pb.ss2022{color:var(--green);border-color:rgba(74,222,128,.4)}
+.pb.hysteria2{color:var(--orange);border-color:rgba(251,146,60,.4)}
+.pb.tuic{color:var(--purple);border-color:rgba(192,132,252,.4)}
+
+/* No flex-wrap here: keeps the 8 pills in a single row so they don't
+   blow out toolbar-right's fixed height (26px) and break the vertical
+   alignment of the labels next to them. */
+.proto-group{display:flex;gap:4px;flex-wrap:nowrap}
+.proto-btn{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;
+  box-sizing:border-box;height:22px;display:inline-flex;align-items:center;justify-content:center;
+  padding:0 8px;border-radius:2px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;text-transform:lowercase;
+}
+.proto-btn:hover{color:var(--text);border-color:var(--dim)}
+.proto-btn.active{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+/* When Ctrl-clicking we may have several pills active at once. Tinted bg
+   makes the selected set visually distinct from a single-select look. */
+.proto-btn#proto-vless.active{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+.proto-btn#proto-vmess.active{color:#a5b1ff;border-color:rgba(129,140,248,.7);background:rgba(129,140,248,.10)}
+.proto-btn#proto-trojan.active{color:var(--red);border-color:rgba(248,113,113,.7);background:rgba(248,113,113,.10)}
+.proto-btn#proto-ss.active{color:var(--teal);border-color:rgba(45,212,191,.7);background:rgba(45,212,191,.10)}
+.proto-btn#proto-ss2022.active{color:var(--green);border-color:rgba(74,222,128,.7);background:rgba(74,222,128,.10)}
+.proto-btn#proto-hysteria2.active{color:var(--orange);border-color:rgba(251,146,60,.7);background:rgba(251,146,60,.10)}
+.proto-btn#proto-tuic.active{color:var(--purple);border-color:rgba(192,132,252,.7);background:rgba(192,132,252,.10)}
+
+.act-cell{display:flex;gap:3px;align-items:center;justify-content:flex-end}
+.cpb{all:unset;cursor:pointer;color:var(--dim);font-size:12px;padding:2px 4px;border-radius:2px;transition:color .12s;display:inline-flex}
+.cpb:hover{color:var(--accent)}.cpb.done{color:var(--green)}
+
+
+.center-msg{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;height:100%;color:var(--dim)}
+.center-msg .ico{font-size:40px;line-height:1}
+.spinner{width:18px;height:18px;border:2px solid var(--dim2);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--dim2);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--dim)}
+/* Split table: the header row lives in .thw OUTSIDE the .tw scroll viewport, so
+   the vertical scrollbar spans only the body rows — it can't overlap the column
+   headers. .thw's 12px right padding mirrors .tw's 4px edge margin + the 8px
+   scrollbar gutter, and both tables carry an identical <colgroup> under
+   table-layout:fixed, so the columns align exactly. bg2 paints the padding
+   strip the same as the header cells. The underline lives on .thw (not the th
+   cells) so it runs the FULL window width — under the padding strip too —
+   instead of stopping where the scrollbar column starts. */
+.thw{flex:none;padding-right:12px;background:var(--bg2);border-bottom:1px solid var(--border)}
+.thw thead th{border-bottom:none}
+/* Keep the Actions content clear of the body scrollbar (equal padding on the
+   header cell keeps the columns visually aligned). */
+thead th.ca,tbody td.ca{padding-right:14px}
+
+
+
+/* ── Custom title bar (standalone frameless mode) ─────────────────────────── */
+#titlebar{
+  display:none;flex-shrink:0;height:36px;
+  background:var(--bg);
+  border-bottom:1px solid var(--border);
+  align-items:stretch;
+  user-select:none;-webkit-user-select:none;
+  -webkit-app-region:drag;
+  position:relative;
+}
+#titlebar.active{display:flex}
+.tb-drag{
+  flex:1;display:flex;align-items:center;padding:0 10px;gap:7px;
+  -webkit-app-region:drag;cursor:default;
+}
+.tb-logo{
+  width:34px;height:34px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;
+}
+.tb-logo img{width:32px;height:32px;object-fit:contain;display:block;pointer-events:none;image-rendering:auto;}
+.tb-appname{
+  font-size:13px;font-weight:700;color:var(--dim);
+  letter-spacing:.05em;white-space:nowrap;
+}
+.tb-btns{
+  display:flex;align-items:stretch;flex-shrink:0;
+  -webkit-app-region:no-drag;
+}
+.tb-btn{
+  all:unset;
+  width:40px;height:36px;
+  display:flex;align-items:center;justify-content:center;
+  cursor:default;color:var(--dim);
+  transition:background .1s,color .1s;
+  font-size:14px;line-height:1;
+}
+.tb-btn:hover{background:var(--bg4);color:var(--text)}
+.tb-btn.tb-close:hover{background:#c42b1c;color:#fff}
+.tb-btn svg{pointer-events:none;display:block}
+
+
+/* ══ Vair 2.0 shell adjustments (React root + Wails v3 drag regions) ══
+   Everything above is the VERBATIM 1.10 stylesheet (web/index.html lines
+   8-760). Only the differences forced by the new shell live below. */
+
+/* React mounts into #root, a child of the flex-column body — make it the
+   full-height column container the 1.10 body used to be. */
+#root{display:flex;flex-direction:column;flex:1;min-height:0}
+
+/* Wails v3 frameless drag regions (replaces -webkit-app-region). */
+#titlebar{--wails-draggable:drag}
+.tb-btns{--wails-draggable:no-drag}
+.tb-drag{--wails-draggable:drag}
+
+/* Neutralize the 1.10 -webkit-app-region (native OS caption region): WebView2
+   honours it and an OS caption swallows mouse events before the Wails JS
+   runtime sees them, so the top resize edge never fires and drag is flaky.
+   v3 dragging works purely via --wails-draggable. With this gone, the runtime
+   handles BOTH: the top ~5px of the titlebar resizes (n-resize wins over drag
+   in the runtime's mousedown), the rest drags. */
+#titlebar,.tb-drag,.tb-btns{-webkit-app-region:no-drag}
+
+/* #root is the flex-column app body (full width, no inset — the native OS
+   resize border lives OUTSIDE the client area now, see resize_windows.go, so
+   the scrollbar can sit flush to the edge exactly like 1.10 without stealing
+   the resize zone). */
+#root{width:100%}
+
+/* Newly-added rows flash green and fade (1.10 used a JS-animated --flash-alpha;
+   a self-contained keyframe is simpler and needs no per-frame driver). The
+   verbatim row-new rule above uses var(--flash-alpha,0)=transparent, so this
+   animation supplies the visible fade. */
+tbody tr.row-new{animation:flashNew 2.5s ease-out forwards}
+/* NB: no !important in the keyframes — per the CSS spec a keyframe declaration
+   carrying !important is DROPPED entirely, which left the fade with no
+   background (only the left box-shadow bar showed). A plain animated background
+   already outranks the normal-author row striping in the cascade. */
+@keyframes flashNew{
+  0%{background:rgba(80,200,120,.30)}
+  100%{background:transparent}
+}
+
+/* Header ctrls: thin vertical divider between button groups (auto ⎸ reload/
+   ping/speed ⎸ logs/⚙) — same look and HEIGHT as the .stat.traf border-left
+   divider (the session/total one spans the ~26px stat column). */
+.ctrl-sep{height:26px;align-self:center;width:0;border-left:1px solid var(--border2);margin:0 5px}
+/* Icon-only ctrls buttons (logs, ⚙): the BOX must equal a regular .btn (the old
+   settings button) — no padding/line-height overrides. The svg is sized to the
+   text line box (11px font × 1.4 ≈ 15px) so both buttons come out equal. */
+.btn.icon svg{display:block;width:15px;height:15px}
+
+/* AUTO panel action buttons (Switch now / Reload): same 5px spacing as the
+   main window's ctrls row. */
+.auto-switch-now + .auto-switch-now{margin-left:5px}
+
+/* Settings search: rows/sections filtered out. !important so it also beats the
+   intentional inline display:block on stacked rows. */
+.set-hidden{display:none!important}
+
+/* The gear glyph reads small at the 11px button font — draw it at 15px (the
+   text line-box height), so the button box stays identical to its neighbours. */
+#btn-settings{font-size:15px;line-height:15px}
+
+/* Scroll arrows at the ends of the table scrollbar (the Claude Desktop look).
+   Native ::-webkit-scrollbar-button: a click steps the scroll; press-and-hold
+   repeats. SVG data-URIs because url() can't read CSS variables — the light
+   theme overrides the fills below. */
+.tw::-webkit-scrollbar-button:single-button{
+  display:block;height:12px;background-color:transparent;
+  background-repeat:no-repeat;background-position:center;background-size:8px 8px;
+}
+.tw::-webkit-scrollbar-button:single-button:vertical:decrement{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 2 7 6H1z' fill='%234a4a4a'/></svg>");
+}
+.tw::-webkit-scrollbar-button:single-button:vertical:decrement:hover{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 2 7 6H1z' fill='%23c8c8c8'/></svg>");
+}
+.tw::-webkit-scrollbar-button:single-button:vertical:increment{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 6 1 2h6z' fill='%234a4a4a'/></svg>");
+}
+.tw::-webkit-scrollbar-button:single-button:vertical:increment:hover{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 6 1 2h6z' fill='%23c8c8c8'/></svg>");
+}
+body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:decrement{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 2 7 6H1z' fill='%238a8a90'/></svg>");
+}
+body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:decrement:hover{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 2 7 6H1z' fill='%231d1d20'/></svg>");
+}
+body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 6 1 2h6z' fill='%238a8a90'/></svg>");
+}
+body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:hover{
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 6 1 2h6z' fill='%231d1d20'/></svg>");
+}

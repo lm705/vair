@@ -1,188 +1,277 @@
 package main
 
 import (
-	"crypto/rand"
+	"embed"
 	"fmt"
-	"net"
-	"net/http"
+	"log"
 	"os"
-	"os/exec"
-	"os/signal"
-	"syscall"
-	"time"
+	"path/filepath"
+	"sync/atomic"
+
+	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
+
+	"vair/core"
 )
 
-// ─────────────────────────── constants ───────────────────────────
+// Wails embeds the built frontend (frontend/dist) into the binary.
+//
+//go:embed all:frontend/dist
+var assets embed.FS
 
-const (
-	pingTestURLDefault = "https://www.gstatic.com/generate_204"
-	pingTimeout        = 1500 * time.Millisecond
-	warmupTimeout      = 4 * time.Second // default warm-up; user-overridable via WarmupTimeoutMs
-	pingRounds         = 3
+// trayIcon is the system-tray icon (PNG; Windows tray decodes via png.Decode).
+//
+//go:embed assets/tray.png
+var trayIcon []byte
 
-	// 50 MB: large enough to fill the measurement window (speedDuration) for
-	// any realistic proxy speed so the window isn't cut short by an early
-	// EOF (the old "response too fast" false positive), yet within
-	// Cloudflare's accepted __down range — bytes=100000000 is rejected by
-	// the endpoint, so we cap at 50 MB. We stop reading at the deadline
-	// anyway, so this size is an upper bound, not an actual 50 MB download.
-	speedTestURLDefault = "https://speed.cloudflare.com/__down?bytes=50000000"
-	speedDuration       = 4 * time.Second
-	speedUserAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-
-	startupTimeout = 4 * time.Second
-	dialTimeout    = 5 * time.Second
-
-	// xrayStartupTimeout: time to wait for xray HTTP port to open during ping/speed test.
-	// Increased for Windows Defender scan delay on first run of extracted binary.
-	xrayStartupTimeout = 8 * time.Second
-
-	// xrayConnTimeout: time to wait for xray to start in persistent proxy connection mode.
-	xrayConnTimeout = 12 * time.Second
-
-	// singboxStartupTimeout: time to wait for the sing-box HTTP port to open
-	// during ping/speed test of a UDP-family node (Hysteria2/TUIC). The QUIC
-	// handshake is slower to come up than a TCP outbound, so this is a touch
-	// more generous than xrayStartupTimeout.
-	singboxStartupTimeout = 10 * time.Second
-
-	// singboxConnTimeout: time to wait for sing-box to start in a persistent
-	// proxy connection. sing-box binds the local HTTP inbound before it ever
-	// dials the QUIC outbound, so this only bounds local listener readiness;
-	// kept generous to cover first-run Defender scan of the extracted binary.
-	singboxConnTimeout = 15 * time.Second
-
-	// tunStartupTimeout: time to wait for sing-box TUN adapter to come up.
-	tunStartupTimeout = 3 * time.Second
-
-	// Default ports for persistent proxy connection
-	connHTTPPort  = 10819
-	connSOCKSPort = 10818
-
-	webPort = 19876
-)
-
-// ─────────────────────────── proxy auth ──────────────────────────
-// Random credentials generated once per program launch.
-// Protects SOCKS5 inbound from abuse by malicious apps on the same machine.
-// See: https://habr.com/ru/articles/1020080/
+// theApp / mainWindow are captured globally so the tray, single-instance handler
+// and deep-link delivery can reach the running app and its window.
 var (
-	proxyAuthUser string
-	proxyAuthPass string
+	theApp     *application.App
+	mainWindow *application.WebviewWindow
+	// pendingDeepLink holds a vair:// URL we were LAUNCHED with until the
+	// frontend mounts and pulls it (TakePendingDeepLink) — no startup race.
+	pendingDeepLink atomic.Value
 )
 
 func init() {
-	proxyAuthUser = randomHex(16)
-	proxyAuthPass = randomHex(32)
+	// Typed events registered up front so the binding generator emits a strongly
+	// typed JS/TS API; the domain events (conn_update, entry_update, …) are
+	// emitted dynamically by core via the emitter bridge.
+	application.RegisterEvent[string]("deeplink")
 }
 
-func randomHex(n int) string {
-	b := make([]byte, n)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)
+// windowBackground is the native window + webview background for the current
+// theme. It MUST match the app's CSS --bg: during a live resize the compositor
+// paints this colour where the webview hasn't caught up yet, so a mismatch
+// (always-dark on a light theme) flashes black bands at the edges.
+func windowBackground() application.RGBA {
+	if core.UITheme() == "light" {
+		return application.NewRGB(244, 244, 245) // #f4f4f5 — light --bg
+	}
+	return application.NewRGB(12, 12, 12) // #0c0c0c — dark --bg
 }
 
-func httpListenAndServe() error {
-	addr := fmt.Sprintf(":%d", webPort)
-	// The elevated relaunch (restartAsAdmin) starts the new instance before
-	// the old one has fully released the port. Retry the bind for a few
-	// seconds so the admin handoff doesn't kill the fresh process with a
-	// "address already in use" error.
-	var ln net.Listener
-	var err error
-	for i := 0; i < 40; i++ {
-		ln, err = net.Listen("tcp", addr)
-		if err == nil {
-			break
+// applyWindowTheme re-syncs every live window's native background to the theme
+// (called from SettingsService.Set when the theme changes).
+func applyWindowTheme() {
+	bg := windowBackground()
+	if mainWindow != nil {
+		mainWindow.SetBackgroundColour(bg)
+	}
+	if autoWindow != nil {
+		autoWindow.SetBackgroundColour(bg)
+	}
+}
+
+// webviewDataPath gives Vair its own WebView2 user-data folder under the app's
+// data root (%LOCALAPPDATA%\Vair). A dedicated folder (rather than the Wails
+// default %APPDATA%\<BinaryName.exe>) keeps the WebView2 cache next to the rest
+// of the app's data. It holds only browser cache — no user data to migrate.
+func webviewDataPath() string {
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		base = os.TempDir()
+	}
+	p := filepath.Join(base, "Vair", "WebView2")
+	_ = os.MkdirAll(p, 0o755)
+	return p
+}
+
+// ── System tray menu (state-aware, ported from 1.10 showTrayMenu) ───────────
+// The menu reflects the live connection / auto state: the connected config +
+// Disconnect when connected, an "auto on" line + Switch now when auto is enabled,
+// always Show + Exit. Rebuilt on conn/auto changes (refreshTrayMenu via the
+// emitter). Labels follow the app language.
+var (
+	theTray     *application.SystemTray
+	trayMenuSig string
+)
+
+// trayT picks the label for the current app language (Russian when settings say
+// so, English otherwise — matching the rest of the UI's i18n default).
+func trayT(en, ru string) string {
+	if core.GetSettings().Language == "ru" {
+		return ru
+	}
+	return en
+}
+
+func buildTrayMenu() *application.Menu {
+	m := theApp.NewMenu()
+	cs := core.ConnSnapshot()
+	connected := cs.Status == core.ConnConnected
+	autoOn := core.AutoEnabled()
+
+	if connected {
+		mode := "Proxy"
+		if cs.Mode == core.ModeTUN {
+			mode = "TUN"
 		}
-		time.Sleep(150 * time.Millisecond)
+		m.Add(fmt.Sprintf("● %s [%s]", cs.EntryName, mode)).SetEnabled(false) // info line
 	}
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+	if autoOn {
+		m.Add("⟳ " + trayT("Auto-connect: ON", "Авто-подключение: ВКЛ")).SetEnabled(false)
 	}
-	if err := http.Serve(ln, nil); err != nil {
-		return fmt.Errorf("server error: %w", err)
+	if connected || autoOn {
+		m.AddSeparator()
 	}
-	return nil
+	m.Add(trayT("Show Vair", "Показать Vair")).OnClick(func(_ *application.Context) { showMain() })
+	if autoOn {
+		m.Add(trayT("Switch now", "Переключить сейчас")).OnClick(func(_ *application.Context) { core.AutoSwitch() })
+	}
+	if connected {
+		m.Add(trayT("Disconnect", "Отключить")).OnClick(func(_ *application.Context) { core.Disconnect() })
+	}
+	m.AddSeparator()
+	m.Add(trayT("Exit", "Выход")).OnClick(func(_ *application.Context) {
+		core.Shutdown() // stop any connection + clear system proxy before exit
+		theApp.Quit()
+	})
+	return m
 }
 
-// ─────────────────────────── main ────────────────────────────────
-
-func main() {
-	// On Windows the standalone build calls standaloneMain() which uses
-	// embedded binaries and shows a native Fyne UI window (no browser needed).
-	// On other platforms (or when LEGACY=1 env is set), fall through to
-	// the classic CLI mode that takes xray/sing-box paths as arguments.
-	if os.Getenv("LEGACY") == "" {
-		standaloneMain()
+// refreshTrayMenu rebuilds the tray menu when the connection / auto / language
+// state that shapes it actually changed (cheap signature guard, since auto_update
+// fires often).
+func refreshTrayMenu() {
+	if theTray == nil {
 		return
 	}
+	cs := core.ConnSnapshot()
+	sig := fmt.Sprintf("%v|%s|%s|%v|%s",
+		cs.Status == core.ConnConnected, cs.EntryName, cs.Mode, core.AutoEnabled(), core.GetSettings().Language)
+	if sig == trayMenuSig {
+		return
+	}
+	trayMenuSig = sig
+	theTray.SetMenu(buildTrayMenu())
+}
 
-	// ── Legacy / cross-platform CLI mode ─────────────────────────────
-	xrayBin := "xray"
-	if len(os.Args) > 1 {
-		xrayBin = os.Args[1]
+// showMain brings the main window back from the tray (un-hide, un-minimise, focus).
+func showMain() {
+	if mainWindow == nil {
+		return
 	}
-	if _, err := exec.LookPath(xrayBin); err != nil {
-		if _, err2 := os.Stat(xrayBin); err2 != nil {
-			fmt.Fprintf(os.Stderr,
-				"❌  xray not found.\n    Usage: %s [xray] [sing-box]\n    Releases: https://github.com/XTLS/Xray-core/releases\n",
-				os.Args[0])
-			os.Exit(1)
-		}
-	}
-	state.xrayBin = xrayBin
+	mainWindow.Show()
+	mainWindow.Restore()
+	mainWindow.Focus()
+	emitMainVis() // the AUTO panel flips Back-to-app → Detach
+}
 
-	if len(os.Args) > 2 {
-		sb := os.Args[2]
-		if _, err := exec.LookPath(sb); err == nil {
-			state.singboxBin = sb
-		} else if _, err2 := os.Stat(sb); err2 == nil {
-			state.singboxBin = sb
-		} else {
-			fmt.Fprintf(os.Stderr, "⚠  sing-box not found at %q — TUN mode unavailable\n", sb)
-		}
-	} else if path, err := exec.LookPath("sing-box"); err == nil {
-		state.singboxBin = path
-		fmt.Printf("ℹ  sing-box auto-detected: %s\n", path)
-	}
-
-	isAdmin := checkAdmin()
-	fmt.Printf("✅  vair → http://localhost:%d\n    xray:     %s\n", webPort, xrayBin)
-	if state.singboxBin != "" {
-		fmt.Printf("    sing-box: %s\n", state.singboxBin)
-	} else {
-		fmt.Printf("    sing-box: not found (TUN unavailable)\n")
-	}
-	fmt.Printf("    admin: %v\n\n", isAdmin)
-	if state.singboxBin != "" && !isAdmin {
-		fmt.Println("⚠  Run as administrator to enable TUN mode.")
-	}
-
+// main is the Ф1 shell: frameless window, single-instance, dedicated WebView2
+// data folder, custom titlebar controls (App.tsx), system tray, the vair:// deep
+// link scheme and autostart support. Ф2 binds the real services.
+func main() {
+	// Settings + tabs + configs load SYNCHRONOUSLY so the very first render already
+	// has the active tab's data — no "0 configs" flash before the store finishes
+	// loading (the 1.10 behaviour the user expects). Engine PATHS are registered
+	// synchronously too, so ConnService.AppInfo() reports sing-box as available
+	// immediately (else the TUN pill briefly reads "sing-box not found"). Only the
+	// genuinely heavy/slow work — writing the ~80 MB of embedded engine bytes to
+	// disk, the SOURCES network fetch, the background loops — is deferred to a
+	// goroutine so it never blocks the window from appearing.
+	core.PreloadSettings()
+	registerEnginePaths() // sing-box path known before the frontend asks
+	core.Init()           // SQLite store + tabs + configs into memory (data ready)
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-		<-sig
-		fmt.Println("\n⏹  Shutting down — cleaning up…")
-		stopConnection()
-		killOrphanedXray()
-		os.Exit(0)
+		core.CleanupUpdateLeftovers() // stray <exe>.new/.old from an aborted update
+		if err := extractEngines(); err != nil {
+			log.Printf("engine extract: %v", err)
+		}
+		core.StartBackground()  // supervisor + auto-refresh + SOURCES fetch
+		applyRemoteSetting()    // LAN remote server, if it was left enabled
+		// Autostart: re-point the HKCU Run key at THIS exe when enabled, so an
+		// entry migrated from 1.10 (or a moved binary) launches the right one at
+		// logon instead of the old path. No-op / removal when disabled.
+		if core.GetSettings().AutostartEnabled {
+			_ = applyAutostart(true)
+		}
 	}()
 
-	registerRoutes()
-	loadTabs()
-	loadSettings()
-	// Auto-connect now implies connect-on-startup (the separate toggle was
-	// removed): if the feature is on, arm intent so the supervisor connects to
-	// the fastest working config once entries load.
-	if appSettings.AutoConnect {
-		autoWant.Store(true)
+	theApp = application.New(application.Options{
+		Name:        "Vair",
+		Description: "Vair 2.0.0",
+		Services: []application.Service{
+			application.NewService(&ConfigService{}),
+			application.NewService(&TabService{}),
+			application.NewService(&ConnService{}),
+			application.NewService(&TestService{}),
+			application.NewService(&SettingsService{}),
+			application.NewService(&AutoService{}),
+			application.NewService(&LogService{}),
+			application.NewService(&QRService{}),
+			application.NewService(&UpdateService{}),
+		},
+		Assets: application.AssetOptions{
+			Handler: application.AssetFileServerFS(assets),
+		},
+		// One running instance; a second launch re-focuses the first and forwards
+		// any vair:// deep link it was started with.
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: "com.vair.app",
+			OnSecondInstanceLaunch: func(data application.SecondInstanceData) {
+				if dl := deepLinkFromArgs(data.Args); dl != "" {
+					theApp.Event.Emit("deeplink", dl)
+				}
+				showMain()
+			},
+		},
+		Windows: application.WindowsOptions{
+			WebviewUserDataPath: webviewDataPath(),
+			// Closing/hiding the window keeps Vair alive in the tray; the app only
+			// quits via the tray's "Выход".
+			DisableQuitOnLastWindowClosed: true,
+		},
+	})
+	app := theApp
+
+	// Register the vair:// scheme (default on, like 1.10). Best-effort.
+	_ = registerDeepLink(true)
+
+	// Default window = 80% of the monitor's work area, floored at 980×620 and
+	// capped at the work area (small monitors never get a window larger than
+	// the screen). Wails centers it.
+	winW, winH := initialWindowSize()
+	mainWindow = app.Window.NewWithOptions(application.WebviewWindowOptions{
+		Title:            "Vair",
+		Width:            winW,
+		Height:           winH,
+		Frameless:        true,
+		BackgroundColour: windowBackground(), // matches the theme's --bg (resize-lag paint)
+		URL:              "/",
+	})
+
+	// Launched at logon (--autostart) → start hidden in the tray.
+	if hasAutostartFlag(os.Args) {
+		mainWindow.Hide()
 	}
-	go startAutoSupervisor()
-	go startAutoRefresh()
-	go fetchAndInit()
-	if err := httpListenAndServe(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+
+	// Any show/hide of the main window (tray, titlebar-✕-to-tray via the JS
+	// runtime, detach) updates the AUTO panel's Detach/Back-to-app button.
+	mainWindow.OnWindowEvent(events.Common.WindowShow, func(_ *application.WindowEvent) { emitMainVis() })
+	mainWindow.OnWindowEvent(events.Common.WindowHide, func(_ *application.WindowEvent) { emitMainVis() })
+
+	// Window/taskbar/alt-tab icons from the multi-size icon.ico (exact 1.10
+	// setWindowIcon behaviour); runs once the native window exists.
+	go applyWindowIcon()
+
+	// System tray: left-click shows the window, right-click opens the menu.
+	theTray = app.SystemTray.New()
+	theTray.SetTooltip("Vair")
+	theTray.SetIcon(trayIcon)
+	theTray.OnClick(func() { showMain() })
+	refreshTrayMenu() // build the initial (state-aware) menu
+
+	// A vair:// link we were launched with: stash it — the frontend PULLS it via
+	// SettingsService.TakePendingDeepLink() once mounted (race-free; the
+	// "deeplink" event stays for second-instance forwarding, when the frontend
+	// is already alive).
+	if dl := deepLinkFromArgs(os.Args); dl != "" {
+		pendingDeepLink.Store(dl)
+	}
+
+	if err := app.Run(); err != nil {
+		log.Fatal(err)
 	}
 }

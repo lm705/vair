@@ -1,0 +1,49 @@
+# Project configuration. After changing `info`, run
+# `wails3 task common:update:build-assets` to regenerate icons/manifests.
+version: '3'
+
+info:
+  companyName: "lm705"
+  productName: "Vair"
+  productIdentifier: "com.vair.app"
+  description: "Vair"
+  copyright: "Copyright © 2026 lm705. GPL-3.0 License"
+  comments: ""
+  version: "2.0.0"
+
+# Dev mode configuration
+dev_mode:
+  root_path: .
+  log_level: warn
+  debounce: 1000
+  ignore:
+    dir:
+      - .git
+      - node_modules
+      - frontend
+      - bin
+      - _legacy
+      - Vair_1.10.0
+      - outputs
+    file:
+      - .DS_Store
+      - .gitignore
+      - .gitkeep
+      - "*_test.go"
+    watched_extension:
+      - "*.go"
+    git_ignore: true
+  executes:
+    - cmd: wails3 build DEV=true
+      type: blocking
+    - cmd: wails3 task common:dev:frontend
+      type: background
+    - cmd: wails3 task run
+      type: primary
+
+# File Associations (deeplink vair:// is wired in Ф1)
+fileAssociations:
+
+# Other data
+other:
+  - name: My Other Data
