@@ -4,6 +4,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Events } from '@wailsio/runtime'
 import { SettingsService, UpdateService, QRService } from '../bindings/vair'
 import { t10 } from './i18n'
+import { useChipSelect } from './chipselect'
 
 // Exact 1.10 preset lists (web/index.html).
 const PING_PRESETS = [
@@ -83,17 +84,25 @@ function Chips({
   disabled,
   placeholder,
   onChange,
+  keepCase,
 }: {
   items: string[]
   disabled?: boolean
   placeholder: string
   onChange: (next: string[]) => void
+  // keepCase: don't lowercase entries and split only on whitespace (for URLs,
+  // where the path is case-sensitive and ',' / ';' can appear legitimately).
+  keepCase?: boolean
 }) {
   const [val, setVal] = useState('')
+  const { wrapRef, onMouseDown, isSel } = useChipSelect(items, (idxs) => {
+    const drop = new Set(idxs)
+    onChange(items.filter((_, i) => !drop.has(i)))
+  })
   const add = (raw: string) => {
     const parts = raw
-      .split(/[\s,;]+/)
-      .map((s) => s.trim().toLowerCase())
+      .split(keepCase ? /\s+/ : /[\s,;]+/)
+      .map((s) => (keepCase ? s.trim() : s.trim().toLowerCase()))
       .filter(Boolean)
     if (!parts.length) return
     const next = [...items]
@@ -101,9 +110,16 @@ function Chips({
     onChange(next)
   }
   return (
-    <div className="chips-wrap" style={disabled ? { opacity: 0.45 } : undefined}>
-      {items.map((d) => (
-        <span key={d} className="chip">
+    <div
+      ref={wrapRef}
+      className="chips-wrap"
+      style={disabled ? { opacity: 0.45 } : undefined}
+      // Selection of the chip values: click / Ctrl+click / Shift+click / drag /
+      // Ctrl+A, then Ctrl+C to copy. See useChipSelect.
+      onMouseDown={onMouseDown}
+    >
+      {items.map((d, i) => (
+        <span key={d} className={'chip' + (isSel(i) ? ' sel' : '')}>
           {d}
           <span className="chip-x" onClick={() => onChange(items.filter((x) => x !== d))}>
             x
@@ -119,6 +135,9 @@ function Chips({
           if (e.key === 'Enter') {
             add(val)
             setVal('')
+          } else if (e.key === 'Backspace' && val === '' && items.length) {
+            // Empty input + Backspace removes the last chip (same as its ✕).
+            onChange(items.slice(0, -1))
           }
         }}
         onPaste={(e) => {
@@ -127,6 +146,7 @@ function Chips({
           setVal('')
         }}
       />
+      <span className="chip-fill" aria-hidden="true" />
     </div>
   )
 }
@@ -271,7 +291,32 @@ export default function SettingsModal({
         : proxyCustomVal || '—'
   const [customFb, setCustomFb] = useState(isCustomFallback(stg.speed_test_url_fallback || ''))
 
-  const rmode = stg.routing_mode || (stg.ru_sites_direct ? 'bypass_ru' : 'proxy_all')
+  // Legacy "bypass_ru" (and the pre-mode ru_sites_direct bool) display as the
+  // generalized bypass-countries mode with Russia active; the backend maps them
+  // the same way, so nothing changes until the user actually touches a toggle.
+  const rmodeRaw = stg.routing_mode || (stg.ru_sites_direct ? 'bypass_ru' : 'proxy_all')
+  const rmode = rmodeRaw === 'bypass_ru' ? 'bypass_countries' : rmodeRaw
+  const bypassCC: string[] =
+    rmodeRaw === 'bypass_ru' ? ['ru'] : ((stg.bypass_countries || []) as string[])
+  const BYPASS_COUNTRIES: { cc: string; flag: string; label: string }[] = [
+    { cc: 'ru', flag: '🇷🇺', label: 'Russian sites' },
+    { cc: 'cn', flag: '🇨🇳', label: 'Chinese sites' },
+    { cc: 'ir', flag: '🇮🇷', label: 'Iranian sites' },
+    { cc: 'kz', flag: '🇰🇿', label: 'Kazakh sites' },
+  ]
+  const setBypassCC = (cc: string, on: boolean) => {
+    const next = on ? [...bypassCC.filter((c) => c !== cc), cc] : bypassCC.filter((c) => c !== cc)
+    // Writing the list also normalizes a legacy bypass_ru value to the new mode.
+    apply({ routing_mode: 'bypass_countries', bypass_countries: next })
+  }
+  // Through-VPN URL list. A pre-2.1 single blocklist_url shows as one chip until
+  // the user edits (any edit writes blocklist_urls and clears the legacy field).
+  const blocklistUrls: string[] =
+    stg.blocklist_urls && stg.blocklist_urls.length
+      ? (stg.blocklist_urls as string[])
+      : stg.blocklist_url
+        ? [stg.blocklist_url]
+        : []
   const fbCur = (() => {
     const cur = stg.speed_test_url_fallback || ''
     return cur === '' ? CACHEFLY : cur
@@ -366,61 +411,104 @@ export default function SettingsModal({
               className="modal-input"
               style={{ marginBottom: 0 }}
               value={rmode}
-              onChange={(e) => apply({ routing_mode: e.target.value })}
+              onChange={(e) => {
+                const m = e.target.value
+                if (m === 'bypass_countries' && bypassCC.length === 0) {
+                  // First entry into the mode: seed Russia so it behaves like the
+                  // old "everything except Russian sites" until customized.
+                  apply({ routing_mode: m, bypass_countries: ['ru'] })
+                } else {
+                  apply({ routing_mode: m })
+                }
+              }}
             >
               <option value="proxy_all">{tt('All traffic through VPN')}</option>
-              <option value="bypass_ru">{tt('Everything except Russian sites')}</option>
+              <option value="bypass_countries">{tt('Everything except selected countries')}</option>
               <option value="only_blocked">{tt('Only blocked-in-Russia resources')}</option>
+              <option value="only_blocked_cn">{tt('Only blocked-in-China resources')}</option>
+              <option value="only_selected">{tt('Only selected sites')}</option>
             </select>
           </div>
           {hint('How traffic is split between the VPN and a direct connection. Takes effect on next connection.')}
-          {rmode === 'only_blocked' && (
-            <div id="only-blocked-opts">
-              <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
-                <span className="modal-row-label">{tt('Custom domains through VPN')}</span>
-                <Toggle
-                  on={!stg.proxy_domains_disabled}
-                  onChange={(v) => apply({ proxy_domains_disabled: !v })}
-                />
+          {rmode === 'bypass_countries' && (
+            <div id="bypass-countries-opts">
+              <div className="modal-hint" style={{ marginTop: 8 }}>
+                {tt('Sites of these countries go direct (bypass the VPN):')}
               </div>
-              <Chips
-                items={stg.proxy_domains || []}
-                disabled={!!stg.proxy_domains_disabled}
-                placeholder={tt('e.g. youtube.com, press Enter')}
-                onChange={(next) => apply({ proxy_domains: next })}
-              />
-              {hint('Domains routed THROUGH the VPN in addition to the built-in blocked-list. Takes effect on next connection.')}
-              <div className="modal-row" style={{ display: 'block', marginTop: 10, marginBottom: 4 }}>
-                <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
-                  {tt('Custom blocklist URL')}
-                </span>
-                <input
-                  className="modal-input"
-                  style={{ marginBottom: 0 }}
-                  defaultValue={stg.blocklist_url || ''}
-                  placeholder="https://…/domains.txt"
-                  onBlur={(e) => apply({ blocklist_url: e.target.value.trim() })}
-                />
-              </div>
-              <div className="modal-hint" style={{ marginTop: 0 }}>
-                {tt('Optional plain-text domain list (one per line) fetched and routed through the VPN. Auto-updated.')}
-              </div>
+              {BYPASS_COUNTRIES.map((c) => (
+                <div className="modal-row" key={c.cc}>
+                  <span className="modal-row-label">
+                    {c.flag} {tt(c.label)}
+                  </span>
+                  <Toggle on={bypassCC.includes(c.cc)} onChange={(v) => setBypassCC(c.cc, v)} />
+                </div>
+              ))}
+              {hint('Local sites of these countries often refuse foreign/VPN addresses (banks, government services) — routing them direct keeps them working while everything else rides the VPN. Each country is matched by its TLD zone (*.ru, *.cn, *.ir, *.kz), its known-domains list and its IP ranges. With nothing selected, everything goes through the VPN. Takes effect on next connection.')}
             </div>
           )}
-          <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
-            <span className="modal-row-label">{tt('Custom domains without VPN')}</span>
-            <Toggle
-              on={!stg.direct_domains_disabled}
-              onChange={(v) => apply({ direct_domains_disabled: !v })}
-            />
+          {rmode === 'only_selected' &&
+            hint('Whitelist mode: ONLY the domains you list below go through the VPN — everything else stays on the direct connection. With an empty list, nothing is tunnelled. If "Set system proxy" is off, the app filter also applies (only apps pointed at the proxy, AND only these domains).')}
+          {rmode === 'only_blocked_cn' &&
+            hint('Regular traffic goes DIRECT; only resources blocked in China go through the VPN — matched by the community GFW list (Loyalsoldier build, auto-updated), plus your own lists below.')}
+
+          {/* ── Custom rules (all modes): domain / IP / CIDR / full:/regexp: ── */}
+          <div className="modal-row" style={{ marginTop: 12, marginBottom: 4 }}>
+            <span className="modal-row-label">{tt('Custom rules — without VPN')}</span>
+            <Toggle on={!stg.direct_domains_disabled} onChange={(v) => apply({ direct_domains_disabled: !v })} />
           </div>
           <Chips
             items={stg.direct_domains || []}
             disabled={!!stg.direct_domains_disabled}
-            placeholder={tt('e.g. vk.com, press Enter')}
+            placeholder={tt('domain, IP or CIDR — press Enter')}
             onChange={(next) => apply({ direct_domains: next })}
           />
-          {hint('Enter a domain — all its subdomains are included automatically. Takes effect on next connection.')}
+          {hint('Kept OFF the VPN (direct). Accepts a domain (all subdomains included), an IP or a CIDR (e.g. 10.0.0.0/8), or an advanced prefix — full:, regexp:, geosite:, geoip: (the geosite:/geoip: categories work in proxy mode only). Takes effect on next connection.')}
+
+          {/* "Through VPN" rules are pointless when EVERYTHING already goes
+              through the VPN — hidden in proxy_all (the lists persist). */}
+          {rmode !== 'proxy_all' && (
+            <>
+              <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
+                <span className="modal-row-label">{tt('Custom rules — through VPN')}</span>
+                <Toggle on={!stg.proxy_domains_disabled} onChange={(v) => apply({ proxy_domains_disabled: !v })} />
+              </div>
+              <Chips
+                items={stg.proxy_domains || []}
+                disabled={!!stg.proxy_domains_disabled}
+                placeholder={tt('domain, IP or CIDR — press Enter')}
+                onChange={(next) => apply({ proxy_domains: next })}
+              />
+              {hint('Forced THROUGH the VPN — even in a bypass mode. Same syntax as above. In whitelist mode (Only selected sites) this is the main list. Takes effect on next connection.')}
+
+              <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
+                <span className="modal-row-label">{tt('Custom rules — through VPN (URL)')}</span>
+                <Toggle
+                  on={!stg.blocklist_urls_disabled}
+                  onChange={(v) => apply({ blocklist_urls_disabled: !v })}
+                />
+              </div>
+              <Chips
+                keepCase
+                items={blocklistUrls}
+                disabled={!!stg.blocklist_urls_disabled}
+                placeholder={tt('https://…/domains.txt — press Enter')}
+                onChange={(next) => apply({ blocklist_urls: next, blocklist_url: '' })}
+              />
+              {hint('A URL-backed version of the list above: one or more links to plain-text domain lists (one domain per line), fetched, auto-updated and routed THROUGH the VPN. Handy for large or community-maintained lists instead of typing each domain. Press Enter to add a link. Takes effect on next connection.')}
+            </>
+          )}
+
+          <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
+            <span className="modal-row-label">{tt('Custom rules — block')}</span>
+            <Toggle on={!stg.block_domains_disabled} onChange={(v) => apply({ block_domains_disabled: !v })} />
+          </div>
+          <Chips
+            items={stg.block_domains || []}
+            disabled={!!stg.block_domains_disabled}
+            placeholder={tt('domain, IP or CIDR — press Enter')}
+            onChange={(next) => apply({ block_domains: next })}
+          />
+          {hint('Dropped entirely (ads, telemetry, unwanted hosts). Same syntax as above. Highest priority: block wins over the without-VPN and through-VPN lists. Takes effect on next connection.')}
           <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
             <span className="modal-row-label">{tt('Apps without VPN (TUN mode only)')}</span>
             <Toggle on={!stg.direct_apps_disabled} onChange={(v) => apply({ direct_apps_disabled: !v })} />
@@ -509,6 +597,16 @@ export default function SettingsModal({
             {tt('Address the proxy will use')}: <b>{proxyBindShown}</b>
           </div>
           {hint('The address the local HTTP/SOCKS proxy listens on when connected. Localhost = this PC only. Allow LAN access = other devices on your network can reach it (binds 0.0.0.0). Custom = a specific interface address. Ports: HTTP 10819, SOCKS 10818 by default (above). Beyond localhost, use only on a trusted network — SOCKS keeps its password, HTTP has none. Applies on the next connection.')}
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Set system proxy')}</span>
+            <Toggle on={!stg.no_system_proxy} onChange={(v) => apply({ no_system_proxy: !v })} />
+          </div>
+          {hint('When on (default), connecting in proxy mode points the Windows system proxy at Vair, so every app that respects it goes through the VPN. Turn off for a "non-system" proxy: Vair only runs the local HTTP/SOCKS proxy on the ports above and changes nothing else — only apps where you explicitly set that proxy go through the VPN, the rest of the system stays direct. Applies immediately, even to a live connection.')}
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Share proxy over LAN in TUN mode')}</span>
+            <Toggle on={!!stg.tun_share_proxy} onChange={(v) => apply({ tun_share_proxy: v })} />
+          </div>
+          {hint('In TUN mode Vair normally routes only THIS PC through the tunnel. Turn this on to ALSO open the HTTP/SOCKS proxy (above) on the Proxy-access address, so another device (a phone) can route through this PC into the VPN while the PC itself stays fully tunnelled. Set Proxy access to "Allow LAN access" (or a custom address) for it to be reachable from other devices, and point the device at the HTTP port. Off by default; applies on the next connection.')}
         </div>
 
         {/* ── Testing ── */}
@@ -936,6 +1034,65 @@ export default function SettingsModal({
             </div>
           )}
           <div className="modal-row">
+            <span className="modal-row-label">{tt('HTTP authentication')}</span>
+            <Toggle
+              on={!!stg.http_auth}
+              onChange={(v) => {
+                const patch: any = { http_auth: v }
+                if (v) {
+                  if (!stg.http_user) patch.http_user = socksRandHex(16)
+                  if (!stg.http_pass) patch.http_pass = socksRandHex(32)
+                }
+                apply(patch)
+              }}
+            />
+          </div>
+          {hint("Protects the local HTTP proxy with a username/password (Basic auth). Applies to BOTH proxy mode and the TUN “Share proxy over LAN” HTTP proxy. Off by default. Takes effect on next connection.")}
+          {!!stg.http_auth && (
+            <div id="http-creds">
+              <div className="modal-row" style={{ display: 'block', marginBottom: 8 }}>
+                <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+                  {tt('HTTP username')}
+                </span>
+                <input
+                  className="modal-input"
+                  style={{ marginBottom: 0 }}
+                  value={stg.http_user || ''}
+                  onChange={(e) => apply({ http_user: e.target.value })}
+                  onBlur={(e) => {
+                    if (!e.target.value.trim()) apply({ http_user: socksRandHex(16) })
+                  }}
+                />
+              </div>
+              <div className="modal-row" style={{ display: 'block', marginBottom: 6 }}>
+                <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+                  {tt('HTTP password')}
+                </span>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
+                  <input
+                    className="modal-input"
+                    style={{ marginBottom: 0, flex: 1 }}
+                    value={stg.http_pass || ''}
+                    onChange={(e) => apply({ http_pass: e.target.value })}
+                    onBlur={(e) => {
+                      if (!e.target.value.trim()) apply({ http_pass: socksRandHex(32) })
+                    }}
+                  />
+                  <button
+                    className="btn ghost sm"
+                    title={tt('Generate new credentials')}
+                    onClick={() => apply({ http_user: socksRandHex(16), http_pass: socksRandHex(32) })}
+                  >
+                    {tt('Reset')}
+                  </button>
+                </div>
+              </div>
+              <div className="modal-hint" style={{ marginTop: 0 }}>
+                {tt('Enter these in your HTTP client. Reset generates new random credentials.')}
+              </div>
+            </div>
+          )}
+          <div className="modal-row">
             <span className="modal-row-label">{tt('TUN DNS leak protection')}</span>
             <Toggle on={!!stg.dns_leak_protection} onChange={(v) => apply({ dns_leak_protection: v })} />
           </div>
@@ -946,7 +1103,7 @@ export default function SettingsModal({
                 <span className="modal-row-label">{tt('TUN Kill-switch')}</span>
                 <Toggle on={!!stg.kill_switch} onChange={(v) => apply({ kill_switch: v })} />
               </div>
-              {hint('Drops all traffic if the VPN goes down — no fallback to your physical network. Relies on the same strict-routing mechanism as DNS leak protection.')}
+              {hint('Drops all traffic if the VPN drops — no fallback to your physical network (strict routing; on Windows a WFP filter). Also hardens DNS-leak protection. On by default; turn it off to let traffic fall back to a direct connection when the tunnel dies. Applies only to TUN mode.')}
               <div className="modal-row">
                 <span className="modal-row-label">{tt('TUN Block LAN traffic')}</span>
                 <Toggle on={!!stg.block_lan} onChange={(v) => apply({ block_lan: v })} />

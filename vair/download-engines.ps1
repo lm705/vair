@@ -93,6 +93,12 @@ $files = @(
     @{ n = "geoip-ru-blocked.srs";   u = "https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/sing-box/rule-set-geoip/geoip-ru-blocked.srs" }
     @{ n = "geosite-ru-blocked.dat"; u = "https://raw.githubusercontent.com/runetfreedom/russia-blocked-geosite/release/geosite-ru-only.dat" }
     @{ n = "geoip-ru-blocked.dat";   u = "https://raw.githubusercontent.com/runetfreedom/russia-blocked-geoip/release/ru-blocked.dat" }
+    @{ n = "geosite-cn.srs";         u = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs" }
+    @{ n = "geoip-cn.srs";           u = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs" }
+    @{ n = "geosite-ir.srs";         u = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ir.srs" }
+    @{ n = "geoip-ir.srs";           u = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ir.srs" }
+    @{ n = "geoip-kz.srs";           u = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-kz.srs" }
+    @{ n = "gfw.txt";                u = "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt" }
 )
 foreach ($f in $files) {
     Step $f.n

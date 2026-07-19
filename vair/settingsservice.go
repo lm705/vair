@@ -40,7 +40,30 @@ func (s *SettingsService) Set(ns core.AppSettings) core.AppSettings {
 	if applied.Language != old.Language {
 		refreshTrayMenu()
 	}
+	// "Set system proxy" toggle applies instantly to a live proxy connection.
+	if applied.NoSystemProxy != old.NoSystemProxy {
+		core.ReapplySystemProxy()
+	}
+	// TUN-mode LAN proxy sharing: reconcile the inbound firewall rule when the
+	// toggle, the ports, or the bind address change (so another device can reach
+	// the shared proxy). The config-side inbound applies on the next connection.
+	if applied.TunShareProxy != old.TunShareProxy || applied.HttpPort != old.HttpPort ||
+		applied.SocksPort != old.SocksPort || applied.ProxyBind != old.ProxyBind {
+		applyTunProxyFirewall()
+	}
 	return applied
+}
+
+// applyTunProxyFirewall opens or closes the inbound firewall rule for the
+// LAN-shared proxy ports based on the TunShareProxy toggle. Called on the
+// relevant settings change and once at startup.
+func applyTunProxyFirewall() {
+	if core.TunShareProxyEnabled() {
+		h, s := core.ProxyPorts()
+		ensureProxyFirewallRule(h, s)
+	} else {
+		removeProxyFirewallRule()
+	}
 }
 
 // RemoteInfo tells the Settings UI whether remote control is on, its token, the

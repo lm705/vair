@@ -77,10 +77,15 @@ type ConnState struct {
 	ConnRaw    string     `json:"conn_raw,omitempty"` // raw vless:// URL for matching after reload
 	HTTPPort   int        `json:"http_port,omitempty"`
 	SOCKSPort  int        `json:"socks_port,omitempty"`
-	TUNIface   string     `json:"tun_iface,omitempty"`
-	StartedAt  time.Time  `json:"started_at"`
-	ErrMsg     string     `json:"error,omitempty"`
-	UptimeSec  int64      `json:"uptime_sec"`
+	// SrcFetchPort is the engine's dedicated source-fetch inbound (proxy mode):
+	// subscription refreshes connect here and are pinned to the proxy outbound,
+	// so they always go through the tunnel regardless of the routing mode.
+	// Internal — not exposed to the frontend.
+	SrcFetchPort int       `json:"-"`
+	TUNIface     string    `json:"tun_iface,omitempty"`
+	StartedAt    time.Time `json:"started_at"`
+	ErrMsg       string    `json:"error,omitempty"`
+	UptimeSec    int64     `json:"uptime_sec"`
 	// StatsUnavailable is true for the pure-sing-box TUN path (Hysteria2/
 	// TUIC): there's no local SOCKS hop to instrument, so session/lifetime
 	// traffic counters don't move. The UI shows a small note instead.
@@ -291,15 +296,12 @@ type AppState struct {
 	activeTab     string
 	xrayBin       string
 	singboxBin    string
-	clients       map[chan SSEEvent]struct{}
-	clientMu      sync.Mutex
 	pingRunning   int32
 	speedRunning  int32
 	conn          *connManager
 }
 
 var state = &AppState{
-	clients:       make(map[chan SSEEvent]struct{}),
 	conn:          newConnManager(),
 	tabEntries:    make(map[string][]*ConfigEntry),
 	cancelledTabs: make(map[string]bool),
@@ -494,23 +496,10 @@ func nextTabNumber() int {
 	}
 }
 
-// broadcast fans an SSE event out to every connected client.
-//
-// Two delivery tiers — driven by ev.Lossy:
-//
-//   - Lossy (live-progress, in-flight stats, bulk-progress ticks): send
-//     non-blocking. If the receiver's 1024-slot buffer is full, drop this
-//     event. A later event will supersede it anyway, so loss is harmless.
-//
-//   - Reliable (terminal entry updates, conn state, bulk_*_done, tabs):
-//     block up to 2 seconds. These represent a state TRANSITION the client
-//     must observe — dropping them leaves rows stuck on stale status (the
-//     classic "connecting…" pill that only disappears after RELOAD).
-//
-// The client list is snapshotted under the lock and the actual sends happen
-// OUTSIDE the lock. Otherwise a single slow client would serialize every
-// broadcast through clientMu, and the 2-second reliable budget would
-// multiply by the client count for unrelated events on other clients.
+// broadcast delivers a domain event to the frontend. SSE (the 1.10 transport,
+// with its per-client Lossy / 2-second reliable tiers) was replaced by Wails
+// events in 2.0: the runtime handles fan-out, so this just emits. The frontend
+// listens via Events.On(ev.Type, …) and reads e.data.payload.
 func (s *AppState) broadcast(ev SSEEvent) {
 	// A config's ping/speed result changed → bump the sort-order cache version so
 	// a ping/speed-sorted view re-sorts on its next read (see memSig). Cheap
@@ -518,20 +507,7 @@ func (s *AppState) broadcast(ev SSEEvent) {
 	if ev.Type == "entry_update" {
 		bumpResultVer()
 	}
-	// SSE replaced by Wails events: the runtime handles delivery, so the old
-	// per-client Lossy / 2-second blocking policy is no longer needed. The
-	// frontend listens via Events.On(ev.Type, …) and reads e.data.payload.
 	Events.Emit(ev.Type, ev)
-}
-func (s *AppState) addClient(ch chan SSEEvent) {
-	s.clientMu.Lock()
-	s.clients[ch] = struct{}{}
-	s.clientMu.Unlock()
-}
-func (s *AppState) removeClient(ch chan SSEEvent) {
-	s.clientMu.Lock()
-	delete(s.clients, ch)
-	s.clientMu.Unlock()
 }
 
 // ─────────────────────────── admin check ─────────────────────────

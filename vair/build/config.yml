@@ -9,7 +9,7 @@ info:
   description: "Vair"
   copyright: "Copyright © 2026 lm705. GPL-3.0 License"
   comments: ""
-  version: "2.0.0"
+  version: "2.1.0"
 
 # Dev mode configuration
 dev_mode:

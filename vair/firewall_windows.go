@@ -17,6 +17,7 @@ import (
 // so if Vair isn't elevated these no-op and the user adds the rule by hand.
 
 const fwRuleName = "Vair Remote Access"
+const fwProxyRuleName = "Vair LAN Proxy"
 
 // ensureFirewallRule (re)creates the inbound allow rule for the given port.
 func ensureFirewallRule(port int) {
@@ -31,6 +32,23 @@ func ensureFirewallRule(port int) {
 // removeFirewallRule deletes the rule (idempotent — ignores "no rule" errors).
 func removeFirewallRule() {
 	netsh("advfirewall", "firewall", "delete", "rule", "name="+fwRuleName)
+}
+
+// ensureProxyFirewallRule (re)creates the inbound allow rule for the LAN-shared
+// proxy (TUN-mode proxy sharing) — one rule covering both the HTTP and SOCKS
+// ports. Same best-effort/admin caveat as the remote rule above. TUN mode already
+// runs elevated, so netsh actually applies when this feature is in use.
+func ensureProxyFirewallRule(httpPort, socksPort int) {
+	removeProxyFirewallRule()
+	netsh("advfirewall", "firewall", "add", "rule",
+		"name="+fwProxyRuleName, "dir=in", "action=allow",
+		"protocol=TCP", fmt.Sprintf("localport=%d,%d", httpPort, socksPort),
+		"profile=private,domain") // trusted networks only — not public Wi-Fi
+}
+
+// removeProxyFirewallRule deletes the LAN-proxy rule (idempotent).
+func removeProxyFirewallRule() {
+	netsh("advfirewall", "firewall", "delete", "rule", "name="+fwProxyRuleName)
 }
 
 // netsh runs a netsh command with no console window, ignoring failures (e.g. not

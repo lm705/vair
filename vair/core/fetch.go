@@ -24,9 +24,19 @@ import (
 func sourceHTTPClient(timeout time.Duration) *http.Client {
 	tr := &http.Transport{}
 	cs := state.conn.snap()
-	if cs.Status == ConnConnected && cs.Mode == ModeProxy && cs.HTTPPort > 0 {
-		if pu, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", cs.HTTPPort)); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
+	if cs.Status == ConnConnected && cs.Mode == ModeProxy {
+		// Prefer the dedicated source-fetch inbound: its traffic is PINNED to the
+		// proxy outbound, so the refresh rides the tunnel in every routing mode
+		// (through the regular port the RU modes can route a subscription host
+		// direct — dead on a censored network). Fall back to the public port.
+		port := cs.SrcFetchPort
+		if port == 0 {
+			port = cs.HTTPPort
+		}
+		if port > 0 {
+			if pu, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port)); err == nil {
+				tr.Proxy = http.ProxyURL(pu)
+			}
 		}
 	}
 	return &http.Client{Timeout: timeout, Transport: tr}
@@ -241,13 +251,6 @@ func (m *subMeta) isEmpty() bool {
 	return m.Title == "" && m.Total == 0 && m.Expire == 0 && m.Upload == 0 &&
 		m.Download == 0 && m.UpdateInterval == "" && m.Updated == "" && m.Count == 0 &&
 		m.Info == "" && len(m.Notes) == 0
-}
-
-// fetchURL is the metadata-less entry point kept for callers that only need the
-// config lines.
-func fetchURL(u string) ([]string, error) {
-	lines, _, err := fetchURLMeta(u)
-	return lines, err
 }
 
 // subFetchUserAgent is sent on every subscription fetch. Some panels / hosts

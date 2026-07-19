@@ -391,15 +391,23 @@ func Reload(tabID string) {
 	}()
 
 	if tabID == "main" {
-		go fetchAndInit()
+		go func() {
+			// Let the cancelled tests' in-flight remainder finish BEFORE the fetch
+			// replaces the entries, or their late results stamp the fresh list
+			// (same tab + idx, different configs).
+			waitTestsDrained(tabID, 30*time.Second)
+			fetchAndInit()
+		}()
 	} else if len(sourceURLs) > 0 || len(sourceFiles) > 0 || ghReady {
 		go func() {
 			state.broadcast(SSEEvent{Type: "loading", Payload: nil, Tab: tabID})
+			waitTestsDrained(tabID, 30*time.Second) // see above
 			fetchTabURLs(tabID, sourceURLs, sourceFiles)
 		}()
 	} else {
 		// No URL: reset all test results for this tab (memory + store).
 		go func() {
+			waitTestsDrained(tabID, 30*time.Second) // late results would undo the reset
 			resetTabResultsMem(tabID)
 			loadedSignal(tabID)
 		}()

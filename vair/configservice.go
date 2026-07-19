@@ -36,6 +36,29 @@ func (c *ConfigService) Reload(tabId string) {
 	core.Reload(tabId)
 }
 
+// BuildConfigURL serialises the add/edit form to a share-link URL (live preview
+// + validation). Errors come back in-band via ConfigURLResult.Error.
+func (c *ConfigService) BuildConfigURL(form core.ConfigForm) core.ConfigURLResult {
+	return core.BuildConfigURL(form)
+}
+
+// ConfigToForm prefills the form from an existing config (edit / view flow).
+func (c *ConfigService) ConfigToForm(raw string) core.ConfigFormResult {
+	return core.ParseConfigToForm(raw)
+}
+
+// AddConfig appends a manually-built config to a user tab. Returns "" on success
+// or an error string.
+func (c *ConfigService) AddConfig(tabId string, form core.ConfigForm) string {
+	return core.AddManualConfig(tabId, form)
+}
+
+// UpdateConfig replaces config idx in a user tab from the edited form. Returns ""
+// on success or an error string.
+func (c *ConfigService) UpdateConfig(tabId string, idx int, form core.ConfigForm) string {
+	return core.UpdateConfig(tabId, idx, form)
+}
+
 // Indices returns the FULL ordered index list of tabId's current view (every
 // matching row, not just loaded windows) — select-all / shift-range need it.
 func (c *ConfigService) Indices(tabId, sort, filter string, proto []string) []int {

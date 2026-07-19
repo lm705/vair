@@ -29,6 +29,36 @@ export const RU: Record<string, string> = {
     "All traffic through VPN": "Весь трафик через VPN",
     "Everything except Russian sites": "Всё, кроме российских сайтов",
     "Only blocked-in-Russia resources": "Только заблокированное в РФ",
+    "Only selected sites": "Только выбранные сайты",
+    "Everything except selected countries": "Всё, кроме сайтов выбранных стран",
+    "Sites of these countries go direct (bypass the VPN):": "Сайты этих стран идут напрямую (мимо VPN):",
+    "Russian sites": "Российские сайты",
+    "Chinese sites": "Китайские сайты",
+    "Iranian sites": "Иранские сайты",
+    "Kazakh sites": "Казахстанские сайты",
+    "Local sites of these countries often refuse foreign/VPN addresses (banks, government services) — routing them direct keeps them working while everything else rides the VPN. Each country is matched by its TLD zone (*.ru, *.cn, *.ir, *.kz), its known-domains list and its IP ranges. With nothing selected, everything goes through the VPN. Takes effect on next connection.":
+      "Локальные сайты этих стран часто не пускают с зарубежных/VPN-адресов (банки, госуслуги) — прямой маршрут сохраняет их работу, а всё остальное идёт через VPN. Страна определяется по её доменной зоне (*.ru, *.cn, *.ir, *.kz), списку известных доменов и IP-диапазонам. Если ничего не выбрано — весь трафик идёт через VPN. Применяется при следующем подключении.",
+    "Only blocked-in-China resources": "Только заблокированное в Китае",
+    "Custom rules — without VPN": "Свои правила — без VPN",
+    "Custom rules — through VPN": "Свои правила — через VPN",
+    "Custom rules — through VPN (URL)": "Свои правила — через VPN (по ссылке)",
+    "https://…/domains.txt — press Enter": "https://…/domains.txt — Enter для добавления",
+    "A URL-backed version of the list above: one or more links to plain-text domain lists (one domain per line), fetched, auto-updated and routed THROUGH the VPN. Handy for large or community-maintained lists instead of typing each domain. Press Enter to add a link. Takes effect on next connection.":
+      "Версия списка выше по ссылке: одна или несколько ссылок на текстовые списки доменов (по одному в строке), которые скачиваются, авто-обновляются и идут ЧЕРЕЗ VPN. Удобно для больших или поддерживаемых сообществом списков — вместо ввода каждого домена вручную. Enter — добавить ссылку. Применяется при следующем подключении.",
+    "Custom rules — block": "Свои правила — блокировать",
+    "domain, IP or CIDR — press Enter": "домен, IP или CIDR — Enter",
+    "Kept OFF the VPN (direct). Accepts a domain (all subdomains included), an IP or a CIDR (e.g. 10.0.0.0/8), or an advanced prefix — full:, regexp:, geosite:, geoip: (the geosite:/geoip: categories work in proxy mode only). Takes effect on next connection.":
+      "Идут мимо VPN (напрямую). Принимается домен (все поддомены включаются), IP или CIDR (например, 10.0.0.0/8), либо продвинутый префикс — full:, regexp:, geosite:, geoip: (категории geosite:/geoip: работают только в режиме proxy). Применяется при следующем подключении.",
+    "Forced THROUGH the VPN — even in a bypass mode. Same syntax as above. In whitelist mode (Only selected sites) this is the main list. Takes effect on next connection.":
+      "Принудительно идут ЧЕРЕЗ VPN — даже в режимах-исключениях. Синтаксис как выше. В режиме белого списка («Только выбранные сайты») это основной список. Применяется при следующем подключении.",
+    "Dropped entirely (ads, telemetry, unwanted hosts). Same syntax as above. Highest priority: block wins over the without-VPN and through-VPN lists. Takes effect on next connection.":
+      "Полностью блокируются (реклама, телеметрия, нежелательные хосты). Синтаксис как выше. Наивысший приоритет: блокировка важнее списков «без VPN» и «через VPN». Применяется при следующем подключении.",
+    "Regular traffic goes DIRECT; only resources blocked in China go through the VPN — matched by the community GFW list (Loyalsoldier build, auto-updated), plus your own lists below.":
+      "Обычный трафик идёт НАПРЯМУЮ; через VPN — только ресурсы, заблокированные в Китае: по комьюнити-списку GFW (сборка Loyalsoldier, автообновляется) плюс ваши списки ниже.",
+    "Whitelist mode: ONLY the domains you list below go through the VPN — everything else stays on the direct connection. With an empty list, nothing is tunnelled. If \"Set system proxy\" is off, the app filter also applies (only apps pointed at the proxy, AND only these domains).":
+      "Режим белого списка: через VPN идут ТОЛЬКО перечисленные ниже домены — всё остальное остаётся на прямом соединении. При пустом списке через туннель не идёт ничего. Если «Задавать системный прокси» выключено, добавляется и фильтр по приложениям (только приложения, указавшие прокси, И только эти домены).",
+    "Domains routed THROUGH the VPN. Everything not listed here (or in the URL list below) goes direct. Takes effect on next connection.":
+      "Домены, которые идут ЧЕРЕЗ VPN. Всё, чего нет в этом списке (или в списке по URL ниже), идёт напрямую. Применяется при следующем подключении.",
     "How traffic is split between the VPN and a direct connection. Takes effect on next connection.":
       "Как трафик распределяется между VPN и прямым подключением. Применяется при следующем подключении.",
     "Custom domains through VPN": "Свои домены через VPN",
@@ -106,6 +136,13 @@ export const RU: Record<string, string> = {
     "Reset": "Сбросить",
     "Enter these in your SOCKS5 client. Reset generates new random credentials.":
       "Введите эти данные в SOCKS5-клиенте. «Сбросить» создаёт новые случайные.",
+    "HTTP authentication": "Аутентификация HTTP",
+    "Protects the local HTTP proxy with a username/password (Basic auth). Applies to BOTH proxy mode and the TUN “Share proxy over LAN” HTTP proxy. Off by default. Takes effect on next connection.":
+      "Защищает локальный HTTP-прокси логином/паролем (Basic-авторизация). Действует и в режиме proxy, и для HTTP-прокси функции «Раздавать прокси по LAN в TUN-режиме». По умолчанию выключено. Применяется при следующем подключении.",
+    "HTTP username": "Логин HTTP",
+    "HTTP password": "Пароль HTTP",
+    "Enter these in your HTTP client. Reset generates new random credentials.":
+      "Введите эти данные в HTTP-клиенте. «Сбросить» создаёт новые случайные.",
     "TUN DNS leak protection": "TUN: защита от утечек DNS",
     "TUN Kill-switch": "TUN: Kill-switch",
     "TUN Block LAN traffic": "TUN: блокировать LAN-трафик",
@@ -185,8 +222,8 @@ export const RU: Record<string, string> = {
       "Считает байты через VPN-туннель в обоих режимах. Итоговая сумма сохраняется между запусками; сессионный счётчик сбрасывается при каждом подключении.",
     "Forces all DNS queries through the tunnel using sing-box's built-in FakeIP. Without this, system DNS can escape through your ISP. Takes effect on next connection. Applies only to TUN mode.":
       "Принудительно отправляет все DNS-запросы через туннель, используя встроенный FakeIP в sing-box. Без этого DNS может утекать к провайдеру. Применится при следующем подключении. Работает только в TUN-режиме.",
-    "Drops all traffic if the VPN goes down — no fallback to your physical network. Relies on the same strict-routing mechanism as DNS leak protection.":
-      "Сбрасывает весь трафик, если VPN упал — без возврата к физической сети. Использует тот же механизм strict-routing, что и защита от утечек DNS.",
+    "Drops all traffic if the VPN drops — no fallback to your physical network (strict routing; on Windows a WFP filter). Also hardens DNS-leak protection. On by default; turn it off to let traffic fall back to a direct connection when the tunnel dies. Applies only to TUN mode.":
+      "Сбрасывает весь трафик, если VPN упал — без возврата к физической сети (strict routing; на Windows — WFP-фильтр). Заодно усиливает защиту от утечек DNS. По умолчанию включено; выключите, чтобы при обрыве туннеля трафик возвращался к прямому соединению. Только для TUN-режима.",
     "By default 192.168.x.x and similar private addresses bypass the VPN so printers, NAS, and router admin pages still work. Enable this to force LAN traffic through the tunnel too — usually breaks local services.":
       "По умолчанию 192.168.x.x и подобные приватные адреса идут мимо VPN — это нужно, чтобы работали принтеры, NAS и админка роутера. Включите, чтобы LAN-трафик тоже шёл через туннель — обычно ломает локальные сервисы.",
     "FakeIP returns pseudo-addresses instantly and resolves the real domain inside the tunnel — fastest, no leak. Turn off to use a real DoH server through the proxy (slower but more compatible with apps that do their own DNS).":
@@ -326,6 +363,46 @@ export const RU: Record<string, string> = {
     "Address the proxy will use": "Адрес, который будет использоваться",
     "The address the local HTTP/SOCKS proxy listens on when connected. Localhost = this PC only. Allow LAN access = other devices on your network can reach it (binds 0.0.0.0). Custom = a specific interface address. Ports: HTTP 10819, SOCKS 10818 by default (above). Beyond localhost, use only on a trusted network — SOCKS keeps its password, HTTP has none. Applies on the next connection.":
       "Адрес, на котором слушает локальный HTTP/SOCKS-прокси при подключении. «Только этот ПК» — доступ лишь с этого компьютера. «Доступ из локальной сети» — прокси доступен другим устройствам в сети (привязка 0.0.0.0). «Свой адрес» — конкретный интерфейс. Порты: по умолчанию HTTP 10819, SOCKS 10818 (выше). За пределами localhost — только в доверенной сети: у SOCKS есть пароль, у HTTP нет. Применяется при следующем подключении.",
+    "Set system proxy": "Задавать системный прокси",
+    "When on (default), connecting in proxy mode points the Windows system proxy at Vair, so every app that respects it goes through the VPN. Turn off for a \"non-system\" proxy: Vair only runs the local HTTP/SOCKS proxy on the ports above and changes nothing else — only apps where you explicitly set that proxy go through the VPN, the rest of the system stays direct. Applies immediately, even to a live connection.":
+      "Когда включено (по умолчанию), при подключении в режиме proxy Vair прописывает себя системным прокси Windows — через VPN идут все программы, которые его уважают. Выключите для «несистемного» прокси: Vair просто поднимет локальный HTTP/SOCKS-прокси на портах выше и больше ничего не тронет — через VPN пойдут только приложения, где вы сами укажете этот прокси, остальная система останется на прямом соединении. Применяется сразу, даже к активному подключению.",
+    "Share proxy over LAN in TUN mode": "Раздавать прокси по LAN в TUN-режиме",
+    "In TUN mode Vair normally routes only THIS PC through the tunnel. Turn this on to ALSO open the HTTP/SOCKS proxy (above) on the Proxy-access address, so another device (a phone) can route through this PC into the VPN while the PC itself stays fully tunnelled. Set Proxy access to \"Allow LAN access\" (or a custom address) for it to be reachable from other devices, and point the device at the HTTP port. Off by default; applies on the next connection.":
+      "В TUN-режиме Vair обычно заворачивает в туннель только сам ПК. Включите это, чтобы ДОПОЛНИТЕЛЬНО открыть HTTP/SOCKS-прокси (выше) на адресе из «Доступ к прокси» — тогда другое устройство (телефон) сможет ходить в интернет через VPN этого ПК, при этом сам ПК остаётся полностью в туннеле. Чтобы прокси был доступен извне, поставьте «Доступ к прокси» в «Доступ из локальной сети» (или свой адрес) и укажите на устройстве HTTP-порт. По умолчанию выключено; применяется при следующем подключении.",
+    "Add config…": "Добавить конфиг…",
+    "This tab is empty": "Эта вкладка пуста",
+    "Add a source": "Добавить источник",
+    "Edit config…": "Изменить конфиг…",
+    "View config…": "Просмотр конфига…",
+    "Add configuration": "Добавить конфигурацию",
+    "Edit configuration": "Изменить конфигурацию",
+    "View configuration": "Просмотр конфигурации",
+    "Basic": "Основное",
+    "Transport": "Транспорт",
+    "Protocol": "Протокол",
+    "Address": "Адрес",
+    "Port": "Порт",
+    "Password": "Пароль",
+    "Encryption method": "Метод шифрования",
+    "Path": "Путь",
+    "Host header": "Заголовок Host",
+    "Service name": "Имя сервиса",
+    "Header type": "Тип заголовка",
+    "Fingerprint": "Отпечаток (fp)",
+    "Allow insecure": "Разрешить небезопасное",
+    "Public key": "Публичный ключ",
+    "Encryption": "Шифрование",
+    "Obfuscation": "Обфускация",
+    "Obfs type": "Тип обфускации",
+    "Obfs password": "Пароль обфускации",
+    "Congestion control": "Контроль перегрузки",
+    "UDP relay mode": "Режим UDP-relay",
+    "Share link": "Ссылка (share link)",
+    "(default)": "(по умолчанию)",
+    "Add config": "Добавить",
+    "Save": "Сохранить",
+    "Config added": "Конфиг добавлен",
+    "Config updated": "Конфиг обновлён",
     "Server port": "Порт сервера",
     "IP address": "IP-адрес",
     "Default 19876. Change it if that port is taken — e.g. while the 1.10 release is still running on this PC.":

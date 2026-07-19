@@ -15,12 +15,14 @@ import {
   QRService,
   SettingsService,
   UpdateService,
+  ClipboardService,
 } from '../bindings/vair'
 import { t10 } from './i18n'
 import SettingsModal from './SettingsModal'
 import TabModal from './TabModal'
 import SourcesModal from './SourcesModal'
 import AutoModal from './AutoModal'
+import ConfigModal from './ConfigModal'
 
 type Row = NonNullable<Awaited<ReturnType<typeof ConfigService.Window>>>[number]
 type Sort = 'idx' | 'ping' | 'speed'
@@ -175,6 +177,10 @@ export default function App() {
   }
   const [tabModalId, setTabModalId] = useState<string | null>(null)
   const [sourcesOpen, setSourcesOpen] = useState(false)
+  // Add / edit / view a config manually (the ConfigModal form). null = closed.
+  const [configModal, setConfigModal] = useState<
+    { mode: 'add' | 'edit' | 'view'; tabId: string; idx?: number; raw?: string } | null
+  >(null)
   const [toast, setToast] = useState<{ text: string; fade: boolean } | null>(null)
   const [updBanner, setUpdBanner] = useState<{ latest: string; notes?: string } | null>(null)
   const [appInfo, setAppInfo] = useState<any>({ singbox_available: true, is_admin: true })
@@ -477,6 +483,19 @@ export default function App() {
     for (const row of cacheRef.current.values()) if (row.index === idx) return row
     return null
   }
+  // Manual add / edit / view config (ConfigModal). Add + edit are user-tab only;
+  // Sources rows open read-only View (upstream configs shouldn't be edited).
+  const openConfigAdd = () => {
+    if (activeTab === 'main') return
+    setMenu(null)
+    setConfigModal({ mode: 'add', tabId: activeTab })
+  }
+  const openConfigEditView = (idx: number, view: boolean) => {
+    const row = findRowByIndex(idx)
+    if (!row) return
+    setMenu(null)
+    setConfigModal({ mode: view ? 'view' : 'edit', tabId: activeTab, idx, raw: row.raw })
+  }
   // dropStashForTab evicts a tab's stashed rows so a background data change
   // can't resurface stale rows when the user switches back to that tab.
   const dropStashForTab = (tab: string) => {
@@ -705,10 +724,22 @@ export default function App() {
   }
   importRef.current = importPayload
   const pasteFromClipboard = () => {
-    navigator.clipboard
-      .readText()
+    // Read the clipboard NATIVELY (Win32 via Wails) — navigator.clipboard.readText()
+    // reads WebView2's cache, which can hand back a value copied earlier instead of
+    // what was just copied in another app. Fall back to the async API only if the
+    // native read comes back empty.
+    ClipboardService.Text()
       .then((text) => {
-        if (pasteworthy(text)) importPayload(text)
+        if (pasteworthy(text)) {
+          importPayload(text)
+          return
+        }
+        navigator.clipboard
+          ?.readText?.()
+          .then((t) => {
+            if (pasteworthy(t)) importPayload(t)
+          })
+          .catch(() => {})
       })
       .catch(() => {})
   }
@@ -1773,6 +1804,17 @@ export default function App() {
             </div>
             <p>{loading.op === 'delete' ? tt('Deleting configs…') : tt('Loading configs…')}</p>
           </div>
+        ) : total === 0 && activeTab !== 'main' ? (
+          /* Empty user tab: show the three ways to fill it (discoverability — the
+             context-menu entry points are invisible until you know to right-click). */
+          <div className="center-msg" id="msg-area">
+            <p style={{ marginBottom: 12 }}>{tt('This tab is empty')}</p>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+              <button className="btn ghost" onClick={openConfigAdd}>{tt('Add config…')}</button>
+              <button className="btn ghost" onClick={pasteFromClipboard}>{tt('Paste configs')}</button>
+              <button className="btn ghost" onClick={() => setTabModalId(activeTab)}>{tt('Add a source')}</button>
+            </div>
+          </div>
         ) : (
           <table id="tbl">
             <colgroup>
@@ -2085,6 +2127,11 @@ export default function App() {
                   {tt('Show QR')}
                 </div>
               )}
+              {selCount <= 1 && (
+                <div className="ctx-menu-item" onClick={() => openConfigEditView(menu.idx, activeTab === 'main')}>
+                  {tt(activeTab === 'main' ? 'View config…' : 'Edit config…')}
+                </div>
+              )}
               {selCount > 1 && (
                 <div className="ctx-menu-item" onClick={connectChain}>
                   {tt('Connect as chain')} ({selCount})
@@ -2122,6 +2169,9 @@ export default function App() {
                     </>
                   )}
                   <div className="ctx-sep" />
+                  <div className="ctx-menu-item" onClick={openConfigAdd}>
+                    {tt('Add config…')}
+                  </div>
                   <div className="ctx-menu-item" onClick={pasteFromClipboard}>
                     {tt('Paste configs')}
                   </div>
@@ -2137,6 +2187,11 @@ export default function App() {
           )}
           {menu.kind === 'empty' && (
             <>
+              {activeTab !== 'main' && (
+                <div className="ctx-menu-item" onClick={openConfigAdd}>
+                  {tt('Add config…')}
+                </div>
+              )}
               <div className="ctx-menu-item" onClick={pasteFromClipboard}>
                 {tt('Paste configs')}
               </div>
@@ -2194,6 +2249,19 @@ export default function App() {
           onClose={() => setTabModalId(null)}
           onShowQR={showQRText}
           lang={lang}
+        />
+      )}
+
+      {/* ── Add / edit / view a config manually (the form → share-link modal) ── */}
+      {configModal && (
+        <ConfigModal
+          mode={configModal.mode}
+          tabId={configModal.tabId}
+          idx={configModal.idx}
+          raw={configModal.raw}
+          onClose={() => setConfigModal(null)}
+          lang={lang}
+          notify={showToast}
         />
       )}
 

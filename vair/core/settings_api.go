@@ -6,6 +6,14 @@ func AppVersion() string { return appVersion }
 // DataDir is the app data directory (Settings → Data → Open folder).
 func DataDir() string { return dataDirPath() }
 
+// TunShareProxyEnabled reports whether the "share proxy over LAN in TUN mode"
+// toggle is on (the shell uses it to reconcile the inbound firewall rule).
+func TunShareProxyEnabled() bool { return tunShareProxyEnabled() }
+
+// ProxyPorts returns the user-facing HTTP and SOCKS proxy ports (for the shell's
+// firewall rule covering the LAN-shared proxy).
+func ProxyPorts() (int, int) { return currentProxyPorts() }
+
 // ResetTotalStats zeroes the persisted lifetime traffic counters (the
 // Settings → Statistics "reset total" button) and pushes fresh stats.
 func ResetTotalStats() {

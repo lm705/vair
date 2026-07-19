@@ -311,10 +311,18 @@ textarea.modal-input{resize:vertical;min-width:0}
 /* chip lists allow text selection so entries can be selected + copied. The
    copy handler reconstructs the selection as a newline column (see
    chipsColumnFromSelection); the × buttons stay unselectable. */
-.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;user-select:text;-webkit-user-select:text;cursor:text}
+/* Native text selection is off here — the chip fields use a controlled
+   click-selection (useChipSelect): click a chip to select it, Ctrl/⌘+click for a
+   multi-selection, Ctrl+C to copy. The input keeps its own native editing. */
+.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;user-select:none;-webkit-user-select:none;cursor:text}
 .chip{display:inline-flex;align-items:center;gap:3px;font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
   padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3);
-  user-select:text;-webkit-user-select:text}
+  user-select:none;-webkit-user-select:none;cursor:pointer;
+  /* Never shrink (a squeezed chip used to collapse into a thin amber sliver with
+     clipped text); keep the value on one line. */
+  flex:0 0 auto;white-space:nowrap;max-width:100%}
+/* A selected chip. */
+.chip.sel{background:rgba(232,197,71,.32);border-color:var(--accent);box-shadow:0 0 0 1px rgba(232,197,71,.55)}
 .chip-tag{font-size:calc(var(--modal-fs-base) - 3px);text-transform:uppercase;letter-spacing:.04em;opacity:.85;font-weight:800;margin-right:2px}
 .chip.col-name{background:rgba(232,197,71,.12);color:var(--accent);border-color:rgba(232,197,71,.3)}
 .chip.col-type{background:rgba(96,165,250,.14);color:#7bb6ff;border-color:rgba(96,165,250,.35)}
@@ -322,7 +330,13 @@ textarea.modal-input{resize:vertical;min-width:0}
 .chip.col-transport{background:rgba(168,85,247,.14);color:#b387f0;border-color:rgba(168,85,247,.35)}
 .chip.col-security{background:rgba(244,114,114,.14);color:#f08a8a;border-color:rgba(244,114,114,.35)}
 .chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px);user-select:none;-webkit-user-select:none}.chip-x:hover{opacity:1;color:var(--red)}
-.chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:var(--modal-fs-base);outline:none;flex:1;min-width:80px}
+/* The input grows to fill its line (so the full placeholder shows and never gets
+   clipped) and wraps to its own line when the chips leave too little room. */
+.chip-input{border:0;background:transparent;color:var(--text);font-family:var(--font);font-size:var(--modal-fs-base);outline:none;flex:1 1 14em;min-width:8em}
+/* A trailing spacer: it shares the leftover space with the input so the field
+   looks full and gives the drag-selection somewhere to start from (a plain click
+   on it just focuses the input). */
+.chip-fill{flex:1 1 3em;min-width:2.5em;align-self:stretch;min-height:1.2em;cursor:text;user-select:none;-webkit-user-select:none}
 /* Exclude filter — one labelled chip box per column. Values are added with
    Enter (same UX as "Custom domains without VPN"). Labels match the plain
    "Deduplicate duplicate configs" style (no caps, no per-column palette). */

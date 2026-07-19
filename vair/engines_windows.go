@@ -34,6 +34,25 @@ var (
 	embeddedGeositeRuBlockedDat []byte
 	//go:embed bin/geoip-ru-blocked.dat
 	embeddedGeoipRuBlockedDat []byte
+	// Bypass-countries baselines (routing mode "everything except selected
+	// countries"): small .srs sets for CN/IR/KZ, embedded like the RU pair so
+	// TUN mode works even when the upstream (GitHub) is unreachable. KZ has no
+	// geosite (IP-only bypass).
+	//go:embed bin/geosite-cn.srs
+	embeddedGeositeCnSrs []byte
+	//go:embed bin/geoip-cn.srs
+	embeddedGeoipCnSrs []byte
+	//go:embed bin/geosite-ir.srs
+	embeddedGeositeIrSrs []byte
+	//go:embed bin/geoip-ir.srs
+	embeddedGeoipIrSrs []byte
+	//go:embed bin/geoip-kz.srs
+	embeddedGeoipKzSrs []byte
+	// Blocked-in-China baseline (routing mode "only blocked in China"): the
+	// community GFW list as plain text, emitted straight into engine configs
+	// (no .dat/.srs involved). Refreshed from upstream at runtime, best-effort.
+	//go:embed bin/gfw.txt
+	embeddedGfwTxt []byte
 )
 
 // engineDir is %LOCALAPPDATA%\vair\bin — where engines + rule-sets extract
@@ -130,6 +149,12 @@ func extractEngines() error {
 		{"geoip-ru-blocked.srs", embeddedGeoipRuBlockedSrs},
 		{"geosite-ru-blocked.dat", embeddedGeositeRuBlockedDat},
 		{"geoip-ru-blocked.dat", embeddedGeoipRuBlockedDat},
+		{"geosite-cn.srs", embeddedGeositeCnSrs},
+		{"geoip-cn.srs", embeddedGeoipCnSrs},
+		{"geosite-ir.srs", embeddedGeositeIrSrs},
+		{"geoip-ir.srs", embeddedGeoipIrSrs},
+		{"geoip-kz.srs", embeddedGeoipKzSrs},
+		{"gfw.txt", embeddedGfwTxt},
 	} {
 		dst := filepath.Join(dir, rs.name)
 		if _, statErr := os.Stat(dst); statErr != nil {

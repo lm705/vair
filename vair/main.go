@@ -181,6 +181,7 @@ func main() {
 		}
 		core.StartBackground()  // supervisor + auto-refresh + SOURCES fetch
 		applyRemoteSetting()    // LAN remote server, if it was left enabled
+		applyTunProxyFirewall() // LAN proxy-sharing firewall rule, if it was left enabled
 		// Autostart: re-point the HKCU Run key at THIS exe when enabled, so an
 		// entry migrated from 1.10 (or a moved binary) launches the right one at
 		// logon instead of the old path. No-op / removal when disabled.
@@ -191,7 +192,7 @@ func main() {
 
 	theApp = application.New(application.Options{
 		Name:        "Vair",
-		Description: "Vair 2.0.0",
+		Description: "Vair 2.1.0",
 		Services: []application.Service{
 			application.NewService(&ConfigService{}),
 			application.NewService(&TabService{}),
@@ -201,6 +202,7 @@ func main() {
 			application.NewService(&AutoService{}),
 			application.NewService(&LogService{}),
 			application.NewService(&QRService{}),
+			application.NewService(&ClipboardService{}),
 			application.NewService(&UpdateService{}),
 		},
 		Assets: application.AssetOptions{

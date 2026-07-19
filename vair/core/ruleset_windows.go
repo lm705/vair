@@ -4,6 +4,7 @@ package core
 
 import (
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"os"
@@ -31,10 +32,37 @@ type ruRuleSetDef struct {
 	url  string // upstream source (best-effort refresh)
 }
 
-// RU-bypass sets (route Russian sites/IPs DIRECT — "Russian sites without VPN").
-var ruBypassRuleSetDefs = []ruRuleSetDef{
-	{"geosite-ru.srs", "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs"},
-	{"geoip-ru.srs", "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs"},
+// countryGeositeSrs maps a bypass country to its upstream sing-geosite file.
+// Countries absent here have no domain list (IP-only bypass — currently KZ).
+var countryGeositeSrs = map[string]string{
+	"ru": "geosite-category-ru.srs",
+	"cn": "geosite-cn.srs",
+	"ir": "geosite-category-ir.srs",
+}
+
+// countryRuleSetDefs returns the local-file + upstream-URL defs for one bypass
+// country ("bypass_countries" mode). Local names are geosite-<cc>.srs /
+// geoip-<cc>.srs under binDir; embedded baselines guarantee they exist even
+// when the upstream (GitHub) is unreachable.
+func countryRuleSetDefs(cc string) []ruRuleSetDef {
+	var defs []ruRuleSetDef
+	if up, ok := countryGeositeSrs[cc]; ok {
+		defs = append(defs, ruRuleSetDef{"geosite-" + cc + ".srs",
+			"https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/" + up})
+	}
+	defs = append(defs, ruRuleSetDef{"geoip-" + cc + ".srs",
+		"https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-" + cc + ".srs"})
+	return defs
+}
+
+// refreshCountryRuleSets best-effort updates the rule sets of the given bypass
+// countries (same throttle/fallback as every other set).
+func refreshCountryRuleSets(ccs []string) {
+	var defs []ruRuleSetDef
+	for _, cc := range ccs {
+		defs = append(defs, countryRuleSetDefs(cc)...)
+	}
+	refreshRuleSets(defs)
 }
 
 // RU-blocked sets (route only resources BLOCKED in Russia through the VPN). srs
@@ -60,24 +88,35 @@ const (
 )
 
 var (
-	ruRefreshMu  sync.Mutex
-	ruLastTry    = map[string]time.Time{} // per-file last download attempt
-	customBLName = "blocklist-custom.txt"
+	ruRefreshMu sync.Mutex
+	ruLastTry   = map[string]time.Time{} // per-file last download attempt
 )
 
 // ruRuleSetLocalPath returns the on-disk path of a rule-set file under binDir.
 func ruRuleSetLocalPath(file string) string { return filepath.Join(binDir, file) }
 
-// customBlocklistPath is the on-disk path of the user's custom blocklist (a plain
-// domain list fetched from BlocklistURL). Empty contents / missing = none.
-func customBlocklistPath() string { return filepath.Join(binDir, customBLName) }
-
-// refreshRuRuleSets best-effort updates the RU-bypass sets. Kept for the existing
-// caller (singboxRuRuleSet).
-func refreshRuRuleSets() { refreshRuleSets(ruBypassRuleSetDefs) }
+// customBlocklistPathFor is the on-disk cache path for one "through VPN (URL)"
+// source, keyed by a hash of the URL so multiple sources don't collide.
+func customBlocklistPathFor(url string) string {
+	h := fnv.New32a()
+	h.Write([]byte(strings.TrimSpace(url)))
+	return filepath.Join(binDir, fmt.Sprintf("blocklist-%08x.txt", h.Sum32()))
+}
 
 // refreshBlockedRuleSets best-effort updates the RU-blocked sets.
 func refreshBlockedRuleSets() { refreshRuleSets(ruBlockedRuleSetDefs) }
+
+// cnBlockedListDefs is the blocked-in-China source ("only_blocked_cn" mode): the
+// community GFW list as a plain domain-per-line text file (Loyalsoldier's build
+// of gfwlist). Text is enough for BOTH engines — the domains are emitted
+// straight into the config (like the custom blocklist), so no extra .dat/.srs
+// is needed and the main geosite.dat stays untouched.
+var cnBlockedListDefs = []ruRuleSetDef{
+	{"gfw.txt", "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt"},
+}
+
+// refreshCnBlockedList best-effort updates the blocked-in-China domain list.
+func refreshCnBlockedList() { refreshRuleSets(cnBlockedListDefs) }
 
 // refreshRuleSets refreshes the given files from upstream. Bounded + throttled:
 // skips files that are still fresh, retries a given file at most every
@@ -109,31 +148,35 @@ func refreshRuleSets(defs []ruRuleSetDef) {
 	}
 }
 
-// refreshCustomBlocklist fetches the user's custom blocklist URL (a plain domain
-// list) into binDir, with the same throttle/fallback. No-op for an empty URL.
-func refreshCustomBlocklist(url string) {
-	url = strings.TrimSpace(url)
-	if url == "" {
-		return
-	}
+// refreshCustomBlocklists fetches each "through VPN (URL)" source into its own
+// per-URL file under binDir, with the same throttle/fallback as every other
+// list. A failed fetch keeps the last good copy for that URL.
+func refreshCustomBlocklists(urls []string) {
 	ruRefreshMu.Lock()
 	defer ruRefreshMu.Unlock()
-	path := customBlocklistPath()
-	if info, err := os.Stat(path); err == nil && time.Since(info.ModTime()) <= ruRuleSetMaxAge {
-		return
-	}
-	key := "custom:" + url
-	if last, ok := ruLastTry[key]; ok && time.Since(last) < ruRefreshThrottle {
-		return
-	}
-	ruLastTry[key] = time.Now()
-	data, err := download(&http.Client{Timeout: ruDownloadTimeout}, url)
-	if err != nil || len(data) == 0 {
-		vlog("warning", "custom blocklist: fetch failed (%v) — using last copy", err)
-		return
-	}
-	if err := atomicWrite(path, data); err == nil {
-		vlog("info", "custom blocklist: updated from %s (%d bytes)", url, len(data))
+	client := &http.Client{Timeout: ruDownloadTimeout}
+	for _, url := range urls {
+		url = strings.TrimSpace(url)
+		if url == "" {
+			continue
+		}
+		path := customBlocklistPathFor(url)
+		if info, err := os.Stat(path); err == nil && time.Since(info.ModTime()) <= ruRuleSetMaxAge {
+			continue
+		}
+		key := "custom:" + url
+		if last, ok := ruLastTry[key]; ok && time.Since(last) < ruRefreshThrottle {
+			continue
+		}
+		ruLastTry[key] = time.Now()
+		data, err := download(client, url)
+		if err != nil || len(data) == 0 {
+			vlog("warning", "custom blocklist %s: fetch failed (%v) — using last copy", url, err)
+			continue
+		}
+		if err := atomicWrite(path, data); err == nil {
+			vlog("info", "custom blocklist: updated from %s (%d bytes)", url, len(data))
+		}
 	}
 }
 

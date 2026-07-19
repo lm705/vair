@@ -11,7 +11,7 @@ import (
 // appVersion is the running version. 1.10 kept this const in selfupdate.go;
 // relocated here (remove selfupdate.go's copy when it ports). Must stay a const
 // because subFetchUserAgent (fetch.go) concatenates it at compile time.
-const appVersion = "2.0.0"
+const appVersion = "2.1.0"
 
 // Engine timeouts (relocated from the 1.10 main.go const block; the others there
 // are already defined within the ported engine files).

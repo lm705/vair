@@ -535,6 +535,51 @@ func autoConnectFromPool(pool []string, preferRaw, excludeRaw string, mode ConnM
 // autoPingRunning guards autoPingTabs so two background sweeps can't overlap.
 var autoPingRunning int32
 
+// The running sweep's cancellation state: RELOAD on a tab the sweep covers
+// cancels it (cancelAutoSweepOnTab via cancelTestsOnTab), so a re-reload stops
+// the stale test instead of colliding with it — the fresh after-refresh test
+// then waits for the drain (waitAutoSweepIdle) and starts cleanly.
+var (
+	autoSweepMu     sync.Mutex
+	autoSweepCancel chan struct{}
+	autoSweepTabs   map[string]bool
+)
+
+// cancelAutoSweepOnTab cancels the background candidate sweep if it covers
+// tabID (or any sweep when tabID is ""). Returns whether a cancel was issued.
+func cancelAutoSweepOnTab(tabID string) bool {
+	if atomic.LoadInt32(&autoPingRunning) == 0 {
+		return false
+	}
+	autoSweepMu.Lock()
+	defer autoSweepMu.Unlock()
+	if autoSweepCancel == nil || (tabID != "" && !autoSweepTabs[tabID]) {
+		return false
+	}
+	select {
+	case <-autoSweepCancel:
+		return false // already cancelled
+	default:
+		close(autoSweepCancel)
+		return true
+	}
+}
+
+// waitAutoSweepIdle blocks until no background sweep is running (or the timeout
+// passes). Used by the after-refresh tests so a freshly-cancelled sweep drains
+// before the new one starts — without this the new test's CAS fails and it is
+// silently skipped.
+func waitAutoSweepIdle(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for atomic.LoadInt32(&autoPingRunning) == 1 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
 // autoPingTabs pings every config across the given tabs (deduped) so the
 // supervisor has fresh Delay/PingStatus for its "fastest by ping" ordering.
 // A config-list refresh rebuilds entries with no ping data, so this is what
@@ -557,13 +602,47 @@ var autoPingRunning int32
 // it to bail if auto-connect is switched off mid-sweep; the per-tab
 // "test after auto-refresh" passes nil (always run to completion).
 func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
-	if atomic.LoadInt32(&state.pingRunning) == 1 || atomic.LoadInt32(&state.speedRunning) == 1 {
+	// manualBulkOverlaps reports whether a manual PING/SPEED-ALL run is testing
+	// one of THIS sweep's tabs. A manual bulk on a DIFFERENT tab must NOT stop the
+	// sweep (each probe runs its own isolated engine, so they coexist fine) — the
+	// old unconditional check let a ping/speed test on any tab (and its Stop) kill
+	// the AUTO candidate sweep on another tab.
+	sweepSet := map[string]bool{}
+	for _, tid := range tabIDs {
+		sweepSet[tid] = true
+	}
+	manualBulkOverlaps := func() bool {
+		if atomic.LoadInt32(&state.pingRunning) == 0 && atomic.LoadInt32(&state.speedRunning) == 0 {
+			return false
+		}
+		testMu.Lock()
+		tt := testingTab
+		testMu.Unlock()
+		return sweepSet[tt]
+	}
+	if manualBulkOverlaps() {
 		return
 	}
 	if !atomic.CompareAndSwapInt32(&autoPingRunning, 0, 1) {
 		return
 	}
 	defer atomic.StoreInt32(&autoPingRunning, 0)
+
+	// Register this sweep's cancel channel + tab set (RELOAD on a covered tab
+	// closes the channel via cancelAutoSweepOnTab).
+	autoSweepMu.Lock()
+	autoSweepCancel = make(chan struct{})
+	sweepCancel := autoSweepCancel
+	autoSweepTabs = map[string]bool{}
+	for _, tid := range tabIDs {
+		autoSweepTabs[tid] = true
+	}
+	autoSweepMu.Unlock()
+	defer func() {
+		autoSweepMu.Lock()
+		autoSweepTabs = nil
+		autoSweepMu.Unlock()
+	}()
 
 	type pingItem struct {
 		e   *ConfigEntry
@@ -601,8 +680,15 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 	sem := make(chan struct{}, currentPingConcurrency())
 	var wg sync.WaitGroup
 	for _, item := range list {
-		// Step aside the moment the user kicks off a manual bulk test.
-		if atomic.LoadInt32(&state.pingRunning) == 1 || atomic.LoadInt32(&state.speedRunning) == 1 {
+		// Cancelled (a RELOAD on a covered tab) → stop dispatching; the refresh
+		// replaced the entries this sweep holds, so testing them is stale work.
+		if isTestCancelled(sweepCancel) {
+			break
+		}
+		// Step aside only when a manual bulk test targets a tab THIS sweep covers
+		// (same tab → don't double-test / fight over its rows). A manual test on
+		// another tab is left to run alongside.
+		if manualBulkOverlaps() {
 			break
 		}
 		// Bail early when the caller's predicate says so. For AUTO this fires when
@@ -669,10 +755,12 @@ func runAfterRefreshTest(tabID string) {
 	}
 	state.mu.RUnlock()
 	switch mode {
-	case "ping":
-		testTabs([]string{tabID}, false, nil)
-	case "speed":
-		testTabs([]string{tabID}, true, nil)
+	case "ping", "speed":
+		// A just-cancelled sweep (reload during a test) may still be draining its
+		// in-flight pings; wait it out so the fresh test actually starts instead
+		// of being skipped by the autoPingRunning guard.
+		waitAutoSweepIdle(30 * time.Second)
+		testTabs([]string{tabID}, mode == "speed", nil)
 	}
 }
 
@@ -693,6 +781,9 @@ func autoPingAfterRefresh(tabID string) {
 	}
 	for _, p := range autoPool() {
 		if p == tabID {
+			// A just-cancelled sweep (reload during a candidate test) may still be
+			// draining; wait so the fresh sweep starts instead of CAS-skipping.
+			waitAutoSweepIdle(30 * time.Second)
 			// When ranking by speed, run the full ping→speed test so the
 			// candidate list has fresh Mbps to rank by — same trigger as ping.
 			autoTestTabs([]string{tabID}, withSpeed)

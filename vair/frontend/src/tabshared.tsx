@@ -1,6 +1,8 @@
 // Shared pieces of the Tab-settings and Sources-settings modals (both are
 // exact ports of the corresponding 1.10 modals and render identical blocks).
+import React from 'react'
 import { t10 } from './i18n'
+import { useChipSelect } from './chipselect'
 
 export const EXCLUDE_COLS = ['name', 'type', 'host', 'transport', 'security'] as const
 export type ExCol = (typeof EXCLUDE_COLS)[number]
@@ -197,44 +199,88 @@ export function ExcludeFields({
   return (
     <div className="ef-fields" id="tab-filter-fields" style={{ opacity: disabled ? 0.45 : 1 }}>
       {EXCLUDE_COLS.map((col) => (
-        <div key={col} className="ef-field" data-col={col}>
-          <div className="ef-field-tag">{col.charAt(0).toUpperCase() + col.slice(1)}</div>
-          <div className="chips-wrap" data-col={col}>
-            {ef[col].map((v) => (
-              <span key={v} className="chip" data-v={v}>
-                {v}
-                <span
-                  className="chip-x"
-                  onClick={() => {
-                    setEf((prev) => ({ ...prev, [col]: prev[col].filter((x) => x !== v) }))
-                    onChanged()
-                  }}
-                >
-                  x
-                </span>
-              </span>
-            ))}
-            <input
-              className="chip-input ef-chip-input"
-              placeholder={EXCLUDE_PLACEHOLDERS[col]}
-              value={efInput[col]}
-              onChange={(e) => setEfInput((prev) => ({ ...prev, [col]: e.target.value }))}
-              onKeyDown={(e) => {
-                if (e.key !== 'Enter') return
-                e.preventDefault()
-                add(col, efInput[col])
-                setEfInput((prev) => ({ ...prev, [col]: '' }))
-              }}
-              onPaste={(e) => {
-                e.preventDefault()
-                const text = e.clipboardData.getData('text')
-                for (const part of text.split(/[\n,;]+/)) add(col, part)
-                setEfInput((prev) => ({ ...prev, [col]: '' }))
-              }}
-            />
-          </div>
-        </div>
+        <ExcludeChipField
+          key={col}
+          col={col}
+          ef={ef}
+          efInput={efInput}
+          setEf={setEf}
+          setEfInput={setEfInput}
+          onChanged={onChanged}
+          add={add}
+        />
       ))}
+    </div>
+  )
+}
+
+// ExcludeChipField is one labelled column. Split out so useChipDragSelect (a
+// hook) is called once per column rather than inside a map.
+function ExcludeChipField({
+  col,
+  ef,
+  efInput,
+  setEf,
+  setEfInput,
+  onChanged,
+  add,
+}: {
+  col: ExCol
+  ef: ExMap
+  efInput: ExInput
+  setEf: React.Dispatch<React.SetStateAction<ExMap>>
+  setEfInput: React.Dispatch<React.SetStateAction<ExInput>>
+  onChanged: () => void
+  add: (col: ExCol, raw: string) => void
+}) {
+  const { wrapRef, onMouseDown, isSel } = useChipSelect(ef[col], (idxs) => {
+    const drop = new Set(idxs)
+    setEf((prev) => ({ ...prev, [col]: prev[col].filter((_, i) => !drop.has(i)) }))
+    onChanged()
+  })
+  return (
+    <div className="ef-field" data-col={col}>
+      <div className="ef-field-tag">{col.charAt(0).toUpperCase() + col.slice(1)}</div>
+      <div ref={wrapRef} className="chips-wrap" data-col={col} onMouseDown={onMouseDown}>
+        {ef[col].map((v, i) => (
+          <span key={v} className={'chip' + (isSel(i) ? ' sel' : '')} data-v={v}>
+            {v}
+            <span
+              className="chip-x"
+              onClick={() => {
+                setEf((prev) => ({ ...prev, [col]: prev[col].filter((x) => x !== v) }))
+                onChanged()
+              }}
+            >
+              x
+            </span>
+          </span>
+        ))}
+        <input
+          className="chip-input ef-chip-input"
+          placeholder={EXCLUDE_PLACEHOLDERS[col]}
+          value={efInput[col]}
+          onChange={(e) => setEfInput((prev) => ({ ...prev, [col]: e.target.value }))}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              add(col, efInput[col])
+              setEfInput((prev) => ({ ...prev, [col]: '' }))
+            } else if (e.key === 'Backspace' && efInput[col] === '' && ef[col].length) {
+              // Empty input + Backspace removes the last chip (same as its ✕).
+              setEf((prev) => ({ ...prev, [col]: prev[col].slice(0, -1) }))
+              onChanged()
+            }
+          }}
+          onPaste={(e) => {
+            e.preventDefault()
+            const text = e.clipboardData.getData('text')
+            for (const part of text.split(/[\n,;]+/)) add(col, part)
+            setEfInput((prev) => ({ ...prev, [col]: '' }))
+          }}
+        />
+        <span className="chip-fill" aria-hidden="true" />
+      </div>
     </div>
   )
 }

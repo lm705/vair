@@ -1386,17 +1386,27 @@ func setNodeName(raw, name string) string {
 // block + freedom). The caller appends the proxy outbound and (optionally)
 // the routing section. Sniffing is enabled only in persistent mode so that
 // the test path stays as minimal as possible.
-func xrayShell(httpPort, socksPort int, socksUser, socksPass string) map[string]interface{} {
+func xrayShell(httpPort, socksPort int, socksUser, socksPass, httpUser, httpPass string) map[string]interface{} {
 	persistent := socksPort > 0
 	sniffing := map[string]interface{}{
 		"enabled":      persistent,
 		"destOverride": []string{"http", "tls", "quic"},
 	}
+	// HTTP auth: a non-empty username adds a Basic-auth account to the HTTP
+	// listener (mirrors the SOCKS auth below). Empty = open, as before. Only the
+	// user-facing proxy passes credentials here; the internal TUN handoff / test
+	// path pass "" (no auth needed on 127.0.0.1-only internal ports).
+	httpSettings := map[string]interface{}{}
+	if httpUser != "" {
+		httpSettings["accounts"] = []interface{}{
+			map[string]interface{}{"user": httpUser, "pass": httpPass},
+		}
+	}
 	inbounds := []interface{}{
 		map[string]interface{}{
 			"tag": "http", "listen": "127.0.0.1", "port": httpPort,
 			"protocol": "http",
-			"settings": map[string]interface{}{"auth": "noauth"},
+			"settings": httpSettings,
 			"sniffing": sniffing,
 		},
 	}
@@ -1501,58 +1511,87 @@ func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, 
 	return stream
 }
 
+// countryGeositeXray maps a bypass country to its xray geosite tag; countries
+// absent here have no domain list (IP-only bypass — currently KZ).
+var countryGeositeXray = map[string]string{
+	"ru": "geosite:category-ru",
+	"cn": "geosite:cn",
+	"ir": "geosite:category-ir",
+}
+
 // xrayRoutingForProxy returns the routing block used in persistent (proxy /
 // hybrid TUN) sessions. Snapshots the settings under lock so we don't race
 // against settings mutations mid-build.
 func xrayRoutingForProxy() map[string]interface{} {
 	mode := routingMode()
-	settingsMu.RLock()
-	var directDomains []string
-	if !appSettings.DirectDomainsDisabled {
-		directDomains = make([]string, len(appSettings.DirectDomains))
-		copy(directDomains, appSettings.DirectDomains)
-	}
-	settingsMu.RUnlock()
 
 	rules := []interface{}{
 		map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
 	}
-	// addDomains appends a domain rule ("domain:" = suffix match) to the given tag.
-	addDomains := func(domains []string, tag string) {
-		var suffixes []string
-		for _, d := range domains {
-			if d = strings.TrimSpace(d); d != "" {
-				suffixes = append(suffixes, "domain:"+d)
-			}
-		}
-		if len(suffixes) > 0 {
-			rules = append(rules, map[string]interface{}{"type": "field", "domain": suffixes, "outboundTag": tag})
-		}
-	}
-	// Custom "without VPN" domains → direct (all modes; no-op where default is direct).
-	addDomains(directDomains, "direct")
+	// User rules first, at a fixed priority: block → direct → proxy. Applied in
+	// EVERY mode (a proxy rule forces a site through the VPN even in a bypass
+	// mode; a direct rule keeps one out even in proxy_all). Entries may be
+	// domains, IP/CIDR or geosite:/geoip:/full:/regexp: (see classifyRules).
+	rules = append(rules, xrayRules(classifyRules(effectiveBlockRules()), "block")...)
+	rules = append(rules, xrayRules(classifyRules(effectiveDirectDomains()), "direct")...)
+	rules = append(rules, xrayRules(classifyRules(effectiveProxyDomains()), "proxy")...)
 
 	switch mode {
 	case "only_blocked":
 		// Default direct; only blocked-in-RU resources go through the VPN.
 		refreshBlockedRuleSets()
-		refreshCustomBlocklist(blocklistURL())
-		proxyDomains := effectiveProxyDomains()
-		proxyDomains = append(proxyDomains, customBlocklistDomains()...)
-		// Force the "check IP" service through the VPN so the button reflects the
-		// tunnel exit (it isn't a blocked resource, so it'd go direct otherwise).
-		proxyDomains = append(proxyDomains, checkExitHost)
-		addDomains(proxyDomains, "proxy")
+		refreshCustomBlocklists(blocklistURLs())
+		// Mode's OWN proxy domains (the user's ProxyDomains are already emitted
+		// above). checkExitHost forces "check IP" through the tunnel exit.
+		extra := append(customBlocklistDomains(), checkExitHost)
+		rules = append(rules, xrayRules(classifyRules(extra), "proxy")...)
 		rules = append(rules,
 			map[string]interface{}{"type": "field", "domain": []string{"ext:geosite-ru-blocked.dat:ru-blocked"}, "outboundTag": "proxy"},
 			map[string]interface{}{"type": "field", "ip": []string{"ext:geoip-ru-blocked.dat:ru-blocked"}, "outboundTag": "proxy"},
 			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
 		)
-	case "bypass_ru":
-		// Everything through the VPN except Russian sites.
+	case "only_blocked_cn":
+		// Default direct; only resources blocked in China (the community GFW list)
+		// go through the VPN.
+		refreshCnBlockedList()
+		refreshCustomBlocklists(blocklistURLs())
+		extra := append(gfwDomains(), customBlocklistDomains()...)
+		extra = append(extra, checkExitHost)
+		rules = append(rules, xrayRules(classifyRules(extra), "proxy")...)
 		rules = append(rules,
-			map[string]interface{}{"type": "field", "domain": []string{"geosite:category-ru"}, "outboundTag": "direct"},
-			map[string]interface{}{"type": "field", "ip": []string{"geoip:ru"}, "outboundTag": "direct"},
+			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
+		)
+	case "only_selected":
+		// Whitelist mode: only the user's own lists ride the VPN (already emitted
+		// above); everything else goes direct.
+		refreshCustomBlocklists(blocklistURLs())
+		extra := append(customBlocklistDomains(), checkExitHost)
+		rules = append(rules, xrayRules(classifyRules(extra), "proxy")...)
+		rules = append(rules,
+			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
+		)
+	case "bypass_countries":
+		// Everything through the VPN except the selected countries' sites. Three
+		// matchers per country: its TLD zone (domain:<cc> — the same trick
+		// category-ru itself uses via tld-ru; for KZ, which has no geosite
+		// category, this IS the domain-level coverage), its geosite category
+		// where one exists, and its geoip ranges. The embedded .dat files cover
+		// every country, so no extra data is needed on the xray side.
+		var domains, ips []string
+		for _, cc := range bypassCountries() {
+			domains = append(domains, "domain:"+cc)
+			if g, ok := countryGeositeXray[cc]; ok {
+				domains = append(domains, g)
+			}
+			ips = append(ips, "geoip:"+cc)
+		}
+		if len(domains) > 0 {
+			rules = append(rules, map[string]interface{}{"type": "field", "domain": domains, "outboundTag": "direct"})
+		}
+		if len(ips) > 0 {
+			rules = append(rules, map[string]interface{}{"type": "field", "ip": ips, "outboundTag": "direct"})
+		}
+		rules = append(rules,
 			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"},
 		)
 	default: // proxy_all
@@ -1739,7 +1778,7 @@ func splitALPN(s string) []string {
 // buildXrayConfigForNode is the protocol-dispatching entry point. Returns
 // nil if n.Kind is not an xray-handled protocol — callers should check
 // engineFor(n.Kind) first to route UDP-family protocols to sing-box.
-func buildXrayConfigForNode(n *Node, httpPort, socksPort int, socksUser, socksPass string) map[string]interface{} {
+func buildXrayConfigForNode(n *Node, httpPort, socksPort int, socksUser, socksPass, httpUser, httpPass string) map[string]interface{} {
 	if n == nil {
 		return nil
 	}
@@ -1748,7 +1787,7 @@ func buildXrayConfigForNode(n *Node, httpPort, socksPort int, socksUser, socksPa
 		// Not an xray protocol; caller bug.
 		return nil
 	}
-	cfg := xrayShell(httpPort, socksPort, socksUser, socksPass)
+	cfg := xrayShell(httpPort, socksPort, socksUser, socksPass, httpUser, httpPass)
 	outbounds := cfg["outbounds"].([]interface{})
 	outbounds[0] = ob
 	cfg["outbounds"] = outbounds
@@ -1857,14 +1896,14 @@ func xrayOutboundForNode(n *Node) map[string]interface{} {
 //
 // All nodes MUST be xray-family (see chainEngineReason). A nil/empty list or
 // any non-xray node returns nil.
-func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int, socksUser, socksPass string) map[string]interface{} {
+func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int, socksUser, socksPass, httpUser, httpPass string) map[string]interface{} {
 	if len(nodes) == 0 {
 		return nil
 	}
 	if len(nodes) == 1 {
-		return buildXrayConfigForNode(nodes[0], httpPort, socksPort, socksUser, socksPass)
+		return buildXrayConfigForNode(nodes[0], httpPort, socksPort, socksUser, socksPass, httpUser, httpPass)
 	}
-	cfg := xrayShell(httpPort, socksPort, socksUser, socksPass)
+	cfg := xrayShell(httpPort, socksPort, socksUser, socksPass, httpUser, httpPass)
 	shell := cfg["outbounds"].([]interface{})
 	// shell layout: [proxy-placeholder(nil), direct, block]. Keep direct+block.
 	direct, block := shell[1], shell[2]
@@ -2000,11 +2039,6 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 
 	mode := routingMode()
 	settingsMu.RLock()
-	var directDomains []string
-	if !appSettings.DirectDomainsDisabled {
-		directDomains = make([]string, len(appSettings.DirectDomains))
-		copy(directDomains, appSettings.DirectDomains)
-	}
 	var directApps []string
 	if !appSettings.DirectAppsDisabled {
 		directApps = make([]string, len(appSettings.DirectApps))
@@ -2048,7 +2082,9 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 			})
 		}
 	}
-	// addSuffix appends a domain_suffix rule to the given outbound.
+	// addSuffix appends a domain_suffix rule to the given outbound. Used for the
+	// mode's OWN plain-domain lists (checkExit / blocklist / GFW); the user's
+	// rule lists (which can also carry IP/CIDR) go through singboxRules below.
 	addSuffix := func(domains []string, outbound string) {
 		var suffixes []string
 		for _, d := range domains {
@@ -2060,58 +2096,86 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 			rules = append(rules, map[string]interface{}{"domain_suffix": suffixes, "outbound": outbound})
 		}
 	}
-	// Custom "without VPN" domains → direct (all modes).
-	addSuffix(directDomains, "direct")
+	// User rules first, at a fixed priority: block → direct → proxy. Applied in
+	// every mode; entries may be domains, IP/CIDR or full:/regexp:/domain:
+	// prefixes (geosite:/geoip: categories are xray-only and skipped here).
+	rules = append(rules, singboxRules(classifyRules(effectiveBlockRules()), "", true)...)
+	rules = append(rules, singboxRules(classifyRules(effectiveDirectDomains()), "direct", false)...)
+	rules = append(rules, singboxRules(classifyRules(effectiveProxyDomains()), "proxy", false)...)
 
 	switch mode {
 	case "only_blocked":
-		// Manual + custom-URL "through VPN" domains → proxy, then blocked-in-RU
-		// sets → proxy. Everything else falls through to route.final = "direct"
-		// (set by applySingboxRouteMode).
-		proxyDomains := effectiveProxyDomains()
-		proxyDomains = append(proxyDomains, customBlocklistDomains()...)
-		// Force the "check IP" service through the VPN so the button reflects the
-		// tunnel exit (it isn't a blocked resource, so it'd go direct otherwise).
-		proxyDomains = append(proxyDomains, checkExitHost)
-		addSuffix(proxyDomains, "proxy")
+		// Mode's OWN "through VPN" domains → proxy (the user's ProxyDomains are
+		// already emitted above), then blocked-in-RU sets → proxy. Everything else
+		// falls through to route.final = "direct" (set by applySingboxRouteMode).
+		// checkExitHost forces "check IP" through the tunnel exit.
+		addSuffix(append(customBlocklistDomains(), checkExitHost), "proxy")
 		rules = append(rules,
 			map[string]interface{}{"rule_set": "geosite-ru-blocked", "outbound": "proxy"},
 			map[string]interface{}{"rule_set": "geoip-ru-blocked", "outbound": "proxy"},
 		)
-	case "bypass_ru":
-		rules = append(rules,
-			map[string]interface{}{"rule_set": "geosite-ru", "outbound": "direct"},
-			map[string]interface{}{"rule_set": "geoip-ru", "outbound": "direct"},
-		)
+	case "only_blocked_cn":
+		// Default direct (route.final); blocked-in-China (GFW) → proxy. Domains
+		// come from the plain-text list — no rule-sets.
+		refreshCnBlockedList()
+		refreshCustomBlocklists(blocklistURLs())
+		extra := append(gfwDomains(), customBlocklistDomains()...)
+		extra = append(extra, checkExitHost)
+		addSuffix(extra, "proxy")
+	case "only_selected":
+		// Whitelist mode: only the user's own lists → proxy (already emitted
+		// above); everything else falls through to route.final = "direct".
+		refreshCustomBlocklists(blocklistURLs())
+		addSuffix(append(customBlocklistDomains(), checkExitHost), "proxy")
+	case "bypass_countries":
+		// Each selected country's TLD zone goes direct (the same trick
+		// category-ru uses via tld-ru; for KZ, which has no geosite set, this IS
+		// the domain-level coverage)…
+		ccs := bypassCountries()
+		addSuffix(ccs, "direct")
+		// …then one direct-rule per available rule set. Mirrors
+		// singboxCountryRuleSets: a rule must only reference a rule_set that is
+		// actually attached (missing local file → both are skipped).
+		for _, cc := range ccs {
+			for _, name := range []string{"geosite-" + cc, "geoip-" + cc} {
+				if fileExists(ruRuleSetLocalPath(name + ".srs")) {
+					rules = append(rules, map[string]interface{}{"rule_set": name, "outbound": "direct"})
+				}
+			}
+		}
 	}
 	return rules
 }
 
-// singboxRuRuleSet returns the route.rule_set definitions for the RU-bypass
-// geosite/geoip rule sets. Only meaningful when RuSitesDirect is on; callers
-// gate on that and attach the result to route["rule_set"].
+// singboxCountryRuleSets returns the route.rule_set definitions for the given
+// bypass countries' geosite/geoip sets (bypass_countries mode).
 //
 // The sets are referenced as LOCAL files (under binDir) rather than remote URLs:
 // the remote form downloaded from raw.githubusercontent.com at start, which is
-// blocked in Russia and made sing-box abort with a FATAL. refreshRuRuleSets
+// blocked in Russia and made sing-box abort with a FATAL. refreshCountryRuleSets
 // still tries to pull the freshest copy from upstream (best-effort, throttled);
-// the embedded baseline is the fallback, so a local file is always present.
-func singboxRuRuleSet() []interface{} {
-	refreshRuRuleSets()
-	return []interface{}{
-		map[string]interface{}{
-			"type":   "local",
-			"tag":    "geosite-ru",
-			"format": "binary",
-			"path":   ruRuleSetLocalPath("geosite-ru.srs"),
-		},
-		map[string]interface{}{
-			"type":   "local",
-			"tag":    "geoip-ru",
-			"format": "binary",
-			"path":   ruRuleSetLocalPath("geoip-ru.srs"),
-		},
+// the embedded baselines are the fallback, so the local files are always present.
+func singboxCountryRuleSets(ccs []string) []interface{} {
+	refreshCountryRuleSets(ccs)
+	var out []interface{}
+	for _, cc := range ccs {
+		for _, name := range []string{"geosite-" + cc, "geoip-" + cc} {
+			path := ruRuleSetLocalPath(name + ".srs")
+			// Skip a set whose local file is missing (no embedded baseline AND the
+			// upstream unreachable) — a dangling local rule_set path is a sing-box
+			// FATAL. The country then simply bypasses by whatever set IS present.
+			if !fileExists(path) {
+				continue
+			}
+			out = append(out, map[string]interface{}{
+				"type":   "local",
+				"tag":    name,
+				"format": "binary",
+				"path":   path,
+			})
+		}
 	}
+	return out
 }
 
 // singboxBlockedRuleSet returns the route.rule_set definitions for the RU-blocked
@@ -2120,7 +2184,7 @@ func singboxRuRuleSet() []interface{} {
 // refresh so its domains are fresh when singboxRoutingRules reads them.
 func singboxBlockedRuleSet() []interface{} {
 	refreshBlockedRuleSets()
-	refreshCustomBlocklist(blocklistURL())
+	refreshCustomBlocklists(blocklistURLs())
 	return []interface{}{
 		map[string]interface{}{
 			"type":   "local",
@@ -2146,20 +2210,29 @@ func applySingboxRouteMode(route map[string]interface{}) {
 	case "only_blocked":
 		route["final"] = "direct"
 		route["rule_set"] = singboxBlockedRuleSet()
-	case "bypass_ru":
+	case "only_blocked_cn", "only_selected":
+		// Default direct; the domain rules already in route.rules (GFW list and/
+		// or the user's own) steer traffic to the proxy. No rule-sets needed.
+		route["final"] = "direct"
+		delete(route, "rule_set")
+	case "bypass_countries":
 		route["final"] = "proxy"
-		route["rule_set"] = singboxRuRuleSet()
+		if sets := singboxCountryRuleSets(bypassCountries()); len(sets) > 0 {
+			route["rule_set"] = sets
+		} else {
+			delete(route, "rule_set")
+		}
 	default: // proxy_all
 		route["final"] = "proxy"
 		delete(route, "rule_set")
 	}
 }
 
-// customBlocklistDomains reads the user's fetched custom blocklist (plain domain
-// list; one suffix per line; #/! comments and a leading "0.0.0.0"/"*." ignored).
-// Capped to keep the generated config sane. Empty when none configured/fetched.
-func customBlocklistDomains() []string {
-	data, err := os.ReadFile(customBlocklistPath())
+// parseDomainListFile reads a plain domain list (one suffix per line; #/!
+// comments and a leading "0.0.0.0"/"*." ignored). Capped to keep the generated
+// config sane. Empty when the file is missing/empty.
+func parseDomainListFile(path string) []string {
+	data, err := os.ReadFile(path)
 	if err != nil || len(data) == 0 {
 		return nil
 	}
@@ -2180,6 +2253,21 @@ func customBlocklistDomains() []string {
 	}
 	return out
 }
+
+// customBlocklistDomains reads and merges every fetched "through VPN (URL)"
+// source (only the currently-configured URLs, so a removed source's stale cache
+// file is ignored).
+func customBlocklistDomains() []string {
+	var out []string
+	for _, url := range blocklistURLs() {
+		out = append(out, parseDomainListFile(customBlocklistPathFor(url))...)
+	}
+	return out
+}
+
+// gfwDomains reads the blocked-in-China (GFW) domain list ("only_blocked_cn"
+// mode) — the embedded baseline or its refreshed copy under binDir.
+func gfwDomains() []string { return parseDomainListFile(ruRuleSetLocalPath("gfw.txt")) }
 
 // singboxOutboundHysteria2 builds the sing-box "hysteria2" outbound. The
 // obfs block is only emitted when an obfs type is present — sing-box
@@ -2380,6 +2468,21 @@ func buildSingboxTestConfig(n *Node, httpPort int) map[string]interface{} {
 // same one hybrid TUN uses with leak-protection off) plus a matching
 // default_domain_resolver keeps sing-box 1.13 from rejecting the config for
 // a missing resolver. Returns nil if sing-box can't build an outbound for n.
+// singboxProxyInbound builds one user-facing sing-box proxy inbound (http or
+// socks) on 127.0.0.1, adding Basic/username auth when creds() returns a
+// non-empty user. Shared by the Hysteria2/TUIC proxy path so its auth matches
+// the xray path and the LAN share.
+func singboxProxyInbound(typ, tag string, port int, creds func() (string, string)) map[string]interface{} {
+	in := map[string]interface{}{
+		"type": typ, "tag": tag,
+		"listen": "127.0.0.1", "listen_port": port,
+	}
+	if u, p := creds(); u != "" {
+		in["users"] = singboxInboundUsers(u, p)
+	}
+	return in
+}
+
 func buildSingboxProxyConfig(n *Node, httpPort, socksPort int) map[string]interface{} {
 	if n == nil {
 		return nil
@@ -2400,14 +2503,8 @@ func buildSingboxProxyConfig(n *Node, httpPort, socksPort int) map[string]interf
 		"log": map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
 		"dns": buildDNSBlock(false, false),
 		"inbounds": []interface{}{
-			map[string]interface{}{
-				"type": "http", "tag": "http-in",
-				"listen": "127.0.0.1", "listen_port": httpPort,
-			},
-			map[string]interface{}{
-				"type": "socks", "tag": "socks-in",
-				"listen": "127.0.0.1", "listen_port": socksPort,
-			},
+			singboxProxyInbound("http", "http-in", httpPort, proxyHttpCreds),
+			singboxProxyInbound("socks", "socks-in", socksPort, proxySocksCreds),
 		},
 		"outbounds": []interface{}{
 			out,
@@ -2448,7 +2545,7 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 		"address":        []string{"172.19.0.1/30"},
 		"mtu":            currentMTU(),
 		"auto_route":     true,
-		"strict_route":   leakProtect,
+		"strict_route":   killSwitchEnabled(), // kill-switch = fail-closed (see buildHybridTUNConfig)
 		"stack":          "gvisor",
 	}
 
@@ -2467,7 +2564,7 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 	return map[string]interface{}{
 		"log":      map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
 		"dns":      buildDNSBlock(leakProtect, useFakeIP),
-		"inbounds": []interface{}{tun},
+		"inbounds": append([]interface{}{tun}, lanProxyInbounds()...),
 		"outbounds": []interface{}{
 			out,
 			map[string]interface{}{"type": "direct", "tag": "direct"},

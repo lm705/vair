@@ -458,84 +458,6 @@ func logTestResult(entry *ConfigEntry) {
 	tlog("%s — %s", nm, b.String())
 }
 
-func runPingAndSpeedForEntry(entry *ConfigEntry, tabID string) {
-	n, err := parseNode(entry.Raw)
-	if err != nil {
-		entry.mu.Lock()
-		entry.PingStatus = StatusFailed
-		entry.Delay = -1
-		entry.PingErr = err.Error()
-		entry.SpeedStatus = StatusSkipped
-		entry.SpeedErr = "parse error"
-		entry.mu.Unlock()
-		return
-	}
-	entry.mu.Lock()
-	entry.Protocol = string(n.Kind)
-	entry.mu.Unlock()
-	if reason := nodeUnsupportedReason(n); reason != "" {
-		entry.mu.Lock()
-		entry.PingStatus = StatusFailed
-		entry.Delay = -1
-		entry.PingErr = reason
-		entry.SpeedStatus = StatusSkipped
-		entry.SpeedErr = reason
-		entry.mu.Unlock()
-		return
-	}
-	ttl := startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
-	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
-		delay, pingErr := measurePing(tr, nil)
-		entry.mu.Lock()
-		if pingErr != nil || delay < 0 {
-			entry.PingStatus = StatusFailed
-			entry.Delay = -1
-			entry.PingErr = cleanPingErr(pingErr)
-			entry.SpeedStatus = StatusSkipped
-			entry.SpeedErr = "ping failed"
-			entry.mu.Unlock()
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
-			return nil
-		}
-		entry.PingStatus = StatusOK
-		entry.Delay = delay
-		entry.PingErr = ""
-		entry.SpeedStatus = StatusTestingSpeed
-		entry.SpeedLive = 0
-		entry.mu.Unlock()
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
-		mbps, sErr := measureSpeed(tr, func(live float64) {
-			entry.mu.Lock()
-			entry.SpeedLive = live
-			entry.mu.Unlock()
-			// Lossy — see runSpeedForEntry's identical callback for why.
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID, Lossy: true})
-		}, nil)
-		entry.mu.Lock()
-		defer entry.mu.Unlock()
-		entry.SpeedLive = 0
-		if sErr != nil {
-			entry.SpeedStatus = StatusFailed
-			entry.SpeedMBps = 0
-			entry.SpeedErr = shortErr(sErr.Error())
-		} else {
-			entry.SpeedStatus = StatusOK
-			entry.SpeedMBps = mbps
-			entry.SpeedErr = ""
-		}
-		return nil
-	}); err != nil {
-		entry.mu.Lock()
-		entry.PingStatus = StatusFailed
-		entry.Delay = -1
-		entry.PingErr = shortErr(err.Error())
-		entry.SpeedStatus = StatusSkipped
-		entry.SpeedErr = "xray failed"
-		entry.mu.Unlock()
-	}
-	logTestResult(entry)
-}
-
 func cleanPingErr(e error) string {
 	if e == nil {
 		return "timeout"
@@ -648,10 +570,61 @@ func isTestCancelled(ch chan struct{}) bool {
 // SPEED ALL buttons still cancel the bulk run globally via cancelPingAll/
 // cancelSpeedAll — a deliberate "one bulk test at a time" toggle.)
 // Returns true if it cancelled anything.
+// testsBusyOnTab reports whether any test that could still write results into
+// tabID is in flight: the background sweep (if it covers the tab), a bulk
+// ping/speed run on the tab, or the tab's manual per-config tests. The running
+// flags only drop after wg.Wait, so "not busy" means in-flight probes finished.
+func testsBusyOnTab(tabID string) bool {
+	if atomic.LoadInt32(&autoPingRunning) == 1 {
+		autoSweepMu.Lock()
+		covered := autoSweepTabs[tabID]
+		autoSweepMu.Unlock()
+		if covered {
+			return true
+		}
+	}
+	if atomic.LoadInt32(&state.pingRunning) == 1 || atomic.LoadInt32(&state.speedRunning) == 1 {
+		testMu.Lock()
+		tt := testingTab
+		testMu.Unlock()
+		if tt == tabID {
+			return true
+		}
+	}
+	manualMu.Lock()
+	n := len(manualTests[tabID])
+	manualMu.Unlock()
+	return n > 0
+}
+
+// waitTestsDrained blocks until every test touching tabID has fully wound down
+// (or the timeout passes). Reload calls it AFTER cancelling and BEFORE fetching:
+// cancellation stops new probes, but the in-flight remainder (up to the
+// concurrency limit, each bounded by its own timeouts) still finishes and writes
+// results — without this wait those stale results stamp the freshly fetched
+// list (same tab + idx, different configs).
+func waitTestsDrained(tabID string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for testsBusyOnTab(tabID) {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
 func cancelTestsOnTab(tabID string) bool {
 	// Manual per-config tests on this tab — always safe to cancel; they're
 	// independent and tab-scoped.
 	cancelled := cancelManualTestsOnTab(tabID)
+	// Background candidate sweep (AUTO / after-refresh) covering this tab: cancel
+	// it too — a reload replaces the tab's entries, so the sweep is testing stale
+	// objects, and its autoPingRunning guard would block the fresh after-refresh
+	// test from ever starting (the reported reload-during-test conflict).
+	if cancelAutoSweepOnTab(tabID) {
+		cancelled = true
+	}
 	// Bulk run: only if it's running AND on this tab. testingTab can be stale
 	// from a finished run, so gate on the running flags too.
 	if atomic.LoadInt32(&state.pingRunning) == 0 && atomic.LoadInt32(&state.speedRunning) == 0 {
@@ -751,20 +724,19 @@ func runPingAll(onlyIndices []int) {
 	if !atomic.CompareAndSwapInt32(&state.pingRunning, 0, 1) {
 		return
 	}
+	// Publish testingTab together with the run flag (before anything slow) so the
+	// AUTO sweep's overlap check never sees pingRunning=1 with a stale testingTab.
+	tabID := activeTabID()
 	testMu.Lock()
 	pingCancelCh = make(chan struct{})
 	cancelCh := pingCancelCh
+	testingTab = tabID
 	testMu.Unlock()
 	defer atomic.StoreInt32(&state.pingRunning, 0)
 	// Load the entries to test from the store (transient *ConfigEntry, mutated
 	// during the test and persisted back via mirrorPingResult). onlyIndices
 	// preserves the client-supplied (on-screen) order; nil = the whole tab.
-	tabID := activeTabID()
 	entries := loadTestEntries(tabID, onlyIndices)
-
-	testMu.Lock()
-	testingTab = tabID
-	testMu.Unlock()
 	state.broadcast(SSEEvent{Type: "bulk_ping_start", Payload: len(entries), Tab: tabID})
 	sem := make(chan struct{}, currentPingConcurrency())
 	var wg sync.WaitGroup
@@ -851,17 +823,14 @@ func runSpeedAll(onlyIndices []int) {
 	if !atomic.CompareAndSwapInt32(&state.speedRunning, 0, 1) {
 		return
 	}
+	tabID := activeTabID()
 	testMu.Lock()
 	speedCancelCh = make(chan struct{})
 	cancelCh := speedCancelCh
-	testMu.Unlock()
-	defer atomic.StoreInt32(&state.speedRunning, 0)
-	tabID := activeTabID()
-	entries := loadTestEntries(tabID, onlyIndices)
-
-	testMu.Lock()
 	testingTab = tabID
 	testMu.Unlock()
+	defer atomic.StoreInt32(&state.speedRunning, 0)
+	entries := loadTestEntries(tabID, onlyIndices)
 	state.broadcast(SSEEvent{Type: "bulk_speed_start", Payload: len(entries), Tab: tabID})
 	sem := make(chan struct{}, currentSpeedConcurrency())
 	var wg sync.WaitGroup

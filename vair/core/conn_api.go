@@ -95,7 +95,9 @@ func CheckExit() ExitInfo {
 		if cs.HTTPPort <= 0 {
 			return ExitInfo{Error: "no proxy port"}
 		}
-		tr = makeSharedTransport(cs.HTTPPort)
+		// Authenticate to the live proxy when HTTP-auth is on (else it 407s).
+		hu, hp := proxyHttpCreds()
+		tr = makeSharedTransport(cs.HTTPPort, hu, hp)
 	} else {
 		// TUN: a direct request is routed through the tunnel by the OS.
 		tr = &http.Transport{

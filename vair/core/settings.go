@@ -23,25 +23,44 @@ type AppSettings struct {
 	// "enabled": both features default ON.
 	DirectDomainsDisabled bool `json:"direct_domains_disabled,omitempty"`
 	DirectAppsDisabled    bool `json:"direct_apps_disabled,omitempty"`
+	// BlockDomains is the "Block" rule list (dropped outbound — ads/telemetry/
+	// unwanted hosts). Same entry syntax as the direct/proxy lists (domain, IP/
+	// CIDR, full:/regexp:/domain:/geosite:/geoip: prefixes). Applied at the
+	// highest user priority (block → direct → proxy → mode rules).
+	BlockDomains         []string `json:"block_domains,omitempty"`
+	BlockDomainsDisabled bool     `json:"block_domains_disabled,omitempty"`
 	// RoutingMode selects the traffic policy:
-	//   "bypass_ru"    — everything through the VPN except Russian sites (legacy
-	//                    RuSitesDirect=true). RU geosite/geoip go direct.
+	//   "bypass_countries" — everything through the VPN except the sites of the
+	//                    countries in BypassCountries (their geosite/geoip go
+	//                    direct). "bypass_ru" is the pre-2.1 name for the same
+	//                    mode fixed to Russia (legacy RuSitesDirect=true).
 	//   "only_blocked" — direct by default, only resources BLOCKED in Russia go
 	//                    through the VPN (runetfreedom ru-blocked rule-sets).
+	//   "only_blocked_cn" — direct by default, only resources BLOCKED in China go
+	//                    through the VPN (the community GFW list, Loyalsoldier).
+	//   "only_selected" — direct by default, only the user's own lists through.
 	//   "proxy_all"    — everything through the VPN (legacy RuSitesDirect=false).
 	// Unset is derived from the legacy RuSitesDirect toggle (see routingMode()),
 	// so old settings files keep their behaviour without an explicit migration.
 	RoutingMode string `json:"routing_mode,omitempty"`
+	// BypassCountries is the country set for "bypass_countries": ISO codes from
+	// bypassCountryOrder ("ru","cn","ir","kz") whose sites go DIRECT.
+	BypassCountries []string `json:"bypass_countries,omitempty"`
 	// ProxyDomains is the manual "Custom domains THROUGH VPN" list (mirror of
 	// DirectDomains); meaningful in only_blocked mode. ProxyDomainsDisabled keeps
 	// the list but stops applying it.
 	ProxyDomains         []string `json:"proxy_domains,omitempty"`
 	ProxyDomainsDisabled bool     `json:"proxy_domains_disabled,omitempty"`
-	// BlocklistURL is an optional user-supplied plain-text domain list (one
-	// suffix per line) fetched + auto-updated and routed through the VPN in
-	// addition to the bundled runetfreedom list (only_blocked mode).
+	// BlocklistURL is the pre-2.1 SINGLE "through VPN (URL)" list. Kept for
+	// migration only: the UI moves it into BlocklistURLs on first edit, and
+	// blocklistURLs() falls back to it while it's still set.
 	BlocklistURL string `json:"blocklist_url,omitempty"`
-	TrayEnabled  bool   `json:"tray_enabled"`
+	// BlocklistURLs are the "through VPN (URL)" sources: one or more links to
+	// plain-text domain lists, each fetched + auto-updated and routed through the
+	// VPN. BlocklistURLsDisabled keeps the list but stops applying it.
+	BlocklistURLs         []string `json:"blocklist_urls,omitempty"`
+	BlocklistURLsDisabled bool     `json:"blocklist_urls_disabled,omitempty"`
+	TrayEnabled           bool     `json:"tray_enabled"`
 	// Per-user concurrency overrides for bulk tests. Zero / unset falls back
 	// to the defaults below. Capped at sane upper bounds inside the
 	// accessors so a fat-fingered "9999" doesn't melt the local network.
@@ -109,6 +128,11 @@ type AppSettings struct {
 	ProxyBind string `json:"proxy_bind,omitempty"`
 	// Deprecated: use ProxyBind. Kept so an old settings.json still migrates.
 	ProxyAllowLAN bool `json:"proxy_allow_lan,omitempty"`
+	// NoSystemProxy: when on, connecting in proxy mode does NOT touch the
+	// Windows system proxy — the local HTTP/SOCKS listeners still run, and only
+	// apps explicitly pointed at them go through the tunnel ("non-system proxy"
+	// mode). Off by default (the system proxy is set, as always).
+	NoSystemProxy bool `json:"no_system_proxy,omitempty"`
 	// UI scale and language for the Settings / Tab settings dialogs.
 	// Both apply to those modals only — the main window (tabs, table,
 	// connection bar, title bar) is intentionally not affected, since
@@ -124,6 +148,11 @@ type AppSettings struct {
 	// Recommended values: 9000 (default, jumbo) or 1500 / 1408 if a slow
 	// network can't handle big frames.
 	TUNMTU int `json:"tun_mtu,omitempty"`
+	// TunShareProxy also exposes Vair's HTTP/SOCKS proxy on the Proxy-access
+	// address while a TUN connection is up, so another LAN device (a phone) can
+	// route through this PC's tunnel. Off by default. Bind address + ports come
+	// from ProxyBind / HttpPort / SocksPort; takes effect on the next connection.
+	TunShareProxy bool `json:"tun_share_proxy,omitempty"`
 	// ── Remote control over LAN (2.0.0) ─────────────────────────────
 	// RemoteEnabled turns on an HTTP+SSE server on the LAN (port webPort) that
 	// serves the same UI to a phone/browser in the same network. Off by default;
@@ -159,12 +188,15 @@ type AppSettings struct {
 	// "off" must round-trip to disk, otherwise it would silently revert to the
 	// default on next launch.
 	DNSLeakProtection bool `json:"dns_leak_protection"`
-	// KillSwitch only takes effect when DNSLeakProtection is on. With
-	// strict_route=true, sing-box already drops traffic that can't go
-	// through the tunnel; the kill-switch wording in UI tells the user
-	// this is happening. (1.6.0 will add Windows Firewall rules as
-	// belt-and-braces.)
-	KillSwitch bool `json:"kill_switch,omitempty"`
+	// KillSwitch (TUN, only meaningful with DNSLeakProtection on) drives
+	// sing-box strict_route: on Windows a WFP filter that drops any traffic
+	// trying to leave OUTSIDE the tunnel, so nothing falls back to the physical
+	// NIC if the VPN drops (fail-closed) and DNS can't leak either. OFF = DNS is
+	// still tunnelled but traffic can fall back to direct on a tunnel drop.
+	// ON by default: before 2.1 strict_route silently followed DNSLeakProtection,
+	// so this default preserves that behaviour while making the toggle real. No
+	// omitempty — an explicit "off" must round-trip to disk.
+	KillSwitch bool `json:"kill_switch"`
 	// BlockLAN is inverted: zero/false = LAN traffic allowed direct.
 	// When true the ip_is_private→direct rule is removed and even
 	// 192.168.x.x goes through the tunnel.
@@ -177,6 +209,13 @@ type AppSettings struct {
 	SocksAuth bool   `json:"socks_auth,omitempty"`
 	SocksUser string `json:"socks_user,omitempty"`
 	SocksPass string `json:"socks_pass,omitempty"`
+	// HttpAuth is the HTTP-proxy counterpart of SocksAuth: when ON, the local
+	// HTTP proxy requires HttpUser/HttpPass (Basic auth). It applies to BOTH the
+	// proxy-mode HTTP listener AND the TUN "share proxy over LAN" HTTP inbound.
+	// OFF by default (the HTTP proxy stays open, as before).
+	HttpAuth bool   `json:"http_auth,omitempty"`
+	HttpUser string `json:"http_user,omitempty"`
+	HttpPass string `json:"http_pass,omitempty"`
 	// FakeIPDisabled is also inverted: zero/false = FakeIP enabled
 	// (when DNSLeakProtection is on). FakeIP returns 198.18.0.0/15
 	// pseudo-addresses for A/AAAA queries; real resolution happens
@@ -612,6 +651,18 @@ func dnsLeakProtectionEnabled() bool {
 	return appSettings.DNSLeakProtection
 }
 
+func tunShareProxyEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.TunShareProxy
+}
+
+func noSystemProxyEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.NoSystemProxy
+}
+
 func killSwitchEnabled() bool {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
@@ -636,13 +687,48 @@ func routingMode() string {
 	ruDirect := appSettings.RuSitesDirect
 	settingsMu.RUnlock()
 	switch m {
-	case "bypass_ru", "only_blocked", "proxy_all":
+	case "only_blocked", "only_blocked_cn", "only_selected", "proxy_all":
 		return m
+	case "bypass_ru", "bypass_countries":
+		// "bypass_ru" is the pre-2.1 name — same mode with the country set
+		// hard-wired to Russia (see bypassCountries).
+		return "bypass_countries"
 	}
 	if ruDirect {
-		return "bypass_ru"
+		return "bypass_countries"
 	}
 	return "proxy_all"
+}
+
+// bypassCountryOrder is the canonical order countries appear in generated
+// configs (deterministic output) and in the Settings UI.
+var bypassCountryOrder = []string{"ru", "cn", "ir", "kz"}
+
+// bypassCountries returns the effective country set for the bypass-countries
+// routing mode: the stored list filtered to known codes in canonical order. The
+// legacy "bypass_ru" mode (and the pre-mode RuSitesDirect bool) map to Russia,
+// so upgraders keep their exact behaviour. An empty list is legitimate —
+// nothing goes direct (behaves like proxy_all) until a country is picked.
+func bypassCountries() []string {
+	settingsMu.RLock()
+	mode := appSettings.RoutingMode
+	ruDirect := appSettings.RuSitesDirect
+	list := append([]string(nil), appSettings.BypassCountries...)
+	settingsMu.RUnlock()
+	if mode == "bypass_ru" || (mode == "" && ruDirect) {
+		return []string{"ru"}
+	}
+	set := map[string]bool{}
+	for _, c := range list {
+		set[strings.ToLower(strings.TrimSpace(c))] = true
+	}
+	var out []string
+	for _, cc := range bypassCountryOrder {
+		if set[cc] {
+			out = append(out, cc)
+		}
+	}
+	return out
 }
 
 // effectiveProxyDomains returns the manual "through VPN" domain list, or nil when
@@ -653,13 +739,18 @@ func effectiveProxyDomains() []string {
 	if appSettings.ProxyDomainsDisabled {
 		return nil
 	}
-	out := make([]string, 0, len(appSettings.ProxyDomains))
-	for _, d := range appSettings.ProxyDomains {
-		if d = strings.TrimSpace(d); d != "" {
-			out = append(out, d)
-		}
+	return trimList(appSettings.ProxyDomains)
+}
+
+// effectiveDirectDomains returns the manual "without VPN" rule list, or nil when
+// the list is toggled off.
+func effectiveDirectDomains() []string {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	if appSettings.DirectDomainsDisabled {
+		return nil
 	}
-	return out
+	return trimList(appSettings.DirectDomains)
 }
 
 // Default xray TLS-fragment ranges. "tlshello" packets are split into chunks
@@ -735,10 +826,22 @@ func currentTLSFingerprint() string {
 }
 
 // blocklistURL returns the trimmed custom blocklist URL ("" = none).
-func blocklistURL() string {
+// blocklistURLs returns the effective "through VPN (URL)" source list: nil when
+// toggled off; otherwise the trimmed BlocklistURLs, falling back to the legacy
+// single BlocklistURL while the user hasn't migrated it.
+func blocklistURLs() []string {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
-	return strings.TrimSpace(appSettings.BlocklistURL)
+	if appSettings.BlocklistURLsDisabled {
+		return nil
+	}
+	out := trimList(appSettings.BlocklistURLs)
+	if len(out) == 0 {
+		if u := strings.TrimSpace(appSettings.BlocklistURL); u != "" {
+			out = []string{u}
+		}
+	}
+	return out
 }
 
 // proxySocksCreds returns the username/password the user-facing SOCKS5 proxy
@@ -750,6 +853,30 @@ func proxySocksCreds() (user, pass string) {
 	on := appSettings.SocksAuth
 	u := strings.TrimSpace(appSettings.SocksUser)
 	p := strings.TrimSpace(appSettings.SocksPass)
+	settingsMu.RUnlock()
+	if !on {
+		return "", ""
+	}
+	if u == "" {
+		u = proxyAuthUser
+	}
+	if p == "" {
+		p = proxyAuthPass
+	}
+	return u, p
+}
+
+// proxyHttpCreds returns the username/password the user-facing HTTP proxy should
+// require, mirroring proxySocksCreds. Returns ("","") when HTTP auth is off — the
+// listener then accepts connections without credentials (the historical default).
+// When on, it uses the user's credentials, falling back to the per-launch random
+// ones if a field was left blank. Applies to both the proxy-mode HTTP listener
+// and the TUN "share proxy over LAN" HTTP inbound.
+func proxyHttpCreds() (user, pass string) {
+	settingsMu.RLock()
+	on := appSettings.HttpAuth
+	u := strings.TrimSpace(appSettings.HttpUser)
+	p := strings.TrimSpace(appSettings.HttpPass)
 	settingsMu.RUnlock()
 	if !on {
 		return "", ""
@@ -822,21 +949,7 @@ func staticHostsSnapshot() map[string]string {
 // Defaults: DNS leak protection ON, FakeIP OFF (FakeIPDisabled=true) — picked
 // for safer out-of-the-box TUN behaviour (DNS through the tunnel, real DoH
 // rather than FakeIP for app compatibility).
-var appSettings = AppSettings{SourcesEnabled: true, DNSLeakProtection: true, FakeIPDisabled: true, AutoHealthSec: 15, AutoFailThreshold: 2, AutoSwitch: true, AutoPingRefresh: true, AutoMaxLatencyMs: 300, DeepLinkEnabled: true}
-
-// deepLinkEnabled reports whether the vair:// URL scheme handler is on.
-func deepLinkEnabled() bool {
-	settingsMu.RLock()
-	defer settingsMu.RUnlock()
-	return appSettings.DeepLinkEnabled
-}
-
-// autostartEnabled reports whether "Launch at Windows startup" is on.
-func autostartEnabled() bool {
-	settingsMu.RLock()
-	defer settingsMu.RUnlock()
-	return appSettings.AutostartEnabled
-}
+var appSettings = AppSettings{SourcesEnabled: true, DNSLeakProtection: true, KillSwitch: true, FakeIPDisabled: true, AutoHealthSec: 15, AutoFailThreshold: 2, AutoSwitch: true, AutoPingRefresh: true, AutoMaxLatencyMs: 300, DeepLinkEnabled: true}
 
 var settingsMu sync.RWMutex
 

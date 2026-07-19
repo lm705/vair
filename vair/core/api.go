@@ -29,9 +29,9 @@ func Init() {
 	tabsOK := loadTabs()
 	// RECOVER, don't sweep: the DB may hold config rows for tab IDs that are
 	// missing from tabs.json (its metadata got lost — e.g. a truncated write, or
-	// an old build that clobbered it). Deleting those rows (the previous
-	// sweepOrphanTabRows) destroyed the user's pasted tabs. Instead, rebuild a
-	// tab entry for each orphan so its configs reappear. Only when tabs.json
+	// an old build that clobbered it). Deleting those orphan rows (as an earlier
+	// build did) destroyed the user's pasted tabs. Instead, rebuild a tab entry
+	// for each orphan so its configs reappear. Only when tabs.json
 	// parsed cleanly (tabsOK) — a parse failure already left the default [main],
 	// and we must not re-save over the (still-readable) file.
 	if store != nil && tabsOK {
@@ -122,9 +122,6 @@ func ActiveTab() string { return activeTabID() }
 // TableTab is the tab the config table displays — now the active tab (driven by
 // the tab bar). Kept as a named alias so Window/Count/Connect/tests share it.
 func TableTab() string { return activeTabID() }
-
-// TabCount returns the number of configs in a tab.
-func TabCount(tabID string) int { return memTabCount(tabID) }
 
 // tabExcludeFilter returns the tab's exclude rules when the filter is enabled,
 // nil otherwise. Applied as a VIEW filter on read (memWindow), so toggling the

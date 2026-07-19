@@ -465,10 +465,6 @@ func (s *configStore) deleteTabRows(tabID string) error {
 	return err
 }
 
-// sweepOrphanTabRows deletes rows whose tab no longer exists — e.g. a tab delete
-// whose background row-cleanup didn't finish before the app exited. Called once
-// at startup with the surviving tab IDs. A no-op when validIDs is empty (never
-// wipe everything as a precaution).
 // distinctTabIDs returns every tab_id that currently has at least one config
 // row (used to recover tabs whose metadata was lost from tabs.json).
 func (s *configStore) distinctTabIDs() ([]string, error) {
@@ -485,22 +481,6 @@ func (s *configStore) distinctTabIDs() ([]string, error) {
 		}
 	}
 	return ids, rows.Err()
-}
-
-func (s *configStore) sweepOrphanTabRows(validIDs []string) error {
-	if len(validIDs) == 0 {
-		return nil
-	}
-	ph := make([]string, len(validIDs))
-	args := make([]interface{}, len(validIDs))
-	for i, id := range validIDs {
-		ph[i] = "?"
-		args[i] = id
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM configs WHERE tab_id NOT IN (`+strings.Join(ph, ",")+`)`, args...)
-	return err
 }
 
 // deleteEntriesByIdx removes just the given rows of a tab (by idx) in chunks,
@@ -631,7 +611,7 @@ type windowQuery struct {
 	proto     []string // type-pill filter (chip protocols: vless, ss2022, …); empty = all
 	dedupHide bool     // hide body-duplicates (keep first by idx)
 	exclude   []string // per-tab exclude filter — a VIEW filter (hides matching configs
-	                    // on read; the store keeps them, so toggling it is instant both ways)
+	// on read; the store keeps them, so toggling it is instant both ways)
 	favorites []string // raw URLs that float to the top
 	offset    int
 	limit     int

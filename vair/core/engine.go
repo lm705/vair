@@ -18,24 +18,70 @@ import (
 //   stitches together xrayShell / xrayStreamSettings / xrayRoutingForProxy
 //   plus the per-protocol xrayOutboundXxx builder.
 
+// lanProxyInbounds returns HTTP+SOCKS inbounds that expose Vair's proxy on the
+// Proxy-access address while a TUN connection is up, so another LAN device (a
+// phone) can route through this PC's tunnel. Empty unless the TunShareProxy
+// toggle is on. This traffic runs through the SAME route.rules as the TUN, so it
+// gets identical routing (RU-direct, blocked-through-VPN, custom domains…).
+//
+// Both listeners honour the USER-FACING proxy credentials (proxyHttpCreds /
+// proxySocksCreds), so what the user enters in Settings → Security is exactly
+// what a phone enters in Telegram: no auth when the toggle is off, the chosen
+// login/password when it's on. Previously SOCKS was hard-wired to the internal
+// per-launch random password (unusable, since it's shown nowhere) and HTTP had
+// no auth at all. Bind + ports come from settings.
+func lanProxyInbounds() []interface{} {
+	if !tunShareProxyEnabled() {
+		return nil
+	}
+	httpPort, socksPort := currentProxyPorts()
+	bind := proxyBindHost()
+
+	httpIn := map[string]interface{}{
+		"type": "http", "tag": "http-lan",
+		"listen": bind, "listen_port": httpPort,
+	}
+	if hu, hp := proxyHttpCreds(); hu != "" {
+		httpIn["users"] = singboxInboundUsers(hu, hp)
+	}
+
+	socksIn := map[string]interface{}{
+		"type": "socks", "tag": "socks-lan",
+		"listen": bind, "listen_port": socksPort,
+	}
+	if su, sp := proxySocksCreds(); su != "" {
+		socksIn["users"] = singboxInboundUsers(su, sp)
+	}
+
+	return []interface{}{httpIn, socksIn}
+}
+
+// singboxInboundUsers builds the sing-box inbound `users` list (Basic auth for
+// http, username/password for socks) for a single credential pair.
+func singboxInboundUsers(user, pass string) []interface{} {
+	return []interface{}{
+		map[string]interface{}{"username": user, "password": pass},
+	}
+}
+
 func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPort int, blockQUIC bool) map[string]interface{} {
 	// Hybrid TUN: sing-box routes traffic, xray handles VLESS protocol.
 	//
-	// Two operating modes, gated by AppSettings.DNSLeakProtection:
+	// Two independent protections (see settings docs):
 	//
-	// 1. Legacy mode (default, leak-prone): strict_route=false, DNS just
-	//    references the OS resolver. System DNS packets can escape
-	//    through the physical NIC. Matches 1.4.0 behaviour exactly so
-	//    upgrades don't break working setups.
-	//
-	// 2. Protected mode: strict_route=true (WFP filter on Windows blocks
-	//    port 53 outside TUN), proper DNS routing block with three
-	//    distinct servers (bootstrap, direct, remote), and either
-	//    FakeIP (default) or "real DNS via proxy detour" for the
-	//    actual tunnelled-traffic queries.
-	//
-	// All knobs come from settings — see currentBootstrapDNS / etc.
+	//   - DNSLeakProtection (leakProtect): installs the real DNS routing block
+	//     (three servers: bootstrap/direct/remote) + a hijack-dns rule, so DNS
+	//     goes through the tunnel instead of the OS resolver. Legacy mode (off)
+	//     defers to the OS resolver — leak-prone, matches 1.4.0.
+	//   - KillSwitch (killSwitch, only meaningful with leakProtect on): turns on
+	//     strict_route — on Windows a WFP filter that drops any traffic (incl.
+	//     port 53) trying to leave OUTSIDE the tunnel. That's the fail-closed
+	//     "no fallback to the physical NIC if the VPN drops" behaviour AND the
+	//     belt on DNS leaks. Off = DNS still tunnelled, but traffic can fall back
+	//     to direct if the tunnel dies. On by default (preserves the pre-2.1
+	//     behaviour, where strict_route followed leakProtect).
 	leakProtect := dnsLeakProtectionEnabled()
+	killSwitch := killSwitchEnabled()
 	useFakeIP := fakeIPEnabled()
 
 	dns := buildDNSBlock(leakProtect, useFakeIP)
@@ -47,7 +93,7 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 		"address":        []string{"172.19.0.1/30"},
 		"mtu":            currentMTU(),
 		"auto_route":     true,
-		"strict_route":   leakProtect, // WFP-filter on Windows when true
+		"strict_route":   killSwitch, // WFP-filter on Windows when true (kill-switch)
 		"stack":          "gvisor",
 	}
 
@@ -119,7 +165,7 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 	return map[string]interface{}{
 		"log":      map[string]interface{}{"level": "warn", "timestamp": true},
 		"dns":      dns,
-		"inbounds": []interface{}{tun},
+		"inbounds": append([]interface{}{tun}, lanProxyInbounds()...),
 		"outbounds": []interface{}{
 			proxyOut,
 			map[string]interface{}{"type": "direct", "tag": "direct"},
@@ -443,8 +489,15 @@ func waitForPort(port int, deadline time.Time) bool {
 	return false
 }
 
-func makeSharedTransport(httpPort int) *http.Transport {
+// makeSharedTransport builds an http.Transport that proxies through the local
+// HTTP proxy on httpPort. When user != "" it embeds Basic-auth credentials in
+// the proxy URL — needed for the live-connection health probe once the user
+// enables HTTP-proxy auth (the throwaway test proxies pass "" here, so no auth).
+func makeSharedTransport(httpPort int, user, pass string) *http.Transport {
 	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", httpPort))
+	if user != "" {
+		proxyURL.User = url.UserPassword(user, pass)
+	}
 	return &http.Transport{
 		Proxy: http.ProxyURL(proxyURL), DisableKeepAlives: false, ForceAttemptHTTP2: false,
 		// Track the warm-up budget: the priming request's TLS/Reality handshake
@@ -488,7 +541,11 @@ func probeLiveTunnel(cm *connManager) (bool, time.Duration) {
 		if cs.HTTPPort <= 0 {
 			return true, 0
 		}
-		tr = makeSharedTransport(cs.HTTPPort) // keep-alive ON
+		// The live proxy carries the user's HTTP-auth credentials (when enabled),
+		// so the probe must authenticate to its own proxy or it 407s and the
+		// candidate looks dead.
+		hu, hp := proxyHttpCreds()
+		tr = makeSharedTransport(cs.HTTPPort, hu, hp) // keep-alive ON
 	} else {
 		// TUN: all system traffic routes through the tunnel, so a direct
 		// request measures the live connection. Keep-alive ON so the warm-up

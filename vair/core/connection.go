@@ -24,7 +24,7 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 	if err != nil {
 		return fmt.Errorf("no free port")
 	}
-	cfg := buildXrayConfigForNode(n, httpPort, -1, "", "")
+	cfg := buildXrayConfigForNode(n, httpPort, -1, "", "", "", "")
 	if cfg == nil {
 		return fmt.Errorf("xray: unsupported protocol %s", n.Kind)
 	}
@@ -89,7 +89,7 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 			return fmt.Errorf("xray: port not ready after %s", xrayStartupTimeout)
 		}
 	}
-	return fn(httpPort, makeSharedTransport(httpPort))
+	return fn(httpPort, makeSharedTransport(httpPort, "", ""))
 }
 
 // withSingbox is the sing-box mirror of withXray: it spins up a throwaway
@@ -169,7 +169,7 @@ func withSingbox(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Tran
 			return fmt.Errorf("sing-box: port not ready after %s", singboxStartupTimeout)
 		}
 	}
-	return fn(httpPort, makeSharedTransport(httpPort))
+	return fn(httpPort, makeSharedTransport(httpPort, "", ""))
 }
 
 // withEngine dispatches a throwaway-proxy probe to the right backend based on
@@ -229,10 +229,33 @@ func setSystemProxy(port int) error {
 }
 
 func unsetSystemProxy() {
+	// Only undo a proxy WE set (this session, or a stale one from a dirty
+	// shutdown — the lock file). In non-system-proxy mode we never touched
+	// WinINET, and flipping ProxyEnable=0 would clobber the user's own proxy.
+	if appliedProxyPort == 0 {
+		if _, err := os.Stat(proxyLockPath()); err != nil {
+			return
+		}
+	}
 	rp := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	runHidden("reg", "add", rp, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run() //nolint:errcheck
 	os.Remove(proxyLockPath())                                                                 //nolint:errcheck
 	appliedProxyPort = 0
+}
+
+// ReapplySystemProxy reconciles the Windows system proxy with the NoSystemProxy
+// setting while a proxy-mode connection is live (the toggle applies instantly:
+// off→on unsets it, on→off points it back at the running listener).
+func ReapplySystemProxy() {
+	cs := state.conn.snap()
+	if cs.Status != ConnConnected || cs.Mode != ModeProxy || cs.HTTPPort <= 0 {
+		return
+	}
+	if noSystemProxyEnabled() {
+		unsetSystemProxy()
+	} else if err := setSystemProxy(cs.HTTPPort); err != nil {
+		fmt.Fprintf(os.Stderr, "⚠  setSystemProxy: %v\n", err)
+	}
 }
 
 // clearStaleProxy runs once at startup. If the proxy-lock file from a prior
@@ -400,10 +423,11 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 
 	runXrayProxyConfig(cm, entries[0], chainName, connTab, labels, raws, func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
-		// Proxy mode = user-facing SOCKS → use the configured SOCKS-auth credentials
-		// (empty when the setting is off).
+		// Proxy mode = user-facing HTTP+SOCKS → use the configured auth credentials
+		// (empty when the respective setting is off).
 		su, sp := proxySocksCreds()
-		return buildXrayChainConfig(nodes, intHTTPPort, intSOCKSPort, su, sp)
+		hu, hp := proxyHttpCreds()
+		return buildXrayChainConfig(nodes, intHTTPPort, intSOCKSPort, su, sp, hu, hp)
 	})
 }
 
@@ -412,10 +436,11 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 // wait/finalize sequence (also used by the chain path).
 func startProxyConnectionXray(cm *connManager, entry *ConfigEntry, n *Node, connTab string) {
 	runXrayProxyConfig(cm, entry, n.Name, connTab, nil, nil, func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
-		// Proxy mode = user-facing SOCKS → use the configured SOCKS-auth credentials
-		// (empty when the setting is off).
+		// Proxy mode = user-facing HTTP+SOCKS → use the configured auth credentials
+		// (empty when the respective setting is off).
 		su, sp := proxySocksCreds()
-		return buildXrayConfigForNode(n, intHTTPPort, intSOCKSPort, su, sp)
+		hu, hp := proxyHttpCreds()
+		return buildXrayConfigForNode(n, intHTTPPort, intSOCKSPort, su, sp, hu, hp)
 	})
 }
 
@@ -427,6 +452,42 @@ func startProxyConnectionXray(cm *connManager, entry *ConfigEntry, n *Node, conn
 // for a chain connection (both nil for a single node), passed through to
 // ConnState. entry is the representative entry (the chain's entry hop) used for
 // index/raw/error reporting; name is what the conn-bar shows.
+// injectSourceFetchInbound adds the dedicated source-fetch HTTP inbound to an
+// XRAY proxy config and pins its traffic to the proxy outbound with a rule
+// prepended ahead of the routing-mode rules (first match wins in xray).
+func injectSourceFetchInbound(cfg map[string]interface{}, port int) {
+	inb, _ := cfg["inbounds"].([]interface{})
+	cfg["inbounds"] = append(inb, map[string]interface{}{
+		"tag": "src-fetch", "listen": "127.0.0.1", "port": port,
+		"protocol": "http",
+		"settings": map[string]interface{}{"auth": "noauth"},
+	})
+	if routing, ok := cfg["routing"].(map[string]interface{}); ok {
+		if rules, ok := routing["rules"].([]interface{}); ok {
+			routing["rules"] = append([]interface{}{
+				map[string]interface{}{"type": "field", "inboundTag": []string{"src-fetch"}, "outboundTag": "proxy"},
+			}, rules...)
+		}
+	}
+}
+
+// injectSourceFetchInboundSingbox is the sing-box flavour of the same pin
+// (proxy-mode Hysteria2/TUIC sessions).
+func injectSourceFetchInboundSingbox(cfg map[string]interface{}, port int) {
+	inb, _ := cfg["inbounds"].([]interface{})
+	cfg["inbounds"] = append(inb, map[string]interface{}{
+		"type": "http", "tag": "src-fetch",
+		"listen": "127.0.0.1", "listen_port": port,
+	})
+	if route, ok := cfg["route"].(map[string]interface{}); ok {
+		if rules, ok := route["rules"].([]interface{}); ok {
+			route["rules"] = append([]interface{}{
+				map[string]interface{}{"inbound": []string{"src-fetch"}, "outbound": "proxy"},
+			}, rules...)
+		}
+	}
+}
+
 func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab string, chain, chainRaws []string, build func(intHTTPPort, intSOCKSPort int) map[string]interface{}) {
 	httpPort, socksPort := currentProxyPorts()
 	if !portFree(httpPort) {
@@ -459,6 +520,18 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 	if xrayCfg == nil {
 		setConnError(cm, entry, "xray: could not build config")
 		return
+	}
+	// Dedicated source-fetch inbound: subscription refreshes connect here and are
+	// PINNED to the proxy outbound ahead of the mode rules, so they always ride
+	// the tunnel. Through the regular inbound they'd be routed by destination —
+	// and both RU modes can classify a subscription host as "direct", which on a
+	// censored network means the refresh dies the moment the VPN is the only way
+	// out (the exact case the user connects for). Best-effort: on a port error
+	// the fetch falls back to the regular proxy port.
+	intSrcPort := 0
+	if pf, e3 := findFreePort(); e3 == nil {
+		intSrcPort = pf
+		injectSourceFetchInbound(xrayCfg, pf)
 	}
 	tmpPath, err := writeTempJSON(xrayCfg, "xray-conn")
 	if err != nil {
@@ -548,7 +621,7 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 	// xray is now listening on the internal ports — hand off to the shared
 	// post-spawn block (byte counters, system proxy, ConnState, tickers).
 	finalizeProxyConnection(cm, entry, name, connTab, cmd, cancel, tmpPath,
-		httpPort, socksPort, intHTTPPort, intSOCKSPort, chain, chainRaws)
+		httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort, chain, chainRaws)
 }
 
 // finalizeProxyConnection performs the post-spawn steps shared by every
@@ -560,7 +633,7 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 // process must already be listening on intHTTPPort/intSOCKSPort.
 func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab string,
 	mainCmd *exec.Cmd, mainCancel context.CancelFunc, tmpPath string,
-	httpPort, socksPort, intHTTPPort, intSOCKSPort int, chain, chainRaws []string) {
+	httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort int, chain, chainRaws []string) {
 
 	counter := &trafficCounter{}
 	fwdCtx, fwdCancel := context.WithCancel(context.Background())
@@ -580,8 +653,12 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 		return
 	}
 
-	if err := setSystemProxy(httpPort); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠  setSystemProxy: %v\n", err)
+	// Non-system-proxy mode: leave the Windows proxy settings alone — only apps
+	// explicitly pointed at the local HTTP/SOCKS ports go through the tunnel.
+	if !noSystemProxyEnabled() {
+		if err := setSystemProxy(httpPort); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠  setSystemProxy: %v\n", err)
+		}
 	}
 
 	cm.mu.Lock()
@@ -593,7 +670,7 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeProxy, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: name,
-		HTTPPort: httpPort, SOCKSPort: socksPort,
+		HTTPPort: httpPort, SOCKSPort: socksPort, SrcFetchPort: intSrcPort,
 		StartedAt: time.Now(),
 		Chain:     chain,
 		ChainRaws: chainRaws,
@@ -650,6 +727,12 @@ func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, c
 	if cfg == nil {
 		setConnError(cm, entry, fmt.Sprintf("sing-box: unsupported protocol %s", n.Kind))
 		return
+	}
+	// Pin source fetches to the tunnel (see runXrayProxyConfig for the rationale).
+	intSrcPort := 0
+	if pf, e3 := findFreePort(); e3 == nil {
+		intSrcPort = pf
+		injectSourceFetchInboundSingbox(cfg, pf)
 	}
 	tmpPath, err := writeTempJSON(cfg, "singbox-conn")
 	if err != nil {
@@ -727,7 +810,7 @@ func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, c
 	}
 
 	finalizeProxyConnection(cm, entry, n.Name, connTab, cmd, cancel, tmpPath,
-		httpPort, socksPort, intHTTPPort, intSOCKSPort, nil, nil)
+		httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort, nil, nil)
 }
 
 // startTUNConnection is the user-facing entry point (called via
@@ -841,11 +924,13 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	// TUN hybrid: this xray SOCKS is the INTERNAL handoff sing-box dials (with the
 	// matching credentials) — never user-facing — so it always keeps auth on with
 	// the per-launch random credentials, independent of the user's SOCKS-auth
-	// setting.
+	// setting. The xray HTTP inbound here is unused (sing-box dials the SOCKS one),
+	// so its auth is left empty. The user-facing LAN share is a separate sing-box
+	// inbound (lanProxyInbounds), which applies the configured credentials.
 	if isChain {
-		xrayCfg = buildXrayChainConfig(chainNodes, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass)
+		xrayCfg = buildXrayChainConfig(chainNodes, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass, "", "")
 	} else {
-		xrayCfg = buildXrayConfigForNode(n, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass)
+		xrayCfg = buildXrayConfigForNode(n, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass, "", "")
 		// In hybrid TUN the proxy-vs-direct split is made by sing-box; the xray
 		// child must send everything it receives straight to the proxy. Otherwise
 		// the child's own routing (e.g. only_blocked default→direct) could push a

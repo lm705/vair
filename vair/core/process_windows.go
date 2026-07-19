@@ -3,7 +3,6 @@
 package core
 
 import (
-	"context"
 	"os/exec"
 	"syscall"
 )
@@ -20,12 +19,6 @@ func hideProcess(cmd *exec.Cmd) {
 
 func runHidden(name string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)
-	hideProcess(cmd)
-	return cmd
-}
-
-func runHiddenContext(ctx context.Context, name string, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, name, args...)
 	hideProcess(cmd)
 	return cmd
 }
