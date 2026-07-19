@@ -10,7 +10,7 @@ GUI клиент для проверки и подключения к VPN-кон
 
 [![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
 
-> 💡 Предложения, ошибки и любые пожелания, пожалуйста, пишите в [**Issues**](https://github.com/lm705/vair/issues).
+> 💡 Предложения, ошибки и любые пожелания, пожалуйста, пишите в [**Issues**](https://github.com/lm705/vair/issues). Писать можно на удобном вам языке.
 
 ## vless_alive.txt
 
