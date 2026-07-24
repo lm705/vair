@@ -10,6 +10,8 @@
 
 [Wiki](https://github.com/lm705/vair/wiki)
 
+📱 如何在手机上使用此电脑的 VPN — [指南](https://github.com/lm705/pc-vpn-to-phone)。
+
 [![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
 
 > 💡 如有建议、错误或任何反馈，请在 [**Issues**](https://github.com/lm705/vair/issues) 中提交。可以使用您方便的任何语言撰写。
@@ -22,7 +24,7 @@
 
 配置每小时自动更新一次，在俄罗斯审查最为严格的地区之一的服务器上进行可用性和速度的自动检测。不可用或速度较慢的配置将被过滤掉。大多数配置在更新时均可正常使用。
 
-配置来源于互联网上的公开资源。
+配置来源于互联网上的公开资源。配置的收集与自动检测由 [vair-collector](https://github.com/lm705/vair-collector) 脚本完成。
 
 配置名称中显示的国家可能与实际出口 IP 不符。
 
