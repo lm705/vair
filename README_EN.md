@@ -10,6 +10,8 @@ A client for testing and connecting to VPN configurations supporting the **VLESS
 
 [Wiki](https://github.com/lm705/vair/wiki)
 
+📱 How to use this PC's VPN on your phone — [guide](https://github.com/lm705/pc-vpn-to-phone).
+
 [![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
 
 > 💡 Please post suggestions, bugs and any feedback in [**Issues**](https://github.com/lm705/vair/issues). Feel free to write in whatever language is convenient for you.
@@ -22,7 +24,7 @@ Preloaded in the **SOURCES** tab of the application. The **RELOAD** button fetch
 
 Configurations are updated every hour, passing automatic availability and speed checks on a server located in one of the most heavily censored regions of Russia. Unavailable and slow configurations are filtered out. Most configurations are functional at the time of each update.
 
-Configurations are collected from open public sources.
+Configurations are collected from open public sources. Collection and automatic checking are done by the [vair-collector](https://github.com/lm705/vair-collector) script.
 
 The country listed in the name may differ from the actual exit IP.
 
