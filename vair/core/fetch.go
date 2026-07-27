@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // sourceHTTPClient is the client used to fetch subscription sources. When a
@@ -164,11 +165,14 @@ func fetchAndInitSilent(silent bool) {
 	seen := make(map[string]bool, len(raws))
 	var deduped []string
 	for _, r := range raws {
-		body := nodeBody(strings.TrimSpace(r))
-		if body == "" || seen[body] {
+		if strings.TrimSpace(r) == "" {
 			continue
 		}
-		seen[body] = true
+		key := dedupKey(r) // canonical identity, not the literal body
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		deduped = append(deduped, r)
 	}
 
@@ -368,16 +372,47 @@ func parseSubHeaders(resp *http.Response, meta *subMeta) {
 
 // decodeProfileTitle handles the "base64:<b64>" form (and bare base64) some
 // panels use for Profile-Title; falls back to the raw value.
+//
+// A BARE value is only decoded when the result is sane text (valid UTF-8, no
+// control characters): plenty of ordinary titles are accidentally valid base64
+// ("VairVPN1"), and blindly decoding those turned a readable name into binary
+// noise. An explicit "base64:" prefix is always honoured.
 func decodeProfileTitle(s string) string {
 	s = strings.TrimSpace(s)
-	raw := strings.TrimPrefix(s, "base64:")
-	if dec, err := base64.StdEncoding.DecodeString(raw); err == nil && len(dec) > 0 {
-		return strings.TrimSpace(string(dec))
+	tagged := strings.HasPrefix(s, "base64:")
+	raw := strings.TrimSpace(strings.TrimPrefix(s, "base64:"))
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding,
+		base64.URLEncoding, base64.RawURLEncoding} {
+		dec, err := enc.DecodeString(raw)
+		if err != nil || len(dec) == 0 {
+			continue
+		}
+		out := strings.TrimSpace(string(dec))
+		if tagged || isPlainText(out) {
+			return out
+		}
 	}
-	if dec, err := base64.RawStdEncoding.DecodeString(raw); err == nil && len(dec) > 0 {
-		return strings.TrimSpace(string(dec))
+	if tagged {
+		return raw // tagged but undecodable — at least drop the marker
 	}
 	return s
+}
+
+// isPlainText reports whether s is valid UTF-8 without control characters —
+// the guard that keeps a coincidentally-base64 title from being "decoded".
+func isPlainText(s string) bool {
+	if s == "" || !utf8.ValidString(s) {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 && r != '\t' {
+			return false
+		}
+		if r == 0xFFFD {
+			return false // replacement char = mis-decoded bytes
+		}
+	}
+	return true
 }
 
 // parseCommentMeta scans the leading "#"-comment block of a static subscription
@@ -416,7 +451,10 @@ func parseCommentMeta(text string, meta *subMeta) {
 		consumed := false
 		switch {
 		case (strings.HasPrefix(key, "profile-title") || key == "title" || key == "название") && val != "" && meta.Title == "":
-			meta.Title, consumed = val, true
+			// Same "base64:<b64>" form as the HTTP header (feeds put the encoded
+			// title in a #profile-title comment too) — decode it, else the raw
+			// "base64:8J+Gky…" string would be shown as the subscription name.
+			meta.Title, consumed = decodeProfileTitle(val), true
 		case strings.HasPrefix(key, "profile-update-interval") && val != "" && meta.UpdateInterval == "":
 			meta.UpdateInterval, consumed = val, true
 		case (strings.HasPrefix(key, "date") || strings.Contains(key, "updated") || strings.Contains(key, "обнов") || key == "дата") && val != "" && meta.Updated == "":
@@ -678,14 +716,14 @@ func dedupByBody(entries []*ConfigEntry) []*ConfigEntry {
 	seen := make(map[string]bool, len(entries))
 	out := make([]*ConfigEntry, 0, len(entries))
 	for _, e := range entries {
-		if e == nil {
+		if e == nil || strings.TrimSpace(e.Raw) == "" {
 			continue
 		}
-		body := nodeBody(e.Raw)
-		if body == "" || seen[body] {
+		key := dedupKey(e.Raw) // canonical identity, not the literal body
+		if seen[key] {
 			continue
 		}
-		seen[body] = true
+		seen[key] = true
 		out = append(out, e)
 	}
 	return out

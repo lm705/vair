@@ -87,6 +87,62 @@ func isSubscriptionURL(s string) bool {
 	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
 }
 
+// addTabSourcesNoFetch registers URLs and/or files as a tab's sources WITHOUT
+// starting a fetch, and returns how many were new plus the tab's full source
+// set. Callers that add several sources at once (the drag-and-drop import) use
+// this and then run ONE fetchTabURLs — adding them one by one would start a
+// fetch per source, each replacing the tab's entries and clearing the spinner
+// early, so the user saw configs trickle in.
+func addTabSourcesNoFetch(id string, urls []string, files []TabFile) (addedURLs, addedFiles int, allURLs []string, allFiles []TabFile, ok bool) {
+	if id == "" || id == "main" {
+		return 0, 0, nil, nil, false
+	}
+	state.mu.Lock()
+	for i := range state.tabs {
+		if state.tabs[i].ID != id {
+			continue
+		}
+		ok = true
+		for _, u := range urls {
+			u = strings.TrimSpace(u)
+			if !isSubscriptionURL(u) || strInSlice(u, state.tabs[i].SourceURLs) {
+				continue
+			}
+			state.tabs[i].SourceURLs = append(state.tabs[i].SourceURLs, u)
+			addedURLs++
+		}
+		for _, f := range files {
+			if f.Path == "" || tabHasFile(state.tabs[i].SourceFiles, f.Path) {
+				continue
+			}
+			state.tabs[i].SourceFiles = append(state.tabs[i].SourceFiles, f)
+			addedFiles++
+		}
+		allURLs = append([]string(nil), state.tabs[i].SourceURLs...)
+		allFiles = append([]TabFile(nil), state.tabs[i].SourceFiles...)
+		break
+	}
+	state.mu.Unlock()
+	if !ok {
+		return 0, 0, nil, nil, false
+	}
+	if addedURLs > 0 || addedFiles > 0 {
+		state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
+		saveTabs()
+	}
+	return addedURLs, addedFiles, allURLs, allFiles, true
+}
+
+// tabHasFile reports whether a file path is already among a tab's source files.
+func tabHasFile(files []TabFile, path string) bool {
+	for _, f := range files {
+		if f.Path == path {
+			return true
+		}
+	}
+	return false
+}
+
 // AddTabSourceURL appends a subscription URL to a tab's persistent Source URLs
 // and re-fetches (1.10 handleTabAddURL — used by QR scans / pasted links /
 // vair:// deep links). Returns false when the URL was already there (or the

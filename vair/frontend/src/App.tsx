@@ -25,13 +25,21 @@ import AutoModal from './AutoModal'
 import ConfigModal from './ConfigModal'
 
 type Row = NonNullable<Awaited<ReturnType<typeof ConfigService.Window>>>[number]
-type Sort = 'idx' | 'ping' | 'speed'
+// Sort is "idx" (original order) or "<column>" / "<column>:desc" — the table
+// header cycles a column through natural → reversed → off. SORT_COLS lists the
+// sortable columns; the backend (core/memstore.go lessKey) knows the same names.
+type SortCol = 'type' | 'name' | 'host' | 'transport' | 'security' | 'ping' | 'speed'
+type Sort = 'idx' | SortCol | `${SortCol}:desc`
 type Menu =
   | { kind: 'row'; x: number; y: number; idx: number }
   | { kind: 'empty'; x: number; y: number }
   | { kind: 'tab'; x: number; y: number; tab: any }
 
 const ROW_H = 33 // measured 1.10 row: act-cell button 22px + td padding 10 + border 1
+// Tab bar → dropdown thresholds: more than this many rows, or a row that can no
+// longer fit this many tabs.
+const TAB_MAX_ROWS = 5
+const TAB_MIN_PER_ROW = 3
 const WINDOW = 200 // rows fetched per Go call (windowed read from the memstore)
 // TYPE pills: [label, protocol value] — exact 1.10 set/order.
 const PROTOS: [string, string][] = [
@@ -123,16 +131,24 @@ function containsNodeURL(text: string): boolean {
   if (!text) return false
   return /(vless|vmess|trojan|ss|hysteria2|hy2|tuic):\/\//i.test(text)
 }
-// looksLikeSubURL: a single bare http(s) link — a subscription the server
-// fetches and imports. Used for scanned QRs, pasted links and deep links.
-function looksLikeSubURL(text: string): boolean {
-  const t = (text || '').trim()
-  return t.indexOf('\n') < 0 && /^https?:\/\/\S+$/i.test(t)
+// subURLsIn returns every bare http(s) link in the text, one per line — so
+// pasting a whole list of subscriptions adds them all. Returns [] when any
+// non-blank line is NOT a bare link (mixed content is configs, not a source
+// list), so config bodies that merely contain a URL never land here.
+function subURLsIn(text: string): string[] {
+  const lines = (text || '').split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean)
+  if (lines.length === 0) return []
+  const urls: string[] = []
+  for (const l of lines) {
+    if (!/^https?:\/\/\S+$/i.test(l)) return []
+    if (!urls.includes(l)) urls.push(l)
+  }
+  return urls
 }
 function pasteworthy(text: string): boolean {
   if (!text) return false
   if (containsNodeURL(text)) return true
-  if (looksLikeSubURL(text)) return true
+  if (subURLsIn(text).length > 0) return true
   // base64-encoded subscription body
   const t = text.trim()
   return t.length > 50 && /^[A-Za-z0-9+/=\r\n]+$/.test(t)
@@ -195,6 +211,10 @@ export default function App() {
   const tabBarRef = useRef<HTMLDivElement>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
   const [tabDD, setTabDD] = useState<{ x: number; y: number } | null>(null)
+  // Type-filter dropdown anchor (null = closed).
+  const [protoDD, setProtoDD] = useState<{ x: number; y: number } | null>(null)
+  // Brief ✓ after copying the connected config from the conn-bar.
+  const [connCopied, setConnCopied] = useState(false)
   const [winW, setWinW] = useState(0)
   // logs
   const [logsOpen, setLogsOpen] = useState(false)
@@ -661,15 +681,27 @@ export default function App() {
     if (editingIdx !== null && editName.trim()) ConfigService.RenameEntry(editingIdx, editName.trim())
     setEditingIdx(null)
   }
-  // addSubToTabSource appends a subscription URL to a tab's persistent
-  // sources (server re-fetches) — 1.10 addSubToTabSource.
-  const addSubToTabSource = (tabId: string, url: string) => {
-    // The add triggers a re-fetch whose "+N" delta toast would stack on ours.
+  // addSubsToTabSource appends one or more subscription URLs to a tab's
+  // persistent sources (the server re-fetches each), sequentially, and reports a
+  // combined toast — 1.10 addSubToTabSource, generalised to a list.
+  const addSubsToTabSource = async (tabId: string, urls: string[]) => {
+    if (urls.length === 0) return
+    // The adds trigger re-fetches whose "+N" delta toasts would stack on ours.
     suppressDeltaRef.current = true
     setTimeout(() => (suppressDeltaRef.current = false), 8000)
-    TabService.AddSourceURL(tabId, url).then((added) =>
-      showToast(added ? tt('Subscription added to tab sources') : tt('Subscription already in tab sources')),
-    )
+    let added = 0
+    for (const u of urls) {
+      try {
+        if (await TabService.AddSourceURL(tabId, u)) added++
+      } catch {
+        /* keep going — one bad link shouldn't abort the rest */
+      }
+    }
+    if (urls.length === 1) {
+      showToast(added ? tt('Subscription added to tab sources') : tt('Subscription already in tab sources'))
+    } else {
+      showToast(`${tt('Sources added')}: ${added} / ${urls.length}`)
+    }
   }
   // pasteConfigs streams the raw text to Go in ≤40MB line-aligned chunks (Wails
   // caps a binding call at 64MB). BeginPaste pins the target tab up front (tab
@@ -698,10 +730,12 @@ export default function App() {
   const importPayload = (text: string, toastAdded?: string) => {
     const trimmed = (text || '').trim()
     if (!trimmed) return
-    const isSub = looksLikeSubURL(trimmed)
+    // One OR MANY bare links → tab sources; anything else is config text.
+    const subs = subURLsIn(trimmed)
+    const isSub = subs.length > 0
     const run = (tabId: string) => {
       if (isSub) {
-        addSubToTabSource(tabId, trimmed)
+        addSubsToTabSource(tabId, subs)
         return
       }
       pasteConfigs(text).then(() => {
@@ -948,6 +982,14 @@ export default function App() {
       Events.On('stats_update', (e: any) => setTraffic(e?.data?.payload)),
       // "+N −M" toast after a reload recomputes the tab's config set. Tab-scoped:
       // background refreshes of OTHER tabs must not toast over the current one.
+      // a file was dropped onto the window → refresh the view + summary toast
+      Events.On('dropped', (e: any) => {
+        const p = e?.data?.payload
+        refreshTabs()
+        TabService.Active().then(setActiveTab)
+        setReloadKey((k) => k + 1)
+        if (p?.message) showToast(t10(langRef.current, 'Imported') + ' — ' + p.message)
+      }),
       Events.On('reload_delta', (e: any) => {
         if (e?.data?.tab && e.data.tab !== activeTabRef.current) return
         if (suppressDeltaRef.current) {
@@ -1181,6 +1223,32 @@ export default function App() {
       document.removeEventListener('click', close)
     }
   }, [tabDD])
+  // File drop is a USER-TAB feature (a dropped file becomes one of that tab's
+  // sources), and SOURCES is the built-in read-only list — so the drop target is
+  // attached only while a user tab is active. Without the attribute Wails raises
+  // no event and shows no highlight, which is exactly the "not allowed here"
+  // behaviour we want on SOURCES.
+  useEffect(() => {
+    const root = document.getElementById('root')
+    if (!root) return
+    if (activeTab && activeTab !== 'main') root.setAttribute('data-file-drop-target', '')
+    else root.removeAttribute('data-file-drop-target')
+  }, [activeTab])
+  // Close the type dropdown on a click OUTSIDE it (clicks inside must survive,
+  // so ctrl+click can pick several types in a row).
+  useEffect(() => {
+    if (!protoDD) return
+    const close = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null
+      if (t?.closest('.proto-dd-menu') || t?.closest('#proto-dd-trigger')) return
+      setProtoDD(null)
+    }
+    const id = setTimeout(() => document.addEventListener('click', close), 10)
+    return () => {
+      clearTimeout(id)
+      document.removeEventListener('click', close)
+    }
+  }, [protoDD])
   // compact-mode detection (1.10 updateTabLayout): measure with compact OFF,
   // then re-apply synchronously before paint — no flicker, no oscillation.
   useLayoutEffect(() => {
@@ -1192,9 +1260,23 @@ export default function App() {
     const btns = bar.querySelectorAll('.tab-btn')
     let compact = false
     if (btns.length >= 2) {
-      const rows = new Set<number>()
-      btns.forEach((b) => rows.add((b as HTMLElement).offsetTop))
-      if (rows.size === btns.length) compact = true
+      // Group the buttons by their row (offsetTop) to get both the row count and
+      // how many tabs each row holds.
+      const perRow = new Map<number, number>()
+      btns.forEach((b) => {
+        const top = (b as HTMLElement).offsetTop
+        perRow.set(top, (perRow.get(top) ?? 0) + 1)
+      })
+      const rows = perRow.size
+      const widestRow = Math.max(...perRow.values())
+      // Collapse into the dropdown when the tabs would need MORE than
+      // TAB_MAX_ROWS rows, or when a row can no longer hold TAB_MIN_PER_ROW
+      // tabs — at that point the bar is a tall stack of near-single tabs, which
+      // the dropdown does better. (The second rule is what actually fires on a
+      // narrow window: the layout floor stops the bar from ever growing to six
+      // rows.) Only meaningful once there are enough tabs to fill a row.
+      if (rows > TAB_MAX_ROWS || (btns.length >= TAB_MIN_PER_ROW && widestRow < TAB_MIN_PER_ROW))
+        compact = true
     }
     if (compact) {
       bar.classList.add('compact')
@@ -1230,10 +1312,57 @@ export default function App() {
   const totalUp = traffic ? traffic.total_up : (stats?.total_up ?? 0)
   const totalDown = traffic ? traffic.total_down : (stats?.total_down ?? 0)
 
+  // copyConnected puts the ACTIVE connection's config URL on the clipboard —
+  // every hop (one per line) for a chain. Works even when the config's row is no
+  // longer in the tab.
+  const copyConnected = () => {
+    const cs = connRef.current
+    if (!cs) return
+    const raws: string[] =
+      cs.chain_raws && cs.chain_raws.length > 0 ? cs.chain_raws : cs.conn_raw ? [cs.conn_raw] : []
+    if (raws.length === 0) return
+    copyText(raws.join('\n'))
+    setConnCopied(true)
+    setTimeout(() => setConnCopied(false), 1200)
+    showToast(tt('Copied') + (raws.length > 1 ? ' ' + raws.length : ''))
+  }
+
   const onProtoClick = (e: React.MouseEvent, val: string) => {
     if (e.ctrlKey || e.metaKey)
       setProtos((p) => (p.includes(val) ? p.filter((x) => x !== val) : [...p, val]))
     else setProtos([val])
+  }
+
+  // ── column sorting ────────────────────────────────────────────────
+  // Left click cycles a column: natural → reversed → off (original order).
+  // Natural means A→Z for the text columns, fastest-first for ping and speed.
+  // Right click clears the sort from any state.
+  const cycleSort = (col: SortCol) => {
+    setSort((s) => (s === col ? (`${col}:desc` as Sort) : s === `${col}:desc` ? 'idx' : (col as Sort)))
+  }
+  // sortableTH renders one clickable header cell with its state arrow.
+  const sortableTH = (cls: string, col: SortCol, label: string) => {
+    const active = sort === col || sort === `${col}:desc`
+    const desc = sort === `${col}:desc`
+    return (
+      <th
+        className={cls + ' sortable' + (active ? ' sorted' : '')}
+        onClick={() => cycleSort(col)}
+        onContextMenu={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          setSort('idx')
+        }}
+        title={
+          active
+            ? (desc ? 'Sorted — click to clear' : 'Sorted — click to reverse') + ' · right-click to clear'
+            : 'Click to sort · right-click to clear'
+        }
+      >
+        <span className="th-label">{label}</span>
+        <span className="th-arrow">{active ? (desc ? '▾' : '▴') : ''}</span>
+      </th>
+    )
   }
 
   const padTop = items.length > 0 ? items[0].start : 0
@@ -1498,13 +1627,15 @@ export default function App() {
             </span>
             <span className="sl">failed</span>
           </div>
-          <div className="stat">
+          {/* .stat-best — hidden on narrow windows (see the 960px media query):
+              the same numbers are visible in the table's ping/speed columns. */}
+          <div className="stat stat-best">
             <span className="sv ms" id="s-ms">
               {stats?.best_ping ? stats.best_ping + 'ms' : '—'}
             </span>
             <span className="sl">best ping</span>
           </div>
-          <div className="stat">
+          <div className="stat stat-best">
             <span className="sv sp" id="s-sp">
               {stats?.best_speed ? stats.best_speed.toFixed(1) + ' MB/s' : '—'}
             </span>
@@ -1656,51 +1787,36 @@ export default function App() {
           <span className="tl tl-lbl" style={{ marginLeft: 6 }}>
             type
           </span>
-          <div className="proto-group" title="Click to filter by one type. Ctrl+click to multi-select.">
-            <button
-              className={'proto-btn' + (protos.length === 0 ? ' active' : '')}
-              id="proto-all"
-              onClick={() => setProtos([])}
-            >
-              all
-            </button>
-            {PROTOS.map(([label, val]) => (
-              <button
-                key={val}
-                className={'proto-btn' + (protos.includes(val) ? ' active' : '')}
-                id={'proto-' + val}
-                onClick={(e) => onProtoClick(e, val)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          <span className="tl tl-lbl" style={{ marginLeft: 6 }}>
-            sort
-          </span>
-          <div className="sort-group">
-            <button
-              className={'sort-btn' + (sort === 'idx' ? ' active' : '')}
-              id="sort-idx"
-              onClick={() => setSort('idx')}
-            >
-              default
-            </button>
-            <button
-              className={'sort-btn' + (sort === 'ping' ? ' active' : '')}
-              id="sort-ping"
-              onClick={() => setSort('ping')}
-            >
-              ping ↑
-            </button>
-            <button
-              className={'sort-btn' + (sort === 'speed' ? ' active' : '')}
-              id="sort-speed"
-              onClick={() => setSort('speed')}
-            >
-              speed ↓
-            </button>
-          </div>
+          {/* Type filter as a dropdown (same pattern as the compact tab picker):
+              the trigger shows the current selection, the menu keeps ctrl+click
+              multi-select. */}
+          <button
+            className={'proto-dd-trigger' + (protos.length ? ' on' : '')}
+            id="proto-dd-trigger"
+            title="Click to filter by one type. Ctrl+click to multi-select."
+            onClick={(e) => {
+              if (protoDD) {
+                setProtoDD(null)
+                return
+              }
+              // The trigger sits at the RIGHT edge of the toolbar, so anchor the
+              // menu to its right side and clamp it inside the viewport (a
+              // left-anchored menu ran off the window).
+              const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+              const W = 150 // keep in sync with .proto-dd-menu min-width
+              const x = Math.max(6, Math.min(r.right - W, window.innerWidth - W - 6))
+              setProtoDD({ x, y: r.bottom + 2 })
+            }}
+          >
+            <span className="proto-dd-name">
+              {protos.length === 0
+                ? 'all'
+                : protos.length <= 2
+                  ? protos.map((v) => PROTOS.find(([, val]) => val === v)?.[0] || v).join(', ')
+                  : protos.length + ' selected'}
+            </span>
+            <span className="proto-dd-caret">▾</span>
+          </button>
         </div>
       </div>
 
@@ -1774,13 +1890,13 @@ export default function App() {
             <thead>
               <tr>
                 <th className="ci">#</th>
-                <th className="cpr">Type</th>
-                <th className="cn">Name</th>
-                <th className="ch">Host</th>
-                <th className="ct">Transport</th>
-                <th className="cs">Security</th>
-                <th className="cp2">Ping</th>
-                <th className="csp">Speed</th>
+                {sortableTH('cpr', 'type', 'Type')}
+                {sortableTH('cn', 'name', 'Name')}
+                {sortableTH('ch', 'host', 'Host')}
+                {sortableTH('ct', 'transport', 'Transport')}
+                {sortableTH('cs', 'security', 'Security')}
+                {sortableTH('cp2', 'ping', 'Ping')}
+                {sortableTH('csp', 'speed', 'Speed')}
                 <th className="ca">Actions</th>
               </tr>
             </thead>
@@ -1804,9 +1920,12 @@ export default function App() {
             </div>
             <p>{loading.op === 'delete' ? tt('Deleting configs…') : tt('Loading configs…')}</p>
           </div>
-        ) : total === 0 && activeTab !== 'main' ? (
-          /* Empty user tab: show the three ways to fill it (discoverability — the
-             context-menu entry points are invisible until you know to right-click). */
+        ) : total === 0 && tabTotal === 0 && activeTab !== 'main' ? (
+          /* Genuinely empty user tab: show the three ways to fill it (discoverability
+             — the context-menu entry points are invisible until you know to
+             right-click). Note tabTotal === 0: when the tab HAS configs and the view
+             is empty only because of a filter / type selection, we fall through to
+             the "nothing matches" message below instead of these hints. */
           <div className="center-msg" id="msg-area">
             <p style={{ marginBottom: 12 }}>{tt('This tab is empty')}</p>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
@@ -1814,6 +1933,15 @@ export default function App() {
               <button className="btn ghost" onClick={pasteFromClipboard}>{tt('Paste configs')}</button>
               <button className="btn ghost" onClick={() => setTabModalId(activeTab)}>{tt('Add a source')}</button>
             </div>
+          </div>
+        ) : total === 0 && tabTotal > 0 ? (
+          /* The tab has configs but the current filter / type selection matches
+             none — say so (and offer to clear), instead of the empty-tab hints. */
+          <div className="center-msg" id="msg-area">
+            <p style={{ marginBottom: 12 }}>{tt('No configs match the filter')}</p>
+            <button className="btn ghost" onClick={() => { setFilter(''); setProtos([]) }}>
+              {tt('Clear filter')}
+            </button>
           </div>
         ) : (
           <table id="tbl">
@@ -1949,6 +2077,19 @@ export default function App() {
           {connecting && <span>{conn?.entry_name}</span>}
           {isError && <span style={{ color: 'var(--red)' }}>{conn?.error || 'unknown error'}</span>}
         </span>
+        {connected && (conn.conn_raw || (conn.chain_raws && conn.chain_raws.length > 0)) && (
+          /* Copy the CONNECTED config — handy when its row is gone from the tab
+             (source refreshed, filtered out, deleted). Copies every hop for a
+             chain, one per line. */
+          <span
+            id="ccopy"
+            className={'cping ccopy' + (connCopied ? ' ok' : '')}
+            title={tt('Copy the connected config')}
+            onClick={copyConnected}
+          >
+            {connCopied ? tt('copied') : tt('copy')}
+          </span>
+        )}
         {connected && (
           <span
             id="cping"
@@ -1975,8 +2116,10 @@ export default function App() {
             {exit?.label || '🌍 ' + tt('check IP')}
           </span>
         )}
+        {/* className="on" rather than an inline display, so the narrow-window
+            media query can hide these chips (inline styles always win). */}
         {connected && (
-          <div id="cports" style={{ display: 'flex' }}>
+          <div id="cports" className="on">
             {isProxy ? (
               <>
                 <div
@@ -2056,6 +2199,34 @@ export default function App() {
       </div>
 
       {/* ── Compact-tab dropdown list ── */}
+      {/* ── Type-filter dropdown (ctrl+click keeps the multi-select) ── */}
+      {protoDD && (
+        <div className="tab-dd-menu proto-dd-menu" style={{ left: protoDD.x, top: protoDD.y }}>
+          <div
+            className={'tab-dd-item' + (protos.length === 0 ? ' active' : '')}
+            onClick={() => {
+              setProtos([])
+              setProtoDD(null)
+            }}
+          >
+            all
+          </div>
+          {PROTOS.map(([label, val]) => (
+            <div
+              key={val}
+              className={'tab-dd-item' + (protos.includes(val) ? ' active' : '')}
+              onClick={(e) => {
+                onProtoClick(e, val)
+                // Ctrl+click keeps the menu open so several types can be picked.
+                if (!(e.ctrlKey || e.metaKey)) setProtoDD(null)
+              }}
+            >
+              {label}
+            </div>
+          ))}
+        </div>
+      )}
+
       {tabDD && (
         <div className="tab-dd-menu" style={{ left: tabDD.x, top: tabDD.y }}>
           {tabs

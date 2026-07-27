@@ -47,15 +47,15 @@ body.theme-light{
   --shadow:rgba(0,0,0,.18);--overlay:rgba(0,0,0,.35);
 }
 html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--font);font-size:13px;line-height:1.4;user-select:none;-webkit-user-select:none}
-/* The header (stats + controls) and conn-bar need ~960px to lay out in one
-   row. Below that the flex-wrap used to break them onto a second line and the
-   layout "collapsed". min-width pins the whole app to that floor; if the CSS
-   viewport is narrower (small window, or a high-DPI laptop where the CSS px
-   count is well under the physical pixels), the WINDOW scrolls horizontally
-   instead of the content overlapping. The @media block further down trims the
-   header on narrow widths so this floor stays low. */
+/* The header (stats + controls) and conn-bar need room to lay out in one row;
+   min-width pins the whole app to that floor, and if the CSS viewport is
+   narrower the WINDOW scrolls horizontally instead of the content overlapping.
+   The @media blocks further down trim the header progressively (labels, then
+   the two "best" stats) so the floor can stay LOW — at 960px the toolbar was
+   wider than a small window, which parked the filter/type controls off-screen
+   and stopped the tab bar from ever needing more rows. */
 html{overflow-x:auto;overflow-y:hidden}
-body{display:flex;flex-direction:column;height:100vh;overflow:hidden;min-width:960px}
+body{display:flex;flex-direction:column;height:100vh;overflow:hidden;min-width:540px}
 input,textarea{user-select:text;-webkit-user-select:text}
 
 /* ── connection bar ── */
@@ -76,6 +76,9 @@ input,textarea{user-select:text;-webkit-user-select:text}
 .cping.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
 .cping.failed{color:var(--red);border-color:rgba(220,80,80,.4)}
 .cping.testing{color:var(--accent);border-color:rgba(232,197,71,.4)}
+/* Copy-the-connected-config chip (same pill shape as the ping chip). */
+.ccopy{letter-spacing:.04em}
+.ccopy.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
 .cexit{flex-shrink:0;cursor:pointer;font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
 .cexit:hover{border-color:var(--accent);color:var(--accent)}
 .cexit.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
@@ -97,6 +100,7 @@ input,textarea{user-select:text;-webkit-user-select:text}
 #cdetail{font-size:11px;color:var(--dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 #cdetail span{color:var(--text)}
 #cports{display:none;gap:6px;align-items:center;flex-shrink:0}
+#cports.on{display:flex} /* shown while connected; hidden again below 720px */
 .pchip{
   background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
   padding:2px 7px;font-size:10px;cursor:pointer;transition:border-color .15s;white-space:nowrap;
@@ -126,9 +130,13 @@ input,textarea{user-select:text;-webkit-user-select:text}
 /* header */
 header{
   flex-shrink:0;background:var(--bg2);
-  padding:9px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:9px 16px;display:flex;align-items:center;gap:14px;
+  /* NEVER wrap: wrapping dropped the controls onto a second line mid-resize
+     (the buttons "jumped" below the stats). The stats block shrinks instead —
+     and below 960px the widest stats are hidden by the media query. */
+  flex-wrap:nowrap;
 }
-.stats{display:flex;gap:14px;align-items:center}
+.stats{display:flex;gap:14px;align-items:center;min-width:0;overflow:hidden}
 .stat{display:flex;flex-direction:column;align-items:flex-end;gap:1px}
 .sv{font-size:16px;font-weight:700;line-height:1}
 .sl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em}
@@ -137,7 +145,8 @@ header{
 .stat.traf{margin-left:8px;padding-left:14px;border-left:1px solid var(--border2)}
 .stat.traf .sv{white-space:nowrap}
 .spacer{flex:1}
-.ctrls{display:flex;gap:5px;align-items:center;flex-wrap:wrap}
+/* nowrap + no shrink: the control buttons stay on the header's single row. */
+.ctrls{display:flex;gap:5px;align-items:center;flex-wrap:nowrap;flex-shrink:0}
 .btn{
   all:unset;cursor:pointer;font-family:var(--font);font-size:11px;font-weight:700;
   padding:5px 11px;border-radius:3px;letter-spacing:.07em;text-transform:uppercase;
@@ -165,6 +174,29 @@ header{
   .ctrls{gap:4px}
   .btn{padding:5px 8px;letter-spacing:.04em}
   #conn-bar{gap:7px;padding:0 12px}
+}
+/* Second step, for genuinely narrow windows (down to the 720px floor): drop the
+   two "best ping / best speed" summaries and the traffic counters — the table
+   itself shows those numbers — and let the filter input shrink. This is what
+   keeps the toolbar inside the window, so the filter/type controls stay next to
+   the tabs instead of being pushed out of view. */
+@media (max-width:960px){
+  header{gap:6px;padding:7px 10px}
+  .stats{gap:7px}
+  .stat-best,.stat.traf{display:none}
+  .toolbar{padding:5px 10px;gap:8px}
+  .toolbar-right{gap:7px}
+  .finput{width:auto;flex:1 1 90px;min-width:70px}
+  #conn-bar{gap:6px;padding:0 10px}
+}
+/* Third step, down to the 540px floor. The conn-bar's port chips are the last
+   thing to go (the same ports live in Settings → Ports); without this the bar
+   is what overflows first, and the tab bar could never get narrow enough to
+   reach its collapse thresholds. */
+@media (max-width:720px){
+  #cports,#cports.on{display:none}
+  .toolbar{padding:5px 8px}
+  #conn-bar{gap:5px;padding:0 8px}
 }
 .btn.dim-btn{opacity:.4;color:var(--dim)}
 .btn.dim-btn:hover{opacity:.6}
@@ -239,6 +271,31 @@ header{
 .tab-dd-item.active{color:var(--accent)}
 .tab-dd-item.active::before{content:'●';font-size:8px}
 .tab-dd-item:not(.active)::before{content:'';width:8px;display:inline-block}
+
+/* Type-filter dropdown trigger — same shape as the toolbar buttons it replaced
+   (proto-btn), lit like the tab trigger when a filter is active. */
+.proto-dd-trigger{
+  all:unset;cursor:pointer;font-family:var(--font);font-size:10px;font-weight:700;
+  box-sizing:border-box;height:22px;padding:0 6px 0 8px;border-radius:3px;
+  color:var(--dim);border:1px solid var(--border2);transition:all .15s;
+  display:inline-flex;align-items:center;gap:5px;max-width:190px;min-width:0;
+  text-transform:uppercase;letter-spacing:.05em;
+}
+.proto-dd-trigger:hover{border-color:var(--accent);color:var(--accent)}
+.proto-dd-trigger.on{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+.proto-dd-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.proto-dd-caret{font-size:8px;opacity:.8;flex-shrink:0}
+/* Narrower than the tab menu and right-anchored by the click handler, so it
+   never runs past the window edge (the trigger lives on the far right). */
+.proto-dd-menu{min-width:150px}
+
+/* Drag-and-drop: Wails adds this class to the INNERMOST [data-file-drop-target]
+   element under the cursor while a file is dragged over the window — so match
+   the class itself, not a specific element. */
+.file-drop-target-active::after{
+  content:'';position:fixed;inset:0;z-index:99998;pointer-events:none;
+  border:2px dashed var(--accent);background:rgba(232,197,71,.07);
+}
 
 /* tab context menu */
 .ctx-menu{
@@ -363,7 +420,11 @@ textarea.modal-input{resize:vertical;min-width:0}
 #sub-bar .sb-bar{display:inline-block;width:90px;height:5px;background:var(--bg4);border-radius:3px;overflow:hidden;vertical-align:middle}
 #sub-bar .sb-fill{height:100%;background:var(--accent)}
 #sub-bar .sb-warn{color:var(--red);font-weight:700}
-.si-row{font-size:calc(var(--modal-fs-base) + 1px);margin-bottom:5px;color:var(--text)}
+/* Subscription info is read-only DATA (title, URL, traffic, expiry, notes), so
+   it must be selectable/copyable — the app-wide user-select:none doesn't apply
+   here. cursor:text advertises it. */
+.si-row{font-size:calc(var(--modal-fs-base) + 1px);margin-bottom:5px;color:var(--text);
+  user-select:text;-webkit-user-select:text;cursor:text}
 .si-row.si-dim{color:var(--dim)}
 .si-row.si-warn{color:var(--red);font-weight:700}
 .si-block.si-sep{border-top:1px solid var(--border2);margin-top:8px;padding-top:8px}
@@ -512,6 +573,22 @@ thead th.cs {text-align:center}
 thead th.cp2{text-align:center}
 thead th.csp{text-align:center}
 thead th.ca {text-align:center}
+/* Sortable column headers: click cycles natural → reversed → off (right-click
+   clears). The arrow slot is always reserved so the label never shifts. */
+thead th.sortable{cursor:pointer;user-select:none;transition:color .12s}
+thead th.sortable:hover{color:var(--text)}
+thead th.sortable.sorted{color:var(--accent)}
+.th-label{vertical-align:middle}
+.th-arrow{
+  display:inline-block;width:9px;margin-left:3px;font-size:8px;
+  vertical-align:middle;color:var(--accent);
+}
+/* Centre-aligned headers keep their label optically centred despite the arrow. */
+thead th.sortable.cpr .th-arrow,
+thead th.sortable.ct  .th-arrow,
+thead th.sortable.cs  .th-arrow,
+thead th.sortable.cp2 .th-arrow,
+thead th.sortable.csp .th-arrow{margin-left:2px;margin-right:-11px}
 tbody tr{border-bottom:1px solid var(--border);transition:background .08s}
 tbody tr:hover{background:var(--bg3)}
 tbody tr.row-cp{background:var(--row-cp)!important;box-shadow:inset 3px 0 0 var(--green)}

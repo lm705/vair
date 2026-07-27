@@ -136,6 +136,12 @@ export const RU: Record<string, string> = {
     "Reset": "Сбросить",
     "Enter these in your SOCKS5 client. Reset generates new random credentials.":
       "Введите эти данные в SOCKS5-клиенте. «Сбросить» создаёт новые случайные.",
+    "Sources added": "Источников добавлено",
+    "Imported": "Импортировано",
+    "Copy the connected config": "Скопировать подключённый конфиг",
+    "copied": "скопировано",
+    "No configs match the filter": "Нет конфигов, подходящих под фильтр",
+    "Clear filter": "Сбросить фильтр",
     "HTTP authentication": "Аутентификация HTTP",
     "Protects the local HTTP proxy with a username/password (Basic auth). Applies to BOTH proxy mode and the TUN “Share proxy over LAN” HTTP proxy. Off by default. Takes effect on next connection.":
       "Защищает локальный HTTP-прокси логином/паролем (Basic-авторизация). Действует и в режиме proxy, и для HTTP-прокси функции «Раздавать прокси по LAN в TUN-режиме». По умолчанию выключено. Применяется при следующем подключении.",

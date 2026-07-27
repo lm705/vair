@@ -192,7 +192,7 @@ func main() {
 
 	theApp = application.New(application.Options{
 		Name:        "Vair",
-		Description: "Vair 2.1.0",
+		Description: "Vair 2.2.0",
 		Services: []application.Service{
 			application.NewService(&ConfigService{}),
 			application.NewService(&TabService{}),
@@ -242,6 +242,17 @@ func main() {
 		Frameless:        true,
 		BackgroundColour: windowBackground(), // matches the theme's --bg (resize-lag paint)
 		URL:              "/",
+		EnableFileDrop:   true, // drop a config / source-list file onto the window
+	})
+
+	// Files dropped onto the window are imported like a paste: config files fill
+	// the active tab, files that are just a list of links become tab sources.
+	// core.ImportFiles does the parsing/routing and broadcasts the result.
+	mainWindow.OnWindowEvent(events.Common.WindowFilesDropped, func(e *application.WindowEvent) {
+		if e == nil || e.Context() == nil {
+			return
+		}
+		go core.ImportFiles(e.Context().DroppedFiles())
 	})
 
 	// Launched at logon (--autostart) → start hidden in the tray.

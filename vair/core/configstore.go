@@ -98,12 +98,14 @@ CREATE INDEX IF NOT EXISTS idx_configs_tab_idx      ON configs(tab_id, idx);
 CREATE INDEX IF NOT EXISTS idx_configs_tab_bodyhash ON configs(tab_id, body_hash);
 `
 
-// hashBody is the dedup key: a 64-bit FNV-1a hash of the node body (raw minus the
-// "#name" fragment). Stored as INTEGER. Collisions are astronomically unlikely and
-// would at worst hide one non-duplicate row in dedup view.
+// hashBody is the dedup key: a 64-bit FNV-1a hash of the node's CANONICAL
+// identity (see dedupKey — parameter order, transport aliases and omitted
+// defaults are normalised away, so the same server written two ways hashes
+// alike). Stored as INTEGER. Collisions are astronomically unlikely and would at
+// worst hide one non-duplicate row in the dedup view.
 func hashBody(raw string) int64 {
 	h := fnv.New64a()
-	h.Write([]byte(nodeBody(strings.TrimSpace(raw))))
+	h.Write([]byte(dedupKey(raw)))
 	return int64(h.Sum64())
 }
 
@@ -168,7 +170,8 @@ func openConfigStore() (*configStore, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	migrateBodyHash(db) // legacy `body TEXT` column → compact body_hash (one-time)
+	migrateBodyHash(db)  // legacy `body TEXT` column → compact body_hash (one-time)
+	migrateDedupKeys(db) // rehash when the dedup algorithm changes (one-time)
 	if _, err := db.Exec(configIndexes); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("indexes: %w", err)
@@ -302,6 +305,75 @@ func migrateBodyHash(db *sql.DB) (migrated bool) {
 		rebuildWithoutBody(db)
 	}
 	return true
+}
+
+// dedupKeyVersion is bumped whenever dedupKey's output changes, so an existing
+// DB's stored body_hash values (computed by the OLD algorithm) get recomputed
+// once at startup. Without this, dedup would silently keep using stale hashes.
+//
+//	1 — pre-2.2: FNV of the raw body (URL minus "#name")
+//	2 — 2.2.0:   FNV of the canonical identity (see core/dedup.go)
+const dedupKeyVersion = 2
+
+// migrateDedupKeys recomputes body_hash for every row when the DB was written
+// with an older dedup algorithm, then records the new version in the DB's
+// user_version. Chunked by id like migrateBodyHash so a huge table doesn't build
+// one giant transaction, and idempotent: an interrupted run simply resumes
+// (user_version is only written after a full pass).
+func migrateDedupKeys(db *sql.DB) {
+	var ver int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		return // can't tell — leave the data alone
+	}
+	if ver >= dedupKeyVersion {
+		return
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM configs`).Scan(&n); err == nil && n > 0 {
+		fmt.Fprintf(os.Stderr, "config store: recomputing dedup keys for %d configs (one-time)…\n", n)
+	}
+	type row struct {
+		id  int64
+		raw string
+	}
+	var lastID int64
+	for {
+		rows, err := db.Query(`SELECT id, raw FROM configs WHERE id > ? ORDER BY id LIMIT 5000`, lastID)
+		if err != nil {
+			return
+		}
+		batch := make([]row, 0, 5000)
+		for rows.Next() {
+			var r row
+			if rows.Scan(&r.id, &r.raw) == nil {
+				batch = append(batch, r)
+			}
+		}
+		rows.Close()
+		if len(batch) == 0 {
+			break
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return
+		}
+		st, err := tx.Prepare(`UPDATE configs SET body_hash=? WHERE id=?`)
+		if err != nil {
+			tx.Rollback() //nolint:errcheck
+			return
+		}
+		for _, r := range batch {
+			h := hashBody(r.raw)
+			if h == 0 {
+				h = 1 // 0 stays reserved as "unset" (see migrateBodyHash)
+			}
+			st.Exec(h, r.id) //nolint:errcheck
+			lastID = r.id
+		}
+		st.Close()
+		tx.Commit() //nolint:errcheck
+	}
+	db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, dedupKeyVersion)) //nolint:errcheck
 }
 
 // rebuildWithoutBody recreates `configs` without the legacy body column (fallback
@@ -696,7 +768,9 @@ func (s *configStore) resetTabResults(tabID string) error {
 func (s *configStore) updateName(tabID string, idx int, name, raw string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_, err := s.db.Exec(`UPDATE configs SET name=?, raw=?, body=? WHERE tab_id=? AND idx=?`,
-		name, raw, nodeBody(strings.TrimSpace(raw)), tabID, idx)
+	// body_hash, not the legacy `body` column (dropped by rebuildWithoutBody) —
+	// writing to `body` failed with "no such column" on every rebuilt DB.
+	_, err := s.db.Exec(`UPDATE configs SET name=?, raw=?, body_hash=? WHERE tab_id=? AND idx=?`,
+		name, raw, hashBody(raw), tabID, idx)
 	return err
 }

@@ -133,9 +133,10 @@ func memSig(q windowQuery, favorites []string) string {
 		boolByte(q.dedupHide) + "\x00" + strings.Join(favorites, "\x01") +
 		"\x00" + strings.Join(q.exclude, "\x01") // exclude view filter (toggles the cache)
 	// Only ping/speed order depends on live test results — fold in the result
-	// version so those views re-sort as results arrive; idx-sorted views keep a
-	// stable cache regardless of tests.
-	if q.sort == "ping" || q.sort == "speed" {
+	// version so those views re-sort as results arrive; the other orders keep a
+	// stable cache regardless of tests. (Field-only compare: the direction
+	// suffix doesn't change WHICH data the order depends on.)
+	if f, _ := splitSort(q.sort); f == "ping" || f == "speed" {
 		s += "\x00" + strconv.FormatInt(atomic.LoadInt64(&memResultVer), 10)
 	}
 	return s
@@ -317,9 +318,11 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 		raw := e.Raw
 		sec := e.Security
 		e.mu.Unlock()
-		// Body is needed for the favorite match and/or dedup — compute it once.
+		// Favorites are matched on the EXACT body (a favorite marks one specific
+		// config), while dedup uses the canonical identity (see dedupKey) so the
+		// same server written differently collapses to one row.
 		var body string
-		if len(favSet) > 0 || q.dedupHide {
+		if len(favSet) > 0 {
 			body = nodeBody(strings.TrimSpace(raw))
 		}
 		k.chip = chipProtoOf(k.protocol, sec)
@@ -339,7 +342,7 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 			continue
 		}
 		if q.dedupHide {
-			k.body = body
+			k.body = dedupKey(raw)
 			if _, dup := seen[k.body]; dup {
 				continue
 			}
@@ -381,35 +384,75 @@ func speedRank(k *sortKey) int {
 	return 4
 }
 
+// splitSort splits a sort mode into its field and direction. The UI (column
+// headers) sends "<field>" for the natural direction and "<field>:desc" for the
+// reversed one; "" / "idx" is the original list order.
+//
+// Natural direction per field: text fields and ping ascending (A→Z, fastest
+// first), speed descending (fastest first) — that's what the header's first
+// click gives, and ":desc" flips it.
+func splitSort(mode string) (field string, rev bool) {
+	if i := strings.IndexByte(mode, ':'); i >= 0 {
+		return mode[:i], mode[i+1:] == "desc"
+	}
+	return mode, false
+}
+
 // lessKey is the comparator matching the legacy SQL orderBy / JS comparators:
-// favorites first, then the active sort.
+// favorites first, then the active sort. Ties always fall back to the original
+// index so the order is stable.
 func lessKey(a, b *sortKey, mode string) bool {
 	if a.fav != b.fav {
 		return a.fav // favorites (true) sort before non-favorites
 	}
-	switch mode {
+	field, rev := splitSort(mode)
+	// cmpText/flip keep every branch below written in its NATURAL direction;
+	// `rev` flips the result once, at the end.
+	flip := func(less bool) bool {
+		if rev {
+			return !less
+		}
+		return less
+	}
+	text := func(x, y string) bool {
+		if x == y {
+			return a.idx < b.idx // stable tie-break, never reversed
+		}
+		return flip(x < y)
+	}
+	switch field {
 	case "ping":
 		al, bl := a.delay > 0, b.delay > 0
 		if al != bl {
-			return al // live (ping>0) before dead
+			return al // live (ping>0) before dead, in BOTH directions
 		}
 		if al && a.delay != b.delay {
-			return a.delay < b.delay
+			return flip(a.delay < b.delay) // natural: fastest first
 		}
 		return a.idx < b.idx
 	case "speed":
 		ra, rb := speedRank(a), speedRank(b)
 		if ra != rb {
-			return ra < rb
+			return ra < rb // measured before untested/failed, in both directions
 		}
 		if ra == 0 && a.speed != b.speed {
-			return a.speed > b.speed // speed DESC
+			return flip(a.speed > b.speed) // natural: fastest first
 		}
 		if ra == 1 && a.delay != b.delay {
-			return a.delay < b.delay // ping ASC
+			return flip(a.delay < b.delay)
 		}
 		return a.idx < b.idx
-	default: // idx
+	case "type":
+		return text(a.chip, b.chip)
+	case "name":
+		return text(a.name, b.name)
+	case "host":
+		return text(a.host, b.host)
+	case "transport":
+		return text(a.network, b.network)
+	case "security":
+		return text(a.security, b.security)
+	default: // idx — the original order
 		return a.idx < b.idx
 	}
 }
