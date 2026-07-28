@@ -6,41 +6,78 @@
 
 一款用于测试和连接 **VLESS、VMess、Trojan、Shadowsocks（包括 SS2022）、Hysteria2、TUIC** 协议 VPN 配置的客户端。基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
 
-仅支持 **Windows**。
+**无需自备配置即可上手：** 程序内置了一份免费配置列表，每小时更新一次并自动检测。在 [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) 模式下，程序会自行测试这些配置，连接到最快的可用配置，并在其失效时自动切换到另一个。标签页的自动刷新则会让列表本身保持最新——新配置会自动加入，无需您操作。
 
-[Wiki](https://github.com/lm705/vair/wiki)
+> ℹ️ **请注意：** 该内置列表**仅在俄罗斯境内**收集和测试，因此在您所在的国家/地区可能无法使用。此时请添加您自己的订阅和配置——下述所有功能对它们同样适用。
 
-📱 如何在手机上使用此电脑的 VPN — [指南](https://github.com/lm705/pc-vpn-to-phone)。
+您自己的配置同样受支持：添加**订阅链接**、文件和单个配置，将它们分类到标签页中，并使用同样的测试、路由和 AUTO 功能。
 
-[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+仅支持 **Windows**。单个 `.exe` 文件，无需安装——xray-core 与 sing-box 引擎已内置其中。
 
 > 💡 如有建议、错误或任何反馈，请在 [**Issues**](https://github.com/lm705/vair/issues) 中提交。可以使用您方便的任何语言撰写。
+
+[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+[![Release](https://img.shields.io/github/v/release/lm705/vair?label=Release)](https://github.com/lm705/vair/releases/latest)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+[![Stars](https://img.shields.io/github/stars/lm705/vair?style=flat)](https://github.com/lm705/vair/stargazers)
+
+<a href="screenshots/main-window.png"><img src="screenshots/main-window.png" alt="Vair 主窗口：配置列表与测试结果" width="900"></a> <a href="screenshots/auto-panel.png"><img src="screenshots/auto-panel.png" alt="AUTO 面板与路由设置" width="450"></a>
+
+## 快速开始
+
+1. 从 [**Releases**](https://github.com/lm705/vair/releases) 页面下载 `Vair.exe` 并运行——无需安装。
+2. 打开 **SOURCES** 标签页并点击 **RELOAD**，即可获取最新的配置列表。
+3. 点击 **PING ALL** 或 **SPEED ALL** 进行检测，然后连接任意可用配置——或者开启 **AUTO**，让程序自动完成。
+
+更多内容见 Wiki 中的[入门指南](https://github.com/lm705/vair/wiki/Начало-работы)。
+
+## 功能
+
+* **多种协议** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC，支持 TLS 与 Reality。
+* **两种模式** — 系统代理（HTTP/SOCKS）和 TUN（全部流量走隧道）。
+* [**自动连接（AUTO）**](https://github.com/lm705/vair/wiki/Авто-подключение) — 自动连接到最快的可用配置，并在其失效时自动切换。
+* **测试** — 对每个配置测量延迟（ping）和下载速度，支持批量；结果在重启后仍会保留。
+* **灵活路由** — 五种模式：全部流量走 VPN；除所选国家（🇷🇺 🇨🇳 🇮🇷 🇰🇿）网站外的全部流量；仅俄罗斯被封锁的资源；仅中国被封锁的资源；仅所选网站。另外还可为域名、IP 和应用设置自定义规则。
+* **链式代理** — 依次经过多个节点（您 → 节点 A → 节点 B → 互联网）。
+* **绕过 DPI** — TLS 握手分片和浏览器 TLS 指纹（uTLS）。
+* **DNS 泄漏防护** 以及 TUN 模式下的 kill-switch。
+* **标签页与订阅源** — 配置可按标签页归类，并从订阅、文件或私有 GitHub 仓库获取，支持自动刷新与过滤。
+* **超大列表** — 多达约 250,000 条配置依然流畅：使用 SQLite 存储，排序、搜索和过滤即时完成。
+* **在手机上使用 VPN** — 从 TUN 模式将代理共享到局域网，以及[用手机控制程序](https://github.com/lm705/pc-vpn-to-phone)。
+* **实用功能** — 二维码、手动创建配置、自动更新、开机自启、深色与浅色主题、俄语和英语界面。
+
+## 文档
+
+* [**Wiki**](https://github.com/lm705/vair/wiki) — 完整手册：设置、模式、路由、链式代理、测试、常见问题。*(俄语)*
+* 📱 [**如何在手机上使用此电脑的 VPN**](https://github.com/lm705/pc-vpn-to-phone) — 通过 Wi-Fi 共享，以及借助 Tailscale 随时随地访问。
 
 ## vless_alive.txt
 
 一份可在俄罗斯境内正常使用的免费 VLESS 配置列表。
 
-该列表已预加载至程序的 **SOURCES** 标签页中。点击 **RELOAD** 按钮可获取最新版本的文件。
+已预加载到程序的 **SOURCES** 标签页中。点击 **RELOAD** 按钮可获取该文件的最新版本。
 
-配置每小时自动更新一次，在俄罗斯审查最为严格的地区之一的服务器上进行可用性和速度的自动检测。不可用或速度较慢的配置将被过滤掉。大多数配置在更新时均可正常使用。
+配置每小时更新一次，并在位于俄罗斯封锁最严重地区之一的服务器上自动检测可用性和速度。不可用和速度慢的配置会被过滤掉。大多数配置在更新时都是可用的。
 
 配置来源于互联网上的公开资源。配置的收集与自动检测由 [vair-collector](https://github.com/lm705/vair-collector) 脚本完成。
 
-配置名称中显示的国家可能与实际出口 IP 不符。
+名称中的国家可能与实际出口 IP 不一致。
 
 ## 免责声明
 
-本软件按"现状"（*as is*）提供，不附带任何明示或暗示的保证。
+本软件按「原样」(*as is*) 提供，不作任何明示或暗示的保证。
 
-本程序是一款用于处理网络协议的技术工具。**这不是 VPN 服务的广告、推广或提供。** 本程序不是 VPN 服务商，不包含自有服务器，也不提供访问被封锁资源的服务。
+本程序是用于处理网络协议的技术工具。**这不是广告、推广，也不提供 VPN 服务。** 本程序不是 VPN 提供商，不包含自有服务器，也不提供访问被封锁资源的服务。
 
 `vless_alive.txt` 文件包含从互联网公开来源收集的配置。作者不拥有、不运营、也不控制配置中所列出的服务器。使用这些服务器时的可用性、安全性和隐私性均不作保证。
 
-用户在使用本软件时，须自行承担遵守所在司法管辖区法律法规的全部责任。
+用户须自行承担在其所属司法辖区内使用本软件时遵守法律的全部责任。
 
 >## 支持
 >
->相关"支付"地址信息仅供参考。所列地址均来源于公开渠道，不属于本项目作者所有。
+>[DALINK](https://dalink.to/lm705)（不使用 VPN 打开可显示卢布价格）
+>
+>相关"支付"地址信息仅供参考。
 >
 >ERC20:
 >
@@ -60,7 +97,6 @@
 
 ## 仓库统计
 
-![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
 <a href="https://www.star-history.com/?repos=lm705%2Fvair&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&theme=dark&legend=top-left&sealed_token=s9Mau_7UPLeko_Ss-eqOe8ikw84z-4uCrMQHEW5p80tUkU11etLD94YMXL309vnuSuOVC--xSK3PZffYkDHUv5Wvfv8irHsn2W6D8NgbQJasCtptbCqpnMyCNbceKc9tV5DGkzozcTxHlkooUzf9pJ-2rKVQ5KFeKz-T79cI3bkcUnYlKKyejM5yuXT1" />
