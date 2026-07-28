@@ -17,7 +17,7 @@ GUI клиент для проверки и подключения к VPN-кон
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
 [![Stars](https://img.shields.io/github/stars/lm705/vair?style=flat)](https://github.com/lm705/vair/stargazers)
 
-<a href="screenshots/main-window.png"><img src="screenshots/main-window.png" alt="Главное окно Vair: таблица конфигураций с результатами тестов" width="731"></a> <a href="screenshots/auto-panel.png"><img src="screenshots/auto-panel.png" alt="Панель AUTO и настройки маршрутизации" width="274"></a>
+<a href="screenshots/main-window.png"><img src="screenshots/main-window.png" alt="Главное окно Vair: таблица конфигураций с результатами тестов" width="900"></a> <a href="screenshots/auto-panel.png"><img src="screenshots/auto-panel.png" alt="Панель AUTO и настройки маршрутизации" width="450"></a>
 
 ## Быстрый старт
 
