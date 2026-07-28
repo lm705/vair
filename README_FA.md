@@ -6,15 +6,50 @@
 
 کلاینتی برای آزمایش و اتصال به پیکربندی‌های VPN با پروتکل‌های **VLESS، VMess، Trojan، Shadowsocks (شامل SS2022)، Hysteria2، TUIC**. بر پایه [Xray-core](https://github.com/XTLS/Xray-core) و [sing-box](https://github.com/SagerNet/sing-box) ساخته شده است.
 
-فقط برای **Windows**.
+**می‌توانید بدون داشتن پیکربندی شخصی شروع کنید:** فهرستی از پیکربندی‌های رایگان از پیش در برنامه هست که هر ساعت به‌روزرسانی و به‌صورت خودکار بررسی می‌شود. در حالت [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) برنامه خودش پیکربندی‌ها را آزمایش می‌کند، به سریع‌ترین گزینهٔ سالم وصل می‌شود و اگر از کار افتاد به گزینهٔ دیگری سوئیچ می‌کند. به‌روزرسانی خودکار تب هم خود فهرست را تازه نگه می‌دارد — موارد جدید بدون دخالت شما اضافه می‌شوند.
 
-[Wiki](https://github.com/lm705/vair/wiki)
+> ℹ️ **توجه:** این فهرست داخلی فقط **در خاک روسیه** جمع‌آوری و آزمایش می‌شود، بنابراین ممکن است در کشور شما کار نکند. در این صورت اشتراک‌ها و پیکربندی‌های خودتان را اضافه کنید — همهٔ امکانات زیر با آن‌ها هم دقیقاً به همین شکل کار می‌کند.
 
-📱 نحوه استفاده از VPN این کامپیوتر روی گوشی — [راهنما](https://github.com/lm705/pc-vpn-to-phone).
+پیکربندی‌های خودتان هم کاملاً پشتیبانی می‌شوند: **لینک اشتراک**، فایل و پیکربندی‌های تکی را اضافه کنید، آن‌ها را در تب‌ها مرتب کنید و از همان آزمایش‌ها، مسیریابی و AUTO استفاده کنید.
 
-[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+فقط برای **Windows**. یک فایل `.exe`، بدون نیاز به نصب — موتورهای xray-core و sing-box از قبل داخل آن هستند.
 
 > 💡 لطفاً پیشنهادها، اشکالات و هر بازخوردی را در [**Issues**](https://github.com/lm705/vair/issues) مطرح کنید. می‌توانید به هر زبانی که برایتان راحت است بنویسید.
+
+[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+[![Release](https://img.shields.io/github/v/release/lm705/vair?label=Release)](https://github.com/lm705/vair/releases/latest)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+[![Stars](https://img.shields.io/github/stars/lm705/vair?style=flat)](https://github.com/lm705/vair/stargazers)
+
+<a href="screenshots/main-window.png"><img src="screenshots/main-window.png" alt="پنجرهٔ اصلی Vair: جدول پیکربندی‌ها با نتایج آزمایش" width="900"></a> <a href="screenshots/auto-panel.png"><img src="screenshots/auto-panel.png" alt="پنل AUTO و تنظیمات مسیریابی" width="450"></a>
+
+## شروع سریع
+
+1. فایل `Vair.exe` را از صفحهٔ [**Releases**](https://github.com/lm705/vair/releases) دانلود و اجرا کنید — نیازی به نصب نیست.
+2. تب **SOURCES** را باز کنید و **RELOAD** را بزنید تا فهرست تازه دریافت شود.
+3. با **PING ALL** یا **SPEED ALL** آن‌ها را بررسی کنید و به هر گزینهٔ سالمی وصل شوید — یا **AUTO** را روشن کنید تا برنامه خودش این کار را انجام دهد.
+
+جزئیات بیشتر در [شروع کار](https://github.com/lm705/vair/wiki/Начало-работы) در ویکی.
+
+## امکانات
+
+* **پروتکل‌های متعدد** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC، همراه با TLS و Reality.
+* **دو حالت** — پروکسی سیستمی (HTTP/SOCKS) و TUN (عبور کل ترافیک از تونل).
+* [**اتصال خودکار (AUTO)**](https://github.com/lm705/vair/wiki/Авто-подключение) — خودش به سریع‌ترین پیکربندی سالم وصل می‌شود و در صورت قطع شدن، به گزینهٔ دیگری سوئیچ می‌کند.
+* **آزمایش** — اندازه‌گیری تأخیر (ping) و سرعت دانلود برای هر پیکربندی، به‌صورت گروهی هم؛ نتایج بین اجراها ذخیره می‌شوند.
+* **مسیریابی انعطاف‌پذیر** — پنج حالت: کل ترافیک از VPN؛ همه‌چیز به‌جز سایت‌های کشورهای انتخابی (🇷🇺 🇨🇳 🇮🇷 🇰🇿)؛ فقط موارد مسدود در روسیه؛ فقط موارد مسدود در چین؛ فقط سایت‌های انتخابی. به‌علاوهٔ قوانین دلخواه برای دامنه‌ها، IP‌ها و برنامه‌ها.
+* **زنجیره** — اتصال از طریق چند گره پشت سر هم (شما → گره A → گره B → اینترنت).
+* **عبور از DPI** — تکه‌تکه کردن دست‌دهی TLS و انتخاب اثر انگشت TLS مرورگر (uTLS).
+* **محافظت در برابر نشت DNS** و kill-switch در حالت TUN.
+* **تب‌ها و منابع** — پیکربندی‌ها در تب‌ها مرتب می‌شوند و از اشتراک‌ها، فایل‌ها یا یک مخزن خصوصی GitHub دریافت می‌شوند، با به‌روزرسانی خودکار و فیلترها.
+* **فهرست‌های بزرگ** — تا حدود ۲۵۰٬۰۰۰ پیکربندی روان کار می‌کند: ذخیره‌سازی در SQLite و مرتب‌سازی، جست‌وجو و فیلتر آنی.
+* **VPN روی گوشی** — اشتراک‌گذاری پروکسی در شبکهٔ محلی از حالت TUN و [کنترل برنامه از گوشی](https://github.com/lm705/pc-vpn-to-phone).
+* **امکانات جانبی** — کد QR، ساخت دستی پیکربندی، به‌روزرسانی خودکار برنامه، اجرای خودکار، پوستهٔ تیره و روشن، رابط روسی و انگلیسی.
+
+## مستندات
+
+* [**ویکی**](https://github.com/lm705/vair/wiki) — راهنمای کامل: تنظیمات، حالت‌ها، مسیریابی، زنجیره‌ها، آزمایش، پرسش‌های متداول. *(به زبان روسی)*
+* 📱 [**نحوه استفاده از VPN این کامپیوتر روی گوشی**](https://github.com/lm705/pc-vpn-to-phone) — اشتراک‌گذاری از طریق Wi-Fi و دسترسی از هر جا با Tailscale.
 
 ## vless_alive.txt
 
@@ -40,7 +75,9 @@
 
 >## حمایت مالی
 >
->اطلاعات آدرس‌های «پرداخت» صرفاً جهت اطلاع‌رسانی ارائه شده است. آدرس‌های ذکرشده از منابع عمومی گردآوری شده‌اند و متعلق به نویسنده پروژه نمی‌باشند.
+>[DALINK](https://dalink.to/lm705) (برای نمایش قیمت به روبل، بدون VPN باز کنید)
+>
+>اطلاعات آدرس‌های «پرداخت» صرفاً جهت اطلاع‌رسانی ارائه شده است.
 >
 >ERC20:
 >
@@ -60,7 +97,6 @@
 
 ## آمار مخزن
 
-![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
 <a href="https://www.star-history.com/?repos=lm705%2Fvair&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&theme=dark&legend=top-left&sealed_token=s9Mau_7UPLeko_Ss-eqOe8ikw84z-4uCrMQHEW5p80tUkU11etLD94YMXL309vnuSuOVC--xSK3PZffYkDHUv5Wvfv8irHsn2W6D8NgbQJasCtptbCqpnMyCNbceKc9tV5DGkzozcTxHlkooUzf9pJ-2rKVQ5KFeKz-T79cI3bkcUnYlKKyejM5yuXT1" />
