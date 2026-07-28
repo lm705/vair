@@ -6,15 +6,50 @@
 
 A client for testing and connecting to VPN configurations supporting the **VLESS, VMess, Trojan, Shadowsocks (including SS2022), Hysteria2, TUIC** protocols. Built on top of [Xray-core](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box).
 
-**Windows** only.
+**You can start without configurations of your own:** a list of free ones is already built in — it is refreshed every hour and checked automatically. In [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) mode the app tests the configurations itself, connects to the fastest working one and switches to another if it stops responding. A tab's auto-refresh then keeps the list itself current — fresh configurations arrive without you doing anything.
 
-[Wiki](https://github.com/lm705/vair/wiki)
+> ℹ️ **Note:** that built-in list is collected and tested **inside Russia only**, so it may not work in your country. In that case add your own subscriptions and configurations — everything below works exactly the same with them.
 
-📱 How to use this PC's VPN on your phone — [guide](https://github.com/lm705/pc-vpn-to-phone).
+Your own configurations are just as welcome: add **subscription links**, files and individual configurations — sort them into tabs and use the same testing, routing and AUTO.
 
-[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+**Windows** only. A single `.exe`, no installation needed — the xray-core and sing-box engines are already inside.
 
 > 💡 Please post suggestions, bugs and any feedback in [**Issues**](https://github.com/lm705/vair/issues). Feel free to write in whatever language is convenient for you.
+
+[![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
+[![Release](https://img.shields.io/github/v/release/lm705/vair?label=Release)](https://github.com/lm705/vair/releases/latest)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+[![Stars](https://img.shields.io/github/stars/lm705/vair?style=flat)](https://github.com/lm705/vair/stargazers)
+
+<a href="screenshots/main-window.png"><img src="screenshots/main-window.png" alt="Vair main window: the configuration table with test results" width="900"></a> <a href="screenshots/auto-panel.png"><img src="screenshots/auto-panel.png" alt="The AUTO panel and routing settings" width="450"></a>
+
+## Quick start
+
+1. Download `Vair.exe` from the [**Releases**](https://github.com/lm705/vair/releases) page and run it — no installation required.
+2. Open the **SOURCES** tab and press **RELOAD** — a fresh list of configurations is fetched.
+3. Press **PING ALL** or **SPEED ALL** to check them and connect to any working one — or turn on **AUTO** and the app will do it for you.
+
+More in [Getting started](https://github.com/lm705/vair/wiki/Начало-работы) in the Wiki.
+
+## Features
+
+* **Many protocols** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC, with TLS and Reality.
+* **Two modes** — system proxy (HTTP/SOCKS) and TUN (all traffic through the tunnel).
+* [**Auto-connect (AUTO)**](https://github.com/lm705/vair/wiki/Авто-подключение) — connects to the fastest working config by itself and switches over when it stops working.
+* **Testing** — latency (ping) and download speed per configuration, in bulk too; results persist between launches.
+* **Flexible routing** — five modes: all traffic through the VPN; everything except the sites of selected countries (🇷🇺 🇨🇳 🇮🇷 🇰🇿); only what's blocked in Russia; only what's blocked in China; only selected sites. Plus your own rules for domains, IPs and apps.
+* **Chains** — connect through several nodes in a row (you → node A → node B → the internet).
+* **DPI bypass** — TLS handshake fragmentation and a browser TLS fingerprint (uTLS).
+* **DNS leak protection** and a kill-switch in TUN mode.
+* **Tabs and sources** — configurations are organised into tabs and pulled from subscriptions, files or a private GitHub repository, with auto-refresh and filters.
+* **Large lists** — up to ~250,000 configurations stay smooth: SQLite storage, instant sorting, search and filtering.
+* **VPN on your phone** — share the proxy over the local network from TUN mode and [control the app from a phone](https://github.com/lm705/pc-vpn-to-phone).
+* **Conveniences** — QR codes, creating configurations by hand, self-update, autostart, dark and light themes, Russian and English interface.
+
+## Documentation
+
+* [**Wiki**](https://github.com/lm705/vair/wiki) — the full manual: settings, modes, routing, chains, testing, FAQ. *(in Russian)*
+* 📱 [**How to use this PC's VPN on your phone**](https://github.com/lm705/pc-vpn-to-phone) — sharing over Wi-Fi and access from anywhere via Tailscale.
 
 ## vless_alive.txt
 
@@ -40,7 +75,9 @@ The user bears full and sole responsibility for compliance with the laws of thei
 
 >## Support
 >
->The "payment" address information is provided for informational purposes only. The listed addresses were obtained from public sources and do not belong to the project author.
+>[DALINK](https://dalink.to/lm705) (open it without a VPN for prices to show in RUB)
+>
+>The "payment" address information is provided for informational purposes only.
 >
 >ERC20:
 >
@@ -60,7 +97,6 @@ The user bears full and sole responsibility for compliance with the laws of thei
 
 ## Repository statistics
 
-![](https://komarev.com/ghpvc/?username=lm705&label=Visitors&color=0e75b6&style=flat)
 <a href="https://www.star-history.com/?repos=lm705%2Fvair&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=lm705/vair&type=date&theme=dark&legend=top-left&sealed_token=s9Mau_7UPLeko_Ss-eqOe8ikw84z-4uCrMQHEW5p80tUkU11etLD94YMXL309vnuSuOVC--xSK3PZffYkDHUv5Wvfv8irHsn2W6D8NgbQJasCtptbCqpnMyCNbceKc9tV5DGkzozcTxHlkooUzf9pJ-2rKVQ5KFeKz-T79cI3bkcUnYlKKyejM5yuXT1" />
