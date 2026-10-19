@@ -51,7 +51,14 @@ func Disconnect() {
 	s := cm.state
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: s})
-	go stopConnection()
+	go func() {
+		stopConnection()
+		// The user said they are done, so the firewall block goes too — after
+		// the tunnel, not before it, so there is no moment where the routes are
+		// back and the block is already gone. A connection that merely died does
+		// NOT come through here; that case is what the block is for.
+		releasePersistentKillSwitch()
+	}()
 }
 
 // ConnSnapshot returns the current connection state for the UI.
@@ -59,13 +66,20 @@ func ConnSnapshot() ConnState {
 	return state.conn.snap()
 }
 
-// Shutdown tears down any active connection (clearing the Windows system proxy /
+// Shutdown tears down any active connection (clearing the system proxy /
 // killing the engine) and reaps stray engine processes. The shell MUST call this
 // on real quit, or a proxy-mode session would leave the system proxy pointing at
 // a dead port and break the user's internet.
 func Shutdown() {
+	// A clean exit is a decision too: leaving the machine blocked because Vair
+	// was closed on purpose would be a trap, not a safety net.
+	releasePersistentKillSwitch()
 	stopConnection()
 	KillOrphanedXray()
+	// Flush + close the optional log file. Without this the last few seconds of
+	// the session die in the bufio buffer on every clean exit — exactly the
+	// lines someone who turned file logging on wants to read afterwards.
+	SetFileLogging(false)
 }
 
 // ExitInfo is the result of CheckExit — the public IP/geo as seen from the far

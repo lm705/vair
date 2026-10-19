@@ -78,8 +78,9 @@ func DeleteFailed(tabID string) int {
 	return len(kept)
 }
 
-// ConnectChain connects the given entries of the ACTIVE tab (top→bottom screen
-// order: entry → exit) as a chain. Returns "" on success or a human-readable
+// ConnectChain connects the given entries of the ACTIVE tab as a chain, in the
+// order given: idxs[0] is the entry hop, idxs[last] is the exit. The caller
+// sends them in the order the user picked them. Returns "" on success or a human-readable
 // rejection ("a chain needs at least 2 configs", mixed-engine reason, …).
 func ConnectChain(idxs []int, mode string) string {
 	var entries []*ConfigEntry
@@ -102,7 +103,7 @@ func ConnectChain(idxs []int, mode string) string {
 	}
 	// Validate engine compatibility up-front so the UI gets a clean rejection
 	// before we tear down any existing connection.
-	if reason := chainEngineReason(nodes); reason != "" {
+	if _, reason := splitChain(nodes); reason != "" {
 		return reason
 	}
 	// User explicitly connected → arm auto-keepalive but mark user-owned so the

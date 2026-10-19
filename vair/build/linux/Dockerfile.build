@@ -1,0 +1,57 @@
+# Reproducible Linux build image for Vair.
+#
+# Wails v3 needs CGO on Linux, so the binary links against the GTK4 and
+# WebKitGTK of whatever machine built it — and against that machine's glibc.
+# That makes the BUILD HOST part of the artifact: build on a newer distro and
+# the package silently stops starting on older ones, with a dynamic-linker error
+# users cannot act on.
+#
+# Ubuntu 24.04 is the floor on purpose. It is the oldest release carrying
+# GTK >= 4.10, which Wails requires for gtk_file_dialog_new; 22.04 ships 4.6.
+# Do not "modernise" this base without checking what glibc symbol version the
+# resulting binary demands.
+#
+# Deliberately not a ready-made cross-compilation image: those pick their own
+# base, which sets a glibc floor we would neither control nor notice changing.
+#
+#   docker build -t vair-build -f build/linux/Dockerfile.build .
+#   docker run --rm -v "$PWD":/src -w /src vair-build wails3 task linux:package
+#
+# Mount the Go module cache to keep rebuilds quick:
+#   -v "$HOME/go/pkg/mod":/root/go/pkg/mod
+FROM ubuntu:24.04
+
+# Pinned, because "latest" here is the whole point of the image. Bumping these
+# is a deliberate act with a rebuild-and-test attached.
+ARG GO_VERSION=1.26.5
+ARG NODE_MAJOR=22
+ARG WAILS_VERSION=v3.0.0-alpha2.109
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/usr/local/go/bin:/root/go/bin:$PATH
+ENV CGO_ENABLED=1
+
+# Build dependencies:
+#   libgtk-4-dev, libwebkitgtk-6.0-dev — what the cgo layer compiles against
+#   pkg-config, build-essential      — how it finds and links them
+#   nfpm needs nothing; wails3 embeds it
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential pkg-config ca-certificates curl git unzip \
+        libgtk-4-dev libwebkitgtk-6.0-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Go from upstream rather than the distro: 24.04 ships an older toolchain than
+# the module requires, and a mismatch here fails late and confusingly.
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+
+# Node for the Vite frontend build.
+RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN go install "github.com/wailsapp/wails/v3/cmd/wails3@${WAILS_VERSION}"
+
+WORKDIR /src
+CMD ["wails3", "task", "linux:package"]

@@ -11,7 +11,7 @@ import (
 // appVersion is the running version. 1.10 kept this const in selfupdate.go;
 // relocated here (remove selfupdate.go's copy when it ports). Must stay a const
 // because subFetchUserAgent (fetch.go) concatenates it at compile time.
-const appVersion = "2.2.0"
+const appVersion = "2.5.0"
 
 // Engine timeouts (relocated from the 1.10 main.go const block; the others there
 // are already defined within the ported engine files).
@@ -48,12 +48,43 @@ func WebPort() int { return webPort }
 // handlers.go); routing forces it through the proxy in only-blocked mode.
 const checkExitHost = "ip-api.com"
 
-// binDir holds the extracted engine binaries (xray/sing-box) + geo data. The
-// shell sets it via SetBinDir after extracting the embedded engines on disk.
+// binDir holds the engine binaries (xray/sing-box) + the geo baselines shipped
+// beside them. The shell sets it via SetBinDir once the engines are on disk.
+//
+// It may be READ-ONLY. On Linux the engines are meant to come from the package
+// (/usr/lib/vair/bin, root-owned) rather than being extracted into the user's
+// home — that is what lets the privileged helper spawn a binary the user cannot
+// replace. So nothing may write here.
 var binDir string
 
-// SetBinDir is called by the shell once the engines are extracted.
+// ruleSetDir is where refreshed rule-sets and downloaded blocklists are WRITTEN.
+// It is always user-writable.
+//
+// These used to share binDir, which held while both meant "%LOCALAPPDATA%\vair\
+// bin". The moment the engines ship as package files the refresher would start
+// writing to a read-only directory — and the failure is silent, because
+// singboxCountryRuleSets skips rule-set files that aren't there by design. The
+// result would be routing quietly losing its country rules with nothing in the
+// log to explain it.
+var ruleSetDir string
+
+// SetBinDir is called by the shell once the engines are located.
 func SetBinDir(path string) { binDir = path }
+
+// SetRuleSetDir points the rule-set refresher at a writable directory. The shell
+// calls it when that differs from binDir; when it doesn't, ruleSetRoot falls
+// back to binDir and behaviour is unchanged.
+func SetRuleSetDir(path string) { ruleSetDir = path }
+
+// ruleSetRoot is the directory rule-set and blocklist files live in — the
+// dedicated writable one when the shell set it, otherwise binDir (Windows,
+// where the two are the same folder, and the tests, which set binDir alone).
+func ruleSetRoot() string {
+	if ruleSetDir != "" {
+		return ruleSetDir
+	}
+	return binDir
+}
 
 // SetEngines records the on-disk paths of the extracted engine binaries so the
 // connect path can spawn them.

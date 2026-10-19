@@ -1,0 +1,28 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Vair
+GenericName=VPN client
+GenericName[ru]=VPN-клиент
+Comment=Connect through VLESS/VMess/Trojan/Shadowsocks servers
+Comment[ru]=Подключение через серверы VLESS/VMess/Trojan/Shadowsocks
+Exec=/usr/bin/vair %u
+Icon=com.vair.app
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;proxy;xray;sing-box;vless;vmess;trojan;shadowsocks;
+Keywords[ru]=впн;прокси;
+StartupNotify=true
+
+# %u above plus this MimeType line are what make `xdg-open vair://…` reach the
+# app: registering the scheme at runtime only rewrites the user's mimeapps.list,
+# which points AT this entry and is useless without it.
+MimeType=x-scheme-handler/vair;
+
+# NOT com.vair.app, deliberately. Wails names its GApplication org.wails.<name>
+# and GTK4 passes that to the compositor as the Wayland app_id; the string is not
+# configurable (see wmClassID in main.go). GNOME matches a window to a desktop
+# entry by that id, so declaring anything else here leaves the window unmatched —
+# measured on GNOME 46: a generic gear in the dash, labelled "org.wails.vair",
+# with no grouping against this entry.
+StartupWMClass=org.wails.vair

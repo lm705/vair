@@ -14,7 +14,7 @@ func GetLogs() []LogLine {
 	src := logs.snapshot()
 	out := make([]LogLine, len(src))
 	for i, l := range src {
-		out[i] = LogLine{T: l.T, Lvl: l.Lvl, Src: l.Src, Msg: l.Msg}
+		out[i] = LogLine(l)
 	}
 	return out
 }

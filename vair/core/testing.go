@@ -664,9 +664,9 @@ func mirrorPingResult(tabID string, e *ConfigEntry) {
 		return
 	}
 	e.mu.Lock()
-	delay, status, errMsg := e.Delay, string(e.PingStatus), e.PingErr
+	delay, status, errMsg, raw := e.Delay, string(e.PingStatus), e.PingErr, e.Raw
 	e.mu.Unlock()
-	store.queuePing(tabID, e.Index, delay, status, errMsg) // batched flush
+	store.queuePing(tabID, e.Index, hashBody(raw), delay, status, errMsg) // batched flush
 }
 func mirrorSpeedResult(tabID string, e *ConfigEntry) {
 	if store == nil {
@@ -675,8 +675,9 @@ func mirrorSpeedResult(tabID string, e *ConfigEntry) {
 	e.mu.Lock()
 	delay, ps, perr := e.Delay, string(e.PingStatus), e.PingErr
 	mbps, ss, serr, live := e.SpeedMBps, string(e.SpeedStatus), e.SpeedErr, e.SpeedLive
+	raw := e.Raw
 	e.mu.Unlock()
-	store.queueSpeed(tabID, e.Index, delay, ps, perr, mbps, ss, serr, live) // batched flush
+	store.queueSpeed(tabID, e.Index, hashBody(raw), delay, ps, perr, mbps, ss, serr, live) // batched flush
 }
 
 // loadTestEntries loads the entries a bulk test should run from the in-memory
@@ -772,6 +773,12 @@ func runPingAll(onlyIndices []int) {
 			}
 			ent.mu.Lock()
 			ent.PingStatus = StatusTestingPing
+			// Drop the PREVIOUS measurement as the re-test starts. Keeping it made
+			// the sort mix stale and fresh numbers while a run was in progress —
+			// rows still holding an old value were ranked as "measured" against
+			// rows that had just been re-measured, which read as random order.
+			ent.Delay = -1
+			ent.PingErr = ""
 			ent.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
 			runPingForEntry(ent, cancelCh)
@@ -862,6 +869,15 @@ func runSpeedAll(onlyIndices []int) {
 			}
 			ent.mu.Lock()
 			ent.PingStatus = StatusTestingPing
+			// Same reason as the ping runner: clear the previous ping AND speed so
+			// a row awaiting its turn can't be ranked by numbers this very run is
+			// about to replace (that's what made the speed sort look random on a
+			// tab whose results were old).
+			ent.Delay = -1
+			ent.PingErr = ""
+			ent.SpeedMBps = 0
+			ent.SpeedLive = 0
+			ent.SpeedErr = ""
 			ent.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
 			runSpeedForEntry(ent, tabID, cancelCh)

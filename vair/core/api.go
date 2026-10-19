@@ -22,6 +22,11 @@ func PreloadSettings() {
 func Init() {
 	clearStaleProxy() // crash recovery: drop a system proxy left set by a dirty exit
 	migrateDataLayout()
+	// The same idea one step further: a firewall block left standing by a crash
+	// means a machine with no way out, and the marker on disk is the only thing
+	// that knows how to undo it. After the data layout is settled, since that is
+	// where the marker lives, and before anything else needs the network.
+	releaseStaleKillSwitch()
 	if s, err := openConfigStore(); err == nil {
 		store = s
 		go s.resultFlusher()

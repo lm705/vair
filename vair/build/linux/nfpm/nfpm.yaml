@@ -1,80 +1,178 @@
-# Feel free to remove those if you don't want/need to use them.
-# Make sure to check the documentation at https://nfpm.goreleaser.com
+# nfpm recipe for the .deb / .rpm / Arch packages. See https://nfpm.goreleaser.com
 #
-# The lines below are called `modelines`. See `:help modeline`
+# ${VERSION} and ${GOARCH} are expanded from the environment, which the
+# generate:* tasks in build/linux/Taskfile.yml set — running nfpm by hand without
+# them produces a package version of "" that dpkg rejects.
 
-name: "vairref.exe"
+name: "vair"
 arch: ${GOARCH}
 platform: "linux"
-version: "0.1.0"
-section: "default"
-priority: "extra"
-maintainer: ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>
-description: "A vairref application"
-vendor: "My Company"
-homepage: "https://wails.io"
-license: "MIT"
+version: "${VERSION}"
 release: "1"
+section: "net"
+priority: "optional"
+# Identity fields mirror build/windows/info.json — the two are the same product
+# metadata expressed for two packaging systems, and a package whose vendor or
+# licence disagrees with the binary's own version resource is a support problem
+# nobody enjoys diagnosing.
+#
+# The maintainer address is GitHub's noreply form on purpose: Debian requires an
+# address here, and a real mailbox in a published package is a permanent
+# spam-harvesting target.
+maintainer: "lm705 <lm705@users.noreply.github.com>"
+description: |
+  VPN client for VLESS/VMess/Trojan/Shadowsocks.
+  Manages subscription tabs, tests configs for latency and speed, and routes
+  traffic through xray-core or sing-box.
+vendor: "lm705"
+homepage: "https://github.com/lm705/vair"
+license: "GPL-3.0"
 
 contents:
-  - src: "./bin/vairref.exe"
-    dst: "/usr/local/bin/vairref.exe"
-  - src: "./build/appicon.png"
-    dst: "/usr/share/icons/hicolor/128x128/apps/vairref.exe.png"
-  - src: "./build/linux/vairref.exe.desktop"
-    dst: "/usr/share/applications/vairref.exe.desktop"
+  - src: "./bin/Vair"
+    dst: "/usr/bin/vair"
+    file_info:
+      mode: 0755
 
-# Default dependencies for the GTK4 + WebKitGTK 6.0 stack (Ubuntu 24.04+ / Debian 13+)
+  # The engines are PACKAGE files, root-owned — deliberately not extracted into
+  # the user's home the way the Windows build does it. The stage-2 privileged
+  # helper runs as root and must only ever execute a binary the unprivileged user
+  # cannot rewrite; a sing-box under $HOME would be a one-line path to root.
+  - src: "./bin/xray"
+    dst: "/usr/lib/vair/bin/xray"
+    file_info:
+      mode: 0755
+  - src: "./bin/sing-box"
+    dst: "/usr/lib/vair/bin/sing-box"
+    file_info:
+      mode: 0755
+
+  # Offline geo baselines. These are seeded into the user's writable rule-set
+  # directory on first run (seedRuleSets in engines_linux.go) rather than read in
+  # place: the refresher rewrites two of them, and this directory is read-only.
+  #
+  # The mode is forced rather than inherited: the source files come from a
+  # download script and land 0664, and a group-writable file owned by root under
+  # /usr/lib is exactly what the stage-2 helper's threat model excludes.
+  - src: "./bin/*.dat"
+    dst: "/usr/lib/vair/rulesets/"
+    file_info:
+      mode: 0644
+  - src: "./bin/*.srs"
+    dst: "/usr/lib/vair/rulesets/"
+    file_info:
+      mode: 0644
+  - src: "./bin/gfw.txt"
+    dst: "/usr/lib/vair/rulesets/gfw.txt"
+    file_info:
+      mode: 0644
+
+  # ── the privileged half ────────────────────────────────────────────
+  # Shipped, but NOT enabled: installing the package must not start a root
+  # service the user never asked for. The GUI runs vair-helper-install through
+  # pkexec when the user first turns TUN mode on, which is also the one moment
+  # they are asked for a password.
+  - src: "./bin/vair-helper"
+    dst: "/usr/lib/vair/vair-helper"
+    file_info:
+      mode: 0755
+  - src: "./bin/vair-helper-install"
+    dst: "/usr/lib/vair/vair-helper-install"
+    file_info:
+      mode: 0755
+  # The unit carries no Group=; the installer drops that in per machine, because
+  # which account may talk to the helper is not something a package can know.
+  - src: "./build/linux/systemd/vair-helper.service"
+    dst: "/usr/lib/systemd/system/vair-helper.service"
+  # Without this policy the password dialog names a binary path and nothing else.
+  - src: "./build/linux/polkit/com.vair.app.helper.policy"
+    dst: "/usr/share/polkit-1/actions/com.vair.app.helper.policy"
+
+  - src: "./build/linux/com.vair.app.desktop"
+    dst: "/usr/share/applications/com.vair.app.desktop"
+
+  # Debian policy expects the licence and copyright statement at this exact path
+  # (rpm and Arch read their own metadata instead, but an extra doc file there is
+  # harmless and keeps one source of truth).
+  - src: "./build/linux/copyright"
+    dst: "/usr/share/doc/vair/copyright"
+
+  # Without this the app does not start on Ubuntu 24.04+ — see the file itself
+  # for the full explanation. deb only: it is Debian/Ubuntu that enable
+  # apparmor_restrict_unprivileged_userns, and Fedora and Arch have no
+  # apparmor_parser to load it with.
+  # config|noreplace so a site's local edits survive an upgrade, as for anything
+  # under /etc.
+  - src: "./build/linux/apparmor/vair"
+    dst: "/etc/apparmor.d/vair"
+    type: config|noreplace
+    packager: deb
+
+  # Icon lookup keys off the DIRECTORY name, so each size goes in its own.
+  # Regenerate with: go run scripts/resize-icon.go
+  - src: "./build/linux/icons/com.vair.app-512.png"
+    dst: "/usr/share/icons/hicolor/512x512/apps/com.vair.app.png"
+  - src: "./build/linux/icons/com.vair.app-256.png"
+    dst: "/usr/share/icons/hicolor/256x256/apps/com.vair.app.png"
+  - src: "./build/linux/icons/com.vair.app-128.png"
+    dst: "/usr/share/icons/hicolor/128x128/apps/com.vair.app.png"
+  - src: "./build/linux/icons/com.vair.app-64.png"
+    dst: "/usr/share/icons/hicolor/64x64/apps/com.vair.app.png"
+  - src: "./build/linux/icons/com.vair.app-32.png"
+    dst: "/usr/share/icons/hicolor/32x32/apps/com.vair.app.png"
+
+# GTK4 + WebKitGTK 6.0 (Ubuntu 24.04+ / Debian 13+). Wails v3 needs GTK >= 4.10
+# for gtk_file_dialog_new, which rules out Ubuntu 22.04 (4.6).
+# xdg-utils provides xdg-open, used for "open data folder" and outbound links.
 depends:
   - libgtk-4-1
   - libwebkitgtk-6.0-4
+  - xdg-utils
 
-# Distribution-specific overrides for different package formats
+# Stock GNOME has no StatusNotifierItem host, so without this extension the tray
+# icon simply never appears. A Recommends (installed by default, removable)
+# rather than a Depends: the app must stay usable on desktops that ship a tray of
+# their own, and on those this package is dead weight.
+recommends:
+  - gnome-shell-extension-appindicator
+
+# Format-specific metadata (NOT overrides — `overrides.<fmt>` only accepts the
+# overridable content/dependency fields, and putting summary there is a parse
+# error).
+rpm:
+  # rpm insists on a one-line Summary; the block description above becomes
+  # %description. Without this, nfpm derives the summary from the first line of
+  # the description, which reads oddly mid-sentence.
+  summary: "VPN client for VLESS/VMess/Trojan/Shadowsocks"
+  group: "Applications/Internet"
+
 overrides:
-  # RPM packages for Fedora / RHEL / AlmaLinux / Rocky Linux
   rpm:
     depends:
       - gtk4
       - webkitgtk6.0
-
-  # Arch Linux packages
+      - xdg-utils
+    recommends:
+      - gnome-shell-extension-appindicator
   archlinux:
     depends:
       - gtk4
       - webkitgtk-6.0
+      - xdg-utils
+    recommends:
+      - libappindicator-gtk3
 
-# scripts section to ensure desktop database is updated after install
 scripts:
   postinstall: "./build/linux/nfpm/scripts/postinstall.sh"
-  # You can also add preremove, postremove if needed
-  # preremove: "./build/linux/nfpm/scripts/preremove.sh"
-  # postremove: "./build/linux/nfpm/scripts/postremove.sh"
+  # The AppArmor profile has to be unloaded BEFORE its file is deleted, which is
+  # why this is preremove and not part of postremove.
+  preremove: "./build/linux/nfpm/scripts/preremove.sh"
+  postremove: "./build/linux/nfpm/scripts/postremove.sh"
 
-# If you build your app with -tags gtk3 (legacy WebKit2GTK 4.1 stack — supported through v3.0.x, removed in v3.1),
-# replace the depends/overrides above with these:
+# If you build with -tags gtk3 (legacy WebKit2GTK 4.1 — supported through v3.0.x,
+# removed in v3.1), swap the dependency sets above for:
 #
-# depends:
-#   - libgtk-3-0
-#   - libwebkit2gtk-4.1-0
+# depends:  [libgtk-3-0, libwebkit2gtk-4.1-0, xdg-utils]
 # overrides:
-#   rpm:
-#     depends:
-#       - gtk3
-#       - webkit2gtk4.1
-#   archlinux:
-#     depends:
-#       - gtk3
-#       - webkit2gtk-4.1
-#
-# replaces:
-#   - foobar
-# provides:
-#   - bar
-# recommends:
-#   - whatever
-# suggests:
-#   - something-else
-# conflicts:
-#   - not-foo
-#   - not-bar
-# changelog: "changelog.yaml"
+#   rpm:       { depends: [gtk3, webkit2gtk4.1, xdg-utils] }
+#   archlinux: { depends: [gtk3, webkit2gtk-4.1, xdg-utils] }

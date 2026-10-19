@@ -14,7 +14,6 @@ export const RU: Record<string, string> = {
     "HTTP proxy port": "Порт HTTP-прокси",
     "SOCKS proxy port": "Порт SOCKS-прокси",
     "Allow LAN access": "Доступ из локальной сети",
-    "Local proxy ports apps connect to. Defaults: HTTP 10819, SOCKS 10818. Allow LAN access lets other devices on your network use the proxy (binds 0.0.0.0 instead of 127.0.0.1) — only on a trusted network; SOCKS keeps its password, HTTP has none. Takes effect on next connection.": "Локальные порты прокси, к которым подключаются приложения. По умолчанию: HTTP 10819, SOCKS 10818. «Доступ из локальной сети» разрешает другим устройствам в твоей сети пользоваться прокси (слушает 0.0.0.0 вместо 127.0.0.1) — только в доверенной сети; SOCKS защищён паролем, HTTP — нет. Применяется при следующем подключении.",
     "Network": "Сеть",
     "Statistics": "Статистика",
     "Security": "Безопасность",
@@ -24,10 +23,8 @@ export const RU: Record<string, string> = {
 
     // Settings — labels / buttons
     "Enable Sources tab": "Включить вкладку «SOURCES»",
-    "Russian sites without VPN": "Российские сайты без VPN",
     "Routing mode": "Режим маршрутизации",
     "All traffic through VPN": "Весь трафик через VPN",
-    "Everything except Russian sites": "Всё, кроме российских сайтов",
     "Only blocked-in-Russia resources": "Только заблокированное в РФ",
     "Only selected sites": "Только выбранные сайты",
     "Everything except selected countries": "Всё, кроме сайтов выбранных стран",
@@ -57,22 +54,17 @@ export const RU: Record<string, string> = {
       "Обычный трафик идёт НАПРЯМУЮ; через VPN — только ресурсы, заблокированные в Китае: по комьюнити-списку GFW (сборка Loyalsoldier, автообновляется) плюс ваши списки ниже.",
     "Whitelist mode: ONLY the domains you list below go through the VPN — everything else stays on the direct connection. With an empty list, nothing is tunnelled. If \"Set system proxy\" is off, the app filter also applies (only apps pointed at the proxy, AND only these domains).":
       "Режим белого списка: через VPN идут ТОЛЬКО перечисленные ниже домены — всё остальное остаётся на прямом соединении. При пустом списке через туннель не идёт ничего. Если «Задавать системный прокси» выключено, добавляется и фильтр по приложениям (только приложения, указавшие прокси, И только эти домены).",
-    "Domains routed THROUGH the VPN. Everything not listed here (or in the URL list below) goes direct. Takes effect on next connection.":
-      "Домены, которые идут ЧЕРЕЗ VPN. Всё, чего нет в этом списке (или в списке по URL ниже), идёт напрямую. Применяется при следующем подключении.",
     "How traffic is split between the VPN and a direct connection. Takes effect on next connection.":
       "Как трафик распределяется между VPN и прямым подключением. Применяется при следующем подключении.",
-    "Custom domains through VPN": "Свои домены через VPN",
-    "e.g. youtube.com, press Enter": "напр. youtube.com, нажмите Enter",
-    "Domains routed THROUGH the VPN in addition to the built-in blocked-list. Takes effect on next connection.":
-      "Домены, которые идут ЧЕРЕЗ VPN в дополнение к встроенному списку блокировок. Применяется при следующем подключении.",
-    "Custom blocklist URL": "Свой список блокировок (URL)",
-    "Optional plain-text domain list (one per line) fetched and routed through the VPN. Auto-updated.":
-      "Необязательный текстовый список доменов (по одному в строке): скачивается и идёт через VPN. Авто-обновляется.",
     "Custom domains without VPN": "Свои домены без VPN",
-    "Apps without VPN (TUN mode only)": "Приложения без VPN (только TUN)",
+    "TUN Apps without VPN": "TUN: приложения без VPN",
     "Browse running processes": "Просмотреть запущенные процессы",
     "Ping concurrency": "Параллельных ping-тестов",
     "Speed concurrency": "Параллельных speed-тестов",
+    "How many candidates auto-connect tests at once — ping when ranking by delay, speed when ranking by speed. Defaults: ping 10, speed 5.":
+      "Сколько кандидатов авто-подключение тестирует одновременно: ping при ранжировании по задержке, speed — при ранжировании по скорости. По умолчанию: ping 10, speed 5.",
+    "These are the same settings as Settings → Testing: changing them here changes them there, and they apply to manual PING ALL / SPEED ALL runs too.":
+      "Это те же настройки, что в «Настройки → Тестирование»: изменение здесь меняет их и там, и они действуют также на ручные PING ALL / SPEED ALL.",
     "Warm-up timeout (ms)": "Таймаут разогрева (мс)",
     "Ping timeout (ms)": "Таймаут ping (мс)",
     "Speed test duration (s)": "Длительность speed-теста (с)",
@@ -96,9 +88,21 @@ export const RU: Record<string, string> = {
     "Fragment interval (ms)": "Интервал фрагментации (мс)",
     "Ranges as \"min-max\" (or a single number). Defaults: length 100-200, interval 10-20. Leave empty to use the defaults.":
       "Диапазоны в виде «min-max» (или одно число). По умолчанию: длина 100-200, интервал 10-20. Оставьте пустым для значений по умолчанию.",
-    "Launch at Windows startup": "Запускать при старте Windows",
-    "Starts Vair automatically when you log in to Windows, minimized to the tray. Off by default.":
-      "Автоматически запускает Vair при входе в Windows, свёрнутым в трей. По умолчанию выключено.",
+    "Launch at system startup": "Запускать при старте системы",
+    "Starts Vair automatically when you log in, minimized to the tray. Off by default.":
+      "Автоматически запускает Vair при входе в систему, свёрнутым в трей. По умолчанию выключено.",
+    "install helper ↗": "установить компонент ↗",
+    "Installs a small system service that creates the tunnel. Asked once.":
+      "Установит небольшую системную службу, которая создаёт туннель. Спросит один раз.",
+    "not available on this system": "недоступно в этой системе",
+    "Open releases": "Открыть релизы",
+    "Download": "Скачать",
+    "This copy was installed from a package — update it through your package manager.":
+      "Эта копия установлена из пакета — обновляйте её через пакетный менеджер.",
+    "This copy runs as an AppImage — download the new one and replace this file.":
+      "Эта копия запущена как AppImage — скачайте новый и замените этот файл.",
+    "Vair cannot open a port in the firewall on this system. If the phone cannot reach the address below, allow it once:":
+      "Vair не может открыть порт в файрволе в этой системе. Если телефон не достучится по адресу ниже, разрешите его один раз:",
     "Handle vair:// links": "Обрабатывать ссылки vair://",
     "Registers the vair:// scheme so clicking a vair://import/… link (e.g. in a browser or Telegram) opens Vair and adds the subscription or config. On by default.":
       "Регистрирует схему vair://, чтобы клик по ссылке vair://import/… (например, в браузере или Telegram) открывал Vair и добавлял подписку или конфиг. По умолчанию включено.",
@@ -138,6 +142,9 @@ export const RU: Record<string, string> = {
       "Введите эти данные в SOCKS5-клиенте. «Сбросить» создаёт новые случайные.",
     "Sources added": "Источников добавлено",
     "Imported": "Импортировано",
+    "Source unavailable": "Источник недоступен",
+    "Retry": "Повторить",
+    "Tab settings": "Настройки вкладки",
     "Copy the connected config": "Скопировать подключённый конфиг",
     "copied": "скопировано",
     "No configs match the filter": "Нет конфигов, подходящих под фильтр",
@@ -164,14 +171,14 @@ export const RU: Record<string, string> = {
     "Raises xray/sing-box log detail (level info) so the Logs panel shows per-connection lines. Takes effect on next connection.":
       "Повышает детализацию логов xray/sing-box (уровень info), чтобы в панели логов были видны строки по каждому соединению. Применяется при следующем подключении.",
     "Log speed/ping tests": "Логировать тесты скорости/пинга",
+    "Save logs to a file": "Сохранять логи в файл",
+    "Mirrors the Logs panel to a file that survives a restart or a crash — the in-app log is memory-only and starts empty every launch. Rotated at 5 MiB, one old copy kept (≈10 MiB max). Off by default: with verbose logs on, the file records which sites you visited, so share it only if you are fine with that.":
+      "Дублирует панель логов в файл, который переживёт перезапуск или сбой — лог в программе хранится только в памяти и при каждом запуске пуст. Ротация на 5 МиБ, хранится одна старая копия (≈ 10 МиБ максимум). По умолчанию выключено: при включённых подробных логах в файл попадает, какие сайты вы открывали — делитесь им только если это вас устраивает.",
     "Logs each ping/speed result plus the full core output during the test (so you can see why a config is unavailable). Off by default — bulk tests can be noisy.":
       "Логирует каждый результат пинга/скорости и полный вывод ядра во время теста (видно, почему конфигурация недоступна). По умолчанию выключено — массовые тесты могут быть шумными.",
     "Logs": "Логи",
     "Copy": "Копировать",
     "Clear": "Очистить",
-    "Auto-scroll": "Автопрокрутка",
-    "No logs yet — connect to a config to see core output.":
-      "Логов пока нет — подключитесь к конфигу, чтобы увидеть вывод ядра.",
     "Settings font size (px)": "Размер текста в настройках (px)",
     "Language": "Язык",
     "Theme": "Тема",
@@ -189,15 +196,9 @@ export const RU: Record<string, string> = {
     "Turn the toggle off to import only the app settings and keep your existing tabs.":
       "Выключите переключатель, чтобы импортировать только настройки приложения, оставив существующие вкладки.",
     "Import tabs and tab settings": "Импортировать вкладки и их настройки",
-    "Replace current tabs and settings with the imported file? This cannot be undone.":
-      "Заменить текущие вкладки и настройки данными из файла? Отменить это действие будет нельзя.",
-    "Replace current app settings with the imported file? Tabs will not be touched.":
-      "Заменить настройки приложения данными из файла? Вкладки затронуты не будут.",
 
     // Placeholders
-    "e.g. vk.com, press Enter": "напр. vk.com, нажмите Enter",
-    "e.g. chrome.exe, press Enter": "напр. chrome.exe, нажмите Enter",
-    "e.g. Russia, press Enter": "напр. Russia, нажмите Enter",
+    "e.g. chrome.exe or firefox, press Enter": "напр. chrome.exe или firefox, нажмите Enter",
 
     // Small annotations
     "(resolves VPN server; plain UDP)": "(резолвит сервер VPN; обычный UDP)",
@@ -209,10 +210,6 @@ export const RU: Record<string, string> = {
       "По заданному интервалу: вкладки с источником/URL подгружают свежий список конфигов; вкладки только со вставленными конфигами (без источника) просто сбрасывают устаревшие результаты ping/скорости, чтобы они были перепроверены.",
 
     // Hints (paragraphs)
-    "Route traffic to Russian domains and IPs directly, bypassing VPN. Takes effect on next connection.":
-      "Трафик к российским доменам и IP идёт напрямую, минуя VPN. Применится при следующем подключении.",
-    "Enter a domain — all its subdomains are included automatically. Takes effect on next connection.":
-      "Введите домен — все его поддомены включаются автоматически. Применится при следующем подключении.",
     "Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).":
       "Имена процессов, которые идут мимо VPN. Работает только в TUN-режиме (системный прокси нельзя исключить пер-приложение).",
     "Takes effect on next connection.": "Применится при следующем подключении.",
@@ -236,14 +233,8 @@ export const RU: Record<string, string> = {
       "FakeIP мгновенно отдаёт псевдо-адрес, а реальное имя резолвится уже внутри туннеля — быстро и без утечек. Отключите, чтобы использовать настоящий DoH через прокси (медленнее, но совместимо с приложениями, у которых свой DNS).",
     "Leave blank for defaults: Quad9 / Yandex / Cloudflare-over-IP. Pick servers that work on your ISP for bootstrap and direct; remote goes through the tunnel so anything reachable from your VPN server works.":
       "Оставьте пустым для значений по умолчанию: Quad9 / Yandex / Cloudflare-over-IP. Для bootstrap и direct выбирайте серверы, которые работают у вашего провайдера; remote идёт через туннель, поэтому подходит всё, что доступно с VPN-сервера.",
-    "Hard-coded answers checked before any DNS server. Useful for pinning the VPN server IP or working around broken DNS. Format: <code>domain ip</code> separated by spaces, one per line.":
-      "Жёсткие ответы, проверяются до любого DNS-сервера. Удобно для прибивания IP VPN-сервера или обхода сломанного DNS. Формат: <code>домен ip</code> через пробел, по одному на строку.",
     "Increase or decrease the text size in the Settings and Tab settings modals only. The main window's typography is unchanged.":
       "Меняет размер текста только в окнах настроек программы и вкладок. Шрифты основного окна не меняются.",
-    "Changes apply immediately when you reopen this dialog.":
-      "Изменения применяются после повторного открытия диалога.",
-    "Reset the lifetime traffic counter to 0? The current session is not affected.":
-      "Сбросить общий счётчик трафика? Текущая сессия не затрагивается.",
 
     // openTabSettings
     "Tab Settings": "Настройки вкладки",
@@ -252,14 +243,10 @@ export const RU: Record<string, string> = {
     "Source URL (read-only)": "URL источника (только чтение)",
     "No source URL.": "Нет URL источника.",
     "Loading…": "Загрузка…",
-    "Failed to load.": "Не удалось загрузить.",
     "copy": "копировать",
     "Show QR": "Показать QR",
     "QR code": "QR-код",
     "QR": "QR",
-    "Scan with a proxy client on your phone.": "Отсканируйте прокси-клиентом на телефоне.",
-    "Scan to open this source URL.": "Отсканируйте, чтобы открыть URL источника.",
-    "Enter a URL first": "Сначала введите URL",
     "Name": "Имя",
     "Source URLs (raw links, base64 subscriptions)": "URL источников (raw-ссылки, base64-подписки)",
     "+ add URL": "+ добавить URL",
@@ -308,7 +295,6 @@ export const RU: Record<string, string> = {
     "Click a process to add it to the Apps without VPN list.": "Кликните по процессу, чтобы добавить его в список «Приложения без VPN».",
     "refresh": "обновить",
     "already added": "уже добавлен",
-    "more, refine filter": "ещё, уточните фильтр",
     "No process list available — only works in the desktop build.": "Список процессов недоступен — работает только в desktop-сборке.",
     "No matches": "Совпадений нет",
 
@@ -358,10 +344,60 @@ export const RU: Record<string, string> = {
     "Switch now": "Переключить сейчас",
     "Search settings…": "Поиск настроек…",
     "Remote access": "Удалённый доступ",
-    "Control from a phone on this network": "Управление с телефона в этой сети",
-    "Runs a small web server on this PC so you can open the same interface in a phone — or another device — browser on the same Wi-Fi. Access is protected by a secret key (in the link/QR below); anyone without it is refused. Turn off when not needed.":
-      "Запускает на этом ПК небольшой веб-сервер, чтобы открыть тот же интерфейс в браузере телефона — или другого устройства — в той же Wi-Fi. Доступ защищён секретным ключом (в ссылке/QR ниже); без него в доступе отказано. Выключайте, когда не нужно.",
+    "Web UI": "Веб-интерфейс",
+    "Works only with this on:": "Работает только при включённой настройке:",
+
+    "Tunnel": "Туннель",
+    "Connection": "Соединение",
+    "DPI bypass": "Обход DPI",
+
+    "Local proxy": "Локальный прокси",
+    "Default 19876. Change it if something else on this machine already listens on that port.": "По умолчанию 19876. Измените, если этот порт на этой машине уже занят.",
+
+    "Proxy kill-switch": "Kill-switch для прокси",
+    "Proxy mode only carries the applications that honour the system proxy — everything else has always gone straight out, connected or not. This blocks that at the firewall while a proxy session is up: what stays open is the engine and loopback, which is the proxy. Needs the same administrator rights TUN mode does, and releases on disconnect.": "Через proxy-режим идут только приложения, которые уважают системный прокси — всё остальное всегда ходило напрямую, подключены вы или нет. Эта настройка перекрывает такой трафик в брандмауэре на время сеанса: открытыми остаются движок и loopback, то есть сам прокси. Нужны те же права администратора, что и для TUN; снимается при отключении.",
+
+    "TUN Keep blocking after the tunnel is gone": "TUN: продолжать блокировать после исчезновения туннеля",
+    "The kill-switch above is enforced by the engine, so it ends when the engine does — a crash, or Vair being closed, returns the machine to its ordinary connection without saying so. This holds the block in the firewall instead: while it is engaged, nothing leaves except through the tunnel. It also covers the switch between two configurations, where the old adapter goes away and the ordinary routes come back for a second.": "Kill-switch выше держит движок, поэтому он заканчивается вместе с движком — падение или закрытие Vair молча возвращает машину на обычное соединение. Эта настройка держит блокировку в брандмауэре: пока она включена, наружу не уходит ничего, кроме как через туннель. Она же закрывает переключение между конфигурациями, где старый адаптер исчезает и на секунду возвращаются обычные маршруты.",
+    "Read this: if Vair is killed while connected, this machine has no internet until you start Vair again (it releases the block at startup) or run in PowerShell as administrator:": "Прочитайте: если Vair будет убит во время подключения, на этой машине не будет интернета, пока вы не запустите Vair снова (при старте он снимает блокировку) или не выполните в PowerShell от администратора:",
+    "Traffic is blocked at the firewall — the server stopped responding": "Трафик заблокирован брандмауэром — сервер перестал отвечать",
+
+    "Watch the connected server": "Присматривать за подключённым сервером",
+    "While connected, checks every few seconds that the server is still answering, and when it stops, closes the connection and sends a desktop notification instead of leaving \"connected\" on screen. Off by default: it ends a connection on the strength of a probe. Does not overlap with AUTO — while AUTO is on it does the watching itself and switches to another server rather than closing; this takes over only when AUTO is off.": "Пока есть подключение, каждые несколько секунд проверяет, отвечает ли сервер, и когда тот замолкает — закрывает соединение и присылает уведомление на рабочий стол, вместо того чтобы оставить на экране «подключено». По умолчанию выключено: соединение закрывается по результату одной проверки. С AUTO не пересекается — когда AUTO включён, он присматривает за узлом сам и переключается на другой сервер, а не закрывает соединение; эта настройка работает только при выключенном AUTO.",
+
+    "Count rule matches": "Считать срабатывания правил",
+    "Shows next to each rule below how many times it has fired, and marks the ones that never have — usually a typo. The engine has to report every routing decision for this, so its log becomes considerably more verbose. Takes effect on next connection.": "Показывает у каждого правила ниже, сколько раз оно сработало, и отмечает те, которые не сработали ни разу — обычно это опечатка. Для этого движок должен сообщать о каждом решении маршрутизации, поэтому его журнал становится заметно подробнее. Вступает в силу при следующем подключении.",
+    "Last match": "Последнее срабатывание",
+    "Never matched — check the spelling": "Ни разу не совпало — проверьте написание",
+    "Not loaded yet — applies on the next connection": "Ещё не применено — вступит в силу при следующем подключении",
+    "Matched inside the engine's own database — not counted here": "Совпадение ищется в собственной базе движка — здесь не считается",
+    "Nothing has been routed yet": "Пока ничего не маршрутизировалось",
+    "just now": "только что",
+    "min ago": "мин назад",
+    "h ago": "ч назад",
+    "d ago": "дн назад",
+
+    "Get a free WARP config": "Получить бесплатный WARP",
+    "Getting WARP…": "Получаю WARP…",
+    "WARP added": "WARP добавлен",
+
+    "Prefer steadier (by measurement history)": "Предпочитать стабильные (по истории замеров)",
+    "Rank on what a server has done over several measurements — its typical delay, charged for how much that delay varies and for probes it failed — instead of on the last measurement alone. A config that answers in 80 ms two tries out of three then ranks below one that answers in 100 ms every time, which is what you want for a call or a page load and not what you want for a leaderboard. Needs a few measurements per config before it changes anything; off by default because it changes which server AUTO picks.":
+      "Ранжировать по тому, как сервер вёл себя за несколько замеров: по типичной задержке со штрафом за её разброс и за неудачные проверки, а не по одному последнему числу. Конфигурация, которая отвечает за 80 мс два раза из трёх, оказывается ниже той, что отвечает за 100 мс всегда, — именно это нужно для звонка или загрузки страницы и не нужно для таблицы рекордов. Начинает работать, когда по конфигурации накопится несколько замеров; по умолчанию выключено, потому что меняет выбор AUTO.",
+
+    "Keep the system proxy set": "Удерживать системный прокси",
+    "While connected, checks every 20 seconds that the system proxy setting still points at Vair and puts it back if something else changed it — another VPN client, a policy refresh, a browser extension. Without this, traffic leaves outside the tunnel while the app still says \"connected\", and nothing tells you. If it is overwritten again and again, Vair stops correcting it and says so in the log rather than fighting the other program. Turn off if something else is meant to own that setting.":
+      "Пока есть подключение, раз в 20 секунд проверяет, что системный прокси всё ещё указывает на Vair, и возвращает настройку, если её изменило что-то другое — другой VPN-клиент, обновление политик, расширение браузера. Без этого трафик уходит мимо туннеля, а программа продолжает показывать «подключено», и узнать об этом неоткуда. Если настройку перебивают снова и снова, Vair перестаёт её возвращать и пишет об этом в лог, вместо того чтобы бороться с другой программой. Выключите, если этой настройкой должно управлять что-то другое.",
+
+    "Show setting descriptions": "Показывать описания настроек",
+    "The explanatory text under each setting, here and in the tab and auto-connect dialogs. Turn it off once the settings are familiar and the dialogs become much shorter.":
+      "Пояснения под каждой настройкой — здесь, а также в настройках вкладки и авто-подключения. Выключите, когда настройки станут привычными: окна станут заметно короче.",
+    "Runs a small web server on this PC so you can open the same interface in a browser on another device — a phone, a tablet, the computer next door. Access is protected by a secret key (in the link/QR below); anyone without it is refused. The connection is plain HTTP, NOT encrypted: everything, including the key, travels the local network in the clear, and whoever can read that traffic can control this program. Use it on a network you trust, and turn it off when you do not need it.":
+      "Запускает на этом ПК небольшой веб-сервер, чтобы открыть тот же интерфейс в браузере другого устройства — телефона, планшета, соседнего компьютера. Доступ защищён секретным ключом (в ссылке/QR ниже); без него в доступе отказано. Соединение идёт по обычному HTTP и НЕ шифруется: всё, включая ключ, передаётся по локальной сети открытым текстом, и тот, кто её слушает, получает управление программой. Пользуйтесь только в сети, которой доверяете, и выключайте, когда не нужно.",
+    "A source over plain http:// can be changed by anyone between you and the server, and what it returns becomes the servers your traffic goes through. Use https:// where the provider offers it.":
+      "Источник по обычному http:// может подменить любой, кто находится между вами и сервером, — а то, что он вернёт, станет серверами, через которые пойдёт ваш трафик. Используйте https://, если провайдер его предлагает.",
     "Copied": "Скопировано",
+    "Could not copy": "Не удалось скопировать",
     "Proxy access": "Доступ к прокси",
     "Localhost only": "Только этот ПК",
     "Custom": "Свой адрес",
@@ -370,9 +406,15 @@ export const RU: Record<string, string> = {
     "The address the local HTTP/SOCKS proxy listens on when connected. Localhost = this PC only. Allow LAN access = other devices on your network can reach it (binds 0.0.0.0). Custom = a specific interface address. Ports: HTTP 10819, SOCKS 10818 by default (above). Beyond localhost, use only on a trusted network — SOCKS keeps its password, HTTP has none. Applies on the next connection.":
       "Адрес, на котором слушает локальный HTTP/SOCKS-прокси при подключении. «Только этот ПК» — доступ лишь с этого компьютера. «Доступ из локальной сети» — прокси доступен другим устройствам в сети (привязка 0.0.0.0). «Свой адрес» — конкретный интерфейс. Порты: по умолчанию HTTP 10819, SOCKS 10818 (выше). За пределами localhost — только в доверенной сети: у SOCKS есть пароль, у HTTP нет. Применяется при следующем подключении.",
     "Set system proxy": "Задавать системный прокси",
-    "When on (default), connecting in proxy mode points the Windows system proxy at Vair, so every app that respects it goes through the VPN. Turn off for a \"non-system\" proxy: Vair only runs the local HTTP/SOCKS proxy on the ports above and changes nothing else — only apps where you explicitly set that proxy go through the VPN, the rest of the system stays direct. Applies immediately, even to a live connection.":
-      "Когда включено (по умолчанию), при подключении в режиме proxy Vair прописывает себя системным прокси Windows — через VPN идут все программы, которые его уважают. Выключите для «несистемного» прокси: Vair просто поднимет локальный HTTP/SOCKS-прокси на портах выше и больше ничего не тронет — через VPN пойдут только приложения, где вы сами укажете этот прокси, остальная система останется на прямом соединении. Применяется сразу, даже к активному подключению.",
-    "Share proxy over LAN in TUN mode": "Раздавать прокси по LAN в TUN-режиме",
+    "When on (default), connecting in proxy mode points the system proxy setting at Vair, so every app that respects it goes through the VPN. Turn off for a \"non-system\" proxy: Vair only runs the local HTTP/SOCKS proxy on the ports above and changes nothing else — only apps where you explicitly set that proxy go through the VPN, the rest of the system stays direct. Applies immediately, even to a live connection.":
+      "Когда включено (по умолчанию), при подключении в режиме proxy Vair прописывает себя системным прокси — через VPN идут все программы, которые его уважают. Выключите для «несистемного» прокси: Vair просто поднимет локальный HTTP/SOCKS-прокси на портах выше и больше ничего не тронет — через VPN пойдут только приложения, где вы сами укажете этот прокси, остальная система останется на прямом соединении. Применяется сразу, даже к активному подключению.",
+    "On this desktop the setting is written to GNOME (gsettings). GNOME apps and browsers set to \"use system proxy settings\" follow it. Terminal tools — curl, git, apt, ssh — read the http_proxy environment variable instead and are NOT covered; point those at the proxy yourself.":
+      "На этом рабочем столе настройка пишется в GNOME (gsettings). Её соблюдают приложения GNOME и браузеры, у которых выбрано «использовать системный прокси». Консольные инструменты — curl, git, apt, ssh — читают переменную окружения http_proxy и НЕ охвачены; их нужно направить на прокси самостоятельно.",
+    "On this desktop the setting is written to KDE (kioslaverc). KDE apps and browsers set to \"use system proxy settings\" follow it. Terminal tools — curl, git, apt, ssh — read the http_proxy environment variable instead and are NOT covered; point those at the proxy yourself.":
+      "На этом рабочем столе настройка пишется в KDE (kioslaverc). Её соблюдают приложения KDE и браузеры, у которых выбрано «использовать системный прокси». Консольные инструменты — curl, git, apt, ssh — читают переменную окружения http_proxy и НЕ охвачены; их нужно направить на прокси самостоятельно.",
+    "This desktop has no system proxy setting Vair can drive, so this switch changes nothing here. Point applications at the local proxy yourself:":
+      "На этом рабочем столе нет системной настройки прокси, которой Vair мог бы управлять, — переключатель здесь ничего не меняет. Направьте приложения на локальный прокси сами:",
+    "TUN Share proxy over LAN": "TUN: раздавать прокси по локальной сети",
     "In TUN mode Vair normally routes only THIS PC through the tunnel. Turn this on to ALSO open the HTTP/SOCKS proxy (above) on the Proxy-access address, so another device (a phone) can route through this PC into the VPN while the PC itself stays fully tunnelled. Set Proxy access to \"Allow LAN access\" (or a custom address) for it to be reachable from other devices, and point the device at the HTTP port. Off by default; applies on the next connection.":
       "В TUN-режиме Vair обычно заворачивает в туннель только сам ПК. Включите это, чтобы ДОПОЛНИТЕЛЬНО открыть HTTP/SOCKS-прокси (выше) на адресе из «Доступ к прокси» — тогда другое устройство (телефон) сможет ходить в интернет через VPN этого ПК, при этом сам ПК остаётся полностью в туннеле. Чтобы прокси был доступен извне, поставьте «Доступ к прокси» в «Доступ из локальной сети» (или свой адрес) и укажите на устройстве HTTP-порт. По умолчанию выключено; применяется при следующем подключении.",
     "Add config…": "Добавить конфиг…",
@@ -409,16 +451,12 @@ export const RU: Record<string, string> = {
     "Save": "Сохранить",
     "Config added": "Конфиг добавлен",
     "Config updated": "Конфиг обновлён",
-    "Server port": "Порт сервера",
+    "Web UI port": "Порт веб-интерфейса",
     "IP address": "IP-адрес",
-    "Default 19876. Change it if that port is taken — e.g. while the 1.10 release is still running on this PC.":
-      "По умолчанию 19876. Смените, если порт занят — например, пока на этом ПК ещё работает версия 1.10.",
     "New key": "Новый ключ",
     "New key generated": "Создан новый ключ",
     "Generate a new key — old links and QR codes stop working":
       "Создать новый ключ — старые ссылки и QR-коды перестанут работать",
-    "Scan the QR from your phone camera. If this address is unreachable, try another IP: ":
-      "Отсканируйте QR камерой телефона. Если адрес недоступен, попробуйте другой IP: ",
     "Reload": "Обновить",
     "Re-fetch the sources of the candidate tabs": "Обновить источники вкладок-кандидатов",
     "Detach": "Отделить",
@@ -426,16 +464,10 @@ export const RU: Record<string, string> = {
     "Back to app": "Вернуться в приложение",
     "Show / hide settings": "Показать / скрыть настройки",
     "Click to connect to this config": "Нажмите, чтобы подключиться к этому конфигу",
-    "Could not connect to that config": "Не удалось подключиться к этому конфигу",
     "Connect as chain": "Подключить цепочкой",
     "chain": "цепочка",
     "chain hop": "узел цепочки",
-    "Select at least 2 configs to chain": "Выберите минимум 2 конфига для цепочки",
-    "Chain failed": "Не удалось подключить цепочку",
     "Rename": "Переименовать",
-    "Rename config": "Переименовать конфиг",
-    "New config name:": "Новое имя конфига:",
-    "Rename failed": "Не удалось переименовать",
     "config": "конфиг",
     "configs": "конфигов",
     "Delete failed ping/speed": "Удалить с ошибкой ping/скорости",
@@ -448,13 +480,9 @@ export const RU: Record<string, string> = {
     "Could not read a QR from that image": "Не удалось прочитать QR из изображения",
     "QR is not a config or subscription": "QR не содержит конфиг или подписку",
     "Added from QR": "Добавлено из QR",
-    "No configs found in the QR": "В QR не найдено конфигов",
-    "Could not import from QR": "Не удалось импортировать из QR",
     "Subscription added to tab sources": "Подписка добавлена в источники вкладки",
     "Subscription already in tab sources": "Подписка уже есть в источниках вкладки",
-    "Could not add subscription": "Не удалось добавить подписку",
     "Scanning screen…": "Сканирование экрана…",
-    "Not supported here": "Недоступно здесь",
     "Delete tab": "Удалить вкладку",
     "OK": "ОК",
     "Cancel": "Отмена",
@@ -466,7 +494,6 @@ export const RU: Record<string, string> = {
       "Подходящих кандидатов пока нет — запустите ping на вкладках-кандидатах.",
     "failed": "сбой",
     "untested": "не проверен",
-    "Enable auto-connect first": "Сначала включите авто-подключение",
     "previous config too slow": "предыдущий конфиг был слишком медленным",
     "previous config stopped responding": "предыдущий конфиг перестал отвечать",
     "slow, but the fastest available": "медленно, но это самый быстрый доступный",

@@ -1,0 +1,36 @@
+# AppArmor profile for Vair. It confines nothing — its only job is to grant the
+# `userns` permission, and it exists because without it the app does not start
+# at all on Ubuntu 24.04+.
+#
+# Those releases ship kernel.apparmor_restrict_unprivileged_userns=1, which
+# denies unprivileged user-namespace creation to any process without a profile
+# naming it. WebKitGTK puts its network and web processes in a bubblewrap
+# sandbox, bwrap fails with "setting up uid map: Permission denied", and
+# WebKitGTK treats a half-built sandbox as fatal:
+#
+#   ERROR: Failed to fully launch dbus-proxy: Child process exited with code 1
+#
+# followed by an immediate abort — a blank crash a few seconds after launch,
+# with nothing on screen to explain it.
+#
+# The alternative fix, WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1, turns the
+# WebKit sandbox off entirely. For an app whose whole job is handling untrusted
+# remote content that is the wrong trade, so we grant the one permission the
+# sandbox needs instead of removing the sandbox.
+#
+# This is byte-for-byte the shape Ubuntu ships for its own WebKitGTK apps —
+# /etc/apparmor.d/epiphany, geary, foliate, devhelp. Deviating from it would be
+# inventing policy where a distro-blessed template already exists.
+#
+# NOTE it matches the PACKAGED path only. A binary run from a build tree is
+# still unconfined and still denied; see the `run` task in build/linux/Taskfile.yml.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile vair /usr/bin/vair flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/vair>
+}

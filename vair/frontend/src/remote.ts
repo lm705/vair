@@ -5,9 +5,15 @@
 // Wails events aren't pushed in the usual way. We detect that and stream events
 // over Server-Sent Events instead.
 
-// IS_REMOTE is true in a plain browser (no WebView2 host bridge), false in the
-// desktop app's WebView2.
-export const IS_REMOTE = !((window as any).chrome && (window as any).chrome.webview)
+// IS_REMOTE is set by the remote server, which stamps every page IT serves with
+// window.__VAIR_REMOTE__. Anything without the stamp is the native window.
+//
+// This used to test for window.chrome.webview — the WebView2 bridge. That object
+// only exists on Windows, so the NATIVE Linux app (WebKitGTK) matched the
+// "remote browser" branch: it hid its own window controls, opened a redundant
+// event stream, and took the browser path everywhere IS_REMOTE is checked.
+// Asking the server is platform-neutral and can't drift with the webview.
+export const IS_REMOTE = (window as any).__VAIR_REMOTE__ === true
 
 // startRemoteEvents pipes Server-Sent Events from /wails/events into the Wails
 // runtime, so every existing Events.On(...) listener fires just as it does in the

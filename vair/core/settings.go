@@ -93,6 +93,34 @@ type AppSettings struct {
 	// Logs panel shows the detailed per-connection lines (like v2rayN). Takes
 	// effect on the next connection.
 	VerboseLogs bool `json:"verbose_logs,omitempty"`
+	// KillSwitchPersistent extends the kill-switch past the tunnel's own life.
+	// The engine's strict_route stops when the engine does; this holds the block
+	// at the firewall, so a crash, a kill or Vair closing does not quietly return
+	// the machine to its unprotected connection. Off by default, and deliberately
+	// separate from KillSwitch: it is the one setting here that can leave a
+	// machine with no way out.
+	KillSwitchPersistent bool `json:"kill_switch_persistent,omitempty"`
+	// ProxyKillSwitch blocks everything that does not go through the proxy.
+	//
+	// Proxy mode has never had a leak story: only applications that honour the
+	// system proxy come through us, and everything else has always gone straight
+	// out. This is the same firewall block the TUN kill-switch uses, with the
+	// tunnel's interface replaced by "the engine and loopback" — so what is left
+	// is the proxy, and nothing else. Off by default, and it needs the same
+	// privileges TUN does, which proxy mode otherwise never asks for.
+	ProxyKillSwitch bool `json:"proxy_kill_switch,omitempty"`
+	// WatchConnection turns on the health check for a connection AUTO is not
+	// managing: the same probe, interval and failure threshold AUTO uses, ending
+	// in "the server stopped responding" and a notification instead of a switch.
+	// Off by default — it drops a connection on the strength of a probe, and that
+	// is a decision to opt into rather than to inherit. Irrelevant while AUTO is
+	// on: AUTO watches the live node itself and moves to another one.
+	WatchConnection bool `json:"watch_connection,omitempty"`
+	// RuleStats, when on, counts how often each line of the user's rule lists
+	// actually fires, so the settings screen can say "never matched" about a rule
+	// that has a typo in it. It costs a debug-level sing-box log — that is where
+	// the engine names the rule it matched — so it is off unless asked for.
+	RuleStats bool `json:"rule_stats,omitempty"`
 	// LogTests, when on, emits a [test] line per ping/speed result into the
 	// Logs panel. Off by default — bulk tests are noisy.
 	LogTests bool `json:"log_tests,omitempty"`
@@ -133,6 +161,13 @@ type AppSettings struct {
 	// apps explicitly pointed at them go through the tunnel ("non-system proxy"
 	// mode). Off by default (the system proxy is set, as always).
 	NoSystemProxy bool `json:"no_system_proxy,omitempty"`
+	// ProxyGuardDisabled turns off the check that the OS proxy still points at
+	// us while connected. Stored as the negative so the guard is on by default:
+	// a hijacked setting sends traffic outside the tunnel while the app still
+	// says "connected", which is the failure the user is least able to notice.
+	// Worth turning off when another program is meant to own the setting.
+	ProxyGuardDisabled bool `json:"proxy_guard_disabled,omitempty"`
+
 	// UI scale and language for the Settings / Tab settings dialogs.
 	// Both apply to those modals only — the main window (tabs, table,
 	// connection bar, title bar) is intentionally not affected, since
@@ -141,6 +176,11 @@ type AppSettings struct {
 	// 11. Language uses BCP-47-ish short codes — "" / "en" / "ru".
 	ModalFontSize int    `json:"modal_font_size,omitempty"`
 	Language      string `json:"language,omitempty"`
+	// HideHints removes the explanatory paragraph under each setting in the
+	// Settings, Tab-settings and auto-connect dialogs. Stored as the negative so
+	// the zero value keeps them — a new user should read what a switch does; it
+	// is the user who already knows who wants the dialogs short.
+	HideHints bool `json:"hide_hints,omitempty"`
 	// Theme is the UI colour scheme: "" / "dark" (default) or "light". Applied
 	// client-side by toggling body.theme-light; the server only stores it.
 	Theme string `json:"theme,omitempty"`
@@ -282,6 +322,12 @@ type AppSettings struct {
 	// speed (SpeedMBps) instead of ascending ping delay. Configs without a
 	// speed result fall back to delay order. Default off.
 	AutoRankBySpeed bool `json:"auto_rank_by_speed,omitempty"`
+	// AutoRankStable ranks candidates on their measured history — typical delay
+	// plus a charge for jitter and for failed probes — instead of on the last
+	// measurement alone. Off by default: it changes which server AUTO picks, and
+	// a change of that kind should be asked for rather than arrive with an
+	// update. Needs a few measurements per server before it does anything.
+	AutoRankStable bool `json:"auto_rank_stable,omitempty"`
 	// LastConnectedMode records the mode ("proxy"/"tun") of the most
 	// recent connection, so AutoMode="" (remember last) can reuse it.
 	LastConnectedMode string `json:"last_connected_mode,omitempty"`
@@ -315,6 +361,12 @@ type AppSettings struct {
 	// no omitempty so an explicit "off" round-trips to disk. Reconciled with the
 	// registry on every settings save (see registerDeepLink).
 	DeepLinkEnabled bool `json:"deep_link_enabled"`
+
+	// LogToFile mirrors the Logs panel to a rotating file in the runtime dir
+	// (buffered, rotated at 5 MiB, one old file kept). OFF by default: the
+	// engines' access lines record which hosts were visited, so this is an
+	// opt-in debugging aid, not a default.
+	LogToFile bool `json:"log_to_file,omitempty"`
 }
 
 const (
@@ -460,8 +512,14 @@ func xrayLogLevel() string {
 
 func singboxLogLevel() string {
 	settingsMu.RLock()
-	v := appSettings.VerboseLogs
+	v, stats := appSettings.VerboseLogs, appSettings.RuleStats
 	settingsMu.RUnlock()
+	// Rule statistics need debug: "router: match[3] domain_suffix=… => route(…)"
+	// is the only line where sing-box names the rule it matched, and it is not
+	// printed at info.
+	if stats {
+		return "debug"
+	}
 	if v {
 		return "info"
 	}
@@ -579,6 +637,16 @@ func RemoteConfig() (enabled bool, token string) {
 // EnsureRemoteToken returns the remote-access token, generating and persisting a
 // fresh random one the first time (so enabling remote access always has a
 // secret to gate on). Idempotent.
+// broadcastSettings tells every window that the settings changed.
+//
+// There is more than one window: the detached AUTO panel is a second copy of
+// the frontend, and it read the settings once, at startup. Switching the
+// language (or the theme, or the hint density) in the main window left it as it
+// was — most visibly the language, which simply stayed as it had been.
+func broadcastSettings(s AppSettings) {
+	state.broadcast(SSEEvent{Type: "settings_update", Payload: s})
+}
+
 func EnsureRemoteToken() string {
 	settingsMu.Lock()
 	if appSettings.RemoteToken == "" {
@@ -661,6 +729,21 @@ func noSystemProxyEnabled() bool {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
 	return appSettings.NoSystemProxy
+}
+
+// persistentKillSwitchEnabled reports whether the firewall-level block is
+// wanted. Meaningless without the kill-switch itself, so it follows it.
+// proxyKillSwitchEnabled reports whether proxy mode should be fenced in.
+func proxyKillSwitchEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.ProxyKillSwitch
+}
+
+func persistentKillSwitchEnabled() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.KillSwitchPersistent && appSettings.KillSwitch && appSettings.DNSLeakProtection
 }
 
 func killSwitchEnabled() bool {
@@ -971,6 +1054,10 @@ func saveSettings() {
 	settingsMu.RLock()
 	data, _ := json.MarshalIndent(appSettings, "", "  ")
 	settingsMu.RUnlock()
-	os.MkdirAll(tabsDir(), 0755)
-	os.WriteFile(settingsFilePath(), data, 0644)
+	os.MkdirAll(tabsDir(), 0o755)
+	// 0600: this file carries the web-interface token and the local proxy
+	// passwords. The Chmod is for the copy an older version already wrote —
+	// WriteFile leaves the mode of an existing file alone.
+	os.WriteFile(settingsFilePath(), data, 0o600) //nolint:errcheck
+	os.Chmod(settingsFilePath(), 0o600)           //nolint:errcheck
 }

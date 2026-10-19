@@ -32,7 +32,7 @@ func replaceAndRelaunch(newExe string) error {
 	pid := os.Getpid()
 	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
 	verb := ""
-	if checkAdmin() {
+	if isPrivileged() {
 		verb = " -Verb RunAs"
 	}
 	// $pid is a reserved PowerShell automatic variable — use $vpid for our PID.

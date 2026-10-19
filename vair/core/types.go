@@ -81,11 +81,16 @@ type ConnState struct {
 	// subscription refreshes connect here and are pinned to the proxy outbound,
 	// so they always go through the tunnel regardless of the routing mode.
 	// Internal — not exposed to the frontend.
-	SrcFetchPort int       `json:"-"`
-	TUNIface     string    `json:"tun_iface,omitempty"`
-	StartedAt    time.Time `json:"started_at"`
-	ErrMsg       string    `json:"error,omitempty"`
-	UptimeSec    int64     `json:"uptime_sec"`
+	SrcFetchPort int    `json:"-"`
+	TUNIface     string `json:"tun_iface,omitempty"`
+	// SystemProxy reports whether the OS proxy setting currently points at this
+	// connection. It is derived, not stored: the UI must not label a session
+	// "system proxy" when the user turned that off, or when this desktop has no
+	// backend to drive and setSystemProxy failed with a warning nobody reads.
+	SystemProxy bool      `json:"system_proxy"`
+	StartedAt   time.Time `json:"started_at"`
+	ErrMsg      string    `json:"error,omitempty"`
+	UptimeSec   int64     `json:"uptime_sec"`
 	// StatsUnavailable is true for the pure-sing-box TUN path (Hysteria2/
 	// TUIC): there's no local SOCKS hop to instrument, so session/lifetime
 	// traffic counters don't move. The UI shows a small note instead.
@@ -109,10 +114,15 @@ type connManager struct {
 	// disconnect, supervisor failover) holds actionMu start-to-finish.
 	// The auto-supervisor takes it via TryLock so a user action always
 	// wins and the supervisor simply skips that tick.
-	actionMu   sync.Mutex
-	mu         sync.Mutex
-	state      ConnState
-	cmd        *exec.Cmd // main process (xray for proxy, sing-box for TUN)
+	actionMu sync.Mutex
+	mu       sync.Mutex
+	state    ConnState
+	cmd      *exec.Cmd // main process (xray for proxy, sing-box for TUN)
+	// tunRemote is set instead of cmd when the TUN engine runs inside the
+	// privileged helper rather than as our own child — the Linux path, where
+	// the app is deliberately unprivileged. Exactly one of the two is non-nil
+	// for a TUN session, and teardown checks this first.
+	tunRemote  tunStopper
 	xrayCmd    *exec.Cmd // secondary xray process (hybrid TUN mode only)
 	cancel     context.CancelFunc
 	xrayCancel context.CancelFunc
@@ -138,6 +148,9 @@ func (cm *connManager) snap() ConnState {
 	if s.Status == ConnConnected && !s.StartedAt.IsZero() {
 		s.UptimeSec = int64(time.Since(s.StartedAt).Seconds())
 	}
+	// Filled here rather than at connect time so it stays true after the live
+	// toggle in settings flips it either way (ReapplySystemProxy).
+	s.SystemProxy = s.Status == ConnConnected && s.Mode == ModeProxy && SystemProxyActive()
 	return s
 }
 
@@ -384,7 +397,7 @@ func saveTabs() {
 	// would drop the user's tabs on the next load). Write a temp file, fsync, then
 	// rename over the target — the rename is atomic on the same filesystem.
 	tmp := tabsFilePath() + ".tmp"
-	if f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644); err == nil {
+	if f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600); err == nil {
 		_, werr := f.Write(data)
 		f.Sync()
 		f.Close()
@@ -396,9 +409,12 @@ func saveTabs() {
 		}
 	}
 	// Fallback (rename unsupported / temp failed): best-effort direct write.
-	if err := os.WriteFile(tabsFilePath(), data, 0644); err != nil {
+	// 0600 for the same reason as settings.json: tab settings carry source
+	// URLs and a GitHub token.
+	if err := os.WriteFile(tabsFilePath(), data, 0o600); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠ saveTabs write: %v\n", err)
 	}
+	os.Chmod(tabsFilePath(), 0o600) //nolint:errcheck — an older version's copy
 }
 
 // loadTabs reads tabs.json into state.tabs. Returns false when the file exists
@@ -510,13 +526,7 @@ func (s *AppState) broadcast(ev SSEEvent) {
 	Events.Emit(ev.Type, ev)
 }
 
-// ─────────────────────────── admin check ─────────────────────────
-
-func checkAdmin() bool {
-	f, err := os.Open(`\\.\PHYSICALDRIVE0`)
-	if err == nil {
-		f.Close()
-		return true
-	}
-	return false
-}
+// The privilege probe used to live here as checkAdmin(), opening
+// \\.\PHYSICALDRIVE0 from a file compiled on every platform — so on Linux it
+// always answered false and TUN mode was unreachable even as root. It is now
+// isPrivileged() in core/caps_{windows,linux}.go, one implementation per OS.

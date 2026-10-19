@@ -16,6 +16,11 @@ type AppInfo struct {
 	SingboxAvailable bool   `json:"singbox_available"`
 	IsAdmin          bool   `json:"is_admin"`
 	OS               string `json:"os"`
+	// Caps is what the UI should gate on. IsAdmin is kept because the existing
+	// conn-bar reads it, but it now means "TUN can start right now" rather than
+	// "the process is elevated" — on Linux the GUI is unprivileged by design, so
+	// the literal question stops being the useful one.
+	Caps Capabilities `json:"caps"`
 }
 
 // GetAppInfo reports engine availability and elevation for the UI.
@@ -23,7 +28,8 @@ func GetAppInfo() AppInfo {
 	state.mu.RLock()
 	sb := state.singboxBin != ""
 	state.mu.RUnlock()
-	return AppInfo{SingboxAvailable: sb, IsAdmin: checkAdmin(), OS: runtime.GOOS}
+	caps := currentCaps()
+	return AppInfo{SingboxAvailable: sb, IsAdmin: caps.TUNReady, OS: runtime.GOOS, Caps: caps}
 }
 
 // PingConnected re-pings the currently connected config regardless of which

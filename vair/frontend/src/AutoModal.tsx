@@ -6,9 +6,10 @@
 // mainVisible), the titlebar ✕ closes just this window.
 import { useEffect, useRef, useState } from 'react'
 import { Events } from '@wailsio/runtime'
-import { AutoService, LogService } from '../bindings/vair'
+import { AutoService, LogService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
 import { IS_REMOTE } from './remote'
+import Select from './Select'
 
 function fmtLogTime(ms: number): string {
   const d = new Date(ms)
@@ -62,6 +63,7 @@ export default function AutoModal({
     localStorage.setItem('auto.logsOpen', logsOpen ? '1' : '0')
   }, [logsOpen])
   const [logLines, setLogLines] = useState<any[]>([])
+  const [impLines, setImpLines] = useState<any[]>([])
   const [logSrc, setLogSrc] = useState('vair') // 1.10 default for the AUTO panel
   const [logLvl, setLogLvl] = useState('')
   const [logAuto, setLogAuto] = useState(true)
@@ -115,13 +117,22 @@ export default function AutoModal({
   // Logs: fetch when expanded, then live-append from the "log" event.
   useEffect(() => {
     logsOpenRef.current = logsOpen
-    if (logsOpen) LogService.Get().then((ls) => setLogLines(ls ?? []))
+    if (logsOpen) {
+      LogService.Get().then((ls) => setLogLines(ls ?? []))
+      // The important lines live in their own, much smaller ring on the backend
+      // too: the main buffer is capped, so an engine flood can push a warning
+      // out of it within seconds while this one still has it minutes later.
+      LogService.GetImportant().then((ls) => setImpLines(ls ?? []))
+    }
   }, [logsOpen])
   useEffect(() => {
     const off = Events.On('log', (e: any) => {
       if (!logsOpenRef.current) return
       const batch = e?.data?.payload
-      if (Array.isArray(batch)) setLogLines((prev) => [...prev, ...batch].slice(-2000))
+      if (!Array.isArray(batch)) return
+      setLogLines((prev) => [...prev, ...batch].slice(-2000))
+      const imp = batch.filter((l: any) => l.lvl !== 'info' || l.src === 'vair' || l.src === 'test')
+      if (imp.length) setImpLines((prev) => [...prev, ...imp].slice(-2000))
     })
     return () => {
       if (typeof off === 'function') off()
@@ -133,15 +144,20 @@ export default function AutoModal({
 
   const logPass = (l: any): boolean => {
     if (logSrc && l.src !== logSrc) return false
-    if (logLvl) {
-      const rank: any = { raw: 1, info: 1, warn: 2, error: 3 }
-      const need: any = { info: 1, warn: 2, error: 3 }
-      if ((rank[l.lvl] || 1) < (need[logLvl] || 0)) return false
-    }
-    return true
+    if (!logLvl) return true // "all"
+    // "important" = everything except the engines' [Info] narration, the same
+    // rule the main log panel uses (and core.isImportant on the other side).
+    if (logLvl === 'important') return l.lvl !== 'info' || l.src === 'vair' || l.src === 'test'
+    // Untagged engine lines rank BELOW info, or "info+" would equal "all".
+    const rank: any = { raw: 0, info: 1, warn: 2, error: 3 }
+    const need: any = { info: 1, warn: 2, error: 3 }
+    return (rank[l.lvl] ?? 0) >= (need[logLvl] ?? 0)
   }
+  // In "important" mode the panel reads the dedicated buffer instead of the
+  // main one, so the lines survive an engine flood.
+  const logBase = () => (logLvl === 'important' ? impLines : logLines)
   const copyLogs = () => {
-    const text = logLines
+    const text = logBase()
       .filter(logPass)
       .map((l) => fmtLogTime(l.t) + ' ' + (l.src || '') + ' ' + l.msg)
       .join('\n')
@@ -344,13 +360,54 @@ export default function AutoModal({
             <div className="modal-hint">
               {tt('Rank candidates by measured download speed (Mbps) instead of ping delay. Configs without a speed result fall back to ping order.')}
             </div>
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('Prefer steadier (by measurement history)')}</span>
+              <Toggle on={!!stg?.auto_rank_stable} onChange={(v) => apply({ auto_rank_stable: v })} />
+            </div>
+            <div className="modal-hint">
+              {tt(
+                'Rank on what a server has done over several measurements — its typical delay, charged for how much that delay varies and for probes it failed — instead of on the last measurement alone. A config that answers in 80 ms two tries out of three then ranks below one that answers in 100 ms every time, which is what you want for a call or a page load and not what you want for a leaderboard. Needs a few measurements per config before it changes anything; off by default because it changes which server AUTO picks.',
+              )}
+            </div>
+            {/* The same two settings as Settings → Testing, deliberately: this is
+                where the user is when they watch auto-connect test a pool, and
+                sending them to another dialog to change how wide it tests is a
+                detour. They write the same keys, so the two dialogs cannot drift
+                — and the hint says so, because a duplicated control that quietly
+                changed something elsewhere would be worse than no control. */}
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('Ping concurrency')}</span>
+              <input
+                className="modal-input num-input"
+                type="number"
+                min={1}
+                max={200}
+                defaultValue={stg?.ping_concurrency || 10}
+                onBlur={(e) => apply({ ping_concurrency: num(e.target.value, 1, 10) })}
+              />
+            </div>
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('Speed concurrency')}</span>
+              <input
+                className="modal-input num-input"
+                type="number"
+                min={1}
+                max={100}
+                defaultValue={stg?.speed_concurrency || 5}
+                onBlur={(e) => apply({ speed_concurrency: num(e.target.value, 1, 5) })}
+              />
+            </div>
+            <div className="modal-hint">
+              {tt('How many candidates auto-connect tests at once — ping when ranking by delay, speed when ranking by speed. Defaults: ping 10, speed 5.')}{' '}
+              <b>{tt('These are the same settings as Settings → Testing: changing them here changes them there, and they apply to manual PING ALL / SPEED ALL runs too.')}</b>
+            </div>
           </div>
           <div className="settings-section">
             <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
               <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
                 {tt('Connection mode')}
               </span>
-              <select
+              <Select
                 className="modal-input"
                 style={{ marginBottom: 0 }}
                 value={stg?.auto_mode || ''}
@@ -359,7 +416,7 @@ export default function AutoModal({
                 <option value="">{tt('Remember last')}</option>
                 <option value="proxy">Proxy</option>
                 <option value="tun">TUN</option>
-              </select>
+              </Select>
             </div>
             <div className="modal-row">
               <span className="modal-row-label">{tt('Health-check interval (s)')}</span>
@@ -414,19 +471,20 @@ export default function AutoModal({
         </div>
         <div className={'auto-collapse-body' + (logsOpen ? '' : ' collapsed')}>
           <div className="auto-log-head">
-            <select className="log-sel" value={logSrc} onChange={(e) => setLogSrc(e.target.value)}>
+            <Select className="log-sel" value={logSrc} onChange={(e) => setLogSrc(e.target.value)}>
               <option value="">all</option>
               <option value="xray">xray</option>
               <option value="singbox">sing-box</option>
               <option value="vair">vair</option>
               <option value="test">test</option>
-            </select>
-            <select className="log-sel" value={logLvl} onChange={(e) => setLogLvl(e.target.value)}>
+            </Select>
+            <Select className="log-sel" value={logLvl} onChange={(e) => setLogLvl(e.target.value)}>
               <option value="">all</option>
+              <option value="important">important</option>
               <option value="info">info+</option>
               <option value="warn">warn+</option>
               <option value="error">error</option>
-            </select>
+            </Select>
             <label className="log-auto">
               <input type="checkbox" checked={logAuto} onChange={(e) => setLogAuto(e.target.checked)} />{' '}
               auto-scroll
@@ -446,7 +504,7 @@ export default function AutoModal({
             </button>
           </div>
           <div className="log-view" id="auto-log-view" ref={logViewRef}>
-            {logLines.filter(logPass).map((l, i) => (
+            {logBase().filter(logPass).map((l, i) => (
               <span key={i} className={'log-line lvl-' + (l.lvl || 'raw')}>
                 <span className="lt">{fmtLogTime(l.t)}</span>
                 <span className={'ls src-' + (l.src || '')}>{l.src === 'singbox' ? 'sing-box' : l.src}</span>

@@ -9,9 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,7 +52,7 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 		cmd.Stdout = io.Discard
 		cmd.Stderr = &stderrBuf
 	}
-	hideProcess(cmd)
+	prepareProc(cmd)
 	if err = cmd.Start(); err != nil {
 		return fmt.Errorf("xray start: %w", err)
 	}
@@ -134,7 +132,7 @@ func withSingbox(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Tran
 		cmd.Stdout = io.Discard
 		cmd.Stderr = &stderrBuf
 	}
-	hideProcess(cmd)
+	prepareProc(cmd)
 	if err = cmd.Start(); err != nil {
 		return fmt.Errorf("sing-box start: %w", err)
 	}
@@ -183,92 +181,10 @@ func withEngine(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Trans
 	return withXray(n, ttl, fn)
 }
 
-// ─────────────────────────── system proxy ────────────────────────
-
-// proxyLockPath marks that WE currently have the Windows system proxy
-// enabled. Written when we set it, removed when we unset it. If it survives
-// to the next startup, the app was killed / the PC shut down without a
-// clean disconnect — see clearStaleProxy.
-func proxyLockPath() string { return runtimePath("proxy.active") }
-
-// appliedProxyPort is the local port the Windows system proxy currently points
-// at, as set by us (0 = not set). It lets setSystemProxy skip the WinINET
-// registry churn when nothing actually changes — the key speedup for switching
-// between configs in proxy mode, where the public port stays the same and only
-// the core underneath swaps. Only touched from the connect/disconnect paths,
-// which are serialised by cm.actionMu (plus clearStaleProxy at startup, before
-// any connection), so it needs no separate lock.
-var appliedProxyPort int
-
-func setSystemProxy(port int) error {
-	if appliedProxyPort == port {
-		// Already pointed here — skip the 3 reg writes + the inetcpl cache flush
-		// (which broadcasts WM_SETTINGCHANGE to every top-level window). This is
-		// what makes a same-port proxy switch feel instant.
-		return nil
-	}
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	bypass := "localhost;127.*;10.*;172.16.*;192.168.*;*.local;<local>"
-	rp := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	for _, c := range [][]string{
-		{"reg", "add", rp, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"},
-		{"reg", "add", rp, "/v", "ProxyServer", "/t", "REG_SZ", "/d", addr, "/f"},
-		{"reg", "add", rp, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", bypass, "/f"},
-	} {
-		if err := runHidden(c[0], c[1:]...).Run(); err != nil {
-			return fmt.Errorf("reg: %w", err)
-		}
-	}
-	// Record that the proxy is ours and active, so a dirty shutdown can be
-	// detected and recovered on next launch.
-	os.MkdirAll(tabsDir(), 0755)                                               //nolint:errcheck
-	os.WriteFile(proxyLockPath(), []byte(addr), 0644)                          //nolint:errcheck
-	runHidden("rundll32.exe", "inetcpl.cpl,ClearMyTracksByProcess", "8").Run() //nolint:errcheck
-	appliedProxyPort = port
-	return nil
-}
-
-func unsetSystemProxy() {
-	// Only undo a proxy WE set (this session, or a stale one from a dirty
-	// shutdown — the lock file). In non-system-proxy mode we never touched
-	// WinINET, and flipping ProxyEnable=0 would clobber the user's own proxy.
-	if appliedProxyPort == 0 {
-		if _, err := os.Stat(proxyLockPath()); err != nil {
-			return
-		}
-	}
-	rp := `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	runHidden("reg", "add", rp, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run() //nolint:errcheck
-	os.Remove(proxyLockPath())                                                                 //nolint:errcheck
-	appliedProxyPort = 0
-}
-
-// ReapplySystemProxy reconciles the Windows system proxy with the NoSystemProxy
-// setting while a proxy-mode connection is live (the toggle applies instantly:
-// off→on unsets it, on→off points it back at the running listener).
-func ReapplySystemProxy() {
-	cs := state.conn.snap()
-	if cs.Status != ConnConnected || cs.Mode != ModeProxy || cs.HTTPPort <= 0 {
-		return
-	}
-	if noSystemProxyEnabled() {
-		unsetSystemProxy()
-	} else if err := setSystemProxy(cs.HTTPPort); err != nil {
-		fmt.Fprintf(os.Stderr, "⚠  setSystemProxy: %v\n", err)
-	}
-}
-
-// clearStaleProxy runs once at startup. If the proxy-lock file from a prior
-// session is still present, the app exited (or the machine powered off)
-// while the Windows system proxy was pointed at a localhost port that no
-// longer has anything listening — which breaks ALL internet until cleared.
-// We restore connectivity by disabling the proxy. A clean disconnect
-// removes the lock, so this is a no-op in the normal case.
-func clearStaleProxy() {
-	if _, err := os.Stat(proxyLockPath()); err == nil {
-		unsetSystemProxy()
-	}
-}
+// The system-proxy implementation moved to core/sysproxy.go and its
+// per-platform backends: Windows drives one WinINET registry switch that
+// nearly everything honours, Linux has no such switch and needs a backend
+// per desktop environment.
 
 // ─────────────────────────── connection manager ──────────────────
 
@@ -352,7 +268,7 @@ func startChain(entries []*ConfigEntry, mode ConnMode) {
 
 // startChainOnTab runs the chain connect sequence (proxy or TUN per mode).
 // Caller MUST hold cm.actionMu. It parses + pre-resolves every hop, validates
-// they're all xray-family (chainEngineReason), then builds a single
+// one engine can carry them all (chainEngine), then builds a single
 // multi-outbound xray config (buildXrayChainConfig) and connects. The
 // representative entry for ConnState is the entry hop (entries[0]); the
 // conn-bar shows the full "A → B" chain.
@@ -391,10 +307,21 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 		e.mu.Unlock()
 	}
 
-	// Single-engine guard: all hops must be xray-family.
-	if reason := chainEngineReason(nodes); reason != "" {
+	// Which engine carries what. One is the common case; two when the chain
+	// mixes hops that only xray gets through (REALITY) with hops only sing-box
+	// can dial at all (WireGuard, Hysteria2, TUIC).
+	segs, reason := splitChain(nodes)
+	if reason != "" {
 		setConnError(cm, entries[0], "chain: "+reason, connTab)
 		return
+	}
+	engine := segs[0].Engine
+	if len(segs) == 1 && engine == "singbox" {
+		// A single sing-box run still prefers xray when xray could carry the lot
+		// — that is where every chain ran before this.
+		if eng, why := chainEngine(nodes); why == "" {
+			engine = eng
+		}
 	}
 
 	// Pre-resolve every hop's server hostname (same reason as the single-node
@@ -412,8 +339,16 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 		cm.state = ConnState{Status: ConnConnecting, Mode: ModeTUN, EntryIndex: entries[0].Index, EntryName: chainName, ConnTab: connTab, ConnRaw: entries[0].Raw, Chain: labels, ChainRaws: raws}
 		cm.mu.Unlock()
 		state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
-		tunIfaceName := fmt.Sprintf("vair-%d", time.Now().Unix()%10000)
-		startTUNConnectionHybrid(cm, entries[0], nodes[0], connTab, tunIfaceName, nodes, labels, raws)
+		tunIface := tunIfaceName()
+		if len(segs) == 2 {
+			setConnError(cm, entries[0], "chain: a chain that needs both engines runs in proxy mode for now — TUN is not wired for it yet", connTab)
+			return
+		}
+		if engine == "singbox" {
+			startTUNChainSingbox(cm, entries[0], nodes, chainName, connTab, tunIface, labels, raws)
+			return
+		}
+		startTUNConnectionHybrid(cm, entries[0], nodes[0], connTab, tunIface, nodes, labels, raws)
 		return
 	}
 
@@ -422,6 +357,17 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 
+	if len(segs) == 2 {
+		startSplitChainProxy(cm, entries[0], segs, chainName, connTab, labels, raws)
+		return
+	}
+	if engine == "singbox" {
+		runSingboxProxyConfig(cm, entries[0], chainName, connTab, labels, raws,
+			func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
+				return buildSingboxChainProxyConfig(nodes, intHTTPPort, intSOCKSPort)
+			})
+		return
+	}
 	runXrayProxyConfig(cm, entries[0], chainName, connTab, labels, raws, func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
 		// Proxy mode = user-facing HTTP+SOCKS → use the configured auth credentials
 		// (empty when the respective setting is off).
@@ -543,8 +489,8 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 	cmd := exec.CommandContext(ctx, state.xrayBin, "run", "-c", tmpPath)
 	// Point xray at the asset dir so external geo files (ext:geosite-ru-blocked.dat
 	// etc.) resolve even if the exe-dir fallback ever changes.
-	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+filepath.Dir(state.xrayBin))
-	hideProcess(cmd)
+	cmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+ruleSetRoot())
+	prepareProc(cmd)
 
 	// xray writes its console log to STDOUT (unlike sing-box, which uses
 	// stderr), so capture both. Stream them into the Logs panel and keep a
@@ -685,6 +631,7 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 		recordLastConnected(entry.Raw, ModeProxy)
 	}
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	engageProxyKillSwitch()
 	startUptimeTicker(cm)
 	startStatsTicker(cm)
 	if len(chain) > 0 {
@@ -701,6 +648,18 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 // The byte counters work here exactly as in the xray path: proxy mode has a
 // real local HTTP/SOCKS hop to instrument (unlike pure-sing-box TUN).
 func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, connTab string) {
+	runSingboxProxyConfig(cm, entry, n.Name, connTab, nil, nil,
+		func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
+			return buildSingboxProxyConfig(n, intHTTPPort, intSOCKSPort)
+		})
+}
+
+// runSingboxProxyConfig is the shared sing-box proxy spawn path: allocate the
+// user-visible and internal ports, build the config with build(), spawn, wait
+// for the port (or an early crash), then finalize. Used by the single-node
+// connect and by a chain whose hops sing-box carries.
+func runSingboxProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab string,
+	chain, chainRaws []string, build func(intHTTPPort, intSOCKSPort int) map[string]interface{}) {
 	httpPort, socksPort := currentProxyPorts()
 	if !portFree(httpPort) {
 		if pf, e := findFreePort(); e == nil {
@@ -723,9 +682,9 @@ func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, c
 		return
 	}
 
-	cfg := buildSingboxProxyConfig(n, intHTTPPort, intSOCKSPort)
+	cfg := build(intHTTPPort, intSOCKSPort)
 	if cfg == nil {
-		setConnError(cm, entry, fmt.Sprintf("sing-box: unsupported protocol %s", n.Kind))
+		setConnError(cm, entry, "sing-box: this configuration cannot be built for sing-box")
 		return
 	}
 	// Pin source fetches to the tunnel (see runXrayProxyConfig for the rationale).
@@ -747,7 +706,7 @@ func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, c
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, state.singboxBin, "run", "-c", tmpPath)
 	cmd.Stdout = io.Discard
-	hideProcess(cmd)
+	prepareProc(cmd)
 	stderrPipe, _ := cmd.StderrPipe()
 	var tailMu sync.Mutex
 	var tail []string
@@ -809,8 +768,8 @@ func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, c
 		}
 	}
 
-	finalizeProxyConnection(cm, entry, n.Name, connTab, cmd, cancel, tmpPath,
-		httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort, nil, nil)
+	finalizeProxyConnection(cm, entry, name, connTab, cmd, cancel, tmpPath,
+		httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort, chain, chainRaws)
 }
 
 // startTUNConnection is the user-facing entry point (called via
@@ -831,24 +790,35 @@ func startTUNConnection(entry *ConfigEntry) {
 // the auto-supervisor via TryLock). See startProxyConnectionOnTab for the
 // rationale behind the explicit connTab parameter.
 func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
-	if !checkAdmin() {
-		setConnError(state.conn, entry, "TUN mode requires administrator/root. Run the program as admin.")
+	// What TUN mode needs before it can start is platform-specific, and the old
+	// check — "are we root?" — is the Windows question. On Linux the app is
+	// deliberately never root; what it needs is a helper it can reach.
+	if reason := tunPreconditionError(); reason != "" {
+		setConnError(state.conn, entry, reason)
 		return
 	}
 	if state.singboxBin == "" {
 		setConnError(state.conn, entry, "sing-box not found. Pass path as 2nd arg: vair xray.exe sing-box.exe")
 		return
 	}
+	// Wait for any ghost sweep still running from the last teardown, so it
+	// cannot remove the adapter this connect is about to create.
+	awaitTUNReap()
 
 	cm := state.conn
 	stopConnectionLocked(cm, false) // TUN: drop any system proxy from a prior proxy session
 
-	// NOTE: no removeTUNAdapter() here anymore. Adapter names are unique per
-	// session (vair-<unixtime>), so a fresh connect never collides with a stale
-	// adapter, and stopConnectionLocked already removed the previous TUN adapter
-	// on teardown. Ghost adapters left by a *crash* are swept once at startup
-	// (see cleanupStaleTUNAdapters). Dropping this saves a full PowerShell launch
-	// (~300–700ms) off every TUN connect.
+	// NOTE: no removeTUNAdapter() here. Adapter names are unique per session
+	// (vair-<unixtime>), so a fresh connect never collides with a stale adapter,
+	// and stopConnectionLocked already removed the previous one on teardown.
+	// Dropping this saves a full PowerShell launch (~300–700ms) off every TUN
+	// connect.
+	//
+	// Ghosts left by a crashed engine are NOT swept at startup, and deliberately
+	// so: the sweep matches vair-* across the whole machine, and another copy of
+	// this program — an older version the user still runs — would lose its live
+	// tunnel to it. They are collected instead by the next ordinary teardown,
+	// which removes every vair-* adapter at once.
 
 	n, err := parseNode(entry.Raw)
 	if err != nil {
@@ -882,7 +852,7 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 	// Unique interface name per session avoids "file already exists".
 	// Even if Windows hasn't fully cleaned the previous adapter kernel-side,
 	// a new name means sing-box never conflicts with the old one.
-	tunIfaceName := fmt.Sprintf("vair-%d", time.Now().Unix()%10000)
+	tunIface := tunIfaceName()
 
 	// Engine branch. TCP-family protocols use the hybrid path (sing-box TUN
 	// front-end → xray outbound). UDP-family (Hysteria2/TUIC) run as a
@@ -890,10 +860,10 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 	// stopConnectionLocked already no-ops on a nil xrayCmd, so teardown
 	// needs no special-casing.
 	if engineForNode(n) == "singbox" {
-		startTUNConnectionSingbox(cm, entry, n, connTab, tunIfaceName)
+		startTUNConnectionSingbox(cm, entry, n, connTab, tunIface)
 		return
 	}
-	startTUNConnectionHybrid(cm, entry, n, connTab, tunIfaceName, nil, nil, nil)
+	startTUNConnectionHybrid(cm, entry, n, connTab, tunIface, nil, nil, nil)
 }
 
 // startTUNConnectionHybrid runs the hybrid TUN path for the TCP-family
@@ -907,7 +877,8 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 // identical — only the xray outbound topology differs — so the rest of the path
 // is unchanged. n is the ENTRY node (used for the host carve-out / QUIC block /
 // ConnState representative); for a single node it's the only node.
-func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIfaceName string, chainNodes []*Node, chainLabels, chainRaws []string) {
+func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIface string, chainNodes []*Node, chainLabels, chainRaws []string) {
+
 	isChain := len(chainNodes) > 1
 	// 1. Start xray as local HTTP+SOCKS proxy
 	xrayHTTPPort, e1 := findFreePort()
@@ -969,11 +940,11 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	}
 	xrayCtx, xrayCancel := context.WithCancel(context.Background())
 	xrayCmd := exec.CommandContext(xrayCtx, state.xrayBin, "run", "-c", xrayTmpPath)
-	xrayCmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+filepath.Dir(state.xrayBin))
+	xrayCmd.Env = append(os.Environ(), "XRAY_LOCATION_ASSET="+ruleSetRoot())
 	// xray logs to stdout (sing-box uses stderr) — capture both into the panel.
 	xrayStdoutPipe, _ := xrayCmd.StdoutPipe()
 	xrayStderrPipe, _ := xrayCmd.StderrPipe()
-	hideProcess(xrayCmd)
+	prepareProc(xrayCmd)
 	if err = xrayCmd.Start(); err != nil {
 		xrayCancel()
 		os.Remove(xrayTmpPath)
@@ -1012,7 +983,20 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	// VLESS with an XTLS flow (xtls-rprx-vision) can't carry QUIC/UDP-443 —
 	// block it so browsers fall back to TCP instead of failing on HTTPS sites.
 	blockQUIC := n.Vless != nil && strings.TrimSpace(n.Vless.Flow) != ""
-	cfg := buildHybridTUNConfig(tunIfaceName, n.Host, xrayHTTPPort, counterSocksPort, blockQUIC)
+	cfg := buildHybridTUNConfig(tunIface, n.Host, xrayHTTPPort, counterSocksPort, blockQUIC)
+
+	// Everything above is unprivileged and stays ours on both platforms: the
+	// xray child, the byte counter, the forwarder. Only the sing-box front-end
+	// needs the tunnel device, so only it goes to the helper.
+	if tunRunsInHelper() {
+		startHybridTUNViaHelper(cm, entry, n, connTab, tunIface, cfg, hybridParts{
+			xrayCmd: xrayCmd, xrayCancel: xrayCancel, xrayTmp: xrayTmpPath,
+			counter: counter, fwdCancel: fwdCancel,
+			isChain: isChain, chainLabels: chainLabels, chainRaws: chainRaws,
+		})
+		return
+	}
+
 	tmpPath, err := writeTempJSON(cfg, "singbox-tun")
 	if err != nil {
 		fwdCancel()
@@ -1033,7 +1017,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	cmd := exec.CommandContext(ctx, state.singboxBin, "run", "-c", tmpPath)
 	stderrPipe, _ := cmd.StderrPipe()
 	cmd.Stdout = io.Discard
-	hideProcess(cmd)
+	prepareProc(cmd)
 
 	if err = cmd.Start(); err != nil {
 		cancel()
@@ -1125,11 +1109,13 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: connName,
-		TUNIface: tunIfaceName, StartedAt: time.Now(),
+		TUNIface: tunIface, StartedAt: time.Now(),
 		Chain: chainLabels, ChainRaws: chainRaws,
 	}
 	cm.mu.Unlock()
-	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig).
+	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig);
+	// the firewall-level one, which outlives the engine, is engaged separately.
+	engagePersistentKillSwitch(tunIface)
 	// last-connected badge → exit hop for a chain, else the single node.
 	if isChain {
 		recordLastConnected(chainRaws[len(chainRaws)-1], ModeTUN)
@@ -1147,12 +1133,35 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 // no local SOCKS hop, so the byte counter cannot be inserted and traffic
 // stats are unavailable for the session (the UI surfaces this). cm.xrayCmd
 // stays nil; stopConnectionLocked already no-ops on a nil xrayCmd.
-func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIfaceName string) {
-	cfg := buildSingboxTUNConfig(n, tunIfaceName)
+func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIface string) {
+	cfg := buildSingboxTUNConfig(n, tunIface)
 	if cfg == nil {
 		setConnError(cm, entry, fmt.Sprintf("sing-box: unsupported protocol %s", n.Kind))
 		return
 	}
+	startTUNSingboxCfg(cm, entry, cfg, n.Name, connTab, tunIface, nil, nil)
+}
+
+// startTUNChainSingbox is the same for a chain sing-box carries — a WireGuard
+// exit behind a proxy hop being the case that needs it.
+func startTUNChainSingbox(cm *connManager, entry *ConfigEntry, nodes []*Node, name, connTab, tunIface string, chain, chainRaws []string) {
+	cfg := buildSingboxChainTUNConfig(nodes, tunIface)
+	if cfg == nil {
+		setConnError(cm, entry, "sing-box: this chain cannot be built")
+		return
+	}
+	startTUNSingboxCfg(cm, entry, cfg, name, connTab, tunIface, chain, chainRaws)
+}
+
+// startTUNSingboxCfg spawns (or hands to the helper) a ready sing-box TUN
+// config. name is what the connection bar shows; chain/chainRaws are set for a
+// multi-hop connection and nil otherwise.
+func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]interface{}, name, connTab, tunIface string, chain, chainRaws []string) {
+	if tunRunsInHelper() {
+		startTUNViaHelper(cm, entry, name, connTab, tunIface, cfg, chain, chainRaws)
+		return
+	}
+
 	tmpPath, err := writeTempJSON(cfg, "singbox-tun")
 	if err != nil {
 		setConnError(cm, entry, "singbox config write: "+err.Error())
@@ -1168,7 +1177,7 @@ func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, con
 	cmd := exec.CommandContext(ctx, state.singboxBin, "run", "-c", tmpPath)
 	stderrPipe, _ := cmd.StderrPipe()
 	cmd.Stdout = io.Discard
-	hideProcess(cmd)
+	prepareProc(cmd)
 
 	if err = cmd.Start(); err != nil {
 		cancel()
@@ -1247,12 +1256,15 @@ func startTUNConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, con
 	cm.fwdCancel = nil
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
-		EntryIndex: entry.Index, EntryName: n.Name,
-		TUNIface: tunIfaceName, StartedAt: time.Now(),
+		EntryIndex: entry.Index, EntryName: name,
+		TUNIface: tunIface, StartedAt: time.Now(),
 		StatsUnavailable: true,
+		Chain:            chain, ChainRaws: chainRaws,
 	}
 	cm.mu.Unlock()
-	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig).
+	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig);
+	// the firewall-level one, which outlives the engine, is engaged separately.
+	engagePersistentKillSwitch(tunIface)
 	recordLastConnected(entry.Raw, ModeTUN)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
@@ -1271,14 +1283,6 @@ func stopConnection() {
 	// batches). Go won't hand that back to the OS for ~5 min on its own, which
 	// is why RSS stayed elevated after disconnect. Force it back now.
 	debug.FreeOSMemory()
-}
-
-// removeTUNAdapter removes the WinTUN/TUN adapter by name so it doesn't linger
-// in the system and doesn't cause "file already exists" on reconnect.
-func removeTUNAdapter() {
-	runHidden("powershell", "-NonInteractive", "-Command",
-		`Get-NetAdapter -Name 'vair-*','xc-tun-*' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:$false`,
-	).Run() //nolint:errcheck
 }
 
 // stopConnectionLocked tears down the live connection. keepProxy=true is passed
@@ -1304,6 +1308,7 @@ func stopConnectionLocked(cm *connManager, keepProxy bool) {
 	mainCmd := cm.cmd
 	mainCancel := cm.cancel
 	mainTmpCfg := cm.tmpCfg
+	tunRemote := cm.tunRemote
 	xrayCmd := cm.xrayCmd
 	xrayCancel := cm.xrayCancel
 	xrayTmpCfg := cm.xrayTmpCfg
@@ -1314,6 +1319,7 @@ func stopConnectionLocked(cm *connManager, keepProxy bool) {
 	cm.cmd = nil
 	cm.cancel = nil
 	cm.tmpCfg = ""
+	cm.tunRemote = nil
 	cm.xrayCmd = nil
 	cm.xrayCancel = nil
 	cm.xrayTmpCfg = ""
@@ -1346,6 +1352,18 @@ func stopConnectionLocked(cm *connManager, keepProxy bool) {
 
 	// === Kill processes WITHOUT holding the lock ===
 
+	// A helper-run tunnel first: it is a request over a socket, not a signal,
+	// and the helper does the teardown we cannot (the interface, the routes,
+	// the nftables rules). Closing the connection alone would also work — the
+	// helper treats a dropped owner as a teardown — but asking lets it report
+	// a problem instead of leaving us to guess.
+	if tunRemote != nil {
+		if err := tunRemote.Stop(); err != nil {
+			vlog("warn", "helper stop: %v", err)
+		}
+		tunRemote.Close()
+	}
+
 	// Cancel contexts first (sends signals)
 	if mainCancel != nil {
 		mainCancel()
@@ -1354,27 +1372,13 @@ func stopConnectionLocked(cm *connManager, keepProxy bool) {
 		xrayCancel()
 	}
 
-	// Kill sing-box and xray in parallel. Go's Process.Kill() on Windows is
-	// soft — it sends WM_CLOSE-like signal and process may try to drain pending
-	// operations before exit (DNS queries with long timeouts, etc).
-	// taskkill /F forces immediate termination.
+	// Kill sing-box and xray in parallel. How a process tree is torn down differs
+	// enough between platforms to live in core/process_{windows,linux}.go: Windows
+	// needs taskkill /F /T because Go's Kill() is soft there, Linux signals the
+	// process group so the xray grandchild goes with its parent.
 	killProc := func(cmd *exec.Cmd, done chan<- struct{}) {
 		defer close(done)
-		if cmd == nil || cmd.Process == nil {
-			return
-		}
-		pid := cmd.Process.Pid
-		// Force-kill immediately in parallel with Go's kill (whoever wins).
-		go runHidden("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run() //nolint:errcheck
-		cmd.Process.Kill()                                                    //nolint:errcheck
-		waitDone := make(chan struct{})
-		go func() { cmd.Wait(); close(waitDone) }() //nolint:errcheck
-		select {
-		case <-waitDone:
-		case <-time.After(1500 * time.Millisecond):
-			// Still running — one more taskkill attempt
-			runHidden("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run() //nolint:errcheck
-		}
+		killTree(cmd)
 	}
 
 	mainDone := make(chan struct{})
@@ -1412,7 +1416,20 @@ func stopConnectionLocked(cm *connManager, keepProxy bool) {
 		}
 	}
 	if wasTUN {
-		removeTUNAdapter()
+		// Off the disconnect path: this is half a second of PowerShell, and the
+		// user is waiting for a button. The engine has already been killed and
+		// wintun removes the adapter when its handle closes, so this is a sweep
+		// for ghosts rather than the teardown itself.
+		//
+		// Serialised with tunReapMu, because the sweep matches vair-* and a new
+		// tunnel would match it too: a connect takes the same lock before it
+		// starts an engine, so the sweep can never run beside a live adapter.
+		go func() {
+			tunReapMu.Lock()
+			defer tunReapMu.Unlock()
+			removeTUNAdapter()
+			tunReapDone++
+		}()
 	}
 
 	// Re-acquire lock to set final state
@@ -1435,6 +1452,41 @@ func setConnError(cm *connManager, entry *ConfigEntry, msg string, tab ...string
 	cm.mu.Unlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	vlog("error", "connect %s: %s", name, msg)
+}
+
+// connectionLost tears down a connection that is up on paper but is not
+// carrying traffic, and leaves the reason where the user will see it.
+//
+// wantMode, when non-empty, restricts this to connections in that mode — the
+// helper's "the engine died" notification is about the TUN session specifically,
+// and must not tear down a proxy connection the user has since started.
+//
+// The teardown, rather than only a warning, is the honest end of the two
+// possibilities. In TUN mode a tunnel that has stopped passing traffic has also
+// taken the machine's networking with it, and removing it is what gives the user
+// their connection back; in proxy mode it is a listener that answers and then
+// fails every request. Either way "connected" was the wrong thing to be showing.
+func connectionLost(reason string, wantMode ConnMode) {
+	cm := state.conn
+	cm.actionMu.Lock()
+	defer cm.actionMu.Unlock()
+
+	cm.mu.Lock()
+	live := cm.state.Status == ConnConnected && (wantMode == "" || cm.state.Mode == wantMode)
+	entryRaw := cm.state.ConnRaw
+	connTab := cm.state.ConnTab
+	cm.mu.Unlock()
+	if !live {
+		return // already torn down, or never up
+	}
+
+	vlog("error", "connection lost: %s", reason)
+	stopConnectionLocked(cm, false)
+	if e, tab, ok := memEntryByRaw(connTab, entryRaw); ok {
+		setConnError(cm, e, reason, tab)
+	} else {
+		state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	}
 }
 
 func startUptimeTicker(cm *connManager) {

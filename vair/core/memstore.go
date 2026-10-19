@@ -126,6 +126,49 @@ type sortKey struct {
 	fav                                     bool
 	name, host, network, security, protocol string // lowercased
 	chip, body                              string
+	// nameSearch is what the FILTER reads: the name plus the ISO code of every
+	// flag emoji in it. Sorting still uses `name`, so spelling the flags out
+	// can't reorder the table. Aliases `name` when there is no flag.
+	nameSearch string
+}
+
+// Regional indicator symbols — a flag emoji is a pair of them, one per letter.
+const (
+	riFirst = 0x1F1E6 // 🇦
+	riLast  = 0x1F1FF // 🇿
+)
+
+// flagCodes returns the lowercase ISO codes of the flag emoji in s, space
+// separated ("🇳🇱 · 🇩🇪" → "nl de"), or "" when there are none. Config names
+// from public lists are often nothing BUT a flag, and a flag carries no
+// searchable text of its own — so without this there is no way to filter for
+// one, since you cannot type 🇳🇱 on a keyboard.
+func flagCodes(s string) string {
+	var b strings.Builder
+	rs := []rune(s)
+	for i := 0; i+1 < len(rs); i++ {
+		a, c := rs[i], rs[i+1]
+		if a >= riFirst && a <= riLast && c >= riFirst && c <= riLast {
+			if b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			b.WriteRune('a' + (a - riFirst))
+			b.WriteRune('a' + (c - riFirst))
+			i++ // the pair is one flag; don't re-read the second half
+		}
+	}
+	return b.String()
+}
+
+// searchableName is the name with its flags spelled out, for the filter only.
+func searchableName(lowerName string) string {
+	fc := flagCodes(lowerName)
+	if fc == "" {
+		return lowerName
+	}
+	// \x00 keeps the code from gluing onto the surrounding text, so a search for
+	// "nl" can't be satisfied by a name ending in "n" next to a 🇱🇸.
+	return lowerName + "\x00" + fc
 }
 
 func memSig(q windowQuery, favorites []string) string {
@@ -221,7 +264,7 @@ func parseFilterTerms(filter string) []filterTerm {
 func termHitKey(k *sortKey, key, val string) bool {
 	switch key {
 	case "name":
-		return strings.Contains(k.name, val)
+		return strings.Contains(k.nameSearch, val)
 	case "host":
 		return strings.Contains(k.host, val)
 	case "type":
@@ -231,7 +274,7 @@ func termHitKey(k *sortKey, key, val string) bool {
 	case "security":
 		return strings.Contains(k.security, val)
 	default: // general — any column
-		return strings.Contains(k.name, val) || strings.Contains(k.host, val) ||
+		return strings.Contains(k.nameSearch, val) || strings.Contains(k.host, val) ||
 			strings.Contains(k.network, val) || strings.Contains(k.security, val) ||
 			strings.Contains(k.protocol, val)
 	}
@@ -308,10 +351,11 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 	}
 	for _, e := range src {
 		e.mu.Lock()
+		nameLower := strings.ToLower(e.Name)
 		k := sortKey{
 			e: e, idx: e.Index, delay: e.Delay, speed: e.SpeedMBps,
 			pStatus: e.PingStatus, sStatus: e.SpeedStatus,
-			name: strings.ToLower(e.Name), host: strings.ToLower(e.Host),
+			name: nameLower, nameSearch: searchableName(nameLower), host: strings.ToLower(e.Host),
 			network: strings.ToLower(e.Network), security: strings.ToLower(e.Security),
 			protocol: strings.ToLower(e.Protocol),
 		}

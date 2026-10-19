@@ -162,7 +162,7 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 	}
 	applySingboxRouteMode(route)
 
-	return map[string]interface{}{
+	cfg := map[string]interface{}{
 		"log":      map[string]interface{}{"level": "warn", "timestamp": true},
 		"dns":      dns,
 		"inbounds": append([]interface{}{tun}, lanProxyInbounds()...),
@@ -172,6 +172,12 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 		},
 		"route": route,
 	}
+	// Last: the platform gets to rewrite what it must (no-op on Windows; on
+	// Linux the interface name, the stack, auto_redirect and the rule-set paths
+	// the privileged helper will accept). Doing it here rather than threading
+	// conditionals through the builder keeps one shape to read.
+	adaptTUNConfig(cfg)
+	return cfg
 }
 
 // buildDNSBlock returns the sing-box "dns" configuration block.
@@ -624,9 +630,20 @@ func minInt(a, b int) int {
 	return b
 }
 
+// writeTempJSON serialises a generated engine config to a private file and
+// returns its path. It lands in volatileDirPath(), NOT the system temp dir:
+// these files carry the proxy credentials, the Reality keys and the real server
+// address, and on Linux os.CreateTemp("") means /tmp — a shared directory where
+// the name is guessable by glob and the file outlives the session. 0600 is set
+// explicitly rather than relying on the umask.
 func writeTempJSON(data interface{}, prefix string) (string, error) {
-	tmp, err := os.CreateTemp("", prefix+"-*.json")
+	tmp, err := os.CreateTemp(volatileDirPath(), prefix+"-*.json")
 	if err != nil {
+		return "", err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
 		return "", err
 	}
 	enc := json.NewEncoder(tmp)

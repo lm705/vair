@@ -27,6 +27,7 @@ const (
 	KindSS        NodeKind = "ss" // includes SS2022 (distinguished by method)
 	KindHysteria2 NodeKind = "hysteria2"
 	KindTUIC      NodeKind = "tuic"
+	KindWireGuard NodeKind = "wireguard"
 )
 
 // Node is the engine-agnostic descriptor of a parsed proxy URL. Exactly one
@@ -48,6 +49,7 @@ type Node struct {
 	SS        *SSParams
 	Hysteria2 *Hysteria2Params
 	TUIC      *TuicParams
+	WireGuard *WireGuardParams
 }
 
 // nodeSchemes lists the URL schemes Vair recognises as proxy node URLs. The
@@ -63,6 +65,8 @@ var nodeSchemes = []string{
 	"hysteria2://",
 	"hy2://",
 	"tuic://",
+	"wireguard://",
+	"wg://",
 }
 
 // looseHostPort parses "host:port" tolerating trailing junk after the port
@@ -219,6 +223,8 @@ func schemeProtocol(raw string) string {
 		return string(KindHysteria2)
 	case strings.HasPrefix(raw, "tuic://"):
 		return string(KindTUIC)
+	case strings.HasPrefix(raw, "wireguard://"), strings.HasPrefix(raw, "wg://"):
+		return string(KindWireGuard)
 	}
 	return ""
 }
@@ -230,6 +236,21 @@ func schemeProtocol(raw string) string {
 func parseNode(raw string) (*Node, error) {
 	raw = strings.TrimSpace(raw)
 	switch {
+	case strings.HasPrefix(raw, "wireguard://"), strings.HasPrefix(raw, "wg://"):
+		p, err := parseWireGuard(raw)
+		if err != nil {
+			return nil, err
+		}
+		return &Node{
+			Kind:      KindWireGuard,
+			Raw:       raw,
+			Name:      p.Name,
+			Host:      p.Host,
+			Port:      p.Port,
+			Network:   "udp",
+			Security:  "wireguard",
+			WireGuard: p,
+		}, nil
 	case strings.HasPrefix(raw, "vless://"):
 		p, err := parseVless(raw)
 		if err != nil {
@@ -1532,9 +1553,13 @@ func xrayRoutingForProxy() map[string]interface{} {
 	// EVERY mode (a proxy rule forces a site through the VPN even in a bypass
 	// mode; a direct rule keeps one out even in proxy_all). Entries may be
 	// domains, IP/CIDR or geosite:/geoip:/full:/regexp: (see classifyRules).
-	rules = append(rules, xrayRules(classifyRules(effectiveBlockRules()), "block")...)
-	rules = append(rules, xrayRules(classifyRules(effectiveDirectDomains()), "direct")...)
-	rules = append(rules, xrayRules(classifyRules(effectiveProxyDomains()), "proxy")...)
+	blockRules, directRules, proxyRules := effectiveBlockRules(), effectiveDirectDomains(), effectiveProxyDomains()
+	// nil apps: xray has no process matching, so an app rule is not in effect
+	// here even when the list is full.
+	armRuleStats(blockRules, directRules, proxyRules, nil)
+	rules = append(rules, xrayRules(classifyRules(blockRules), "block")...)
+	rules = append(rules, xrayRules(classifyRules(directRules), "direct")...)
+	rules = append(rules, xrayRules(classifyRules(proxyRules), "proxy")...)
 
 	switch mode {
 	case "only_blocked":
@@ -1894,7 +1919,7 @@ func xrayOutboundForNode(n *Node) map[string]interface{} {
 // server is dialed through Czech, and Czech is dialed directly. Net path:
 // you → Czech → NL → internet; exit IP = NL.
 //
-// All nodes MUST be xray-family (see chainEngineReason). A nil/empty list or
+// All nodes MUST be xray-family (see chainEngine). A nil/empty list or
 // any non-xray node returns nil.
 func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int, socksUser, socksPass, httpUser, httpPass string) map[string]interface{} {
 	if len(nodes) == 0 {
@@ -1952,25 +1977,128 @@ func buildXrayChainConfig(nodes []*Node, httpPort, socksPort int, socksUser, soc
 	return cfg
 }
 
-// chainEngineReason validates that a set of nodes can form a single-engine
-// chain. Returns "" when the chain is buildable, or a human-readable reason
-// why not (mixed engines, or a non-xray node). Chains are currently xray-only:
-// xray's dialerProxy links TCP-family outbounds (VLESS/VMess/Trojan/SS) in one
-// process. Hysteria2/TUIC run under sing-box and can't be mixed into an xray
-// dialer chain, so they're rejected with a clear message.
-func chainEngineReason(nodes []*Node) string {
+// singboxChainEgress wires a multi-hop chain the way sing-box links hops:
+// through "detour".
+//
+// Same order as everywhere else here — nodes[0] is the ENTRY your machine
+// dials, nodes[last] is the EXIT whose address sites see. sing-box reads it the
+// other way round from xray: an egress with "detour": X reaches its own server
+// through X, so the EXIT carries the detour of the hop before it, and the ENTRY
+// carries none.
+//
+// Returns the outbounds list and the endpoints list, because a WireGuard hop is
+// an endpoint rather than an outbound — which is the whole point of doing this
+// in sing-box. Nil, nil when a node has no sing-box egress.
+func singboxChainEgress(nodes []*Node) ([]interface{}, []interface{}) {
 	if len(nodes) < 2 {
-		return "a chain needs at least 2 configs"
+		return nil, nil
 	}
+	last := len(nodes) - 1
+	tagFor := func(i int) string {
+		if i == last {
+			return "proxy" // the routing rules already name this one
+		}
+		return fmt.Sprintf("hop%d", i)
+	}
+
+	var outs, eps []interface{}
+	for i, n := range nodes {
+		out, ep := singboxOutboundForNode(n), singboxEndpointForNode(n)
+		egress := out
+		if egress == nil {
+			egress = ep
+		}
+		if egress == nil {
+			return nil, nil
+		}
+		egress["tag"] = tagFor(i)
+		if i > 0 {
+			egress["detour"] = tagFor(i - 1)
+		}
+		if out != nil {
+			outs = append(outs, out)
+		} else {
+			eps = append(eps, ep)
+		}
+	}
+	outs = append(outs, map[string]interface{}{"type": "direct", "tag": "direct"})
+	return outs, eps
+}
+
+// buildSingboxChainProxyConfig is buildSingboxProxyConfig for a chain.
+func buildSingboxChainProxyConfig(nodes []*Node, httpPort, socksPort int) map[string]interface{} {
+	outs, eps := singboxChainEgress(nodes)
+	if outs == nil {
+		return nil
+	}
+	route := map[string]interface{}{
+		"auto_detect_interface":   true,
+		"default_domain_resolver": "dns-local",
+		"rules":                   singboxRoutingRules(false),
+	}
+	applySingboxRouteMode(route)
+	return map[string]interface{}{
+		"log": map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
+		"dns": buildDNSBlock(false, false),
+		"inbounds": []interface{}{
+			singboxProxyInbound("http", "http-in", httpPort, proxyHttpCreds),
+			singboxProxyInbound("socks", "socks-in", socksPort, proxySocksCreds),
+		},
+		"outbounds": outs,
+		"endpoints": eps,
+		"route":     route,
+	}
+}
+
+// buildSingboxChainTUNConfig is buildSingboxTUNConfig for a chain: the same TUN
+// front-end, with the chain's egress in place of the single one.
+func buildSingboxChainTUNConfig(nodes []*Node, ifaceName string) map[string]interface{} {
+	if len(nodes) < 2 {
+		return nil
+	}
+	cfg := buildSingboxTUNConfig(nodes[len(nodes)-1], ifaceName)
+	if cfg == nil {
+		return nil
+	}
+	outs, eps := singboxChainEgress(nodes)
+	if outs == nil {
+		return nil
+	}
+	cfg["outbounds"] = outs
+	cfg["endpoints"] = eps
+	return cfg
+}
+
+// chainEngine picks the engine for a chain, or returns why there isn't one.
+//
+// xray stays the default: its dialerProxy chain is what every existing chain
+// runs on, and changing that for the sake of uniformity would be a change in
+// behaviour for people who never asked for one. sing-box is used when a hop
+// only it can carry — a WireGuard hop, which is an interface rather than an
+// outbound and cannot be linked by an xray dialer at all.
+func chainEngine(nodes []*Node) (string, string) {
+	if len(nodes) < 2 {
+		return "", "a chain needs at least 2 configs"
+	}
+	allXray, allSingbox := true, true
 	for _, n := range nodes {
 		if n == nil {
-			return "unparseable config in selection"
+			return "", "unparseable config in selection"
 		}
 		if engineFor(n.Kind) != "xray" {
-			return fmt.Sprintf("%s can't be chained (chains support VLESS/VMess/Trojan/Shadowsocks only)", n.Kind)
+			allXray = false
+		}
+		if singboxOutboundForNode(n) == nil && singboxEndpointForNode(n) == nil {
+			allSingbox = false
 		}
 	}
-	return ""
+	switch {
+	case allXray:
+		return "xray", ""
+	case allSingbox:
+		return "singbox", ""
+	}
+	return "", "these configurations cannot be chained together — one of them is carried by an engine the others are not"
 }
 
 // nodeUnsupportedReason returns a non-empty human-readable reason when the
@@ -2007,7 +2135,7 @@ func nodeUnsupportedReason(n *Node) string {
 // (Hysteria2/TUIC) because xray-core's support there is patchy.
 func engineFor(k NodeKind) string {
 	switch k {
-	case KindHysteria2, KindTUIC:
+	case KindHysteria2, KindTUIC, KindWireGuard:
 		return "singbox"
 	default:
 		return "xray"
@@ -2099,9 +2227,13 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 	// User rules first, at a fixed priority: block → direct → proxy. Applied in
 	// every mode; entries may be domains, IP/CIDR or full:/regexp:/domain:
 	// prefixes (geosite:/geoip: categories are xray-only and skipped here).
-	rules = append(rules, singboxRules(classifyRules(effectiveBlockRules()), "", true)...)
-	rules = append(rules, singboxRules(classifyRules(effectiveDirectDomains()), "direct", false)...)
-	rules = append(rules, singboxRules(classifyRules(effectiveProxyDomains()), "proxy", false)...)
+	blockRules, directRules, proxyRules := effectiveBlockRules(), effectiveDirectDomains(), effectiveProxyDomains()
+	// Remember what went in, so "never matched" can be told apart from "edited
+	// since this connection started, not loaded yet".
+	armRuleStats(blockRules, directRules, proxyRules, directApps)
+	rules = append(rules, singboxRules(classifyRules(blockRules), "", true)...)
+	rules = append(rules, singboxRules(classifyRules(directRules), "direct", false)...)
+	rules = append(rules, singboxRules(classifyRules(proxyRules), "proxy", false)...)
 
 	switch mode {
 	case "only_blocked":
@@ -2399,6 +2531,208 @@ func singboxOutboundShadowsocks(p *SSParams) map[string]interface{} {
 // singboxOutboundForNode dispatches to the per-protocol sing-box outbound
 // builder. Returns nil for any kind sing-box doesn't own — callers gate on
 // engineForNode.
+// singboxEndpointForNode returns the top-level endpoints entry for a protocol
+// that owns an interface rather than dialling out. Nil for everything else, so
+// a caller can ask both questions and use whichever answers.
+func singboxEndpointForNode(n *Node) map[string]interface{} {
+	if n == nil || n.Kind != KindWireGuard {
+		return nil
+	}
+	return singboxEndpointWireGuard(n.WireGuard)
+}
+
+// ── sing-box outbounds for the TCP family ────────────────────────────────────
+//
+// These exist for one reason: a chain that ends in WireGuard has to be carried
+// by one engine, and only sing-box can carry the WireGuard hop. Everything else
+// keeps running on xray, which is where the years of REALITY/xtls behaviour
+// this program depends on already live — so these are the chain path only, not
+// a second implementation of the ordinary connect.
+//
+// Only the transports sing-box actually has. xray's xhttp/splithttp and kcp are
+// not among them, and a node using one produces no outbound here — the chain
+// then reports that no single engine can carry it, which is true and is a
+// better answer than a tunnel that builds and fails.
+
+// singboxCanCarryTLS refuses a REALITY node whose public key we do not have.
+//
+// Without the key there is no REALITY handshake to make, and what would be
+// emitted instead is a plain TLS connection to the camouflage name — which
+// fails verification against the certificate the server fronts, sends the
+// camouflage SNI in the clear, and reads to the user as "the chain connects and
+// nothing works". Refusing here makes the chain say it cannot carry this node.
+func singboxCanCarryTLS(security, publicKey string) bool {
+	return security != "reality" || publicKey != ""
+}
+
+// singboxTLS builds the tls block shared by the TCP-family outbounds.
+func singboxTLS(security, sni, host, alpn, fingerprint, publicKey, shortID string, insecure bool) map[string]interface{} {
+	if security != "tls" && security != "reality" && security != "xtls" {
+		return nil
+	}
+	tls := map[string]interface{}{"enabled": true}
+	if s := firstNonEmpty(sni, host); s != "" {
+		tls["server_name"] = s
+	}
+	if insecure {
+		tls["insecure"] = true
+	}
+	if a := splitALPN(alpn); len(a) > 0 {
+		tls["alpn"] = a
+	}
+	// A fingerprint means uTLS: the ClientHello is shaped like a browser's. That
+	// is the whole point of these configurations, so it is not optional here.
+	if fingerprint != "" {
+		tls["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fingerprint}
+	}
+	if security == "reality" && publicKey != "" {
+		if _, has := tls["utls"]; !has {
+			// REALITY without uTLS is refused by sing-box, and by the servers.
+			tls["utls"] = map[string]interface{}{"enabled": true, "fingerprint": "chrome"}
+		}
+		reality := map[string]interface{}{"enabled": true, "public_key": publicKey}
+		if shortID != "" {
+			reality["short_id"] = shortID
+		}
+		tls["reality"] = reality
+	}
+	return tls
+}
+
+// singboxTransport maps our network field to sing-box's transport block. Nil
+// for plain TCP (which sing-box expresses by having no transport at all), and
+// nil with ok=false for a transport sing-box does not implement.
+func singboxTransport(network, path, host2, serviceName string) (map[string]interface{}, bool) {
+	switch network {
+	case "", "tcp", "raw":
+		return nil, true
+	case "ws":
+		t := map[string]interface{}{"type": "ws"}
+		if path != "" {
+			t["path"] = path
+		}
+		if host2 != "" {
+			t["headers"] = map[string]interface{}{"Host": host2}
+		}
+		return t, true
+	case "grpc":
+		t := map[string]interface{}{"type": "grpc"}
+		if serviceName != "" {
+			t["service_name"] = serviceName
+		}
+		return t, true
+	case "http", "h2":
+		t := map[string]interface{}{"type": "http"}
+		if path != "" {
+			t["path"] = path
+		}
+		if host2 != "" {
+			t["host"] = []string{host2}
+		}
+		return t, true
+	case "httpupgrade":
+		t := map[string]interface{}{"type": "httpupgrade"}
+		if path != "" {
+			t["path"] = path
+		}
+		if host2 != "" {
+			t["host"] = host2
+		}
+		return t, true
+	}
+	return nil, false // xhttp, splithttp, kcp — xray's, not sing-box's
+}
+
+func singboxOutboundVless(p *VlessParams) map[string]interface{} {
+	if p == nil {
+		return nil
+	}
+	tr, ok := singboxTransport(p.Network, p.Path, p.Host2, p.ServiceName)
+	if !ok {
+		return nil
+	}
+	if !singboxCanCarryTLS(p.Security, p.PublicKey) {
+		return nil
+	}
+	out := map[string]interface{}{
+		"type":        "vless",
+		"tag":         "proxy",
+		"server":      p.Host,
+		"server_port": p.Port,
+		"uuid":        p.UUID,
+	}
+	if p.Flow != "" {
+		out["flow"] = p.Flow
+	}
+	if tls := singboxTLS(p.Security, p.SNI, p.Host, p.ALPN, p.Fingerprint, p.PublicKey, p.ShortID, p.AllowInsecure); tls != nil {
+		out["tls"] = tls
+	}
+	if tr != nil {
+		out["transport"] = tr
+	}
+	return out
+}
+
+func singboxOutboundTrojan(p *TrojanParams) map[string]interface{} {
+	if p == nil {
+		return nil
+	}
+	tr, ok := singboxTransport(p.Network, p.Path, p.Host2, p.ServiceName)
+	if !ok {
+		return nil
+	}
+	if !singboxCanCarryTLS(p.Security, p.PublicKey) {
+		return nil
+	}
+	out := map[string]interface{}{
+		"type":        "trojan",
+		"tag":         "proxy",
+		"server":      p.Host,
+		"server_port": p.Port,
+		"password":    p.Password,
+	}
+	// Trojan is TLS by definition; a link that says nothing still means TLS.
+	sec := p.Security
+	if sec == "" || sec == "none" {
+		sec = "tls"
+	}
+	if tls := singboxTLS(sec, p.SNI, p.Host, p.ALPN, p.Fingerprint, p.PublicKey, p.ShortID, p.AllowInsecure); tls != nil {
+		out["tls"] = tls
+	}
+	if tr != nil {
+		out["transport"] = tr
+	}
+	return out
+}
+
+func singboxOutboundVmess(p *VmessParams) map[string]interface{} {
+	if p == nil {
+		return nil
+	}
+	tr, ok := singboxTransport(p.Network, p.Path, p.Host2, p.ServiceName)
+	if !ok {
+		return nil
+	}
+	out := map[string]interface{}{
+		"type":        "vmess",
+		"tag":         "proxy",
+		"server":      p.Host,
+		"server_port": p.Port,
+		"uuid":        p.UUID,
+		"alter_id":    p.AlterID,
+	}
+	if p.Scy != "" {
+		out["security"] = p.Scy
+	}
+	if tls := singboxTLS(p.Security, p.SNI, p.Host, p.ALPN, p.Fingerprint, "", "", false); tls != nil {
+		out["tls"] = tls
+	}
+	if tr != nil {
+		out["transport"] = tr
+	}
+	return out
+}
+
 func singboxOutboundForNode(n *Node) map[string]interface{} {
 	if n == nil {
 		return nil
@@ -2410,6 +2744,12 @@ func singboxOutboundForNode(n *Node) map[string]interface{} {
 		return singboxOutboundTUIC(n.TUIC)
 	case KindSS:
 		return singboxOutboundShadowsocks(n.SS)
+	case KindVLESS:
+		return singboxOutboundVless(n.Vless)
+	case KindTrojan:
+		return singboxOutboundTrojan(n.Trojan)
+	case KindVMess:
+		return singboxOutboundVmess(n.Vmess)
 	}
 	return nil
 }
@@ -2429,6 +2769,30 @@ func engineForNode(n *Node) string {
 	return engineFor(n.Kind)
 }
 
+// singboxEgress is the outbounds list: the protocol's own outbound when it has
+// one, and always a direct outbound for the traffic routing sends around the
+// tunnel.
+func singboxEgress(out map[string]interface{}) []interface{} {
+	list := []interface{}{}
+	if out != nil {
+		list = append(list, out)
+	}
+	return append(list, map[string]interface{}{"type": "direct", "tag": "direct"})
+}
+
+// singboxEndpoints is the endpoints list, omitted entirely when the protocol
+// does not use one.
+//
+// Nil rather than an empty slice on purpose: an "endpoints": [] in the document
+// is a key the config validator in the privileged helper would have to accept
+// for every configuration rather than only for the ones that need it.
+func singboxEndpoints(ep map[string]interface{}) []interface{} {
+	if ep == nil {
+		return nil
+	}
+	return []interface{}{ep}
+}
+
 // buildSingboxTestConfig builds a minimal sing-box config for ping/speed
 // probing: one HTTP inbound on httpPort, one proxy outbound for the node,
 // plus a direct outbound, no routing. This is the sing-box analogue of the
@@ -2438,8 +2802,8 @@ func buildSingboxTestConfig(n *Node, httpPort int) map[string]interface{} {
 	if n == nil {
 		return nil
 	}
-	out := singboxOutboundForNode(n)
-	if out == nil {
+	out, ep := singboxOutboundForNode(n), singboxEndpointForNode(n)
+	if out == nil && ep == nil {
 		return nil
 	}
 	return map[string]interface{}{
@@ -2452,10 +2816,8 @@ func buildSingboxTestConfig(n *Node, httpPort int) map[string]interface{} {
 				"listen_port": httpPort,
 			},
 		},
-		"outbounds": []interface{}{
-			out,
-			map[string]interface{}{"type": "direct", "tag": "direct"},
-		},
+		"outbounds": singboxEgress(out),
+		"endpoints": singboxEndpoints(ep),
 	}
 }
 
@@ -2487,8 +2849,8 @@ func buildSingboxProxyConfig(n *Node, httpPort, socksPort int) map[string]interf
 	if n == nil {
 		return nil
 	}
-	out := singboxOutboundForNode(n)
-	if out == nil {
+	out, ep := singboxOutboundForNode(n), singboxEndpointForNode(n)
+	if out == nil && ep == nil {
 		return nil
 	}
 
@@ -2506,11 +2868,9 @@ func buildSingboxProxyConfig(n *Node, httpPort, socksPort int) map[string]interf
 			singboxProxyInbound("http", "http-in", httpPort, proxyHttpCreds),
 			singboxProxyInbound("socks", "socks-in", socksPort, proxySocksCreds),
 		},
-		"outbounds": []interface{}{
-			out,
-			map[string]interface{}{"type": "direct", "tag": "direct"},
-		},
-		"route": route,
+		"outbounds": singboxEgress(out),
+		"endpoints": singboxEndpoints(ep),
+		"route":     route,
 	}
 }
 
@@ -2531,8 +2891,8 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 	if n == nil {
 		return nil
 	}
-	out := singboxOutboundForNode(n)
-	if out == nil {
+	out, ep := singboxOutboundForNode(n), singboxEndpointForNode(n)
+	if out == nil && ep == nil {
 		return nil
 	}
 	leakProtect := dnsLeakProtectionEnabled()
@@ -2561,14 +2921,14 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 	}
 	applySingboxRouteMode(route)
 
-	return map[string]interface{}{
-		"log":      map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
-		"dns":      buildDNSBlock(leakProtect, useFakeIP),
-		"inbounds": append([]interface{}{tun}, lanProxyInbounds()...),
-		"outbounds": []interface{}{
-			out,
-			map[string]interface{}{"type": "direct", "tag": "direct"},
-		},
-		"route": route,
+	cfg := map[string]interface{}{
+		"log":       map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
+		"dns":       buildDNSBlock(leakProtect, useFakeIP),
+		"inbounds":  append([]interface{}{tun}, lanProxyInbounds()...),
+		"outbounds": singboxEgress(out),
+		"endpoints": singboxEndpoints(ep),
+		"route":     route,
 	}
+	adaptTUNConfig(cfg) // see the hybrid builder
+	return cfg
 }

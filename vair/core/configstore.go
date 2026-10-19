@@ -58,7 +58,7 @@ func configDBPath() string { return dataPath("configs.db") }
 // the full body text (which nearly duplicated raw). The dedup-"hide" view filter
 // compares hashes. Indexing an 8-byte integer instead of a ~200-byte string cuts
 // the largest index — and the column — by ~20×.
-const configSchema = `
+const configSchema = nodeStatsSchema + `
 CREATE TABLE IF NOT EXISTS configs (
 	id          INTEGER PRIMARY KEY,
 	tab_id      TEXT    NOT NULL,
@@ -183,6 +183,10 @@ func openConfigStore() (*configStore, error) {
 	// incremental DB just keeps its ptr map — we simply never actively vacuum it.
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
+	// Read the measurement history into memory once. Ranking consults it for
+	// every candidate in the pool, and a query per candidate would turn one
+	// decision into thousands of round trips.
+	loadNodeStats(db)
 	return &configStore{db: db}, nil
 }
 
@@ -598,18 +602,23 @@ func (s *configStore) deleteAll() error {
 // queuePing / queueSpeed buffer a test result for the next batched flush instead
 // of writing it immediately (a bulk test produces ~200k of these — one
 // transaction each would be far too many fsyncs in DELETE journal mode).
-func (s *configStore) queuePing(tabID string, idx int, delay int64, status, errMsg string) {
+func (s *configStore) queuePing(tabID string, idx int, hash int64, delay int64, status, errMsg string) {
 	if s == nil {
 		return
 	}
+	// Fold it into the server's history here rather than at flush time: the
+	// flush runs on a timer and may coalesce, and every measurement counts
+	// towards the mean exactly once.
+	recordPingStat(hash, delay, status == string(StatusOK))
 	s.resMu.Lock()
 	s.resBuf = append(s.resBuf, resultUpdate{tabID: tabID, idx: idx, hasPing: true, delay: delay, pStatus: status, pErr: errMsg})
 	s.resMu.Unlock()
 }
-func (s *configStore) queueSpeed(tabID string, idx int, delay int64, pStatus, pErr string, mbps float64, sStatus, sErr string, live float64) {
+func (s *configStore) queueSpeed(tabID string, idx int, hash int64, delay int64, pStatus, pErr string, mbps float64, sStatus, sErr string, live float64) {
 	if s == nil {
 		return
 	}
+	recordPingStat(hash, delay, pStatus == string(StatusOK))
 	s.resMu.Lock()
 	s.resBuf = append(s.resBuf, resultUpdate{tabID: tabID, idx: idx,
 		hasPing: true, delay: delay, pStatus: pStatus, pErr: pErr,
@@ -661,6 +670,10 @@ func (s *configStore) flushResults() {
 	pingStmt.Close()
 	speedStmt.Close()
 	tx.Commit()
+
+	// Same cadence, separate transaction: a failure to persist the history must
+	// never cost the test results, which are what the user is looking at.
+	flushNodeStats(s.db)
 }
 
 // resultFlusher periodically flushes buffered test results. Started once in

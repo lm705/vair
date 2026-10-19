@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+
+<!--
+  The description below is the entire text a user sees in the password prompt.
+  Without this file polkit falls back to naming the binary, so the dialog reads
+  "Authentication is required to run /usr/lib/vair/vair-helper-install" — which
+  tells someone being asked for their password nothing about what they are
+  agreeing to.
+
+  auth_admin_keep rather than auth_admin: the install does several privileged
+  steps in a row, and one prompt for the operation is what "install once" means.
+-->
+<policyconfig>
+  <vendor>Vair</vendor>
+  <vendor_url>https://github.com/lm705/vair</vendor_url>
+
+  <action id="com.vair.app.helper.install">
+    <description>Install the Vair VPN helper service</description>
+    <description xml:lang="ru">Установить служебный компонент Vair для VPN</description>
+    <message>Vair needs to install a system service so VPN (TUN) mode can create a tunnel. The app itself keeps running without administrator rights.</message>
+    <message xml:lang="ru">Vair устанавливает системную службу, чтобы режим VPN (TUN) мог создать туннель. Само приложение при этом продолжает работать без прав администратора.</message>
+    <icon_name>com.vair.app</icon_name>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/vair/vair-helper-install</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

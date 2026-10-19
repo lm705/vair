@@ -13,6 +13,12 @@
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
+  /* Tells the engine which palette its OWN widgets should use: the popup a
+     <select> drops down, form-control chrome, the default scrollbars. Without
+     it the engine assumes light and renders a white list over a black app —
+     visible on Linux, where that popup is drawn by the toolkit against the
+     desktop theme rather than by our CSS. Overridden in the light theme below. */
+  color-scheme:dark;
   --bg:#0c0c0c;--bg2:#111;--bg3:#181818;--bg4:#1e1e1e;
   --border:#222;--border2:#2a2a2a;
   --text:#c8c8c8;--dim:#4a4a4a;--dim2:#303030;
@@ -34,6 +40,7 @@
    every component reads them through var(), so the whole UI re-tints. Chosen
    for comfortable contrast on a light background (dark text on near-white). */
 body.theme-light{
+  color-scheme:light;
   --bg:#f4f4f5;--bg2:#ffffff;--bg3:#ececef;--bg4:#e2e2e6;
   --border:#d4d4d8;--border2:#c4c4c8;
   --text:#1d1d20;--dim:#8a8a90;--dim2:#c8c8cc;
@@ -224,6 +231,9 @@ header{
   transition:all .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em;
   display:inline-flex;align-items:center;gap:3px;
 }
+/* A long press on these opens their context menu (the touch stand-in for
+   right-click), so iOS must not answer the same gesture with its own callout. */
+.tab-btn,.tab-dd-trigger,#tb tr{-webkit-touch-callout:none}
 .tab-btn:hover{color:var(--text);border-color:var(--dim)}
 .tab-btn.active{color:var(--accent);border-color:var(--accent)}
 .tab-add{
@@ -298,10 +308,12 @@ header{
 }
 
 /* tab context menu */
+/* max-height + scroll for the same reason FloatingMenu clamps the position: a
+   menu taller than the window cannot be moved into view, only scrolled. */
 .ctx-menu{
   position:fixed;z-index:9999;background:var(--bg3);border:1px solid var(--border2);
-  border-radius:5px;padding:4px 0;min-width:180px;box-shadow:0 6px 20px rgba(0,0,0,.5);
-  font-family:var(--font);font-size:11px;
+  border-radius:5px;padding:4px 0;min-width:180px;max-height:80vh;overflow-y:auto;
+  box-shadow:0 6px 20px rgba(0,0,0,.5);font-family:var(--font);font-size:11px;
 }
 .ctx-menu-item{
   padding:6px 14px;color:var(--text);cursor:pointer;transition:background .08s;
@@ -317,6 +329,10 @@ header{
   position:fixed;inset:0;z-index:9998;background:var(--overlay);
   display:flex;align-items:center;justify-content:center;
 }
+/* A modal opened FROM another modal (the QR of a source inside tab settings)
+   must stack above it — same z-index meant the QR rendered behind, and the
+   settings window had to be closed to see it. */
+.modal-overlay.modal-nested{z-index:10001}
 /* Modal text scale.
  * A single CSS variable on :root drives every font-size in the Settings
  * and Tab settings modals. The user can grow or shrink modal typography
@@ -386,6 +402,13 @@ textarea.modal-input{resize:vertical;min-width:0}
 .chip.col-host{background:rgba(132,204,22,.14);color:#9fd84a;border-color:rgba(132,204,22,.35)}
 .chip.col-transport{background:rgba(168,85,247,.14);color:#b387f0;border-color:rgba(168,85,247,.35)}
 .chip.col-security{background:rgba(244,114,114,.14);color:#f08a8a;border-color:rgba(244,114,114,.35)}
+.chip-hit{font-size:calc(var(--modal-fs-base) - 3px);font-weight:800;line-height:1;padding:1px 4px;border-radius:99px;
+  background:rgba(232,197,71,.25);color:var(--accent);cursor:default}
+/* Never matched: the one state worth interrupting for — a rule with a typo in
+   it is indistinguishable from a working one until this says otherwise. */
+.chip-hit.never{background:rgba(244,114,114,.22);color:#f08a8a}
+/* Nothing to say yet: not loaded, not countable, or nothing routed so far. */
+.chip-hit.muted,.chip-hit.pending{background:transparent;color:var(--text);opacity:.45;font-weight:700}
 .chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px);user-select:none;-webkit-user-select:none}.chip-x:hover{opacity:1;color:var(--red)}
 /* The input grows to fill its line (so the full placeholder shows and never gets
    clipped) and wraps to its own line when the chips leave too little room. */
@@ -402,9 +425,16 @@ textarea.modal-input{resize:vertical;min-width:0}
 .ef-field-tag{font-size:var(--modal-fs-base);color:var(--text)}
 .ef-field .chips-wrap{margin-bottom:0}
 .modal-hint{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-top:-6px;margin-bottom:10px}
+/* "Show setting descriptions" off. One rule instead of a condition at 35 call
+   sites — and it reaches every dialog, including ones added later. The rows
+   keep their own spacing, so what is left is the settings themselves. */
+body.no-hints .modal-hint{display:none}
 /* The exclude-filter intro hint sits below a label, so the global -6px pull
    would clip it onto the label above. Reset it to a small positive gap. */
 .modal-hint.ef-hint{margin-top:2px;margin-bottom:12px}
+/* file path under the "save logs to a file" toggle — monospace so a Windows
+   path with backslashes stays readable, and selectable so it can be copied */
+.modal-hint.log-path{font-family:var(--mono,ui-monospace,Consolas,monospace);margin-top:-4px;user-select:text;word-break:break-all}
 /* Tab-settings modal: render the all-caps section labels in the same plain
    style as the "Deduplicate duplicate configs" row label. */
 #tab-modal-box .modal-label{text-transform:none;letter-spacing:0;color:var(--text);font-size:var(--modal-fs-base)}
@@ -619,6 +649,10 @@ tbody tr.row-new{box-shadow:inset 3px 0 0 var(--green)}
 .log-title{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--accent)}
 .log-head .spacer{flex:1}
 .log-sel{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:10px;border-radius:3px;padding:1px 4px;outline:none;cursor:pointer}
+/* Free-text search over the log lines (also narrows what "copy" writes). */
+.log-find{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:10px;border-radius:3px;padding:1px 6px;outline:none;width:130px;height:20px;box-sizing:border-box}
+.log-find:focus{border-color:var(--accent)}
+.log-find-n{font-size:10px;color:var(--dim);white-space:nowrap}
 .log-auto{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.04em;cursor:pointer;user-select:none}
 .log-head .btn{padding:3px 9px;font-size:10px}
 .log-view{flex:1;overflow-y:auto;padding:6px 12px;font-family:var(--font);font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;background:var(--bg);user-select:text;-webkit-user-select:text;cursor:text}
@@ -813,6 +847,9 @@ td{padding:5px 10px;vertical-align:middle;font-size:12px}
 .proto-btn#proto-tuic.active{color:var(--purple);border-color:rgba(192,132,252,.7);background:rgba(192,132,252,.10)}
 
 .act-cell{display:flex;gap:3px;align-items:center;justify-content:flex-end}
+/* Each row action ships two labels — the word and a compact form. The phone
+   media query swaps them; on the desktop only the word is shown. */
+.lbl-short{display:none}
 .cpb{all:unset;cursor:pointer;color:var(--dim);font-size:12px;padding:2px 4px;border-radius:2px;transition:color .12s;display:inline-flex}
 .cpb:hover{color:var(--accent)}.cpb.done{color:var(--green)}
 
@@ -977,3 +1014,168 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment{
 body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:hover{
   background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='8' height='8'><path d='M4 6 1 2h6z' fill='%231d1d20'/></svg>");
 }
+
+/* ──────────────────────────────────────────────────────────────────────────
+   Phone layout (remote control from a browser on a phone).
+
+   Everything here lives behind a max-width query that a desktop window never
+   reaches, so the PC layout is untouched byte for byte.
+
+   The core problem it solves: body{min-width:720px} pins the layout, so on a
+   ~400px screen the page doesn't fit — it SCROLLS sideways. That produced two
+   independent scroll areas (page and table) and column headers overlapping.
+   Dropping the floor lets everything reflow into one column with one scroll.
+   Buttons keep their desktop size on purpose.
+   ────────────────────────────────────────────────────────────────────────── */
+@media (max-width:600px){
+  /* No horizontal scrolling: the layout fits the screen instead. */
+  html{overflow-x:hidden}
+  body{min-width:0}
+
+  /* Header: stats on one line, controls wrap under them. */
+  header{flex-wrap:wrap;gap:6px;padding:6px 8px}
+  header .spacer{display:none}
+  .stats{gap:8px;flex-wrap:wrap}
+  .stat-best,.stat.traf{display:none}
+  .ctrls{flex-wrap:wrap;gap:4px;width:100%}
+  .ctrl-sep{display:none}
+
+  /* Toolbar: tabs on their own row, filter + type below, full width. */
+  .toolbar{flex-wrap:wrap;padding:5px 8px;gap:6px}
+  .toolbar-right{margin-left:0;width:100%;flex-wrap:wrap;gap:6px}
+  .finput{width:auto;flex:1 1 120px;min-width:90px}
+  .tl-lbl{display:none}
+
+  /* Table: keep the columns that matter on a phone. #, transport, security and
+     the host are dropped — they're what made the headers collide. The action
+     buttons stay (connect/ping/speed is the point of remote control). */
+  .ci,.ch,.ct,.cs{display:none}
+  /* Long names must ellipsize instead of spilling over the ping cell. */
+  .cn{min-width:0;max-width:none;overflow:hidden}
+  .cn .nm,.cn .nm-row{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  /* Actions keep all three buttons, in their compact form: connect→conn,
+     disconnect→disc, ping/speed→glyphs. That fits the whole action set in the
+     space two words used to take. Only the copy icon goes — it duplicates the
+     row's context menu. */
+  .lbl-full{display:none}
+  .lbl-short{display:inline}
+  .cpb{display:none}
+  /* .btn.sm sets padding:3px 9px and outranks a single class, so the compact
+     padding has to be spelled out at the same specificity or it silently loses.
+     Note box-sizing is content-box here: min-width would size the CONTENT and
+     add padding on top, so the glyph span is what carries the fixed width —
+     that also makes both icon buttons exactly the same size. */
+  .btn.sm.act-ping,.btn.sm.act-speed{padding:2px 4px}
+  .act-ping .lbl-short,.act-speed .lbl-short{display:inline-block;width:12px;text-align:center}
+  .act-cell{gap:4px}
+  thead th.ca,tbody td.ca{padding-right:6px}
+  .pb{padding:1px 5px;font-size:9px} /* the protocol badge, tightened to fit */
+  /* The ping/speed values lose their pill on a phone and become plain coloured
+     text. The pill's 66px floor plus padding and border needs ~82px per value
+     column — a quarter of the screen each — which is what squeezed the name out
+     and left the pill's own border clipped by the cell. The colour carries the
+     same meaning without the box. */
+  .cp2 .pill,.csp .pill{min-width:0;max-width:none;padding:0;border:0;background:none;border-radius:0}
+  /* Widths are pixels again, but now sized to what the content ACTUALLY needs
+     once the pills are flat — badge 48, "timeout" 54, "123.4 MB/s" 72, the
+     three action buttons 92 — so the name keeps the largest possible remainder
+     at every width instead of paying for padding nobody sees. Percentages were
+     worse here: the other four columns have fixed content needs, so scaling
+     them with the viewport inflated them and starved the name.
+     Measured name width: 179px at 453, 116 at 390, 101 at 375, 46 at 320. */
+  .cpr{width:48px}
+  .cp2{width:56px}
+  .csp{width:76px}
+  .ca{width:110px} /* conn/disc 46 + two 22px icon buttons + gaps + padding */
+  /* width:100% rather than auto, and this is not cosmetic. The hidden columns
+     (#, host, transport, security) are display:none but still take part in the
+     fixed-layout width distribution, and the leftover space ends up split with
+     them instead of going to the name: the BODY table gave the name 18px and
+     left 74px of the table unpainted on the right, while the HEADER table gave
+     it 100px — the two drifted apart, which is why the rows looked shifted left
+     from their own headers. An explicit 100% makes the name claim the whole
+     remainder in both tables. Only visible with many rows (the virtualised body
+     differs from the plain header table), which is why short tabs looked fine
+     and a 100-config tab did not. */
+  .cn{width:100%}
+  /* Belt and braces: whatever the width, a cell may never paint over its
+     neighbour again — it clips instead. */
+  td.cpr,td.cn,td.cp2,td.csp,td.ca{overflow:hidden}
+  /* 10px keeps the widest realistic value ("123.4 MB/s" = 60px) inside the cell
+     without widening the column at the name's expense. The size has to land on
+     the SPANS, not just .vc: .sv sets its own 16px, which beat an inherited
+     size and made the speed value wrap onto a second line — which in turn made
+     those rows taller than the rest. nowrap makes that impossible regardless. */
+  .cp2 .vc,.csp .vc,.cp2 .vc>span,.csp .vc>span{font-size:10px;white-space:nowrap}
+  .cp2 .vc>span,.csp .vc>span{overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  /* The desktop reserves a scrollbar gutter (.tw) plus a header padding that
+     mirrors it (.thw), so the columns line up around a classic scrollbar. A
+     phone draws OVERLAY scrollbars, so that reservation is just an empty strip
+     down the right-hand side of the table — visible as the table stopping short
+     while the toolbar and the connection bar run the full width. */
+  .tw{scrollbar-gutter:auto;margin-right:0}
+  .thw{padding-right:0}
+  thead th{padding:5px 6px;font-size:8px;letter-spacing:.06em}
+  tbody td{padding:5px 6px}
+  .nh{display:none} /* host line inside the name cell */
+
+  /* Connection bar: status + name + disconnect; the port chips and the exit
+     check are desktop conveniences that don't fit here. */
+  #conn-bar{flex-wrap:wrap;gap:6px;padding:4px 8px;min-height:0}
+  /* !important: #cports carries an inline display:flex from the JSX, and an
+     inline style beats a stylesheet rule. */
+  #cports{display:none!important}
+  #cexit{display:none}
+  #cdetail{flex:1 1 100%;order:3}
+  /* #cdetail was the flex:1 element that pushed the trailing control to the
+     right edge; moving it to its own row left the first row with nothing to
+     absorb the free space, so everything packed left. margin-left:auto restores
+     the right alignment without a filler element. */
+  #btn-dc,#mode-wrap{margin-left:auto}
+
+  /* Very narrow layout viewports (a 320px phone, or a wider one with iOS
+     "Larger Text", which shrinks the CSS viewport): the four fixed columns add
+     up to 290px, which would leave the name nothing. Type is the cheapest to
+     drop — a list is usually one protocol throughout, and the name is what
+     tells two rows apart. Below this the name still gets ~66px. */
+  @media (max-width:380px){
+    .cpr{display:none}
+  }
+
+  /* Logs panel: the toolbar wraps instead of overflowing. */
+  .log-head{flex-wrap:wrap;gap:6px}
+  .log-find{width:100%}
+}
+
+/* ── Select (frontend/src/Select.tsx) ──────────────────────────────
+   Replaces the native <select>, whose popup is drawn by the toolkit and cannot
+   be styled — on Linux it renders white over the dark app no matter what the
+   page asks for. The trigger keeps whatever class the call site passed
+   (.modal-input, .log-sel) so sizing and borders stay as they were; only the
+   list below is ours. */
+.vsel{display:flex;align-items:center;justify-content:space-between;gap:6px;
+  cursor:pointer;text-align:left;font-family:inherit;font-size:inherit;color:var(--text)}
+.vsel-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vsel-caret{flex-shrink:0;color:var(--text);opacity:.55;font-size:11px;line-height:1}
+.vsel-open{border-color:var(--accent)}
+/* Fixed, not absolute: the list is portalled to <body> so a select near the
+   bottom of the scrolling settings modal is not clipped by its overflow. */
+.vsel-list{position:fixed;z-index:9999;max-height:260px;overflow-y:auto;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:4px;
+  box-shadow:0 6px 18px var(--shadow);padding:3px}
+.vsel-opt{padding:4px 9px;border-radius:3px;white-space:nowrap;cursor:pointer;color:var(--text)}
+.vsel-act{background:var(--bg4)}
+.vsel-cur{color:var(--accent)}
+.vsel-dis{color:var(--dim);cursor:default}
+
+/* A command the user has to run themselves. Deliberately NOT a dim hint: it is
+   an instruction, and the previous version — grey small text with an inline
+   <code> that inherited the same grey — read as another sentence to skip. Text
+   selection is off app-wide, so the copy button is the only way to get it. */
+.cmd-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  margin:2px 0 12px;padding:7px 9px;border-radius:4px;
+  background:var(--bg3);border:1px solid var(--border2);border-left:3px solid var(--orange)}
+.cmd-note-text{flex:1 1 100%;font-size:calc(var(--modal-fs-base) - 2px);color:var(--text)}
+.cmd-note code{flex:1 1 auto;min-width:140px;color:var(--accent);
+  font-family:inherit;font-size:calc(var(--modal-fs-base) - 1px);
+  user-select:text;-webkit-user-select:text;word-break:break-all}

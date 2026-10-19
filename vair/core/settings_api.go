@@ -45,5 +45,10 @@ func SetSettings(s AppSettings) AppSettings {
 	appSettings = s
 	settingsMu.Unlock()
 	saveSettings()
+	// Opening/closing the log file is a side effect of the save, not of a
+	// connection — apply it here so the toggle takes effect immediately.
+	SetFileLogging(s.LogToFile)
+	// Every window, not just the one that made the change.
+	broadcastSettings(s)
 	return s
 }

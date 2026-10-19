@@ -41,6 +41,23 @@ type logStore struct {
 	rlStart   time.Time
 	rlCount   int
 	rlDropped int
+
+	// important is a SECOND, small ring holding only the lines that matter —
+	// errors, warnings and Vair's own messages. The rate limit protects
+	// INGESTION (error/warn always pass it) but not EVICTION: under a verbose
+	// flood ~800 engine lines/second roll the 2000-line main ring in about two
+	// seconds, so an error from ten seconds ago is already gone by the time you
+	// look. Engine chatter can't reach this ring, so those lines survive.
+	important    []logLine
+	importantCap int
+
+	// Optional file sink (Settings → System). Buffered on purpose: a flood
+	// writes through one bufio flush every few seconds instead of thousands of
+	// tiny writes. nil when the setting is off.
+	file   *os.File
+	fw     *bufio.Writer
+	fBytes int64
+	fPath  string
 }
 
 const (
@@ -48,7 +65,7 @@ const (
 	logRateLimit    = 200 // info/raw lines per interval (~800/s) before dropping
 )
 
-var logs = &logStore{cap: 2000}
+var logs = &logStore{cap: 2000, importantCap: 500}
 
 // ansiRe matches ANSI SGR colour escapes (e.g. sing-box on Windows still
 // emits them even when stderr is piped). We strip them before storing so the
@@ -88,6 +105,19 @@ func (l *logStore) push(ln logLine) {
 		// stream (the panel re-fetches the full snapshot on open anyway).
 		l.pending = append(l.pending[:0], l.pending[len(l.pending)-l.cap:]...)
 	}
+	if isImportant(ln) {
+		l.important = append(l.important, ln)
+		if len(l.important) > 2*l.importantCap {
+			l.important = append(l.important[:0], l.important[len(l.important)-l.importantCap:]...)
+		}
+	}
+	l.writeFileLocked(ln)
+}
+
+// isImportant mirrors the panel's "important" filter: everything except the
+// engines' [Info] narration.
+func isImportant(ln logLine) bool {
+	return ln.Lvl != "info" || ln.Src == "vair" || ln.Src == "test"
 }
 
 // add stores a pre-classified line (vlog/tlog and result summaries). Not
@@ -176,6 +206,7 @@ func (l *logStore) clear() {
 	// flood is actually reclaimed by the GC.
 	l.lines = nil
 	l.pending = nil
+	l.important = nil
 	l.mu.Unlock()
 }
 
@@ -300,6 +331,13 @@ func pumpProcLog(src string, pipe io.Reader, sink func(string)) {
 	scanner := bufio.NewScanner(pipe)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
+		// Rule statistics read the line BEFORE the rate gate: the gate exists to
+		// keep the log panel readable under a flood, and dropping a match line
+		// there would quietly undercount exactly when there is most to count.
+		// Off by default, and a substring test when on.
+		if ruleStatsEnabled() {
+			noteEngineLine(src, string(scanner.Bytes()))
+		}
 		// Drop/keep decision on the raw bytes first — no string allocation for
 		// the lines we drop under a verbose flood (the bulk of them).
 		if !logs.gate(levelErrWarnBytes(scanner.Bytes())) {
@@ -311,4 +349,127 @@ func pumpProcLog(src string, pipe io.Reader, sink func(string)) {
 		}
 		logs.add(src, parseLevel(src, line), line)
 	}
+}
+
+// ─────────────────────── optional file sink ──────────────────────
+//
+// OFF by default, and deliberately so: the engines' access lines record WHICH
+// HOSTS were visited, so a log on disk is a browsing record that doesn't exist
+// otherwise. It's a debugging aid the user opts into (Settings → System), not
+// something we do behind their back.
+//
+// Cost when enabled: writes go through a bufio.Writer flushed on a ticker, so
+// even the worst case (the rate limit caps kept lines at ~800/s ≈ 120 KB/s)
+// lands as a handful of sequential writes per second. The file is capped and
+// rotated, so it can never grow without bound.
+const (
+	logFileMax   = 5 << 20 // rotate at 5 MiB
+	logFileFlush = 2 * time.Second
+)
+
+func logFilePath() string { return runtimePath("vair.log") }
+
+// writeFileLocked appends one line to the file sink. Caller holds l.mu.
+func (l *logStore) writeFileLocked(ln logLine) {
+	if l.fw == nil {
+		return
+	}
+	s := time.UnixMilli(ln.T).Format("2006-01-02 15:04:05.000") + " [" + ln.Lvl + "] " + ln.Src + ": " + ln.Msg + "\n"
+	n, err := l.fw.WriteString(s)
+	if err != nil {
+		return
+	}
+	l.fBytes += int64(n)
+	if l.fBytes >= logFileMax {
+		l.rotateLocked()
+	}
+}
+
+// rotateLocked keeps ONE previous file (vair.log.1), so the sink costs at most
+// ~10 MiB on disk regardless of how long it runs.
+func (l *logStore) rotateLocked() {
+	if l.file == nil {
+		return
+	}
+	l.fw.Flush()   //nolint:errcheck
+	l.file.Close() //nolint:errcheck
+	l.fw, l.file = nil, nil
+	os.Remove(l.fPath + ".1")        //nolint:errcheck
+	os.Rename(l.fPath, l.fPath+".1") //nolint:errcheck
+	l.openFileLocked(l.fPath)
+}
+
+// openFileLocked starts (or restarts) the sink. Caller holds l.mu.
+func (l *logStore) openFileLocked(path string) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	st, _ := f.Stat()
+	l.file, l.fw, l.fPath = f, bufio.NewWriterSize(f, 32<<10), path
+	if st != nil {
+		l.fBytes = st.Size()
+	}
+}
+
+// SetFileLogging turns the file sink on or off. Enabling starts the flush
+// ticker; disabling flushes and closes, leaving the file in place.
+func SetFileLogging(on bool) {
+	logs.mu.Lock()
+	defer logs.mu.Unlock()
+	if on {
+		if logs.fw != nil {
+			return // already on
+		}
+		os.MkdirAll(runtimeDirPath(), 0o700) //nolint:errcheck
+		logs.openFileLocked(logFilePath())
+		if logs.fw != nil {
+			go logFlushTicker()
+			logs.push(logLine{T: time.Now().UnixMilli(), Lvl: "warn", Src: "vair",
+				Msg: "file logging ON — " + logFilePath() + " (contains visited hosts)"})
+		}
+		return
+	}
+	if logs.fw == nil {
+		return
+	}
+	logs.fw.Flush()   //nolint:errcheck
+	logs.file.Close() //nolint:errcheck
+	logs.fw, logs.file = nil, nil
+}
+
+// logFlushTicker pushes the buffer to disk periodically; it exits once the sink
+// is turned off (fw == nil), so a toggle never leaves a goroutine behind.
+func logFlushTicker() {
+	t := time.NewTicker(logFileFlush)
+	defer t.Stop()
+	for range t.C {
+		logs.mu.Lock()
+		if logs.fw == nil {
+			logs.mu.Unlock()
+			return
+		}
+		logs.fw.Flush() //nolint:errcheck
+		logs.mu.Unlock()
+	}
+}
+
+// LogFilePath is what the settings UI shows next to the toggle.
+func LogFilePath() string { return logFilePath() }
+
+// ImportantLogs returns the important-only ring (errors, warnings and Vair's
+// own messages) — the panel reads this in "important" mode so a verbose flood
+// can't evict them.
+func ImportantLogs() []LogLine {
+	logs.mu.Lock()
+	src := logs.important
+	if len(src) > logs.importantCap {
+		src = src[len(src)-logs.importantCap:]
+	}
+	out := make([]LogLine, len(src))
+	for i, l := range src {
+		out[i] = LogLine(l)
+	}
+	logs.mu.Unlock()
+	return out
 }

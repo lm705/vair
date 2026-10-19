@@ -44,6 +44,9 @@ func sourceHTTPClient(timeout time.Duration) *http.Client {
 }
 
 // ─────────────────────────── config sources ─────────────────────
+
+// SourceDef is one configured source of configurations: a URL, a local file, or
+// a private GitHub repository.
 type SourceDef struct {
 	URL   string
 	Group string
@@ -103,10 +106,17 @@ func fetchAndInitSilent(silent bool) {
 	var subs []subMeta
 
 	// Fetch from sources (with fallback — only skip rest if vless configs were received)
+	// failed records why a source didn't yield configs. The built-in sources are
+	// a primary + fallbacks, so a failure here isn't necessarily fatal — but when
+	// they ALL fail these records are the only explanation the user gets (the
+	// toast and the SOURCES settings modal read them), and previously they were
+	// dropped, leaving a bare "source unavailable" with no reason.
+	var failed []subMeta
 	for _, src := range sourceDefs {
 		lines, meta, err := fetchURLMeta(src.URL)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "⚠  fetch %s: %v\n", src.URL, err)
+			failed = append(failed, subMeta{URL: src.URL, Error: shortErr(err.Error())})
 			continue
 		}
 		// Check if any line actually contains a recognised proxy URL.
@@ -124,6 +134,7 @@ func fetchAndInitSilent(silent bool) {
 		}
 		if !hasNode {
 			fmt.Fprintf(os.Stderr, "⚠  fetch %s: no proxy configs in response (%d lines)\n", src.URL, len(lines))
+			failed = append(failed, subMeta{URL: src.URL, Error: "no configs found"})
 			continue
 		}
 		if meta != nil { // metadata of the source we actually use (others are fallbacks)
@@ -145,10 +156,42 @@ func fetchAndInitSilent(silent bool) {
 		}
 	}
 
-	// If nothing fetched, keep existing entries
+	// If nothing fetched, keep the existing entries — but still treat this as a
+	// refresh (clear the stale test results, report the failure and re-run the
+	// pool test), exactly like the user-tab path in fetchTabURLs. See the comment
+	// there for why: a successful fetch wipes ping/speed by rebuilding the
+	// entries, so skipping that on failure made RELOAD look like a no-op and left
+	// AUTO ranking by hours-old numbers.
 	if len(raws) == 0 {
-		fmt.Fprintf(os.Stderr, "⚠  no configs fetched, keeping existing\n")
+		// Every source failed, so `failed` holds the reasons.
+		var errs []string
+		for _, s := range failed {
+			if s.Error != "" {
+				errs = append(errs, s.Error)
+			}
+		}
+		vlog("warn", "SOURCES: source unreachable (%s) — configs kept, test results cleared",
+			strings.Join(errs, "; "))
+		resetTabResultsMem("main")
+		// Persist the per-source errors so the SOURCES settings modal shows them
+		// (the tab keeps its configs, so these records are the only trace).
+		if len(failed) > 0 {
+			state.mu.Lock()
+			for i := range state.tabs {
+				if state.tabs[i].ID == "main" {
+					state.tabs[i].Subs = failed
+					break
+				}
+			}
+			state.mu.Unlock()
+			state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
+		}
 		loadedSignal("main") // keep existing rows; client re-fetches its window
+		// AFTER loadedSignal — see the note in fetchTabURLs' matching branch.
+		state.broadcast(SSEEvent{Type: "source_error", Payload: map[string]any{
+			"tab": "main", "errors": errs,
+		}, Tab: "main"})
+		go autoPingAfterRefresh("main")
 		return
 	}
 

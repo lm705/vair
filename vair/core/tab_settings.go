@@ -466,6 +466,13 @@ func Reload(tabID string) {
 			waitTestsDrained(tabID, 30*time.Second) // late results would undo the reset
 			resetTabResultsMem(tabID)
 			loadedSignal(tabID)
+			// And re-test, exactly as the two branches above end up doing through
+			// fetchAndInit / fetchTabURLs. Without this a paste-only tab in the
+			// candidate pool came out of a RELOAD with every row cleared to
+			// "pending" and nothing to ever fill them back in: AUTO then ranked on
+			// data that had just been deleted. The tab having no source to re-fetch
+			// is not a reason for it to be the one tab a reload leaves untested.
+			autoPingAfterRefresh(tabID)
 		}()
 	}
 }
@@ -602,10 +609,32 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 			return
 		}
 		// Sources were enabled but yielded nothing (network failure, bad link) —
-		// keep existing entries; the reconciled subscription info shows the error.
-		fmt.Fprintf(os.Stderr, "⚠ tab %s: no configs fetched, keeping existing\n", tabID)
+		// keep the existing entries, but treat the refresh as a REFRESH anyway:
+		//
+		//  * clear the test results. A successful fetch rebuilds the entries and
+		//    thereby wipes ping/speed; skipping that on failure left stale numbers
+		//    on screen, so RELOAD looked like it did nothing — and, worse, AUTO
+		//    kept ranking candidates by measurements from hours ago.
+		//  * re-run the pool test, exactly like the success path does, so AUTO
+		//    gets fresh data instead of the values it just invalidated.
+		//  * report it: this used to go only to stderr and the tab-settings modal,
+		//    which is invisible while you're looking at the table.
+		var errs []string
+		for _, s := range subs {
+			if s.Error != "" {
+				errs = append(errs, s.Error)
+			}
+		}
+		vlog("warn", "tab %s: source unreachable — configs kept, test results cleared", tabID)
+		resetTabResultsMem(tabID)
 		state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 		loadedSignal(tabID)
+		// AFTER loadedSignal: the UI clears a tab's error state when it loads, so
+		// emitting this first would wipe the very error we're reporting.
+		state.broadcast(SSEEvent{Type: "source_error", Payload: map[string]any{
+			"tab": tabID, "errors": errs,
+		}, Tab: tabID})
+		go autoPingAfterRefresh(tabID)
 		return
 	}
 

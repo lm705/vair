@@ -1,9 +1,11 @@
 // Settings modal — an exact port of the 1.10 openSettings() DOM (same classes,
 // same sections/rows/hints, instant apply on change, no Save button).
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { Events } from '@wailsio/runtime'
-import { SettingsService, UpdateService, QRService } from '../bindings/vair'
+import { SettingsService, UpdateService, QRService, LogService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import Select from './Select'
 import { useChipSelect } from './chipselect'
 
 // Exact 1.10 preset lists (web/index.html).
@@ -79,17 +81,104 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
   )
 }
 
+// One rule list's tallies: entry text → how it has been doing.
+type RuleHit = { hits: number; last: number; pending: boolean; tracked: boolean }
+type RuleStats = { enabled: boolean; observed: number; since: number; lists: Record<string, Record<string, RuleHit>> }
+
+// agoText turns a unix second into "2 min ago" — coarse on purpose: the point
+// of the badge is "recently / a while back / never", not a stopwatch.
+function agoText(tt: (s: string) => string, unix: number): string {
+  const secs = Math.max(0, Math.floor(Date.now() / 1000) - unix)
+  if (secs < 60) return tt('just now')
+  const mins = Math.floor(secs / 60)
+  if (mins < 60) return mins + ' ' + tt('min ago')
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return hours + ' ' + tt('h ago')
+  return Math.floor(hours / 24) + ' ' + tt('d ago')
+}
+
+// RuleBadge is the mark next to a rule: how many times it fired, or the reason
+// there is no number. The case worth the whole feature is "never matched" — a
+// rule with a typo in it looks exactly like a rule that works until something
+// says this.
+function RuleBadge({ hit, observed, tt }: { hit?: RuleHit; observed: number; tt: (s: string) => string }) {
+  if (!hit) return null
+  if (hit.pending)
+    return (
+      <span className="chip-hit pending" title={tt('Not loaded yet — applies on the next connection')}>
+        •
+      </span>
+    )
+  if (!hit.tracked)
+    return (
+      <span className="chip-hit muted" title={tt('Matched inside the engine\'s own database — not counted here')}>
+        —
+      </span>
+    )
+  if (hit.hits > 0)
+    return (
+      <span className="chip-hit" title={tt('Last match') + ': ' + agoText(tt, hit.last)}>
+        {hit.hits}
+      </span>
+    )
+  if (observed === 0)
+    return (
+      <span className="chip-hit muted" title={tt('Nothing has been routed yet')}>
+        —
+      </span>
+    )
+  return (
+    <span className="chip-hit never" title={tt('Never matched — check the spelling')}>
+      0
+    </span>
+  )
+}
+
+// Dependent wraps settings that only do something once another setting is on.
+//
+// Dimmed and inert rather than hidden: a setting that vanishes teaches nobody
+// what it was, and someone who saw it once then cannot find it again. It stays
+// where it was, greyed, and says which switch brings it to life.
+function Dependent({
+  on,
+  needs,
+  tt,
+  children,
+}: {
+  on: boolean
+  needs: string // the label of the setting that has to be on
+  tt: (en: string) => string
+  children: ReactNode
+}) {
+  if (on) return <>{children}</>
+  return (
+    <div style={{ opacity: 0.45, pointerEvents: 'none' }}>
+      <div className="modal-hint" style={{ marginTop: 0 }}>
+        {tt('Works only with this on:')} {tt(needs)}
+      </div>
+      {children}
+    </div>
+  )
+}
+
 function Chips({
   items,
   disabled,
   placeholder,
   onChange,
   keepCase,
+  hits,
+  observed,
+  tt,
 }: {
   items: string[]
   disabled?: boolean
   placeholder: string
   onChange: (next: string[]) => void
+  // hits: the tallies for THIS list, when rule statistics are on (see RuleBadge).
+  hits?: Record<string, RuleHit>
+  observed?: number
+  tt?: (s: string) => string
   // keepCase: don't lowercase entries and split only on whitespace (for URLs,
   // where the path is case-sensitive and ',' / ';' can appear legitimately).
   keepCase?: boolean
@@ -121,6 +210,7 @@ function Chips({
       {items.map((d, i) => (
         <span key={d} className={'chip' + (isSel(i) ? ' sel' : '')}>
           {d}
+          {hits && tt && <RuleBadge hit={hits[d]} observed={observed || 0} tt={tt} />}
           <span className="chip-x" onClick={() => onChange(items.filter((x) => x !== d))}>
             x
           </span>
@@ -159,6 +249,7 @@ export default function SettingsModal({
   notify,
   lang,
   version,
+  caps,
 }: {
   stg: any
   apply: (patch: Record<string, any>) => void
@@ -167,6 +258,7 @@ export default function SettingsModal({
   notify: (msg: string) => void
   lang: string
   version: string
+  caps?: any
 }) {
   const tt = (en: string) => t10(lang, en)
   // On blur, empty/invalid input snaps back to the default IN THE FIELD (not only
@@ -195,7 +287,7 @@ export default function SettingsModal({
   }
   // Updates section state (1.10 checkUpdate/onUpdateStatus).
   const [updMsg, setUpdMsg] = useState<string | null>(null)
-  const [updLatest, setUpdLatest] = useState<{ latest: string; notes?: string } | null>(null)
+  const [updLatest, setUpdLatest] = useState<{ latest: string; notes?: string; download_url?: string } | null>(null)
   const [updPct, setUpdPct] = useState<number | null>(null)
   const [updBusy, setUpdBusy] = useState(false)
 
@@ -207,6 +299,33 @@ export default function SettingsModal({
   const remoteIP =
     stg.remote_ip && remote?.ips?.includes(stg.remote_ip) ? stg.remote_ip : remote?.ips?.[0] || ''
   const remoteURL = remoteIP ? `http://${remoteIP}:${remote.port}/?key=${remote.token}` : ''
+  // Rule statistics: poll while the screen is open and the counting is on. The
+  // numbers only move while a connection is up, so a slow poll is plenty and a
+  // closed settings screen costs nothing.
+  // Whether this machine will actually show the watch's notification. Windows
+  // has a master switch for notifications, and with it off the toast is
+  // accepted and displayed to nobody — worth saying under the promise.
+  const [notifyBlocked, setNotifyBlocked] = useState('')
+  useEffect(() => {
+    if (!stg.watch_connection) {
+      setNotifyBlocked('')
+      return
+    }
+    SettingsService.NotificationsBlocked().then((r: string) => setNotifyBlocked(r || ''))
+  }, [stg.watch_connection])
+  const [ruleStats, setRuleStats] = useState<RuleStats | null>(null)
+  useEffect(() => {
+    if (!stg.rule_stats) {
+      setRuleStats(null)
+      return
+    }
+    const pull = () => SettingsService.RuleStats().then((r: any) => setRuleStats(r))
+    pull()
+    const id = setInterval(pull, 3000)
+    return () => clearInterval(id)
+  }, [stg.rule_stats])
+  const ruleHits = (list: string) => (stg.rule_stats ? ruleStats?.lists?.[list] : undefined)
+
   useEffect(() => {
     SettingsService.Remote().then((r: any) => setRemote(r))
   }, [stg.remote_enabled, stg.remote_port])
@@ -227,7 +346,7 @@ export default function SettingsModal({
       }
       if (j?.available) {
         setUpdMsg(t10(lang, 'Update available') + ': ' + j.latest + (j.notes ? ' — ' + j.notes : ''))
-        setUpdLatest({ latest: j.latest, notes: j.notes })
+        setUpdLatest({ latest: j.latest, notes: j.notes, download_url: j.download_url })
       } else {
         setUpdMsg(t10(lang, 'You have the latest version.'))
         setUpdLatest(null)
@@ -370,6 +489,11 @@ export default function SettingsModal({
     }
   }, [q, stg])
 
+  // Shown under the file-logging toggle so the user can find the file.
+  const [logPath, setLogPath] = useState('')
+  useEffect(() => {
+    LogService.FilePath().then((p) => setLogPath(p || ''))
+  }, [])
   const hint = (en: string) => <div className="modal-hint">{tt(en)}</div>
 
   return (
@@ -407,7 +531,7 @@ export default function SettingsModal({
             <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
               {tt('Routing mode')}
             </span>
-            <select
+            <Select
               className="modal-input"
               style={{ marginBottom: 0 }}
               value={rmode}
@@ -427,7 +551,7 @@ export default function SettingsModal({
               <option value="only_blocked">{tt('Only blocked-in-Russia resources')}</option>
               <option value="only_blocked_cn">{tt('Only blocked-in-China resources')}</option>
               <option value="only_selected">{tt('Only selected sites')}</option>
-            </select>
+            </Select>
           </div>
           {hint('How traffic is split between the VPN and a direct connection. Takes effect on next connection.')}
           {rmode === 'bypass_countries' && (
@@ -451,6 +575,14 @@ export default function SettingsModal({
           {rmode === 'only_blocked_cn' &&
             hint('Regular traffic goes DIRECT; only resources blocked in China go through the VPN — matched by the community GFW list (Loyalsoldier build, auto-updated), plus your own lists below.')}
 
+          <div className="modal-row" style={{ marginTop: 12 }}>
+            <span className="modal-row-label">{tt('Count rule matches')}</span>
+            <Toggle on={!!stg.rule_stats} onChange={(v) => apply({ rule_stats: v })} />
+          </div>
+          {hint(
+            'Shows next to each rule below how many times it has fired, and marks the ones that never have — usually a typo. The engine has to report every routing decision for this, so its log becomes considerably more verbose. Takes effect on next connection.'
+          )}
+
           {/* ── Custom rules (all modes): domain / IP / CIDR / full:/regexp: ── */}
           <div className="modal-row" style={{ marginTop: 12, marginBottom: 4 }}>
             <span className="modal-row-label">{tt('Custom rules — without VPN')}</span>
@@ -458,6 +590,9 @@ export default function SettingsModal({
           </div>
           <Chips
             items={stg.direct_domains || []}
+            hits={ruleHits('direct')}
+            observed={ruleStats?.observed || 0}
+            tt={tt}
             disabled={!!stg.direct_domains_disabled}
             placeholder={tt('domain, IP or CIDR — press Enter')}
             onChange={(next) => apply({ direct_domains: next })}
@@ -474,6 +609,9 @@ export default function SettingsModal({
               </div>
               <Chips
                 items={stg.proxy_domains || []}
+            hits={ruleHits('proxy')}
+            observed={ruleStats?.observed || 0}
+            tt={tt}
                 disabled={!!stg.proxy_domains_disabled}
                 placeholder={tt('domain, IP or CIDR — press Enter')}
                 onChange={(next) => apply({ proxy_domains: next })}
@@ -504,40 +642,58 @@ export default function SettingsModal({
           </div>
           <Chips
             items={stg.block_domains || []}
+            hits={ruleHits('block')}
+            observed={ruleStats?.observed || 0}
+            tt={tt}
             disabled={!!stg.block_domains_disabled}
             placeholder={tt('domain, IP or CIDR — press Enter')}
             onChange={(next) => apply({ block_domains: next })}
           />
           {hint('Dropped entirely (ads, telemetry, unwanted hosts). Same syntax as above. Highest priority: block wins over the without-VPN and through-VPN lists. Takes effect on next connection.')}
-          <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
-            <span className="modal-row-label">{tt('Apps without VPN (TUN mode only)')}</span>
-            <Toggle on={!stg.direct_apps_disabled} onChange={(v) => apply({ direct_apps_disabled: !v })} />
-          </div>
-          <Chips
-            items={stg.direct_apps || []}
-            disabled={!!stg.direct_apps_disabled}
-            placeholder={tt('e.g. chrome.exe, press Enter')}
-            onChange={(next) => apply({ direct_apps: next })}
-          />
-          <div className="modal-hint">
-            {tt("Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).")}{' '}
-            <a
-              href="#"
-              onClick={(e) => {
-                e.preventDefault()
-                openProcPicker()
-              }}
-              style={{ color: 'var(--accent)', textDecoration: 'underline' }}
-            >
-              {tt('Browse running processes')}
-            </a>
-            . {tt('Takes effect on next connection.')}
-          </div>
+          {/* Per-application routing is a TUN feature, and TUN is not on every
+              platform yet. A list the engine will never consult looks like a
+              setting that quietly stopped working. */}
+          {caps?.split_tunnel !== false && (
+            <>
+              <div className="modal-row" style={{ marginTop: 10, marginBottom: 4 }}>
+                <span className="modal-row-label">{tt('TUN Apps without VPN')}</span>
+                <Toggle on={!stg.direct_apps_disabled} onChange={(v) => apply({ direct_apps_disabled: !v })} />
+              </div>
+              <Chips
+                items={stg.direct_apps || []}
+                hits={ruleHits('apps')}
+                observed={ruleStats?.observed || 0}
+                tt={tt}
+                disabled={!!stg.direct_apps_disabled}
+                placeholder={tt('e.g. chrome.exe or firefox, press Enter')}
+                onChange={(next) => apply({ direct_apps: next })}
+              />
+              <div className="modal-hint">
+                {tt("Process names that bypass VPN. Only works in TUN mode (system proxy can't be excluded per-app at the OS level).")}{' '}
+                {caps?.process_picker !== false && (
+                  <>
+                    <a
+                      href="#"
+                      onClick={(e) => {
+                        e.preventDefault()
+                        openProcPicker()
+                      }}
+                      style={{ color: 'var(--accent)', textDecoration: 'underline' }}
+                    >
+                      {tt('Browse running processes')}
+                    </a>
+                    .{' '}
+                  </>
+                )}
+                {tt('Takes effect on next connection.')}
+              </div>
+            </>
+          )}
         </div>
 
         {/* ── Ports ── */}
         <div className="settings-section">
-          <div className="section-header">{tt('Ports')}</div>
+          <div className="section-header">{tt('Local proxy')}</div>
           <div className="modal-row">
             <span className="modal-row-label">{tt('HTTP proxy port')}</span>
             <input
@@ -562,7 +718,7 @@ export default function SettingsModal({
           </div>
           <div className="modal-row">
             <span className="modal-row-label">{tt('Proxy access')}</span>
-            <select
+            <Select
               className="modal-input"
               style={{ width: 'auto', marginBottom: 0 }}
               value={proxySelect}
@@ -579,7 +735,7 @@ export default function SettingsModal({
               <option value="local">{tt('Localhost only')} (127.0.0.1)</option>
               <option value="lan">{tt('Allow LAN access')} (0.0.0.0)</option>
               <option value="custom">{tt('Custom')}</option>
-            </select>
+            </Select>
           </div>
           {proxyCustom && (
             <div className="modal-row">
@@ -601,379 +757,51 @@ export default function SettingsModal({
             <span className="modal-row-label">{tt('Set system proxy')}</span>
             <Toggle on={!stg.no_system_proxy} onChange={(v) => apply({ no_system_proxy: !v })} />
           </div>
-          {hint('When on (default), connecting in proxy mode points the Windows system proxy at Vair, so every app that respects it goes through the VPN. Turn off for a "non-system" proxy: Vair only runs the local HTTP/SOCKS proxy on the ports above and changes nothing else — only apps where you explicitly set that proxy go through the VPN, the rest of the system stays direct. Applies immediately, even to a live connection.')}
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Share proxy over LAN in TUN mode')}</span>
-            <Toggle on={!!stg.tun_share_proxy} onChange={(v) => apply({ tun_share_proxy: v })} />
-          </div>
-          {hint('In TUN mode Vair normally routes only THIS PC through the tunnel. Turn this on to ALSO open the HTTP/SOCKS proxy (above) on the Proxy-access address, so another device (a phone) can route through this PC into the VPN while the PC itself stays fully tunnelled. Set Proxy access to "Allow LAN access" (or a custom address) for it to be reachable from other devices, and point the device at the HTTP port. Off by default; applies on the next connection.')}
-        </div>
-
-        {/* ── Testing ── */}
-        <div className="settings-section">
-          <div className="section-header">{tt('Testing')}</div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Ping concurrency')}</span>
-            <input
-              className="modal-input num-input"
-              type="number"
-              min={1}
-              max={200}
-              defaultValue={stg.ping_concurrency || 10}
-              onBlur={numBlur('ping_concurrency', 10)}
-            />
-          </div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Speed concurrency')}</span>
-            <input
-              className="modal-input num-input"
-              type="number"
-              min={1}
-              max={100}
-              defaultValue={stg.speed_concurrency || 5}
-              onBlur={numBlur('speed_concurrency', 5)}
-            />
-          </div>
-          {hint('How many configs are pinged or speed-tested in parallel. Defaults: ping 10, speed 5. Takes effect on the next bulk test run.')}
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Warm-up timeout (ms)')}</span>
-            <input
-              className="modal-input num-input"
-              type="number"
-              min={200}
-              max={20000}
-              step={100}
-              defaultValue={stg.warmup_timeout_ms || 4000}
-              onBlur={numBlur('warmup_timeout_ms', 4000)}
-            />
-          </div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Ping timeout (ms)')}</span>
-            <input
-              className="modal-input num-input"
-              type="number"
-              min={200}
-              max={10000}
-              step={100}
-              defaultValue={stg.ping_timeout_ms || 1500}
-              onBlur={numBlur('ping_timeout_ms', 1500)}
-            />
-          </div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Speed test duration (s)')}</span>
-            <input
-              className="modal-input num-input"
-              type="number"
-              min={1}
-              max={60}
-              defaultValue={stg.speed_duration_sec || 4}
-              onBlur={numBlur('speed_duration_sec', 4)}
-            />
-          </div>
-          {hint('Warm-up timeout bounds the first un-measured request that establishes the tunnel (TCP + TLS/Reality handshake) — raise it if working configs are wrongly marked "timeout". Ping timeout is per round (3 rounds run, best is reported). Speed duration is how long the test downloads before computing throughput. Defaults: warm-up 4000 ms, ping 1500 ms, speed 4 s.')}
-          <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
-            <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
-              {tt('Ping URL')}
-            </span>
-            <select
-              className="modal-input"
-              style={{ marginBottom: 0 }}
-              value={customPing ? '__custom' : stg.ping_test_url || ''}
-              onChange={(e) => {
-                if (e.target.value === '__custom') {
-                  setCustomPing(true)
-                  return
-                }
-                setCustomPing(false)
-                apply({ ping_test_url: e.target.value })
-              }}
-            >
-              {PING_PRESETS.map((p) => (
-                <option key={p.label} value={p.url}>
-                  {p.label}
-                </option>
-              ))}
-              <option value="__custom">Custom URL…</option>
-            </select>
-          </div>
-          {customPing && (
-            <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
-              <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
-                {tt('Custom ping URL')}
-              </span>
-              <input
-                className="modal-input"
-                style={{ marginBottom: 0 }}
-                placeholder="https://..."
-                defaultValue={isCustomURL(stg.ping_test_url || '', PING_PRESETS) ? stg.ping_test_url : ''}
-                onBlur={(e) => {
-                  const v = e.target.value.trim()
-                  if (!v) setCustomPing(false) // cleared → drop back to the default preset
-                  apply({ ping_test_url: v })
-                }}
-              />
-            </div>
-          )}
-          <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
-            <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
-              {tt('Speed URL')}
-            </span>
-            <select
-              className="modal-input"
-              style={{ marginBottom: 0 }}
-              value={customSpeed ? '__custom' : stg.speed_test_url || ''}
-              onChange={(e) => {
-                if (e.target.value === '__custom') {
-                  setCustomSpeed(true)
-                  return
-                }
-                setCustomSpeed(false)
-                apply({ speed_test_url: e.target.value })
-              }}
-            >
-              {SPEED_PRESETS.map((p) => (
-                <option key={p.label} value={p.url}>
-                  {p.label}
-                </option>
-              ))}
-              <option value="__custom">Custom URL…</option>
-            </select>
-          </div>
-          {customSpeed && (
-            <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
-              <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
-                {tt('Custom speed URL')}
-              </span>
-              <input
-                className="modal-input"
-                style={{ marginBottom: 0 }}
-                placeholder="https://..."
-                defaultValue={isCustomURL(stg.speed_test_url || '', SPEED_PRESETS) ? stg.speed_test_url : ''}
-                onBlur={(e) => {
-                  const v = e.target.value.trim()
-                  if (!v) setCustomSpeed(false) // cleared → drop back to the default preset
-                  apply({ speed_test_url: v })
-                }}
-              />
-            </div>
-          )}
-          <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
-            <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
-              {tt('Speed URL fallback')}{' '}
-              <span style={{ color: 'var(--muted)', fontWeight: 400 }}>
-                {tt('(used when the main URL returns HTTP 429)')}
-              </span>
-            </span>
-            <select
-              className="modal-input"
-              style={{ marginBottom: 0 }}
-              value={
-                customFb ? '__custom' : stg.speed_test_url_fallback === '__none' ? '__none' : fbCur
-              }
-              onChange={(e) => {
-                const v = e.target.value
-                if (v === '__custom') {
-                  setCustomFb(true)
-                  return
-                }
-                setCustomFb(false)
-                apply({ speed_test_url_fallback: v })
-              }}
-            >
-              <option value="__none">{tt('None — no fallback')}</option>
-              {SPEED_PRESETS.map((p) => {
-                const url = p.url || SPEED_DEFAULT_URL
-                let lbl = (p.label || '').replace(/\s*\(default\)\s*$/, '')
-                if (url === CACHEFLY) lbl += ' (default)'
-                return (
-                  <option key={url} value={url}>
-                    {lbl}
-                  </option>
-                )
-              })}
-              <option value="__custom">Custom URL…</option>
-            </select>
-          </div>
-          {customFb && (
-            <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
-              <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
-                {tt('Custom speed fallback URL')}
-              </span>
-              <input
-                className="modal-input"
-                style={{ marginBottom: 0 }}
-                placeholder="https://..."
-                defaultValue={
-                  isCustomFallback(stg.speed_test_url_fallback || '') ? stg.speed_test_url_fallback : ''
-                }
-                onBlur={(e) => apply({ speed_test_url_fallback: e.target.value.trim() })}
-              />
-            </div>
-          )}
-          <div className="modal-hint">
-            {tt('Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.')}{' '}
-            {tt('Pick "None" to disable the retry.')}
-          </div>
-        </div>
-
-        {/* ── Network ── */}
-        <div className="settings-section">
-          <div className="section-header">{tt('Network')}</div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('TUN MTU')}</span>
-            <input
-              className="modal-input num-input"
-              type="number"
-              min={576}
-              max={9000}
-              defaultValue={stg.tun_mtu || 9000}
-              onBlur={numBlur('tun_mtu', 9000)}
-            />
-          </div>
-          {hint('Default 9000 (jumbo frames). If you see download stalls or sites hanging, try 1500 or 1408. Takes effect on next connection.')}
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('TLS fragmentation (DPI bypass)')}</span>
-            <Toggle on={!!stg.tls_fragment} onChange={(v) => apply({ tls_fragment: v })} />
-          </div>
-          {hint("Splits the TLS handshake (ClientHello) into pieces so a DPI can't match the connection in a single packet. Helps when the server is alive but the handshake is being reset. xray protocols only (VLESS/VMess/Trojan/SS over TLS). Takes effect on next connection.")}
-          {!!stg.tls_fragment && (
-            <div id="tlsfrag-deps">
+          {hint('When on (default), connecting in proxy mode points the system proxy setting at Vair, so every app that respects it goes through the VPN. Turn off for a "non-system" proxy: Vair only runs the local HTTP/SOCKS proxy on the ports above and changes nothing else — only apps where you explicitly set that proxy go through the VPN, the rest of the system stays direct. Applies immediately, even to a live connection.')}
+          {/* What the switch actually REACHES, which is not the same everywhere.
+              On Windows one registry setting covers nearly everything; on Linux
+              the desktop's setting covers its own apps and browsers, and nothing
+              that reads http_proxy from its environment — a difference users
+              would otherwise discover as "the VPN doesn't work in my terminal". */}
+          {caps?.system_proxy_backend === 'gsettings' &&
+            hint('On this desktop the setting is written to GNOME (gsettings). GNOME apps and browsers set to "use system proxy settings" follow it. Terminal tools — curl, git, apt, ssh — read the http_proxy environment variable instead and are NOT covered; point those at the proxy yourself.')}
+          {caps?.system_proxy_backend === 'kde' &&
+            hint('On this desktop the setting is written to KDE (kioslaverc). KDE apps and browsers set to "use system proxy settings" follow it. Terminal tools — curl, git, apt, ssh — read the http_proxy environment variable instead and are NOT covered; point those at the proxy yourself.')}
+          {/* Only meaningful where a backend exists to be hijacked. */}
+          {caps?.system_proxy_backend !== 'none' && (
+            <Dependent on={!stg.no_system_proxy} needs="Set system proxy" tt={tt}>
               <div className="modal-row">
-                <span className="modal-row-label">{tt('Fragment length')}</span>
-                <input
-                  className="modal-input num-input"
-                  style={{ width: 110 }}
-                  placeholder="100-200"
-                  defaultValue={stg.tls_fragment_length || ''}
-                  onBlur={(e) => apply({ tls_fragment_length: e.target.value.trim() })}
+                <span className="modal-row-label">{tt('Keep the system proxy set')}</span>
+                <Toggle
+                  on={!stg.proxy_guard_disabled}
+                  onChange={(v) => apply({ proxy_guard_disabled: !v })}
                 />
               </div>
-              <div className="modal-row">
-                <span className="modal-row-label">{tt('Fragment interval (ms)')}</span>
-                <input
-                  className="modal-input num-input"
-                  style={{ width: 110 }}
-                  placeholder="10-20"
-                  defaultValue={stg.tls_fragment_interval || ''}
-                  onBlur={(e) => apply({ tls_fragment_interval: e.target.value.trim() })}
-                />
-              </div>
-              {hint('Ranges as "min-max" (or a single number). Defaults: length 100-200, interval 10-20. Leave empty to use the defaults.')}
-            </div>
-          )}
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('TLS fingerprint (uTLS)')}</span>
-            <select
-              className="modal-input"
-              style={{ width: 130 }}
-              value={stg.tls_fingerprint || 'chrome'}
-              onChange={(e) => apply({ tls_fingerprint: e.target.value })}
-            >
-              {TLS_FPS.map((f) => (
-                <option key={f} value={f}>
-                  {f}
-                </option>
-              ))}
-            </select>
-          </div>
-          {hint("Which browser's TLS handshake xray imitates (uTLS) when a config has no fp= of its own — without it the connection uses an easily-fingerprinted TLS signature. Applies to TLS/Reality nodes. Default: chrome. Takes effect on next connection.")}
-        </div>
-
-        {/* ── Remote access ── */}
-        <div className="settings-section">
-          <div className="section-header">{tt('Remote access')}</div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Control from a phone on this network')}</span>
-            <Toggle on={!!stg.remote_enabled} onChange={(v) => apply({ remote_enabled: v })} />
-          </div>
-          {hint(
-            'Runs a small web server on this PC so you can open the same interface in a phone — or another device — browser on the same Wi-Fi. Access is protected by a secret key (in the link/QR below); anyone without it is refused. Turn off when not needed.',
-          )}
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Server port')}</span>
-            <input
-              className="modal-input num-input"
-              type="number"
-              min={1}
-              max={65535}
-              defaultValue={stg.remote_port || 19876}
-              onBlur={(e) => {
-                const v = +e.target.value
-                const valid = v >= 1 && v <= 65535 && v !== 19876
-                e.target.value = String(valid ? v : 19876) // empty/invalid snaps to the default
-                apply({ remote_port: valid ? v : 0 })
-              }}
-            />
-          </div>
-          {hint('Default 19876. Change it if that port is taken — e.g. while the 1.10 release is still running on this PC.')}
-          {stg.remote_enabled && remote?.ips?.length > 1 && (
-            <div className="modal-row">
-              <span className="modal-row-label">{tt('IP address')}</span>
-              <select
-                className="modal-input"
-                style={{ width: 'auto', marginBottom: 0 }}
-                value={remoteIP}
-                onChange={(e) => apply({ remote_ip: e.target.value === remote.ips[0] ? '' : e.target.value })}
-              >
-                {remote.ips.map((ip: string) => (
-                  <option key={ip} value={ip}>
-                    {ip}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          {stg.remote_enabled && remoteURL && (
-            <div className="modal-row" style={{ display: 'block' }}>
-              <div
-                style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '4px 0 10px', flexWrap: 'wrap' }}
-              >
-                <input
-                  className="modal-input"
-                  readOnly
-                  value={remoteURL}
-                  style={{ flex: 1, minWidth: 200, marginBottom: 0 }}
-                />
-                <button
-                  className="btn ghost"
-                  onClick={() => {
-                    navigator.clipboard?.writeText(remoteURL).then(
-                      () => notify(tt('Copied')),
-                      () => notify(remoteURL),
-                    )
-                  }}
-                >
-                  {tt('Copy')}
-                </button>
-                <button
-                  className="btn ghost"
-                  title={tt('Generate a new key — old links and QR codes stop working')}
-                  onClick={() => {
-                    SettingsService.RegenerateRemoteToken().then((r: any) => {
-                      setRemote(r)
-                      notify(tt('New key generated'))
-                    })
-                  }}
-                >
-                  ↻ {tt('New key')}
-                </button>
-              </div>
-              {remoteQR && (
-                <img
-                  src={remoteQR}
-                  alt="QR"
-                  width={160}
-                  height={160}
-                  style={{ display: 'block', borderRadius: 6, background: '#fff', padding: 6 }}
-                />
+              {hint(
+                'While connected, checks every 20 seconds that the system proxy setting still points at Vair and puts it back if something else changed it — another VPN client, a policy refresh, a browser extension. Without this, traffic leaves outside the tunnel while the app still says "connected", and nothing tells you. If it is overwritten again and again, Vair stops correcting it and says so in the log rather than fighting the other program. Turn off if something else is meant to own that setting.',
               )}
+            </Dependent>
+          )}
+          {caps?.kill_switch_persistent !== false && (
+            <>
+              <div className="modal-row">
+                <span className="modal-row-label">{tt('Proxy kill-switch')}</span>
+                <Toggle
+                  on={!!stg.proxy_kill_switch}
+                  onChange={(v) => apply({ proxy_kill_switch: v })}
+                />
+              </div>
+              {hint(
+                'Proxy mode only carries the applications that honour the system proxy — everything else has always gone straight out, connected or not. This blocks that at the firewall while a proxy session is up: what stays open is the engine and loopback, which is the proxy. Needs the same administrator rights TUN mode does, and releases on disconnect.'
+              )}
+            </>
+          )}
+          {caps?.system_proxy_backend === 'none' && (
+            <div className="modal-hint">
+              {tt('This desktop has no system proxy setting Vair can drive, so this switch changes nothing here. Point applications at the local proxy yourself:')}{' '}
+              <code>export http_proxy=http://127.0.0.1:{stg.http_port || 10819}</code>
             </div>
           )}
-        </div>
-
-        {/* ── Security ── */}
-        <div className="settings-section">
-          <div className="section-header">{tt('Security')}</div>
           <div className="modal-row">
             <span className="modal-row-label">{tt('SOCKS authentication')}</span>
             <Toggle
@@ -1092,31 +920,83 @@ export default function SettingsModal({
               </div>
             </div>
           )}
+        </div>
+        {/* ── Tunnel ── */}
+        <div className="settings-section">
+          <div className="section-header">{tt('Tunnel')}</div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('TUN MTU')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={576}
+              max={9000}
+              defaultValue={stg.tun_mtu || 9000}
+              onBlur={numBlur('tun_mtu', 9000)}
+            />
+          </div>
+          {hint('Default 9000 (jumbo frames). If you see download stalls or sites hanging, try 1500 or 1408. Takes effect on next connection.')}
           <div className="modal-row">
             <span className="modal-row-label">{tt('TUN DNS leak protection')}</span>
             <Toggle on={!!stg.dns_leak_protection} onChange={(v) => apply({ dns_leak_protection: v })} />
           </div>
           {hint("Forces all DNS queries through the tunnel using sing-box's built-in FakeIP. Without this, system DNS can escape through your ISP. Takes effect on next connection. Applies only to TUN mode.")}
-          {!!stg.dns_leak_protection && (
+          <Dependent on={!!stg.dns_leak_protection} needs="TUN DNS leak protection" tt={tt}>
             <div id="security-deps">
-              <div className="modal-row">
-                <span className="modal-row-label">{tt('TUN Kill-switch')}</span>
-                <Toggle on={!!stg.kill_switch} onChange={(v) => apply({ kill_switch: v })} />
-              </div>
-              {hint('Drops all traffic if the VPN drops — no fallback to your physical network (strict routing; on Windows a WFP filter). Also hardens DNS-leak protection. On by default; turn it off to let traffic fall back to a direct connection when the tunnel dies. Applies only to TUN mode.')}
+              {/* A safety switch that cannot be enforced must not be offered:
+                  someone who turns it on and believes it would be worse off
+                  than someone who knows it is missing. */}
+              {caps?.kill_switch !== false && (
+                <>
+                  <div className="modal-row">
+                    <span className="modal-row-label">{tt('TUN Kill-switch')}</span>
+                    <Toggle on={!!stg.kill_switch} onChange={(v) => apply({ kill_switch: v })} />
+                  </div>
+                  {hint('Drops all traffic if the VPN drops — no fallback to your physical network (strict routing; on Windows a WFP filter). Also hardens DNS-leak protection. On by default; turn it off to let traffic fall back to a direct connection when the tunnel dies. Applies only to TUN mode.')}
+                  {/* Only meaningful once the kill-switch above is on: this is
+                      that block, made to outlive the engine that enforces it. */}
+                  {caps?.kill_switch_persistent !== false && (
+                    <Dependent on={!!stg.kill_switch} needs="TUN Kill-switch" tt={tt}>
+                      <div className="modal-row">
+                        <span className="modal-row-label">{tt('TUN Keep blocking after the tunnel is gone')}</span>
+                        <Toggle
+                          on={!!stg.kill_switch_persistent}
+                          onChange={(v) => apply({ kill_switch_persistent: v })}
+                        />
+                      </div>
+                      {hint(
+                        'The kill-switch above is enforced by the engine, so it ends when the engine does — a crash, or Vair being closed, returns the machine to its ordinary connection without saying so. This holds the block in the firewall instead: while it is engaged, nothing leaves except through the tunnel. It also covers the switch between two configurations, where the old adapter goes away and the ordinary routes come back for a second.'
+                      )}
+                      {!!stg.kill_switch_persistent && (
+                        <div className="modal-hint" style={{ color: 'var(--red)' }}>
+                          {tt('Read this: if Vair is killed while connected, this machine has no internet until you start Vair again (it releases the block at startup) or run in PowerShell as administrator:')}{' '}
+                          <code>Set-NetFirewallProfile -All -DefaultOutboundAction Allow</code>
+                        </div>
+                      )}
+                    </Dependent>
+                  )}
+                </>
+              )}
               <div className="modal-row">
                 <span className="modal-row-label">{tt('TUN Block LAN traffic')}</span>
                 <Toggle on={!!stg.block_lan} onChange={(v) => apply({ block_lan: v })} />
               </div>
               {hint('By default 192.168.x.x and similar private addresses bypass the VPN so printers, NAS, and router admin pages still work. Enable this to force LAN traffic through the tunnel too — usually breaks local services.')}
             </div>
+          </Dependent>
+          {/* Meaningless without TUN mode, which not every platform has yet. */}
+          {caps?.tun !== false && (
+            <>
+              <div className="modal-row">
+                <span className="modal-row-label">{tt('TUN Share proxy over LAN')}</span>
+                <Toggle on={!!stg.tun_share_proxy} onChange={(v) => apply({ tun_share_proxy: v })} />
+              </div>
+              {hint('In TUN mode Vair normally routes only THIS PC through the tunnel. Turn this on to ALSO open the HTTP/SOCKS proxy (above) on the Proxy-access address, so another device (a phone) can route through this PC into the VPN while the PC itself stays fully tunnelled. Set Proxy access to "Allow LAN access" (or a custom address) for it to be reachable from other devices, and point the device at the HTTP port. Off by default; applies on the next connection.')}
+            </>
           )}
-        </div>
-
-        {/* ── DNS (only with leak protection on) ── */}
-        {!!stg.dns_leak_protection && (
-          <div className="settings-section" id="dns-section">
+          <div id="dns-section">
             <div className="section-header">{tt('DNS')}</div>
+            <Dependent on={!!stg.dns_leak_protection} needs="TUN DNS leak protection" tt={tt}>
             <div className="modal-row">
               <span className="modal-row-label">{tt('TUN FakeIP')}</span>
               <Toggle on={!stg.fakeip_disabled} onChange={(v) => apply({ fakeip_disabled: !v })} />
@@ -1184,15 +1064,404 @@ export default function SettingsModal({
               />
             </div>
             {hint('Hard-coded answers checked before any DNS server. Useful for pinning the VPN server IP or working around broken DNS. Format: domain ip separated by spaces, one per line.')}
+            </Dependent>
           </div>
-        )}
+        </div>
+
+        {/* ── Connection ── */}
+        <div className="settings-section">
+          <div className="section-header">{tt('Connection')}</div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Watch the connected server')}</span>
+            <Toggle on={!!stg.watch_connection} onChange={(v) => apply({ watch_connection: v })} />
+          </div>
+          {hint(
+            'While connected, checks every few seconds that the server is still answering, and when it stops, closes the connection and sends a desktop notification instead of leaving "connected" on screen. Off by default: it ends a connection on the strength of a probe. Does not overlap with AUTO — while AUTO is on it does the watching itself and switches to another server rather than closing; this takes over only when AUTO is off.'
+          )}
+          {notifyBlocked && <div className="modal-hint" style={{ color: 'var(--red)' }}>{notifyBlocked}</div>}
+        </div>
+
+        {/* ── DPI bypass ── */}
+        <div className="settings-section">
+          <div className="section-header">{tt('DPI bypass')}</div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('TLS fragmentation (DPI bypass)')}</span>
+            <Toggle on={!!stg.tls_fragment} onChange={(v) => apply({ tls_fragment: v })} />
+          </div>
+          {hint("Splits the TLS handshake (ClientHello) into pieces so a DPI can't match the connection in a single packet. Helps when the server is alive but the handshake is being reset. xray protocols only (VLESS/VMess/Trojan/SS over TLS). Takes effect on next connection.")}
+          {!!stg.tls_fragment && (
+            <div id="tlsfrag-deps">
+              <div className="modal-row">
+                <span className="modal-row-label">{tt('Fragment length')}</span>
+                <input
+                  className="modal-input num-input"
+                  style={{ width: 110 }}
+                  placeholder="100-200"
+                  defaultValue={stg.tls_fragment_length || ''}
+                  onBlur={(e) => apply({ tls_fragment_length: e.target.value.trim() })}
+                />
+              </div>
+              <div className="modal-row">
+                <span className="modal-row-label">{tt('Fragment interval (ms)')}</span>
+                <input
+                  className="modal-input num-input"
+                  style={{ width: 110 }}
+                  placeholder="10-20"
+                  defaultValue={stg.tls_fragment_interval || ''}
+                  onBlur={(e) => apply({ tls_fragment_interval: e.target.value.trim() })}
+                />
+              </div>
+              {hint('Ranges as "min-max" (or a single number). Defaults: length 100-200, interval 10-20. Leave empty to use the defaults.')}
+            </div>
+          )}
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('TLS fingerprint (uTLS)')}</span>
+            <Select
+              className="modal-input"
+              style={{ width: 130 }}
+              value={stg.tls_fingerprint || 'chrome'}
+              onChange={(e) => apply({ tls_fingerprint: e.target.value })}
+            >
+              {TLS_FPS.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </Select>
+          </div>
+          {hint("Which browser's TLS handshake xray imitates (uTLS) when a config has no fp= of its own — without it the connection uses an easily-fingerprinted TLS signature. Applies to TLS/Reality nodes. Default: chrome. Takes effect on next connection.")}
+        </div>
+
+        {/* ── Testing ── */}
+        <div className="settings-section">
+          <div className="section-header">{tt('Testing')}</div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Ping concurrency')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={1}
+              max={200}
+              defaultValue={stg.ping_concurrency || 10}
+              onBlur={numBlur('ping_concurrency', 10)}
+            />
+          </div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Speed concurrency')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={1}
+              max={100}
+              defaultValue={stg.speed_concurrency || 5}
+              onBlur={numBlur('speed_concurrency', 5)}
+            />
+          </div>
+          {hint('How many configs are pinged or speed-tested in parallel. Defaults: ping 10, speed 5. Takes effect on the next bulk test run.')}
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Warm-up timeout (ms)')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={200}
+              max={20000}
+              step={100}
+              defaultValue={stg.warmup_timeout_ms || 4000}
+              onBlur={numBlur('warmup_timeout_ms', 4000)}
+            />
+          </div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Ping timeout (ms)')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={200}
+              max={10000}
+              step={100}
+              defaultValue={stg.ping_timeout_ms || 1500}
+              onBlur={numBlur('ping_timeout_ms', 1500)}
+            />
+          </div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Speed test duration (s)')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={1}
+              max={60}
+              defaultValue={stg.speed_duration_sec || 4}
+              onBlur={numBlur('speed_duration_sec', 4)}
+            />
+          </div>
+          {hint('Warm-up timeout bounds the first un-measured request that establishes the tunnel (TCP + TLS/Reality handshake) — raise it if working configs are wrongly marked "timeout". Ping timeout is per round (3 rounds run, best is reported). Speed duration is how long the test downloads before computing throughput. Defaults: warm-up 4000 ms, ping 1500 ms, speed 4 s.')}
+          <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
+            <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+              {tt('Ping URL')}
+            </span>
+            <Select
+              className="modal-input"
+              style={{ marginBottom: 0 }}
+              value={customPing ? '__custom' : stg.ping_test_url || ''}
+              onChange={(e) => {
+                if (e.target.value === '__custom') {
+                  setCustomPing(true)
+                  return
+                }
+                setCustomPing(false)
+                apply({ ping_test_url: e.target.value })
+              }}
+            >
+              {PING_PRESETS.map((p) => (
+                <option key={p.label} value={p.url}>
+                  {p.label}
+                </option>
+              ))}
+              <option value="__custom">Custom URL…</option>
+            </Select>
+          </div>
+          {customPing && (
+            <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
+              <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+                {tt('Custom ping URL')}
+              </span>
+              <input
+                className="modal-input"
+                style={{ marginBottom: 0 }}
+                placeholder="https://..."
+                defaultValue={isCustomURL(stg.ping_test_url || '', PING_PRESETS) ? stg.ping_test_url : ''}
+                onBlur={(e) => {
+                  const v = e.target.value.trim()
+                  if (!v) setCustomPing(false) // cleared → drop back to the default preset
+                  apply({ ping_test_url: v })
+                }}
+              />
+            </div>
+          )}
+          <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
+            <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+              {tt('Speed URL')}
+            </span>
+            <Select
+              className="modal-input"
+              style={{ marginBottom: 0 }}
+              value={customSpeed ? '__custom' : stg.speed_test_url || ''}
+              onChange={(e) => {
+                if (e.target.value === '__custom') {
+                  setCustomSpeed(true)
+                  return
+                }
+                setCustomSpeed(false)
+                apply({ speed_test_url: e.target.value })
+              }}
+            >
+              {SPEED_PRESETS.map((p) => (
+                <option key={p.label} value={p.url}>
+                  {p.label}
+                </option>
+              ))}
+              <option value="__custom">Custom URL…</option>
+            </Select>
+          </div>
+          {customSpeed && (
+            <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
+              <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+                {tt('Custom speed URL')}
+              </span>
+              <input
+                className="modal-input"
+                style={{ marginBottom: 0 }}
+                placeholder="https://..."
+                defaultValue={isCustomURL(stg.speed_test_url || '', SPEED_PRESETS) ? stg.speed_test_url : ''}
+                onBlur={(e) => {
+                  const v = e.target.value.trim()
+                  if (!v) setCustomSpeed(false) // cleared → drop back to the default preset
+                  apply({ speed_test_url: v })
+                }}
+              />
+            </div>
+          )}
+          <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
+            <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+              {tt('Speed URL fallback')}{' '}
+              <span style={{ color: 'var(--muted)', fontWeight: 400 }}>
+                {tt('(used when the main URL returns HTTP 429)')}
+              </span>
+            </span>
+            <Select
+              className="modal-input"
+              style={{ marginBottom: 0 }}
+              value={
+                customFb ? '__custom' : stg.speed_test_url_fallback === '__none' ? '__none' : fbCur
+              }
+              onChange={(e) => {
+                const v = e.target.value
+                if (v === '__custom') {
+                  setCustomFb(true)
+                  return
+                }
+                setCustomFb(false)
+                apply({ speed_test_url_fallback: v })
+              }}
+            >
+              <option value="__none">{tt('None — no fallback')}</option>
+              {SPEED_PRESETS.map((p) => {
+                const url = p.url || SPEED_DEFAULT_URL
+                let lbl = (p.label || '').replace(/\s*\(default\)\s*$/, '')
+                if (url === CACHEFLY) lbl += ' (default)'
+                return (
+                  <option key={url} value={url}>
+                    {lbl}
+                  </option>
+                )
+              })}
+              <option value="__custom">Custom URL…</option>
+            </Select>
+          </div>
+          {customFb && (
+            <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
+              <span className="modal-row-label" style={{ display: 'block', marginBottom: 4 }}>
+                {tt('Custom speed fallback URL')}
+              </span>
+              <input
+                className="modal-input"
+                style={{ marginBottom: 0 }}
+                placeholder="https://..."
+                defaultValue={
+                  isCustomFallback(stg.speed_test_url_fallback || '') ? stg.speed_test_url_fallback : ''
+                }
+                onBlur={(e) => apply({ speed_test_url_fallback: e.target.value.trim() })}
+              />
+            </div>
+          )}
+          <div className="modal-hint">
+            {tt('Speed test runs for ~4 seconds regardless of file size, measuring throughput. Ping test accepts any HTTP response — pick whichever endpoint your provider routes best.')}{' '}
+            {tt('Pick "None" to disable the retry.')}
+          </div>
+        </div>
+
+        {/* ── Remote access ── */}
+        <div className="settings-section">
+          <div className="section-header">{tt('Remote access')}</div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Web UI')}</span>
+            <Toggle on={!!stg.remote_enabled} onChange={(v) => apply({ remote_enabled: v })} />
+          </div>
+          {hint(
+            'Runs a small web server on this PC so you can open the same interface in a browser on another device — a phone, a tablet, the computer next door. Access is protected by a secret key (in the link/QR below); anyone without it is refused. The connection is plain HTTP, NOT encrypted: everything, including the key, travels the local network in the clear, and whoever can read that traffic can control this program. Use it on a network you trust, and turn it off when you do not need it.',
+          )}
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Web UI port')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={1}
+              max={65535}
+              defaultValue={stg.remote_port || 19876}
+              onBlur={(e) => {
+                const v = +e.target.value
+                const valid = v >= 1 && v <= 65535 && v !== 19876
+                e.target.value = String(valid ? v : 19876) // empty/invalid snaps to the default
+                apply({ remote_port: valid ? v : 0 })
+              }}
+            />
+          </div>
+          {hint('Default 19876. Change it if something else on this machine already listens on that port.')}
+          {/* On Windows the app adds its own inbound firewall rule when this is
+              switched on. Here it cannot: opening a port needs root, which the
+              GUI deliberately does not have. Saying nothing would leave the user
+              with a link that works on this machine and times out on the phone,
+              with no clue why — so show the command instead of pretending. */}
+          {stg.remote_enabled && caps?.firewall_rules === false && (
+            <div className="cmd-note">
+              <div className="cmd-note-text">
+                {tt('Vair cannot open a port in the firewall on this system. If the phone cannot reach the address below, allow it once:')}
+              </div>
+              <code>sudo ufw allow {stg.remote_port || 19876}/tcp</code>
+              <button
+                className="btn ghost sm"
+                onClick={() => {
+                  const cmd = `sudo ufw allow ${stg.remote_port || 19876}/tcp`
+                  navigator.clipboard?.writeText(cmd).then(
+                    () => notify(tt('Copied')),
+                    () => notify(tt('Could not copy')),
+                  )
+                }}
+              >
+                {tt('copy')}
+              </button>
+            </div>
+          )}
+          {stg.remote_enabled && remote?.ips?.length > 1 && (
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('IP address')}</span>
+              <Select
+                className="modal-input"
+                style={{ width: 'auto', marginBottom: 0 }}
+                value={remoteIP}
+                onChange={(e) => apply({ remote_ip: e.target.value === remote.ips[0] ? '' : e.target.value })}
+              >
+                {remote.ips.map((ip: string) => (
+                  <option key={ip} value={ip}>
+                    {ip}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          )}
+          {stg.remote_enabled && remoteURL && (
+            <div className="modal-row" style={{ display: 'block' }}>
+              <div
+                style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '4px 0 10px', flexWrap: 'wrap' }}
+              >
+                <input
+                  className="modal-input"
+                  readOnly
+                  value={remoteURL}
+                  style={{ flex: 1, minWidth: 200, marginBottom: 0 }}
+                />
+                <button
+                  className="btn ghost"
+                  onClick={() => {
+                    navigator.clipboard?.writeText(remoteURL).then(
+                      () => notify(tt('Copied')),
+                      () => notify(remoteURL),
+                    )
+                  }}
+                >
+                  {tt('Copy')}
+                </button>
+                <button
+                  className="btn ghost"
+                  title={tt('Generate a new key — old links and QR codes stop working')}
+                  onClick={() => {
+                    SettingsService.RegenerateRemoteToken().then((r: any) => {
+                      setRemote(r)
+                      notify(tt('New key generated'))
+                    })
+                  }}
+                >
+                  ↻ {tt('New key')}
+                </button>
+              </div>
+              {remoteQR && (
+                <img
+                  src={remoteQR}
+                  alt="QR"
+                  width={160}
+                  height={160}
+                  style={{ display: 'block', borderRadius: 6, background: '#fff', padding: 6 }}
+                />
+              )}
+            </div>
+          )}
+        </div>
 
         {/* ── Appearance ── */}
         <div className="settings-section">
           <div className="section-header">{tt('Appearance')}</div>
           <div className="modal-row">
             <span className="modal-row-label">{tt('Theme')}</span>
-            <select
+            <Select
               className="modal-input num-input"
               style={{ width: 120, textAlign: 'left' }}
               value={stg.theme === 'light' ? 'light' : 'dark'}
@@ -1200,11 +1469,11 @@ export default function SettingsModal({
             >
               <option value="dark">{tt('Dark')}</option>
               <option value="light">{tt('Light')}</option>
-            </select>
+            </Select>
           </div>
           <div className="modal-row">
             <span className="modal-row-label">{tt('Language')}</span>
-            <select
+            <Select
               className="modal-input num-input"
               style={{ width: 120, textAlign: 'left' }}
               value={stg.language === 'ru' ? 'ru' : 'en'}
@@ -1212,7 +1481,7 @@ export default function SettingsModal({
             >
               <option value="en">English</option>
               <option value="ru">Русский</option>
-            </select>
+            </Select>
           </div>
           <div className="modal-row">
             <span className="modal-row-label">{tt('Settings font size (px)')}</span>
@@ -1226,6 +1495,14 @@ export default function SettingsModal({
             />
           </div>
           {hint("Increase or decrease the text size in the Settings and Tab settings modals only. The main window's typography is unchanged.")}
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Show setting descriptions')}</span>
+            <Toggle on={!stg.hide_hints} onChange={(v) => apply({ hide_hints: !v })} />
+          </div>
+          {/* Deliberately still shown with descriptions off — it is the way back. */}
+          <div className="modal-hint" style={{ display: 'block' }}>
+            {tt('The explanatory text under each setting, here and in the tab and auto-connect dialogs. Turn it off once the settings are familiar and the dialogs become much shorter.')}
+          </div>
         </div>
 
         {/* ── Statistics ── */}
@@ -1255,20 +1532,36 @@ export default function SettingsModal({
         {/* ── System ── */}
         <div className="settings-section">
           <div className="section-header">{tt('System')}</div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Minimize to tray on close')}</span>
-            <Toggle on={!!stg.tray_enabled} onChange={(v) => apply({ tray_enabled: v })} />
-          </div>
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Launch at Windows startup')}</span>
-            <Toggle on={!!stg.autostart_enabled} onChange={(v) => apply({ autostart_enabled: v })} />
-          </div>
-          {hint('Starts Vair automatically when you log in to Windows, minimized to the tray. Off by default.')}
-          <div className="modal-row">
-            <span className="modal-row-label">{tt('Handle vair:// links')}</span>
-            <Toggle on={stg.deep_link_enabled !== false} onChange={(v) => apply({ deep_link_enabled: v })} />
-          </div>
-          {hint('Registers the vair:// scheme so clicking a vair://import/… link (e.g. in a browser or Telegram) opens Vair and adds the subscription or config. On by default.')}
+          {/* Hidden where there is no tray to minimize INTO: turning it on
+              there would hide the window with nothing left to reopen it from,
+              while the app keeps running and holding the system proxy. */}
+          {caps?.tray !== false && (
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('Minimize to tray on close')}</span>
+              <Toggle on={!!stg.tray_enabled} onChange={(v) => apply({ tray_enabled: v })} />
+            </div>
+          )}
+          {/* Both rows are gated on the capability rather than shown-and-dead:
+              a switch that flips and changes nothing is worse than no switch,
+              because the user then trusts a setting that was never applied. */}
+          {caps?.autostart !== false && (
+            <>
+              <div className="modal-row">
+                <span className="modal-row-label">{tt('Launch at system startup')}</span>
+                <Toggle on={!!stg.autostart_enabled} onChange={(v) => apply({ autostart_enabled: v })} />
+              </div>
+              {hint('Starts Vair automatically when you log in, minimized to the tray. Off by default.')}
+            </>
+          )}
+          {caps?.deep_link_toggle !== false && (
+            <>
+              <div className="modal-row">
+                <span className="modal-row-label">{tt('Handle vair:// links')}</span>
+                <Toggle on={stg.deep_link_enabled !== false} onChange={(v) => apply({ deep_link_enabled: v })} />
+              </div>
+              {hint('Registers the vair:// scheme so clicking a vair://import/… link (e.g. in a browser or Telegram) opens Vair and adds the subscription or config. On by default.')}
+            </>
+          )}
           <div className="modal-row">
             <span className="modal-row-label">{tt('Verbose logs')}</span>
             <Toggle on={!!stg.verbose_logs} onChange={(v) => apply({ verbose_logs: v })} />
@@ -1279,6 +1572,14 @@ export default function SettingsModal({
             <Toggle on={!!stg.log_tests} onChange={(v) => apply({ log_tests: v })} />
           </div>
           {hint('Logs each ping/speed result plus the full core output during the test (so you can see why a config is unavailable). Off by default — bulk tests can be noisy.')}
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Save logs to a file')}</span>
+            <Toggle on={!!stg.log_to_file} onChange={(v) => apply({ log_to_file: v })} />
+          </div>
+          {hint(
+            'Mirrors the Logs panel to a file that survives a restart or a crash — the in-app log is memory-only and starts empty every launch. Rotated at 5 MiB, one old copy kept (≈10 MiB max). Off by default: with verbose logs on, the file records which sites you visited, so share it only if you are fine with that.',
+          )}
+          {logPath && <div className="modal-hint log-path">{logPath}</div>}
         </div>
 
         {/* ── Data ── */}
@@ -1349,16 +1650,46 @@ export default function SettingsModal({
               <span className="modal-row-label">
                 {tt('New version')}: {updLatest.latest}
               </span>
-              <button
-                className="btn"
-                onClick={() => {
-                  if (!window.confirm(tt('Download and install the update now? Vair will restart.'))) return
-                  setUpdBusy(true)
-                  UpdateService.Apply()
-                }}
-              >
-                {tt('Update now')}
-              </button>
+              {/* "Update now" only where the app can actually install one. A
+                  packaged build belongs to dpkg/rpm and an AppImage is a file
+                  the user placed themselves; offering a button that downloads
+                  and then fails is worse than sending them to the release. */}
+              {caps?.self_update === 'inplace' ? (
+                <button
+                  className="btn"
+                  onClick={() => {
+                    if (!window.confirm(tt('Download and install the update now? Vair will restart.'))) return
+                    setUpdBusy(true)
+                    UpdateService.Apply()
+                  }}
+                >
+                  {tt('Update now')}
+                </button>
+              ) : (
+                <button
+                  className="btn ghost"
+                  onClick={() =>
+                    // Straight to the artifact for THIS install when the
+                    // manifest names one; the releases page is the fallback for
+                    // a manifest that predates per-platform assets.
+                    SettingsService.OpenURL(
+                      updLatest.download_url || 'https://github.com/lm705/vair/releases',
+                    )
+                  }
+                >
+                  {updLatest.download_url ? tt('Download') : tt('Open releases')}
+                </button>
+              )}
+            </div>
+          )}
+          {updLatest && caps?.self_update === 'package' && (
+            <div className="modal-hint">
+              {tt('This copy was installed from a package — update it through your package manager.')}
+            </div>
+          )}
+          {updLatest && caps?.self_update === 'appimage' && (
+            <div className="modal-hint">
+              {tt('This copy runs as an AppImage — download the new one and replace this file.')}
             </div>
           )}
           <div className="upd-attrib">

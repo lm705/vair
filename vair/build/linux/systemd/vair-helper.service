@@ -1,0 +1,58 @@
+[Unit]
+Description=Vair privileged helper (TUN mode)
+Documentation=https://github.com/lm705/vair
+# The tunnel is torn down before the network goes away, not after: stopping in
+# the other order leaves routes pointing at an interface whose owner is gone.
+After=network.target
+Before=network-pre.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/vair/vair-helper
+# Idempotent, and it runs BEFORE every start — not only after a clean stop. The
+# helper can be killed without ever running its own teardown (systemctl kill, an
+# OOM, a crash), and /run survives that; only a reboot clears it.
+ExecStartPre=/usr/lib/vair/vair-helper --cleanup
+Restart=on-failure
+RestartSec=2
+
+# systemd creates /run/vair as root:<Group> 0750 and removes it on stop. The
+# group is NOT set here — the installer drops in 10-group.conf naming the
+# account that installed the helper, because the answer is per-machine and the
+# package cannot know it.
+RuntimeDirectory=vair
+RuntimeDirectoryMode=0750
+
+# ── what this service may do ────────────────────────────────────────────
+# It runs as root because creating a TUN device and rewriting the routing table
+# need that. Everything below narrows what "root" means here.
+#
+# CAP_NET_ADMIN      create the interface, set routes, install nftables rules
+# CAP_NET_RAW        raw sockets, which the engine needs for its own probes
+# CAP_NET_BIND_SERVICE  bind low ports (a DNS listener on 53, later)
+# CAP_SYS_PTRACE     read /proc/<pid> of other processes — how sing-box matches
+# CAP_DAC_READ_SEARCH   process_name rules for split tunnelling
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+
+# ProtectHome is the one that matters most, and it is not decoration: without it
+# the helper could be asked to execute a sing-box under the user's home — a file
+# that user can overwrite, run as root. It is also why the packages install the
+# engines to /usr/lib/vair/bin instead of extracting them into ~/.local/share
+# the way the Windows build does.
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/vair
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# AF_UNIX for the socket, AF_NETLINK for routes, AF_INET/AF_INET6 for the tunnel.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

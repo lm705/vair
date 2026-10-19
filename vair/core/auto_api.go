@@ -163,10 +163,12 @@ func StartBackground() {
 	// only set by the SetAuto toggle / "Switch now".
 	settingsMu.RLock()
 	autoOn := appSettings.AutoConnect
+	toFile := appSettings.LogToFile
 	settingsMu.RUnlock()
 	if autoOn {
 		autoWant.Store(true)
 	}
+	SetFileLogging(toFile) // re-open the log file if the user left it on
 	go startAutoSupervisor()
 	go logFlushLoop()     // flush batched engine/app logs to the "log" event
 	go startAutoRefresh() // per-tab RefreshMin source refresh (1.10 routes.go)

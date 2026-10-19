@@ -2,8 +2,9 @@
 // openSourcesSettings() DOM: read-only built-in URLs (copy/QR), auto-refresh
 // interval + test-after, exclude filter. Live apply debounced 250ms.
 import { useEffect, useRef, useState } from 'react'
-import { TabService } from '../bindings/vair'
+import { TabService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import Select from './Select'
 import {
   ExcludeFields,
   SubInfoSection,
@@ -173,7 +174,7 @@ export default function SourcesModal({
           </div>
           <div className="modal-row" style={{ marginTop: 8 }}>
             <span className="modal-row-label">{tt('Test after auto-refresh')}</span>
-            <select
+            <Select
               className="modal-input num-input"
               style={{ width: 'auto', marginBottom: 0 }}
               value={refreshTest}
@@ -185,7 +186,7 @@ export default function SourcesModal({
               <option value="">{tt('off')}</option>
               <option value="ping">{tt('Ping only')}</option>
               <option value="speed">{tt('Speed test')}</option>
-            </select>
+            </Select>
           </div>
           <div className="modal-hint">
             {tt("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}

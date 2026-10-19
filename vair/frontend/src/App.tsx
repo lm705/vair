@@ -16,13 +16,14 @@ import {
   SettingsService,
   UpdateService,
   ClipboardService,
-} from '../bindings/vair'
+} from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
 import SettingsModal from './SettingsModal'
 import TabModal from './TabModal'
 import SourcesModal from './SourcesModal'
 import AutoModal from './AutoModal'
 import ConfigModal from './ConfigModal'
+import Select from './Select'
 
 type Row = NonNullable<Awaited<ReturnType<typeof ConfigService.Window>>>[number]
 // Sort is "idx" (original order) or "<column>" / "<column>:desc" — the table
@@ -50,6 +51,7 @@ const PROTOS: [string, string][] = [
   ['ss2022', 'ss2022'],
   ['hy2', 'hysteria2'],
   ['tuic', 'tuic'],
+  ['wg', 'wireguard'],
 ]
 // The detached AUTO window loads the same app at /?view=auto; the 1.10
 // body.auto-standalone CSS then hides everything except the titlebar + panel.
@@ -57,6 +59,46 @@ const STANDALONE_AUTO = new URLSearchParams(window.location.search).get('view') 
 
 const FILTER_TITLE =
   'Filter by name, host, type, transport or security. + combines conditions: germany+ws+tls needs all three (name, transport, security); germany+poland matches either (same column). Use field: to target a column, e.g. name:russia.'
+
+// FloatingMenu positions a fixed pop-up at (x, y) but never outside the window.
+//
+// A menu opened by right-clicking near the right or bottom edge used to be drawn
+// past the frame, and the further into the corner the click was, the more of the
+// menu went with it — the last items, which are the destructive ones, ended up
+// unreachable. Measured after mount rather than guessed from a fixed width,
+// because the menus differ in size and the row menu grows with the selection.
+//
+// useLayoutEffect, not useEffect: it runs before the browser paints, so the
+// corrected position is the first one drawn and there is no visible jump.
+function FloatingMenu({
+  x,
+  y,
+  className,
+  children,
+}: {
+  x: number
+  y: number
+  className: string
+  children: React.ReactNode
+}) {
+  const ref = useRef<HTMLDivElement | null>(null)
+  const [pos, setPos] = useState({ left: x, top: y })
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const gap = 6 // never flush against the frame
+    const { width, height } = el.getBoundingClientRect()
+    setPos({
+      left: Math.max(gap, Math.min(x, window.innerWidth - width - gap)),
+      top: Math.max(gap, Math.min(y, window.innerHeight - height - gap)),
+    })
+  }, [x, y])
+  return (
+    <div ref={ref} className={className} style={{ left: pos.left, top: pos.top }}>
+      {children}
+    </div>
+  )
+}
 
 // ── exact 1.10 helpers ──────────────────────────────────────────────
 function fmtBytes(n: number): string {
@@ -90,12 +132,20 @@ function rawBody(raw: string): string {
   return i >= 0 ? raw.slice(0, i) : raw || ''
 }
 function protoLabel(pr: string): string {
-  return pr === 'hysteria2' ? 'hy2' : pr
+  if (pr === 'hysteria2') return 'hy2'
+  if (pr === 'wireguard') return 'wg'
+  return pr
 }
 function fmtLogTime(ms: number): string {
   const d = new Date(ms)
   const p = (n: number) => (n < 10 ? '0' + n : '' + n)
   return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+}
+// isImp mirrors core.isImportant — everything except the engines' [Info]
+// narration. Both sides must agree, or the live stream and the buffer fetched
+// on open would disagree about what belongs in the "important" view.
+function isImp(l: any): boolean {
+  return l.lvl !== 'info' || l.src === 'vair' || l.src === 'test'
 }
 // copyText copies to the OS clipboard with a WebView2-safe fallback: the async
 // navigator.clipboard API is often blocked in the embedded webview (non-secure
@@ -129,7 +179,7 @@ function execCopy(text: string) {
 
 function containsNodeURL(text: string): boolean {
   if (!text) return false
-  return /(vless|vmess|trojan|ss|hysteria2|hy2|tuic):\/\//i.test(text)
+  return /(vless|vmess|trojan|ss|hysteria2|hy2|tuic|wireguard|wg):\/\//i.test(text)
 }
 // subURLsIn returns every bare http(s) link in the text, one per line — so
 // pasting a whole list of subscriptions adds them all. Returns [] when any
@@ -192,6 +242,9 @@ export default function App() {
     setTimeout(() => setCopiedSet(new Set()), 1000)
   }
   const [tabModalId, setTabModalId] = useState<string | null>(null)
+  // Per-tab "source unreachable" reason, set from the source_error event and
+  // cleared once that tab loads configs again.
+  const [srcErr, setSrcErr] = useState<Record<string, string>>({})
   const [sourcesOpen, setSourcesOpen] = useState(false)
   // Add / edit / view a config manually (the ConfigModal form). null = closed.
   const [configModal, setConfigModal] = useState<
@@ -219,6 +272,12 @@ export default function App() {
   // logs
   const [logsOpen, setLogsOpen] = useState(false)
   const [logLines, setLogLines] = useState<any[]>([])
+  // Second, much smaller buffer holding ONLY the important lines (mirrors the
+  // backend's own important ring). The main buffer is capped, so a verbose
+  // engine flood pushes an error out of it within seconds; this one only ever
+  // receives important lines, so the error is still there minutes later.
+  const [impLines, setImpLines] = useState<any[]>([])
+  const [logFind, setLogFind] = useState('') // free-text search in the Logs panel
   const [logSrc, setLogSrc] = useState('')
   const [logLvl, setLogLvl] = useState('')
   const [logAuto, setLogAuto] = useState(true)
@@ -306,8 +365,22 @@ export default function App() {
   }
 
   // ── data loading ──────────────────────────────────────────────────
+  // The window range last painted, so a re-sort knows which cached rows are
+  // still worth keeping (see below).
+  const visibleWinRef = useRef<[number, number] | null>(null)
+  // Which view the rows in flight belong to. A re-sort is NOT a new view, and
+  // treating it as one is what kept a speed-sorted table wrong until RELOAD:
+  // every landing result bumped the order, every bump invalidated the window
+  // fetch that was on its way back, and under a running AUTO the answers never
+  // stopped being superseded. Only a real change of view — tab, sort, filter,
+  // protocol — may discard rows that are already on their way.
+  const viewKeyRef = useRef('')
   useEffect(() => {
-    viewSeqRef.current++
+    const viewKey = [activeTab, sort, filter, protos.join(',')].join('\u0000')
+    if (viewKeyRef.current !== viewKey) {
+      viewKeyRef.current = viewKey
+      viewSeqRef.current++
+    }
     if (prevTabRef.current !== activeTab) {
       // Real TAB switch: stash the outgoing tab's rows, restore the incoming
       // tab's if we have them (instant paint, corrected by the refetch below).
@@ -326,6 +399,21 @@ export default function App() {
     // Same tab (sort / filter / reload / paste / delete / the loaded bump that
     // follows a switch): keep the rows on screen — mark every window stale and
     // refetch over them in place. Never blank mid-view.
+    //
+    // Rows OUTSIDE the viewport are dropped, though. The order is recomputed on
+    // the backend for every result that lands, and only the visible windows are
+    // refetched; keeping the rest meant the table was assembled from several
+    // different orders at once. Sorted by speed under a running AUTO that shows
+    // as a list sorted in pieces, with dead configs sitting in the middle of the
+    // fast ones — each piece correct for the order it was fetched under. A row
+    // that briefly is not there yet is better than a row that is wrong.
+    if (prevTabRef.current === activeTab && visibleWinRef.current) {
+      const [vs, ve] = visibleWinRef.current
+      for (const pos of [...cacheRef.current.keys()]) {
+        const w = Math.floor(pos / WINDOW) * WINDOW
+        if (w < vs || w > ve) cacheRef.current.delete(pos)
+      }
+    }
     winFreshRef.current = new Set()
     pendingRef.current.clear()
     allIdxRef.current = null // full-order cache follows the view
@@ -356,6 +444,7 @@ export default function App() {
     // cleared pendingRef, that mark belongs to the newer run's own fetch.
     const seq = viewSeqRef.current
     const targetCache = cacheRef.current
+    visibleWinRef.current = [startW, endW]
     for (let w = startW; w <= endW; w += WINDOW) {
       // Fresh for this run? skip. Otherwise (re)fetch — stale rows stay rendered
       // until the fresh window overwrites them in place.
@@ -414,6 +503,59 @@ export default function App() {
   // so releasing on the source tab doesn't also "switch" (harmless) — mainly it
   // stops a drag-that-ended-on-the-same-tab from feeling like a mis-click.
   const suppressTabClickRef = useRef(false)
+
+  // ── long-press: the touch stand-in for right-click ──────────────────
+  // A phone has no context menu gesture of its own, so the tab menu (Settings,
+  // Delete tab) was unreachable there. Holding a tab for half a second opens
+  // the same menu at the finger. Only touch pointers arm it — a mouse still
+  // uses the real right-click, and holding the button down to drag a tab must
+  // not pop a menu. Any real movement cancels it so a drag stays a drag.
+  const lpTimer = useRef<number | null>(null)
+  const lpFrom = useRef<{ x: number; y: number } | null>(null)
+  // Set when a long press opened a menu. The click that arrives on release must
+  // be swallowed, or the same gesture would also switch tab / select the row
+  // behind the menu it just opened.
+  const lpFired = useRef(false)
+  const consumeLongPress = () => {
+    if (!lpFired.current) return false
+    lpFired.current = false
+    return true
+  }
+  const cancelLongPress = () => {
+    if (lpTimer.current !== null) {
+      clearTimeout(lpTimer.current)
+      lpTimer.current = null
+    }
+    lpFrom.current = null
+  }
+  const beginLongPress = (e: React.PointerEvent, fire: (x: number, y: number) => void) => {
+    if (e.pointerType !== 'touch') return
+    cancelLongPress()
+    lpFired.current = false // a fresh gesture never inherits the last one's flag
+    const x = e.clientX
+    const y = e.clientY
+    lpFrom.current = { x, y }
+    lpTimer.current = window.setTimeout(() => {
+      lpTimer.current = null
+      lpFrom.current = null
+      lpFired.current = true
+      fire(x, y)
+    }, 500)
+  }
+  const moveLongPress = (e: React.PointerEvent) => {
+    const from = lpFrom.current
+    if (!from) return
+    if (Math.abs(e.clientX - from.x) > 8 || Math.abs(e.clientY - from.y) > 8) cancelLongPress()
+  }
+  // Attached to anything that arms a long press, so the timer can never outlive
+  // the gesture that started it.
+  const longPressCancelProps = {
+    onPointerMove: moveLongPress,
+    onPointerUp: cancelLongPress,
+    onPointerCancel: cancelLongPress,
+    onPointerLeave: cancelLongPress,
+  }
+
   const startTabDrag = (e: React.PointerEvent, dragId: string) => {
     // Pointer capture routes every move/up to this element even when the cursor
     // leaves it — far more reliable than document mouse listeners inside WebView2
@@ -503,6 +645,19 @@ export default function App() {
     for (const row of cacheRef.current.values()) if (row.index === idx) return row
     return null
   }
+  // Cloudflare WARP: enrol and drop the result into the tab as a WireGuard
+  // config. A network round trip, so the button says it is working — enrolment
+  // is normally under a second but goes through the tunnel when one is up.
+  const [warpBusy, setWarpBusy] = useState(false)
+  const addWARP = () => {
+    if (warpBusy) return
+    setWarpBusy(true)
+    ConfigService.AddWARP(activeTabRef.current)
+      .then((err: string) => showToast(err || tt('WARP added')))
+      .catch((e: any) => showToast(String(e)))
+      .finally(() => setWarpBusy(false))
+  }
+
   // Manual add / edit / view config (ConfigModal). Add + edit are user-tab only;
   // Sources rows open read-only View (upstream configs shouldn't be edited).
   const openConfigAdd = () => {
@@ -647,16 +802,16 @@ export default function App() {
     })
   }
   selectAllRef.current = selectAllInView
-  // connectChain connects the selection (top→bottom screen order) as a chain.
+  // connectChain connects the selection as a chain, in the order it was PICKED:
+  // the first config clicked is the entry hop, the last is the exit whose
+  // address sites see. Screen order was wrong for this — the table re-sorts
+  // itself as results arrive, so the same two clicks built a different chain
+  // depending on what the pings did in between.
   const connectChain = () => {
-    const sel = [...selRef.current]
-    if (sel.length < 2) return
-    ensureAllIndices(() => {
-      const pos = allPosRef.current
-      const ordered = sel.sort((a, b) => (pos?.get(a) ?? 0) - (pos?.get(b) ?? 0))
-      ConnService.ConnectChain(ordered, selectedMode).then((err) => {
-        if (err) showToast(err)
-      })
+    const ordered = [...selRef.current]
+    if (ordered.length < 2) return
+    ConnService.ConnectChain(ordered, selectedMode).then((err) => {
+      if (err) showToast(err)
     })
   }
   const testSelected = (idx: number, withSpeed: boolean) => {
@@ -804,6 +959,21 @@ export default function App() {
     })
   }
 
+  // acquirePrivilege gets whatever TUN mode is missing: elevation on Windows,
+  // the helper service on Linux. Windows never comes back from a successful
+  // call — the elevated copy takes over — while Linux does, so capabilities are
+  // re-read afterwards or the chip would keep offering an install that has
+  // already happened.
+  const acquirePrivilege = () => {
+    ConnService.RestartAdmin().then((why: string) => {
+      if (why) {
+        showToast(why)
+        return
+      }
+      ConnService.AppInfo().then(setAppInfo)
+    })
+  }
+
   // ── conn-bar chips ────────────────────────────────────────────────
   const rePingConn = () => {
     const idx = findConnIdx()
@@ -831,6 +1001,11 @@ export default function App() {
 
   // ── settings modal (instant apply, as in 1.10 — no Save button) ────
   const applyTheme = (th?: string) => document.body.classList.toggle('theme-light', th === 'light')
+  // One class on <body> rather than a prop threaded through four dialogs: every
+  // hint is already a .modal-hint, so hiding them is a stylesheet's job and the
+  // setting reaches the tab, settings and auto dialogs — including the
+  // standalone auto window — without any of them knowing about it.
+  const applyHints = (hide?: boolean) => document.body.classList.toggle('no-hints', !!hide)
   const openSettings = () => {
     SettingsService.Get().then(setStg)
     setSettingsOpen(true)
@@ -844,6 +1019,7 @@ export default function App() {
     if ('language' in patch) setLang(patch.language || 'en')
     if ('modal_font_size' in patch)
       document.documentElement.style.setProperty('--modal-fs-base', (patch.modal_font_size || 11) + 'px')
+    if ('hide_hints' in patch) applyHints(patch.hide_hints)
     SettingsService.Set(merged).then((applied: any) => {
       setStg(applied)
       setAuto(!!applied?.auto_connect)
@@ -859,6 +1035,7 @@ export default function App() {
     logsOpenRef.current = true
     setLogsOpen(true)
     LogService.Get().then((ls) => setLogLines(ls ?? []))
+    LogService.GetImportant().then((ls) => setImpLines(ls ?? []))
   }
   const closeLogs = () => {
     logsOpenRef.current = false
@@ -866,23 +1043,34 @@ export default function App() {
   }
   const logPass = (l: any): boolean => {
     if (logSrc && l.src !== logSrc) return false
-    if (logLvl) {
-      const rank: any = { raw: 1, info: 1, warn: 2, error: 3 }
-      const need: any = { info: 1, warn: 2, error: 3 }
-      if ((rank[l.lvl] || 1) < (need[logLvl] || 0)) return false
-    }
-    return true
+    if (logFind && !(l.msg || '').toLowerCase().includes(logFind.toLowerCase())) return false
+    if (!logLvl) return true // "all"
+    // "important" = everything that is NOT an engine [Info] line. That keeps the
+    // warnings and errors, Vair's own messages (connect, refresh, AUTO) AND the
+    // engines' access lines ("… accepted … [http -> proxy]"), which say which
+    // destination was requested and which outbound took it — the genuinely
+    // useful part. Only xray/sing-box's [Info] narration is dropped.
+    if (logLvl === 'important') return isImp(l)
+    // Untagged engine lines ("… accepted … [http -> proxy]") rank BELOW info:
+    // they used to share info's rank, which made "info+" identical to "all".
+    const rank: any = { raw: 0, info: 1, warn: 2, error: 3 }
+    const need: any = { info: 1, warn: 2, error: 3 }
+    return (rank[l.lvl] ?? 0) >= (need[logLvl] ?? 0)
   }
+  // In "important" mode the panel reads the dedicated buffer instead of the
+  // main one, so the lines survive an engine flood. Every other mode filters
+  // the main buffer as before.
+  const logBase = logLvl === 'important' ? impLines : logLines
+  const logShown = logBase.filter(logPass)
   const copyLogs = () => {
-    const text = logLines
-      .filter(logPass)
+    const text = logShown
       .map((l) => fmtLogTime(l.t) + ' ' + (l.src || '') + ' ' + l.msg)
       .join('\n')
     navigator.clipboard.writeText(text).catch(() => {})
   }
   useEffect(() => {
     if (logAuto && logViewRef.current) logViewRef.current.scrollTop = logViewRef.current.scrollHeight
-  }, [logLines, logAuto])
+  }, [logLines, impLines, logAuto])
 
   // ── mount: initial state + events ─────────────────────────────────
   useEffect(() => {
@@ -894,6 +1082,7 @@ export default function App() {
       setStg(s)
       if (STANDALONE_AUTO) document.body.classList.add('auto-standalone')
       applyTheme(s?.theme)
+      applyHints(s?.hide_hints)
       if (s?.language) setLang(s.language)
       if (s?.last_connected_raw) setLastRaw(s.last_connected_raw)
       if (s?.last_connected_mode === 'tun') setSelectedMode('tun')
@@ -950,6 +1139,20 @@ export default function App() {
         }
         importRef.current(payload, t10(langRef.current, 'Added from link'))
       }),
+      // Settings changed — possibly in ANOTHER window. The detached AUTO panel
+      // is a second copy of this frontend and used to read the settings once,
+      // at startup, so switching the language in the main window left it in the
+      // old one. Presentation only: the language, theme, hint density and font
+      // size, plus the settings object the dialogs read.
+      Events.On('settings_update', (e: any) => {
+        const s = e?.data?.payload
+        if (!s) return
+        setStg(s)
+        setLang(s.language || 'en')
+        applyTheme(s.theme)
+        applyHints(s.hide_hints)
+        document.documentElement.style.setProperty('--modal-fs-base', (s.modal_font_size || 11) + 'px')
+      }),
       Events.On('active_tab', (e: any) => {
         const id = e?.data?.payload
         if (!id) return
@@ -967,6 +1170,16 @@ export default function App() {
         setLoading({ op: e?.data?.payload?.op })
       }),
       Events.On('loaded', (e: any) => {
+        // A tab that just loaded configs is no longer in the "source unreachable"
+        // state (a failed refresh re-raises source_error right after).
+        const lt = e?.data?.tab
+        if (lt)
+          setSrcErr((m) => {
+            if (m[lt] === undefined) return m
+            const next = { ...m }
+            delete next[lt]
+            return next
+          })
         if (e?.data?.tab && e.data.tab !== activeTabRef.current) {
           // A background refresh changed a NON-active tab (e.g. its sources): drop
           // that tab's stashed windows so switching to it refetches, never paints
@@ -989,6 +1202,17 @@ export default function App() {
         TabService.Active().then(setActiveTab)
         setReloadKey((k) => k + 1)
         if (p?.message) showToast(t10(langRef.current, 'Imported') + ' — ' + p.message)
+      }),
+      // a tab's source could not be fetched → tell the user right away (until
+      // now this was only visible inside the tab-settings modal)
+      Events.On('source_error', (e: any) => {
+        const p = e?.data?.payload
+        const first = (p?.errors || [])[0]
+        showToast(t10(langRef.current, 'Source unavailable') + (first ? ' — ' + first : ''))
+        // Remember it per tab: an EMPTY tab whose source is unreachable must say
+        // so instead of offering the "add a config" hints (nothing is missing —
+        // the source just didn't answer).
+        if (p?.tab) setSrcErr((m) => ({ ...m, [p.tab]: first || '' }))
       }),
       Events.On('reload_delta', (e: any) => {
         if (e?.data?.tab && e.data.tab !== activeTabRef.current) return
@@ -1098,7 +1322,10 @@ export default function App() {
       Events.On('log', (e: any) => {
         if (!logsOpenRef.current) return
         const batch = e?.data?.payload
-        if (Array.isArray(batch)) setLogLines((prev) => [...prev, ...batch].slice(-2000))
+        if (!Array.isArray(batch)) return
+        setLogLines((prev) => [...prev, ...batch].slice(-2000))
+        const imp = batch.filter(isImp)
+        if (imp.length) setImpLines((prev) => [...prev, ...imp].slice(-500))
       }),
     ]
 
@@ -1153,6 +1380,12 @@ export default function App() {
     const onCopy = (e: ClipboardEvent) => {
       const el = document.activeElement as HTMLElement | null
       if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')) return
+      // Someone who has highlighted text — in the log panel, in a hint, anywhere
+      // — is copying that text. Rows can stay selected for a long time, and this
+      // handler used to overwrite the clipboard with them, which made copying a
+      // log line by hand impossible.
+      const textSel = window.getSelection()
+      if (textSel && !textSel.isCollapsed && String(textSel).trim() !== '') return
       if (selRef.current.size === 0) return
       const pos = allPosRef.current
       const idxs = [...selRef.current]
@@ -1294,9 +1527,16 @@ export default function App() {
   const isActive = connected || connecting || isError
   const isProxy = conn?.mode !== 'tun'
   const stateCls = connected ? (isProxy ? 'cp' : 'conn-tun') : connecting ? 'cc' : isError ? 'ce' : ''
+  // "SYSTEM PROXY" only when the OS setting really points at us. It does not
+  // when the user turned that off in settings, and it cannot on a desktop with
+  // no backend to drive (see Capabilities.SystemProxyBackend) — in both cases
+  // only apps explicitly aimed at the local port are tunnelled, and claiming
+  // otherwise is how "the VPN doesn't work" reports get written.
   const clabel = connected
     ? isProxy
-      ? 'SYSTEM PROXY'
+      ? conn?.system_proxy
+        ? 'SYSTEM PROXY'
+        : 'LOCAL PROXY'
       : 'TUN MODE'
     : connecting
       ? conn?.mode === 'tun'
@@ -1429,8 +1669,22 @@ export default function App() {
         style={{ height: ROW_H }}
         onClick={(e) => {
           if ((e.target as HTMLElement).closest('.act-cell')) return
+          if (consumeLongPress()) return
           toggleRowSelect(r.index, e)
         }}
+        onPointerDown={(e) => {
+          // Not over the action buttons — a hold there is aimed at the button.
+          if ((e.target as HTMLElement).closest('.act-cell')) return
+          beginLongPress(e, (x, y) => {
+            if (!selRef.current.has(r.index)) {
+              selRawsRef.current.clear()
+              selRawsRef.current.set(r.index, r.raw)
+              setSelected(new Set([r.index]))
+            }
+            setMenu({ kind: 'row', x, y, idx: r.index })
+          })
+        }}
+        {...longPressCancelProps}
         onDoubleClick={(e) => {
           if ((e.target as HTMLElement).closest('.act-cell')) return
           e.preventDefault()
@@ -1528,7 +1782,8 @@ export default function App() {
               </span>
             ) : isConn ? (
               <button className="btn sm-disc" title="Disconnect" onClick={() => ConnService.Disconnect()}>
-                disconnect
+                <span className="lbl-full">disconnect</span>
+                <span className="lbl-short">disc</span>
               </button>
             ) : (
               <button
@@ -1536,14 +1791,22 @@ export default function App() {
                 title={selectedMode === 'tun' ? 'TUN mode (all traffic)' : 'System Proxy (HTTP/SOCKS)'}
                 onClick={() => ConnService.Connect(r.index, selectedMode)}
               >
-                connect
+                <span className="lbl-full">connect</span>
+                <span className="lbl-short">conn</span>
               </button>
             )}
-            <button className="btn sm ghost" title="Ping" onClick={() => TestService.PingOne(r.index)}>
-              ping
+            {/* Every action carries both a word and a compact form; the phone
+                media query swaps which one is displayed. Doing it in CSS rather
+                than JS keeps the labels correct during a resize with no
+                re-render and no width tracking. The stopwatch/bolt use U+FE0E so
+                they render as monochrome glyphs instead of colour emoji. */}
+            <button className="btn sm ghost act-ping" title="Ping" onClick={() => TestService.PingOne(r.index)}>
+              <span className="lbl-full">ping</span>
+              <span className="lbl-short">⏱︎</span>
             </button>
-            <button className="btn sm ghost" title="Speed" onClick={() => TestService.SpeedOne(r.index)}>
-              speed
+            <button className="btn sm ghost act-speed" title="Speed" onClick={() => TestService.SpeedOne(r.index)}>
+              <span className="lbl-full">speed</span>
+              <span className="lbl-short">⚡︎</span>
             </button>
             <button
               className={'cpb' + (copiedSet.has(r.index) ? ' done' : '')}
@@ -1567,8 +1830,32 @@ export default function App() {
   return (
     <>
 
-      {/* ── Custom title bar ── */}
-      <div id="titlebar" className="active">
+      {/* ── Custom title bar ──
+          Hidden when the compositor draws its own decorations instead, which
+          would stack two titlebars. The remote UI runs in a browser with no
+          native decoration, so it keeps this one regardless.
+
+          onDoubleClick is the maximise gesture every desktop expects from a
+          titlebar. Windows gives it to us for free — the drag region is a
+          caption hit-test there, and the WM handles the double-click — so we
+          must NOT add our own on top or the two toggles cancel each other out.
+          GTK's move-drag has no such gesture, so on Linux this handler IS the
+          gesture. Hence native_titlebar_gestures rather than an OS check. */}
+      {(IS_REMOTE || appInfo?.caps?.custom_titlebar !== false) && (
+      <div
+        id="titlebar"
+        className="active"
+        onDoubleClick={
+          !IS_REMOTE && appInfo?.caps?.native_titlebar_gestures === false
+            ? (e) => {
+                // Only the drag area — double-clicking a window button must not
+                // also maximise.
+                if ((e.target as HTMLElement).closest('.tb-btns')) return
+                Window.ToggleMaximise()
+              }
+            : undefined
+        }
+      >
         <div className="tb-drag" id="tb-drag">
           <div className="tb-logo">
             <img id="tb-logo-img" src="/icon.png" alt="" />
@@ -1594,7 +1881,11 @@ export default function App() {
             title="Close"
             onClick={() => {
               if (STANDALONE_AUTO) AutoService.CloseAuto()
-              else if (stg?.tray_enabled) Window.Hide() // minimize-to-tray on close
+              // The capability check is not redundant with the setting: a
+              // profile carried over from a machine that HAD a tray still says
+              // tray_enabled, and honouring it here would hide the window into
+              // nothing.
+              else if (stg?.tray_enabled && appInfo?.caps?.tray !== false) Window.Hide()
               else SettingsService.Quit() // 1.10 default: ✕ really quits
             }}
           >
@@ -1604,7 +1895,8 @@ export default function App() {
             </svg>
           </button>
         </div>
-      </div>
+        </div>
+      )}
 
       {/* ── Header ── */}
       <header>
@@ -1729,6 +2021,9 @@ export default function App() {
             title="Switch tab"
             onClick={(e) => {
               e.stopPropagation()
+              // A long press already opened the tab menu; the release must not
+              // also drop the tab list on top of it.
+              if (consumeLongPress()) return
               const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
               setTabDD((dd) => (dd ? null : { x: r.left, y: r.bottom + 4 }))
             }}
@@ -1737,6 +2032,13 @@ export default function App() {
               const act = tabs.find((t) => t.id === activeTab)
               if (act) setMenu({ kind: 'tab', x: e.clientX, y: e.clientY, tab: act })
             }}
+            onPointerDown={(e) =>
+              beginLongPress(e, (x, y) => {
+                const act = tabs.find((t) => t.id === activeTab)
+                if (act) setMenu({ kind: 'tab', x, y, tab: act })
+              })
+            }
+            {...longPressCancelProps}
           >
             <span className="tab-dd-name">{tabs.find((t) => t.id === activeTab)?.name || ''}</span>
             <span className="tab-dd-caret">▾</span>
@@ -1750,8 +2052,11 @@ export default function App() {
                 className={'tab-btn' + (tb.id === activeTab ? ' active' : '')}
                 onPointerDown={(e) => {
                   if (e.button === 0) startTabDrag(e, tb.id)
+                  beginLongPress(e, (x, y) => setMenu({ kind: 'tab', x, y, tab: tb }))
                 }}
+                {...longPressCancelProps}
                 onClick={() => {
+                  if (consumeLongPress()) return
                   if (suppressTabClickRef.current) {
                     suppressTabClickRef.current = false
                     return
@@ -1920,6 +2225,23 @@ export default function App() {
             </div>
             <p>{loading.op === 'delete' ? tt('Deleting configs…') : tt('Loading configs…')}</p>
           </div>
+        ) : total === 0 && tabTotal === 0 && srcErr[activeTab] !== undefined ? (
+          /* The tab HAS a source, it just couldn't be fetched — say that instead
+             of the "add a config" hints, which imply the tab is unconfigured. */
+          <div className="center-msg" id="msg-area">
+            <p style={{ marginBottom: 6 }}>{tt('Source unavailable')}</p>
+            {srcErr[activeTab] ? (
+              <p style={{ marginBottom: 12, color: 'var(--dim)', fontSize: 12 }}>{srcErr[activeTab]}</p>
+            ) : null}
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+              <button className="btn ghost" onClick={() => ConfigService.Reload(activeTab)}>
+                {tt('Retry')}
+              </button>
+              <button className="btn ghost" onClick={() => setTabModalId(activeTab)}>
+                {tt('Tab settings')}
+              </button>
+            </div>
+          </div>
         ) : total === 0 && tabTotal === 0 && activeTab !== 'main' ? (
           /* Genuinely empty user tab: show the three ways to fill it (discoverability
              — the context-menu entry points are invisible until you know to
@@ -1932,6 +2254,9 @@ export default function App() {
               <button className="btn ghost" onClick={openConfigAdd}>{tt('Add config…')}</button>
               <button className="btn ghost" onClick={pasteFromClipboard}>{tt('Paste configs')}</button>
               <button className="btn ghost" onClick={() => setTabModalId(activeTab)}>{tt('Add a source')}</button>
+              <button className="btn ghost" onClick={addWARP} disabled={warpBusy}>
+                {warpBusy ? tt('Getting WARP…') : tt('Get a free WARP config')}
+              </button>
             </div>
           </div>
         ) : total === 0 && tabTotal > 0 ? (
@@ -2000,19 +2325,34 @@ export default function App() {
             <span className="log-title" id="log-title">
               Logs
             </span>
-            <select className="log-sel" id="log-src" value={logSrc} onChange={(e) => setLogSrc(e.target.value)}>
+            <Select className="log-sel" id="log-src" value={logSrc} onChange={(e) => setLogSrc(e.target.value)}>
               <option value="">all</option>
               <option value="xray">xray</option>
               <option value="singbox">sing-box</option>
               <option value="vair">vair</option>
               <option value="test">test</option>
-            </select>
-            <select className="log-sel" id="log-lvl" value={logLvl} onChange={(e) => setLogLvl(e.target.value)}>
+            </Select>
+            <Select className="log-sel" id="log-lvl" value={logLvl} onChange={(e) => setLogLvl(e.target.value)}>
               <option value="">all</option>
+              <option value="important">important</option>
               <option value="info">info+</option>
               <option value="warn">warn+</option>
               <option value="error">error</option>
-            </select>
+            </Select>
+            <input
+              className="log-find"
+              id="log-find"
+              placeholder="search…"
+              title="Filter the lines by text (case-insensitive). Applies to copy too."
+              value={logFind}
+              onChange={(e) => setLogFind(e.target.value)}
+              spellCheck={false}
+            />
+            {logFind && (
+              <span className="log-find-n">
+                {logShown.length}/{logBase.length}
+              </span>
+            )}
             <label className="log-auto">
               <input type="checkbox" checked={logAuto} onChange={(e) => setLogAuto(e.target.checked)} />{' '}
               <span id="log-auto-lbl">auto-scroll</span>
@@ -2027,6 +2367,7 @@ export default function App() {
               onClick={() => {
                 LogService.Clear()
                 setLogLines([])
+                setImpLines([])
               }}
             >
               clear
@@ -2036,7 +2377,7 @@ export default function App() {
             </button>
           </div>
           <div className="log-view" id="log-view" ref={logViewRef}>
-            {logLines.filter(logPass).map((l, i) => (
+            {logShown.map((l, i) => (
               <span key={i} className={'log-line lvl-' + (l.lvl || 'raw')}>
                 <span className="lt">{fmtLogTime(l.t)}</span>
                 <span className={'ls src-' + (l.src || '')}>{l.src === 'singbox' ? 'sing-box' : l.src}</span>
@@ -2044,7 +2385,7 @@ export default function App() {
                 {'\n'}
               </span>
             ))}
-            {logLines.length === 0 && <span className="log-empty">— no log lines yet —</span>}
+            {logBase.length === 0 && <span className="log-empty">— no log lines yet —</span>}
           </div>
         </div>
       )}
@@ -2160,15 +2501,20 @@ export default function App() {
               className={
                 'mpill' +
                 (selectedMode === 'tun' ? ' sel-tun' : '') +
-                (!appInfo.singbox_available || !appInfo.is_admin ? ' off' : '')
+                (appInfo.caps?.tun_ready === false ? ' off' : '')
               }
               id="mp-tun"
               onClick={() => {
                 // 1.10 setMode: TUN needs sing-box + admin; clicking while
                 // unelevated offers the UAC relaunch instead of selecting.
-                if (!appInfo.singbox_available) return
-                if (!appInfo.is_admin) {
-                  ConnService.RestartAdmin()
+                // "no_helper" is the Linux case, and from the user's side it is
+                // the same gesture — one prompt — even though underneath it
+                // installs a service rather than relaunching as root. Any other
+                // reason is not actionable, so the click does nothing instead of
+                // pretending.
+                const why = appInfo.caps?.tun_block_reason
+                if (appInfo.caps?.tun_ready === false) {
+                  if (why === 'not_admin' || why === 'no_helper') acquirePrivilege()
                   return
                 }
                 setSelectedMode('tun')
@@ -2176,17 +2522,41 @@ export default function App() {
             >
               tun
             </button>
-            {(!appInfo.singbox_available || !appInfo.is_admin) && (
+            {/* The note says WHY TUN is unavailable, and the reason comes from
+                the backend rather than being inferred here. Inferring it read
+                "requires admin" on Linux, where elevation would change nothing:
+                TUN needs the privileged helper that does not exist yet, and
+                offering a relaunch-as-root that cannot help is worse than
+                saying so. */}
+            {appInfo.caps?.tun_ready === false && appInfo.caps?.tun_block_reason && (
               <span
                 className="mtip"
                 id="mtip"
-                style={!appInfo.singbox_available ? { cursor: 'default' } : undefined}
-                title={appInfo.singbox_available ? 'Restart Vair as Administrator' : undefined}
+                style={
+                  appInfo.caps.tun_block_reason !== 'not_admin' &&
+                  appInfo.caps.tun_block_reason !== 'no_helper'
+                    ? { cursor: 'default' }
+                    : undefined
+                }
+                title={
+                  appInfo.caps.tun_block_reason === 'not_admin'
+                    ? 'Restart Vair as Administrator'
+                    : appInfo.caps.tun_block_reason === 'no_helper'
+                      ? tt('Installs a small system service that creates the tunnel. Asked once.')
+                      : undefined
+                }
                 onClick={() => {
-                  if (appInfo.singbox_available && !appInfo.is_admin) ConnService.RestartAdmin()
+                  const why = appInfo.caps?.tun_block_reason
+                  if (why === 'not_admin' || why === 'no_helper') acquirePrivilege()
                 }}
               >
-                {appInfo.singbox_available ? 'requires admin ↗' : 'sing-box not found'}
+                {appInfo.caps.tun_block_reason === 'not_admin'
+                  ? 'requires admin ↗'
+                  : appInfo.caps.tun_block_reason === 'no_helper'
+                    ? tt('install helper ↗')
+                    : appInfo.caps.tun_block_reason === 'no_singbox'
+                      ? 'sing-box not found'
+                      : tt('not available on this system')}
               </span>
             )}
           </div>
@@ -2201,7 +2571,7 @@ export default function App() {
       {/* ── Compact-tab dropdown list ── */}
       {/* ── Type-filter dropdown (ctrl+click keeps the multi-select) ── */}
       {protoDD && (
-        <div className="tab-dd-menu proto-dd-menu" style={{ left: protoDD.x, top: protoDD.y }}>
+        <FloatingMenu className="tab-dd-menu proto-dd-menu" x={protoDD.x} y={protoDD.y}>
           <div
             className={'tab-dd-item' + (protos.length === 0 ? ' active' : '')}
             onClick={() => {
@@ -2224,11 +2594,11 @@ export default function App() {
               {label}
             </div>
           ))}
-        </div>
+        </FloatingMenu>
       )}
 
       {tabDD && (
-        <div className="tab-dd-menu" style={{ left: tabDD.x, top: tabDD.y }}>
+        <FloatingMenu className="tab-dd-menu" x={tabDD.x} y={tabDD.y}>
           {tabs
             .filter((tb) => !(tb.id === 'main' && stg?.sources_enabled === false))
             .map((tb) => (
@@ -2243,7 +2613,7 @@ export default function App() {
                 {tb.name}
               </div>
             ))}
-        </div>
+        </FloatingMenu>
       )}
 
       {/* ── Startup "new version" banner (1.10 upd-banner) ── */}
@@ -2284,7 +2654,7 @@ export default function App() {
 
       {/* ── Context menus ── */}
       {menu && (
-        <div className="ctx-menu" style={{ left: menu.x, top: menu.y }}>
+        <FloatingMenu className="ctx-menu" x={menu.x} y={menu.y}>
           {menu.kind === 'row' && (
             <>
               <div className="ctx-menu-item" onClick={copySelected}>
@@ -2346,9 +2716,19 @@ export default function App() {
                   <div className="ctx-menu-item" onClick={pasteFromClipboard}>
                     {tt('Paste configs')}
                   </div>
-                  <div className="ctx-menu-item" onClick={scanQRScreen}>
-                    {tt('Scan QR from screen')}
+                  <div className="ctx-menu-item" onClick={addWARP}>
+                    {warpBusy ? tt('Getting WARP…') : tt('Get a free WARP config')}
                   </div>
+                  {/* Screen capture needs a portal handshake on Wayland that
+                      this build does not do, so the item is hidden rather than
+                      left to fail with "no QR found" — which reads as "your QR
+                      is bad", not "this cannot work here". Scanning from a FILE
+                      is unaffected and stays. */}
+                  {appInfo?.caps?.qr_screen !== false && (
+                    <div className="ctx-menu-item" onClick={scanQRScreen}>
+                      {tt('Scan QR from screen')}
+                    </div>
+                  )}
                   <div className="ctx-menu-item" onClick={scanQRFile}>
                     {tt('Scan QR from file')}
                   </div>
@@ -2366,9 +2746,14 @@ export default function App() {
               <div className="ctx-menu-item" onClick={pasteFromClipboard}>
                 {tt('Paste configs')}
               </div>
-              <div className="ctx-menu-item" onClick={scanQRScreen}>
-                {tt('Scan QR from screen')}
+              <div className="ctx-menu-item" onClick={addWARP}>
+                {warpBusy ? tt('Getting WARP…') : tt('Get a free WARP config')}
               </div>
+              {appInfo?.caps?.qr_screen !== false && (
+                <div className="ctx-menu-item" onClick={scanQRScreen}>
+                  {tt('Scan QR from screen')}
+                </div>
+              )}
               <div className="ctx-menu-item" onClick={scanQRFile}>
                 {tt('Scan QR from file')}
               </div>
@@ -2390,12 +2775,14 @@ export default function App() {
                 </div>
               </>
             ))}
-        </div>
+        </FloatingMenu>
       )}
 
       {/* ── QR modal ── */}
       {qrSrc && (
-        <div className="modal-overlay" onClick={() => setQrSrc(null)}>
+        /* modal-nested: the QR is often opened from inside the tab-settings
+           modal, so it has to stack above it. */
+        <div className="modal-overlay modal-nested" onClick={() => setQrSrc(null)}>
           <div
             className="modal-box"
             style={{ width: 'auto', textAlign: 'center' }}
@@ -2451,6 +2838,7 @@ export default function App() {
           notify={showToast}
           lang={lang}
           version={version}
+          caps={appInfo?.caps}
         />
       )}
 

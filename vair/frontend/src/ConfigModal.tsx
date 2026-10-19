@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
-import { ConfigService } from '../bindings/vair'
+import { ConfigService } from '../bindings/vair/internal/services'
 import type { ConfigForm } from '../bindings/vair/core'
 import { t10 } from './i18n'
+import Select from './Select'
 
 type Mode = 'add' | 'edit' | 'view'
 
@@ -99,10 +100,10 @@ export default function ConfigModal({
       disabled={readOnly} onChange={(e) => set(k, +e.target.value || 0)} />
   )
   const sel = (k: string, opts: string[], labels?: Record<string, string>) => (
-    <select className="modal-input" style={iStyle} value={form[k] ?? opts[0]}
+    <Select className="modal-input" style={iStyle} value={form[k] ?? opts[0]}
       disabled={readOnly} onChange={(e) => set(k, e.target.value)}>
       {opts.map((o) => <option key={o} value={o}>{labels ? labels[o] : (o === '' ? tt('(default)') : o)}</option>)}
-    </select>
+    </Select>
   )
   const chk = (k: string) => (
     <input type="checkbox" checked={!!form[k]} disabled={readOnly} onChange={(e) => set(k, e.target.checked)} />
@@ -122,9 +123,9 @@ export default function ConfigModal({
 
         {row('Protocol', mode === 'add'
           ? (
-            <select className="modal-input" style={iStyle} value={p} onChange={(e) => changeProtocol(e.target.value)}>
+            <Select className="modal-input" style={iStyle} value={p} onChange={(e) => changeProtocol(e.target.value)}>
               {PROTOCOLS.map((o) => <option key={o} value={o}>{PROTO_LABEL[o]}</option>)}
-            </select>
+            </Select>
           )
           : <span className="modal-input" style={{ ...iStyle, opacity: 0.8 }}>{PROTO_LABEL[p] || p}</span>)}
 

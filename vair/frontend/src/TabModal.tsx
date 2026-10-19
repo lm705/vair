@@ -1,8 +1,9 @@
 // Tab settings modal — an exact port of the 1.10 openTabSettings() DOM
 // (same classes/sections, live apply debounced 250ms, no Save button).
 import { useEffect, useRef, useState } from 'react'
-import { TabService } from '../bindings/vair'
+import { TabService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import Select from './Select'
 import {
   ExcludeFields,
   SubInfoSection,
@@ -222,6 +223,13 @@ export default function TabModal({
         {/* ── Sources: URLs + files ── */}
         <div className="settings-section">
           <div className="modal-label">{tt('Source URLs (raw links, base64 subscriptions)')}</div>
+          {urls.some((r) => /^http:\/\//i.test(r.url.trim())) && (
+            <div className="modal-hint" style={{ display: 'block', color: 'var(--warn, #d9a441)' }}>
+              {tt(
+                'A source over plain http:// can be changed by anyone between you and the server, and what it returns becomes the servers your traffic goes through. Use https:// where the provider offers it.',
+              )}
+            </div>
+          )}
           <div id="ms-urls">
             {urls.map((r, i) => (
               <div key={i} className={'url-row' + (r.disabled ? ' src-off' : '')}>
@@ -426,7 +434,7 @@ export default function TabModal({
           </div>
           <div className="modal-row" style={{ marginTop: 8 }}>
             <span className="modal-row-label">{tt('Test after auto-refresh')}</span>
-            <select
+            <Select
               className="modal-input num-input"
               style={{ width: 'auto', marginBottom: 0 }}
               value={refreshTest}
@@ -438,7 +446,7 @@ export default function TabModal({
               <option value="">{tt('off')}</option>
               <option value="ping">{tt('Ping only')}</option>
               <option value="speed">{tt('Speed test')}</option>
-            </select>
+            </Select>
           </div>
           <div className="modal-hint">
             {tt("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}
