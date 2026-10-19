@@ -4,7 +4,7 @@
 
 > ⚠️ This is an AI translation and may be inaccurate. The [Russian version](README.md) is the source of truth.
 
-A client for testing and connecting to VPN configurations supporting the **VLESS, VMess, Trojan, Shadowsocks (including SS2022), Hysteria2, TUIC** protocols. Built on top of [Xray-core](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box).
+A client for testing and connecting to VPN configurations supporting the **VLESS, VMess, Trojan, Shadowsocks (including SS2022), Hysteria2, TUIC, WireGuard** protocols. Built on top of [Xray-core](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box).
 
 **You can start without configurations of your own:** a list of free ones is already built in — it is refreshed every hour and checked automatically. In [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) mode the app tests the configurations itself, connects to the fastest working one and switches to another if it stops responding. A tab's auto-refresh then keeps the list itself current — fresh configurations arrive without you doing anything.
 
@@ -12,13 +12,13 @@ A client for testing and connecting to VPN configurations supporting the **VLESS
 
 Your own configurations are just as welcome: add **subscription links**, files and individual configurations — sort them into tabs and use the same testing, routing and AUTO.
 
-**Windows** only. A single `.exe`, no installation needed — the xray-core and sing-box engines are already inside.
+**Windows and Linux.** On Windows it is a single `.exe` that needs no installation — the xray-core and sing-box engines are already inside. On Linux there are `.deb`, `.rpm` and Arch packages; the engines are installed and updated with the package.
 
-> 💡 Please post suggestions, bugs and any feedback in [**Issues**](https://github.com/lm705/vair/issues). Feel free to write in whatever language is convenient for you.
+> 💡 Please post suggestions, bugs and any feedback in [**Issues**](https://github.com/lm705/vair/issues). Feel free to write in whatever language is convenient for you. To reach me directly: Telegram [**t.me/mial705**](https://t.me/mial705).
 
 [![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
 [![Release](https://img.shields.io/github/v/release/lm705/vair?label=Release)](https://github.com/lm705/vair/releases/latest)
-![Platform](https://img.shields.io/badge/platform-Windows-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-blue)
 [![Stars](https://img.shields.io/github/stars/lm705/vair?style=flat)](https://github.com/lm705/vair/stargazers)
 
 <a href="screenshots/main-window.png"><img src="screenshots/main-window.png" alt="Vair main window: the configuration table with test results" width="900"></a> <a href="screenshots/auto-panel.png"><img src="screenshots/auto-panel.png" alt="The AUTO panel and routing settings" width="450"></a>
@@ -33,14 +33,14 @@ More in [Getting started](https://github.com/lm705/vair/wiki/Начало-раб
 
 ## Features
 
-* **Many protocols** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC, with TLS and Reality.
+* **Many protocols** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC / WireGuard, with TLS and Reality. A free Cloudflare WARP config is one button away.
 * **Two modes** — system proxy (HTTP/SOCKS) and TUN (all traffic through the tunnel).
 * [**Auto-connect (AUTO)**](https://github.com/lm705/vair/wiki/Авто-подключение) — connects to the fastest working config by itself and switches over when it stops working.
 * **Testing** — latency (ping) and download speed per configuration, in bulk too; results persist between launches.
 * **Flexible routing** — five modes: all traffic through the VPN; everything except the sites of selected countries (🇷🇺 🇨🇳 🇮🇷 🇰🇿); only what's blocked in Russia; only what's blocked in China; only selected sites. Plus your own rules for domains, IPs and apps.
 * **Chains** — connect through several nodes in a row (you → node A → node B → the internet).
 * **DPI bypass** — TLS handshake fragmentation and a browser TLS fingerprint (uTLS).
-* **DNS leak protection** and a kill-switch in TUN mode.
+* **DNS leak protection** and a kill-switch in TUN mode (the kill-switch is Windows-only for now).
 * **Tabs and sources** — configurations are organised into tabs and pulled from subscriptions, files or a private GitHub repository, with auto-refresh and filters.
 * **Large lists** — up to ~250,000 configurations stay smooth: SQLite storage, instant sorting, search and filtering.
 * **VPN on your phone** — share the proxy over the local network from TUN mode and [control the app from a phone](https://github.com/lm705/pc-vpn-to-phone).
@@ -58,6 +58,8 @@ A list of free VLESS configurations that work within Russia.
 Preloaded in the **SOURCES** tab of the application. The **RELOAD** button fetches the latest version of the file.
 
 Configurations are updated every hour, passing automatic availability and speed checks on a server located in one of the most heavily censored regions of Russia. Unavailable and slow configurations are filtered out. Most configurations are functional at the time of each update.
+
+> ⚠️ **From 19 October 2026 the list is no longer updated hourly.** I have moved (and I recommend the same — there is less time than it seems), so I can no longer keep up a regular schedule. Someone else will keep updating it in their free time, without a fixed cadence. The availability and speed checks stay, but the configurations may be less fresh than before — it is worth adding sources of your own as well.
 
 Configurations are collected from open public sources. Collection and automatic checking are done by the [vair-collector](https://github.com/lm705/vair-collector) script.
 
