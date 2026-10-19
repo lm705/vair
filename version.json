@@ -1,6 +1,20 @@
 {
-  "version": "2.2.0",
-  "url": "https://github.com/lm705/vair/releases/download/v2.2.0/Vair.exe",
-  "sha256": "e8def0bd3256ccefb76e0589649c54f4652a9733ebad1672d9867ff92d543931",
-  "notes": "Умная дедупликация конфигураций, сортировка кликом по столбцам, фильтр типов выпадающим списком, перетаскивание файлов в окно, вставка нескольких источников сразу, копирование активной конфигурации."
+  "version": "2.5.0",
+  "url": "https://github.com/lm705/vair/releases/download/v2.5.0/Vair.exe",
+  "sha256": "2ceb96da0226aea43c834135808b585e315d627f6bb671bfa47a52c33fe22a6d",
+  "notes": "Поддержка Linux: пакеты .deb, .rpm и Arch, режим TUN через привилегированную службу. WireGuard и WARP, цепочки из двух движков, kill switch для локального прокси, счётчик срабатываний правил, переработанные разделы настроек.",
+  "assets": {
+    "linux/amd64/deb": {
+      "url": "https://github.com/lm705/vair/releases/download/v2.5.0/vair_2.5.0-1_amd64.deb",
+      "sha256": "dac894889ed83ba4f4e125a835bc9e209d96f942462fea02f3dff34c049af45a"
+    },
+    "linux/amd64/rpm": {
+      "url": "https://github.com/lm705/vair/releases/download/v2.5.0/vair-2.5.0-1.x86_64.rpm",
+      "sha256": "51d2589d8ab8f8a520d656e5fe15057692744e069645953eda12c00746c28dd7"
+    },
+    "linux/amd64/archlinux": {
+      "url": "https://github.com/lm705/vair/releases/download/v2.5.0/vair-2.5.0-1-x86_64.pkg.tar.zst",
+      "sha256": "fa45a205dd9acbc0f1b445296cb19c7055fde89f73a5e45610d3d61a3c52df18"
+    }
+  }
 }
