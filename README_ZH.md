@@ -4,7 +4,7 @@
 
 > ⚠️ 本翻译由 AI 生成，可能不够准确，请以[俄语版本](README.md)为准。
 
-一款用于测试和连接 **VLESS、VMess、Trojan、Shadowsocks（包括 SS2022）、Hysteria2、TUIC、WireGuard** 协议 VPN 配置的客户端。基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
+一款 VPN 客户端，用于测试和连接 **VLESS、VMess、Trojan、Shadowsocks（包括 SS2022）、Hysteria2、TUIC、WireGuard** 协议的配置。基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
 
 **无需自备配置即可上手：** 程序内置了一份免费配置列表，每小时更新一次并自动检测。在 [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) 模式下，程序会自行测试这些配置，连接到最快的可用配置，并在其失效时自动切换到另一个。标签页的自动刷新则会让列表本身保持最新——新配置会自动加入，无需您操作。
 
