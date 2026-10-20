@@ -2,7 +2,7 @@
 
 **Русский** | [English](README_EN.md) | [فارسی](README_FA.md) | [中文](README_ZH.md)
 
-GUI клиент для проверки и подключения к VPN-конфигурациям протоколов **VLESS, VMess, Trojan, Shadowsocks (включая SS2022), Hysteria2, TUIC, WireGuard**. Построен на базе [Xray-core](https://github.com/XTLS/Xray-core) и [sing-box](https://github.com/SagerNet/sing-box).
+VPN-клиент для проверки и подключения к конфигурациям протоколов **VLESS, VMess, Trojan, Shadowsocks (включая SS2022), Hysteria2, TUIC, WireGuard**. Построен на базе [Xray-core](https://github.com/XTLS/Xray-core) и [sing-box](https://github.com/SagerNet/sing-box).
 
 **Можно начать без своих конфигураций:** внутри уже есть список бесплатных конфигураций, который обновляется каждый час и проходит автопроверку. В режиме [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) программа сама тестирует конфигурации, подключается к самой быстрой рабочей и переключается на другую, если та перестала отвечать. А авто-обновление вкладки будет держать сам список конфигураций актуальным — свежие подтянутся без вашего участия.
 
