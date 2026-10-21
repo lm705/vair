@@ -4,17 +4,15 @@
 
 > ⚠️ 本翻译由 AI 生成，可能不够准确，请以[俄语版本](README.md)为准。
 
-一款 VPN 客户端，用于测试和连接 **VLESS、VMess、Trojan、Shadowsocks（包括 SS2022）、Hysteria2、TUIC、WireGuard** 协议的配置。基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
+一款 VPN 客户端，用于测试和连接 **VLESS、VMess、Trojan、Shadowsocks（包括 SS2022）、Hysteria2、TUIC、WireGuard** 协议的配置，同时也支持普通的 **SOCKS5、HTTP 与 HTTPS** 代理。基于 [Xray-core](https://github.com/XTLS/Xray-core) 和 [sing-box](https://github.com/SagerNet/sing-box) 构建。
 
 **无需自备配置即可上手：** 程序内置了一份免费配置列表，每小时更新一次并自动检测。在 [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) 模式下，程序会自行测试这些配置，连接到最快的可用配置，并在其失效时自动切换到另一个。标签页的自动刷新则会让列表本身保持最新——新配置会自动加入，无需您操作。
 
 > ℹ️ **请注意：** 该内置列表**仅在俄罗斯境内**收集和测试，因此在您所在的国家/地区可能无法使用。此时请添加您自己的订阅和配置——下述所有功能对它们同样适用。
 
-您自己的配置同样受支持：添加**订阅链接**、文件和单个配置，将它们分类到标签页中，并使用同样的测试、路由和 AUTO 功能。
+您自己的配置同样受支持：**订阅链接**、文件和单个配置可分类到标签页中，并使用同样的测试、路由和 AUTO 功能。
 
-**支持 Windows 与 Linux。** 在 Windows 上是单个 `.exe` 文件，无需安装——xray-core 与 sing-box 引擎已内置其中。在 Linux 上提供 `.deb`、`.rpm` 与 Arch 软件包；引擎随软件包一同安装并由其更新。
-
-> 💡 如有建议、错误或任何反馈，请在 [**Issues**](https://github.com/lm705/vair/issues) 中提交。可以使用您方便的任何语言撰写。如需直接联系：Telegram [**t.me/mial705**](https://t.me/mial705)。
+**支持 Windows 与 Linux。** Windows：内置引擎的便携版 `Vair.exe`（无需安装），或无需管理员权限的安装程序 `Vair_2.6.0_setup.exe`。Linux：`.deb`、`.rpm` 与 Arch 软件包，引擎随包安装并更新。
 
 [![Download](https://img.shields.io/github/downloads/lm705/vair/total?label=Download&logo=github)](https://github.com/lm705/vair/releases)
 [![Release](https://img.shields.io/github/v/release/lm705/vair?label=Release)](https://github.com/lm705/vair/releases/latest)
@@ -25,7 +23,7 @@
 
 ## 快速开始
 
-1. 从 [**Releases**](https://github.com/lm705/vair/releases) 页面下载 `Vair.exe` 并运行——无需安装。
+1. 从 [**Releases**](https://github.com/lm705/vair/releases) 页面下载：`Vair.exe`（便携版，无需安装即可运行）或 `Vair_2.6.0_setup.exe`（安装程序）。
 2. 打开 **SOURCES** 标签页并点击 **RELOAD**，即可获取最新的配置列表。
 3. 点击 **PING ALL** 或 **SPEED ALL** 进行检测，然后连接任意可用配置——或者开启 **AUTO**，让程序自动完成。
 
@@ -33,16 +31,15 @@
 
 ## 功能
 
-* **多种协议** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC / WireGuard，支持 TLS 与 Reality。
-* **两种模式** — 系统代理（HTTP/SOCKS）和 TUN（全部流量走隧道）。
-* [**自动连接（AUTO）**](https://github.com/lm705/vair/wiki/Авто-подключение) — 自动连接到最快的可用配置，并在其失效时自动切换。
-* **测试** — 对每个配置测量延迟（ping）和下载速度，支持批量；结果在重启后仍会保留。
-* **灵活路由** — 五种模式：全部流量走 VPN；除所选国家（🇷🇺 🇨🇳 🇮🇷 🇰🇿）网站外的全部流量；仅俄罗斯被封锁的资源；仅中国被封锁的资源；仅所选网站。另外还可为域名、IP 和应用设置自定义规则。
-* **链式代理** — 依次经过多个节点（您 → 节点 A → 节点 B → 互联网）。
-* **绕过 DPI** — TLS 握手分片和浏览器 TLS 指纹（uTLS）。
-* **DNS 泄漏防护** 以及 TUN 模式下的 kill-switch（kill-switch 目前仅限 Windows）。
-* **标签页与订阅源** — 配置可按标签页归类，并从订阅、文件或私有 GitHub 仓库获取，支持自动刷新与过滤。
-* **超大列表** — 多达约 250,000 条配置依然流畅：使用 SQLite 存储，排序、搜索和过滤即时完成。
+* **协议** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC / WireGuard，以及 SOCKS5、HTTP 与 HTTPS 代理，支持 TLS 与 Reality。Cloudflare WARP 一键可用。
+* **两种模式** — 系统代理（HTTP/SOCKS）和 TUN：全部流量走隧道。
+* [**自动连接（AUTO）**](https://github.com/lm705/vair/wiki/Авто-подключение) — 自动连接到最快的可用配置，并在其不再应答时自动切换。
+* **测试** — 对每个配置测量延迟和速度，支持批量；结果在重启后保留并汇成历史。另有检测：哪台服务器能打开哪些服务。
+* **路由** — 五种模式：全部流量走 VPN；除所选国家（🇷🇺 🇨🇳 🇮🇷 🇰🇿）网站外的全部流量；仅俄罗斯被封锁的资源；仅中国被封锁的资源；仅所选网站。另可为域名、IP 和应用设置自定义规则。
+* **防泄漏** — TUN 模式下的 kill-switch 与 DNS 泄漏防护，Windows 与 Linux 均可使用；即使关闭程序仍然保持的阻断（Windows）；可选择如何处理 IPv6。
+* **看得到隧道里在跑什么** — 连接面板：程序、目标、生效的规则与流量，并用单独的表格显示绕过 VPN 的连接。
+* **链式代理与绕过 DPI** — 依次经过多个节点；TLS 握手分片和浏览器 TLS 指纹（uTLS）。
+* **标签页与订阅源** — 订阅链接、文件与私有 GitHub 仓库，支持自动刷新与过滤；多达约 250,000 条配置依然流畅（SQLite）。
 * **在手机上使用 VPN** — 从 TUN 模式将代理共享到局域网，以及[用手机控制程序](https://github.com/lm705/pc-vpn-to-phone)。
 * **实用功能** — 二维码、手动创建配置、自动更新、开机自启、深色与浅色主题、俄语和英语界面。
 
@@ -50,6 +47,11 @@
 
 * [**Wiki**](https://github.com/lm705/vair/wiki) — 完整手册：设置、模式、路由、链式代理、测试、常见问题。*(俄语)*
 * 📱 [**如何在手机上使用此电脑的 VPN**](https://github.com/lm705/pc-vpn-to-phone) — 通过 Wi-Fi 共享，以及借助 Tailscale 随时随地访问。
+
+## 反馈
+
+* 如有建议、错误或任何反馈，请在 [**Issues**](https://github.com/lm705/vair/issues) 中提交。可以使用您方便的任何语言撰写。
+* 如需直接联系：Telegram [**t.me/mial705**](https://t.me/mial705)。
 
 ## vless_alive.txt
 
