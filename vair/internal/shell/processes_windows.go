@@ -39,8 +39,15 @@ var (
 )
 
 // ListRunningProcessNames returns a sorted, deduplicated list of executable
-// names of currently running processes (e.g. "chrome.exe"). Names are
-// lowercased so the chip-input's case-insensitive matching stays consistent.
+// names of currently running processes (e.g. "Discord.exe").
+//
+// The spelling is Windows's own. It used to be lowercased here, which read as a
+// harmless tidy-up and was not: the name goes straight into the "apps without
+// VPN" list, and sing-box matched it byte for byte, so every program with a
+// capital letter in its name was added to the list and then ignored by the
+// engine. The matching is case-insensitive now (see core.processMatchRegex), and
+// showing "Discord.exe" as Discord.exe is what the person reading the list
+// expects. Deduplication and sorting stay case-insensitive.
 func ListRunningProcessNames() []string {
 	hSnap, _, _ := procCreateToolhelp32Snapshot.Call(th32csSnapProcess, 0)
 	// INVALID_HANDLE_VALUE is -1 on x64; on a uintptr that's all-bits-set.
@@ -57,11 +64,13 @@ func ListRunningProcessNames() []string {
 		return nil
 	}
 
-	seen := make(map[string]bool, 256)
+	seen := make(map[string]string, 256) // lowercased name → the spelling to show
 	for {
 		name := syscall.UTF16ToString(entry.ExeFile[:])
 		if name != "" {
-			seen[strings.ToLower(name)] = true
+			if _, dup := seen[strings.ToLower(name)]; !dup {
+				seen[strings.ToLower(name)] = name
+			}
 		}
 		ret, _, _ := procProcess32NextW.Call(hSnap, uintptr(unsafe.Pointer(&entry)))
 		if ret == 0 {
@@ -70,9 +79,11 @@ func ListRunningProcessNames() []string {
 	}
 
 	out := make([]string, 0, len(seen))
-	for n := range seen {
+	for _, n := range seen {
 		out = append(out, n)
 	}
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool {
+		return strings.ToLower(out[i]) < strings.ToLower(out[j])
+	})
 	return out
 }

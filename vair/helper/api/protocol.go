@@ -23,16 +23,16 @@ import (
 // keeps running the old code until it is reinstalled. Without a version, that
 // mismatch shows up as a request the helper half-understands. With one, it
 // shows up as a message telling the user to reinstall the helper.
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 // SocketPath is where the helper listens, and DirPath the directory systemd
 // creates for it (RuntimeDirectory=vair, mode 0750, group = the installing
 // user's).
 //
 // Plain constants on purpose — not build flags, not environment overrides.
-// Clash Verge Rev shipped a release whose service listened on the path its test
-// harness used; a socket location is exactly the kind of thing that must be
-// impossible to change by accident.
+// A released client once shipped with its service listening on the path its
+// test harness used; a socket location is exactly the kind of thing that must
+// be impossible to change by accident.
 const (
 	DirPath    = "/run/vair"
 	SocketPath = DirPath + "/helper.sock"
@@ -115,7 +115,28 @@ type Request struct {
 	// Data is base64 on the wire, which encoding/json does for []byte.
 	Name string `json:"name,omitempty"`
 	Data []byte `json:"data,omitempty"`
+
+	// The kill-switch, on start_tun (protocol 3).
+	//
+	// Windows gets this from sing-box itself: strict_route installs a WFP filter
+	// that drops anything leaving outside the tunnel. On Linux strict_route
+	// means something else and sing-box warns against pairing it with
+	// auto_redirect, so the block is ours to install — an nftables table the
+	// helper owns, put up with the tunnel and taken down with it.
+	//
+	// KillSwitch asks for it. AllowLAN keeps private networks reachable, exactly
+	// as the routing rules do. ServerIPs are the addresses the engine dials to
+	// build the tunnel; they must be allowed out, or the block would cut the
+	// connection it is protecting. The app has them already — it resolves the
+	// server before connecting so the configuration carries an address rather
+	// than a name.
+	KillSwitch bool     `json:"kill_switch,omitempty"`
+	AllowLAN   bool     `json:"allow_lan,omitempty"`
+	ServerIPs  []string `json:"server_ips,omitempty"`
 }
+
+// MaxServerIPs bounds the allow-list. A chain is a hop each; nobody has more.
+const MaxServerIPs = 8
 
 // RuleSetDir is where staged rule-sets land. Inside DirPath, so it is covered by
 // the same root-owned 0750 directory the validator already trusts.

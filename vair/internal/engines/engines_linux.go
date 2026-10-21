@@ -3,7 +3,6 @@ package engines
 import (
 	"os"
 	"path/filepath"
-	"strings"
 
 	"vair/core"
 )
@@ -103,14 +102,8 @@ func ruleSetSourceDirs() []string {
 	return dirs
 }
 
-func isRuleSetFile(name string) bool {
-	return strings.HasSuffix(name, ".srs") || strings.HasSuffix(name, ".dat") || name == "gfw.txt"
-}
-
 // Extract is a no-op here: nothing is embedded on Linux, because the packages
 // install the engines under /usr/lib/vair/bin where the privileged helper is
 // allowed to run them from. The argument is accepted and ignored so the two
 // platforms present the same call to main.
 func Extract([]File) error { return nil }
-
-func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }

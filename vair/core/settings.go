@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
 	"net"
 	"os"
@@ -9,7 +10,29 @@ import (
 	"time"
 )
 
+// trimBOM drops a leading UTF-8 byte-order mark.
+//
+// Every JSON file this program reads back can have been through an editor, and
+// several Windows tools write that mark by default — Notepad once did,
+// PowerShell 5.1's Set-Content -Encoding utf8 still does. encoding/json rejects
+// it as a syntax error at byte zero, so the file "cannot be read" while looking
+// perfectly correct on screen, and the whole configuration falls back to
+// defaults. Three bytes off the front is the entire fix; the mark carries no
+// information for a file whose encoding is already fixed at UTF-8.
+func trimBOM(b []byte) []byte { return bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF}) }
+
 // ─────────────────────────── settings ──────────────────────────────
+
+// UnlockServiceDef is one saved service-check entry. It is the settings shape of
+// core.unlockService, kept separate so the on-disk format does not move every
+// time the checker grows a field.
+type UnlockServiceDef struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	URL       string   `json:"url"`
+	OpenIf    []string `json:"open_if,omitempty"`
+	BlockedIf []string `json:"blocked_if,omitempty"`
+}
 
 type AppSettings struct {
 	SourcesEnabled bool     `json:"sources_enabled"`
@@ -78,6 +101,10 @@ type AppSettings struct {
 	// http.Client.Timeout, so an unreachable fallback cannot extend the test
 	// indefinitely or leak goroutines.
 	SpeedTestURLFallback string `json:"speed_test_url_fallback,omitempty"`
+	// CheckIPURL is what the "check IP" button asks. Empty → the built-in
+	// default. Any service that answers JSON will do: the reply is read by field
+	// name, not by a shape (see CheckExit).
+	CheckIPURL string `json:"check_ip_url,omitempty"`
 	// Raw URL of the most recently connected config. Drives the "last"
 	// badge in the table. Persisted so the badge survives restarts; only
 	// one config carries it at a time.
@@ -90,8 +117,8 @@ type AppSettings struct {
 	// version strictly newer than this is published (see checkForUpdate.Notify).
 	UpdateDismissedVersion string `json:"update_dismissed_version,omitempty"`
 	// VerboseLogs raises the xray/sing-box log level from warning→info so the
-	// Logs panel shows the detailed per-connection lines (like v2rayN). Takes
-	// effect on the next connection.
+	// Logs panel shows the detailed per-connection lines. Takes effect on the
+	// next connection.
 	VerboseLogs bool `json:"verbose_logs,omitempty"`
 	// KillSwitchPersistent extends the kill-switch past the tunnel's own life.
 	// The engine's strict_route stops when the engine does; this holds the block
@@ -116,11 +143,22 @@ type AppSettings struct {
 	// is a decision to opt into rather than to inherit. Irrelevant while AUTO is
 	// on: AUTO watches the live node itself and moves to another one.
 	WatchConnection bool `json:"watch_connection,omitempty"`
+	// ConnTrackingOff stops the connections panel collecting anything: no row
+	// per connection, no peek at the first bytes to learn where it is going, no
+	// parsing of the engine's log for it. Inverted, so the zero value is the
+	// normal case — tracking on — and the switch in the panel is the only way to
+	// turn it off.
+	ConnTrackingOff bool `json:"conn_tracking_off,omitempty"`
 	// RuleStats, when on, counts how often each line of the user's rule lists
 	// actually fires, so the settings screen can say "never matched" about a rule
 	// that has a typo in it. It costs a debug-level sing-box log — that is where
 	// the engine names the rule it matched — so it is off unless asked for.
 	RuleStats bool `json:"rule_stats,omitempty"`
+	// UnlockServices is the service-check list once the user has edited it:
+	// added their own, renamed one, pointed one somewhere else. Empty means
+	// nothing has been touched and the built-in list is used as it shipped —
+	// which is also what "restore the defaults" does, by emptying this.
+	UnlockServices []UnlockServiceDef `json:"unlock_services,omitempty"`
 	// LogTests, when on, emits a [test] line per ping/speed result into the
 	// Logs panel. Off by default — bulk tests are noisy.
 	LogTests bool `json:"log_tests,omitempty"`
@@ -168,13 +206,17 @@ type AppSettings struct {
 	// Worth turning off when another program is meant to own the setting.
 	ProxyGuardDisabled bool `json:"proxy_guard_disabled,omitempty"`
 
-	// UI scale and language for the Settings / Tab settings dialogs.
-	// Both apply to those modals only — the main window (tabs, table,
-	// connection bar, title bar) is intentionally not affected, since
-	// that's where pixel-precise typography matters most. ModalFontSize
-	// is the px value driving the --modal-fs-base CSS variable; default
-	// 11. Language uses BCP-47-ish short codes — "" / "en" / "ru".
+	// Two text sizes and the language. ModalFontSize drives --modal-fs-base and
+	// covers the dialogs — settings, tab settings, AUTO, connections, the
+	// service check; default 12. AppFontSize drives --app-fs-base and covers the
+	// main window — toolbar, tabs, table, connection bar, logs; default 13, the
+	// size the window has always been.
+	//
+	// Two settings rather than one because the two have different room to grow:
+	// a dialog is laid out by its content, while the table's columns have fixed
+	// widths and the toolbar has one row to fit in.
 	ModalFontSize int    `json:"modal_font_size,omitempty"`
+	AppFontSize   int    `json:"app_font_size,omitempty"`
 	Language      string `json:"language,omitempty"`
 	// HideHints removes the explanatory paragraph under each setting in the
 	// Settings, Tab-settings and auto-connect dialogs. Stored as the negative so
@@ -188,6 +230,19 @@ type AppSettings struct {
 	// Recommended values: 9000 (default, jumbo) or 1500 / 1408 if a slow
 	// network can't handle big frames.
 	TUNMTU int `json:"tun_mtu,omitempty"`
+	// TUNStack is which TCP/IP stack sing-box runs inside the tunnel:
+	// "" / "gvisor" (default), "mixed" or "system".
+	//
+	// It is the difference between "TUN costs a little CPU" and "TUN costs a
+	// core". gVisor implements TCP in user space, in Go: every packet crossing
+	// the tunnel is parsed, reassembled and re-emitted by the engine, which is
+	// work proxy mode never does at all — there the application speaks SOCKS to
+	// the engine and the operating system does the networking. "system" hands
+	// TCP back to the OS and costs a fraction of it; "mixed" is system TCP with
+	// gVisor's UDP. gVisor stays the default because it is the one that behaves
+	// identically everywhere; the other two are worth trying on a machine where
+	// the tunnel is expensive.
+	TUNStack string `json:"tun_stack,omitempty"`
 	// TunShareProxy also exposes Vair's HTTP/SOCKS proxy on the Proxy-access
 	// address while a TUN connection is up, so another LAN device (a phone) can
 	// route through this PC's tunnel. Off by default. Bind address + ports come
@@ -267,6 +322,14 @@ type AppSettings struct {
 	// appSettings initialiser). No omitempty for the same round-trip reason as
 	// DNSLeakProtection.
 	FakeIPDisabled bool `json:"fakeip_disabled"`
+	// IPv6Mode decides what happens to IPv6 while a connection is up. Three
+	// answers, because there are only three: keep it off the machine, carry it
+	// through the tunnel, or let it go around. Empty = ipv6Blocked, which is
+	// where users effectively already were — the DNS block asked for A records
+	// only, so v6 rarely happened; what it could not stop was an application
+	// with its own resolver, a literal address, or DNS leak protection turned
+	// off, and those are the leaks this closes.
+	IPv6Mode string `json:"ipv6_mode,omitempty"`
 	// DNS server overrides. Empty falls back to the built-in default
 	// for the slot (see dnsServerOr* helpers).
 	BootstrapDNS string `json:"bootstrap_dns,omitempty"` // plain UDP, IP-only
@@ -306,11 +369,29 @@ type AppSettings struct {
 	// AutoFailThreshold is the number of consecutive failed probes before
 	// a failover switch is triggered (default 2).
 	AutoFailThreshold int `json:"auto_fail_threshold,omitempty"`
+
+	// ReconnectOnStart brings back the connection that was up when the program
+	// last closed. Off by default: starting a program is not the same as asking
+	// it to send your traffic somewhere. It is also what makes the persistent
+	// kill switch hold across a close — see core/restore.go.
+	ReconnectOnStart bool `json:"reconnect_on_start,omitempty"`
+	// LastSessionActive is whether a connection was up the last time anything
+	// was recorded. Set on connect, cleared by an explicit disconnect, and
+	// deliberately left alone by shutdown — which is what tells a start that
+	// there is something to come back to.
+	LastSessionActive bool `json:"last_session_active,omitempty"`
 	// AutoPingRefresh re-pings the candidate pool after a config-list refresh
 	// (auto-refresh / manual / startup) so failover can rank the fresh list by
 	// real delay. Default ON; turn off to avoid the extra test traffic. No
 	// omitempty: a default-true bool must persist an explicit false.
 	AutoPingRefresh bool `json:"auto_ping_refresh"`
+	// The switch tolerance: how much better a candidate has to be before AUTO
+	// leaves a working connection, and how long it must stay before it may leave
+	// at all. Without them AUTO flaps between servers that differ by noise.
+	// Zero means the built-in default (20 ms / 15 % / 60 s).
+	AutoSwitchToleranceMs int `json:"auto_switch_tolerance_ms,omitempty"`
+	AutoSwitchSpeedPct    int `json:"auto_switch_speed_pct,omitempty"`
+	AutoMinDwellSec       int `json:"auto_min_dwell_sec,omitempty"`
 	// AutoMaxLatencyMs is the live-probe round-trip budget in milliseconds.
 	// When AutoSwitch is on and the live link stays reachable but slower than
 	// this for AutoFailThreshold checks in a row, the app fails over to the
@@ -328,9 +409,32 @@ type AppSettings struct {
 	// a change of that kind should be asked for rather than arrive with an
 	// update. Needs a few measurements per server before it does anything.
 	AutoRankStable bool `json:"auto_rank_stable,omitempty"`
+	// AutoRankMode is what AUTO ranks candidates by, and it replaces the two
+	// booleans above — which were never independent: speed decided and history
+	// only broke ties, so two switches offered four states that meant three
+	// things, one of them silently unreachable.
+	//
+	//	"delay"         the last measured ping (the original behaviour)
+	//	"speed"         the last measured download speed
+	//	"history"       typical delay, charged for jitter and for failed probes
+	//	"speed_history" the speed a server can be relied on: typical less spread
+	//
+	// Empty means "derive it from the old pair", which autoRankMode does. The old
+	// fields are still written, so a downgrade keeps the setting.
+	AutoRankMode string `json:"auto_rank_mode,omitempty"`
 	// LastConnectedMode records the mode ("proxy"/"tun") of the most
 	// recent connection, so AutoMode="" (remember last) can reuse it.
 	LastConnectedMode string `json:"last_connected_mode,omitempty"`
+	// SelectedMode is the proxy/tun pill on the main window — the mode the user
+	// is looking at, whether or not they have connected in it yet.
+	//
+	// It exists because "remember last" used to mean LastConnectedMode alone,
+	// and the two can disagree for as long as someone flips the pill without
+	// connecting: the window said proxy, the AUTO panel said proxy, and AUTO
+	// brought servers up in TUN because that was the mode of a session from an
+	// hour ago. The pill is what the user believes is selected, so that is what
+	// "remember last" now reads first.
+	SelectedMode string `json:"selected_mode,omitempty"`
 
 	// ── TLS fragmentation (DPI evasion) ──────────────────────────────
 	// TLSFragment, when on, routes the xray outbound's connection to its server
@@ -348,7 +452,7 @@ type AppSettings struct {
 	// Reality nodes (chrome, firefox, safari, ios, edge, random, randomized).
 	// A config's own fp= always wins; this is the fallback when it has none.
 	// Without it xray uses Go's TLS stack, which DPI can fingerprint — so the
-	// default is "chrome" (matches v2rayN/Hiddify). "" → chrome.
+	// default is "chrome", the one most traffic looks like. "" → chrome.
 	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
 
 	// AutostartEnabled launches Vair at Windows logon (HKCU Run key, started
@@ -547,15 +651,16 @@ func recordLastConnected(raw string, mode ConnMode) {
 		return
 	}
 	settingsMu.Lock()
-	changed := appSettings.LastConnectedRaw != raw || appSettings.LastConnectedMode != string(mode)
 	appSettings.LastConnectedRaw = raw
 	if mode != "" {
 		appSettings.LastConnectedMode = string(mode)
 	}
+	// Written on every successful connect, not only when the configuration
+	// changed: a start after a crash reads this to know there was a session to
+	// bring back.
+	appSettings.LastSessionActive = true
 	settingsMu.Unlock()
-	if changed {
-		saveSettings()
-	}
+	saveSettings()
 }
 
 // Sane bounds for the two test-duration knobs. The lower bounds protect
@@ -590,8 +695,9 @@ func currentPingTimeout() time.Duration {
 // currentWarmupTimeout returns the warm-up request timeout — the un-measured
 // priming request that establishes the tunnel before the timed ping rounds.
 // Zero / unset / out-of-range falls back to the compile-time warmupTimeout
-// default (4 s). Raising this is the fix for "slow to connect but works" configs
-// that v2rayN reports as alive while a tight warm-up here marks them "timeout".
+// default (4 s). Raising this is the fix for "slow to connect but works"
+// configs: a server with a long handshake is alive, and a tight warm-up here
+// marks it "timeout".
 func currentWarmupTimeout() time.Duration {
 	settingsMu.RLock()
 	ms := appSettings.WarmupTimeoutMs
@@ -625,6 +731,21 @@ func currentMTU() int {
 		return 9000
 	}
 	return m
+}
+
+// tunStack returns the TCP/IP stack for the tunnel inbound, defaulting to the
+// one every platform behaves the same on. Anything unrecognised (an old file, a
+// hand-edited settings.json) falls back to that default rather than handing the
+// engine a word it will refuse to start on.
+func tunStack() string {
+	settingsMu.RLock()
+	v := appSettings.TUNStack
+	settingsMu.RUnlock()
+	switch v {
+	case "system", "mixed":
+		return v
+	}
+	return "gvisor"
 }
 
 // RemoteConfig returns whether LAN remote control is enabled and its token.
@@ -746,6 +867,34 @@ func persistentKillSwitchEnabled() bool {
 	return appSettings.KillSwitchPersistent && appSettings.KillSwitch && appSettings.DNSLeakProtection
 }
 
+// The switch tolerance, with the defaults the numbers used to be hard-coded to.
+func autoSwitchToleranceMs() int64 {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	if v := appSettings.AutoSwitchToleranceMs; v > 0 {
+		return int64(v)
+	}
+	return 20
+}
+
+func autoSwitchSpeedFactor() float64 {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	if v := appSettings.AutoSwitchSpeedPct; v > 0 {
+		return 1 + float64(v)/100
+	}
+	return 1.15
+}
+
+func autoMinDwell() time.Duration {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	if v := appSettings.AutoMinDwellSec; v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return 60 * time.Second
+}
+
 func killSwitchEnabled() bool {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
@@ -837,9 +986,9 @@ func effectiveDirectDomains() []string {
 }
 
 // Default xray TLS-fragment ranges. "tlshello" packets are split into chunks
-// of `length` bytes with `interval` ms between them. These mirror the values
-// commonly used in v2rayN/Hiddify and are conservative enough not to break
-// throughput while still defeating one-packet SNI matching.
+// of `length` bytes with `interval` ms between them. These are the values in
+// common use — conservative enough not to break throughput while still
+// defeating one-packet SNI matching.
 const (
 	defaultTLSFragmentLength   = "100-200"
 	defaultTLSFragmentInterval = "10-20"
@@ -1045,9 +1194,16 @@ func loadSettings() {
 	if err != nil {
 		return
 	}
+	data = trimBOM(data)
 	settingsMu.Lock()
 	defer settingsMu.Unlock()
-	json.Unmarshal(data, &appSettings)
+	// Said out loud, because the failure is otherwise invisible: an unreadable
+	// file leaves every setting at its default, the dialog then shows those
+	// defaults as if they were the user's, and the next save writes them over
+	// the file that still had the real ones.
+	if err := json.Unmarshal(data, &appSettings); err != nil {
+		vlog("error", "settings.json could not be read (%v) — running on defaults; the next change will overwrite the file", err)
+	}
 }
 
 func saveSettings() {
@@ -1060,4 +1216,214 @@ func saveSettings() {
 	// WriteFile leaves the mode of an existing file alone.
 	os.WriteFile(settingsFilePath(), data, 0o600) //nolint:errcheck
 	os.Chmod(settingsFilePath(), 0o600)           //nolint:errcheck
+}
+
+// currentCheckIPURL is the address the "check IP" button asks, and
+// checkIPHost the hostname inside it.
+//
+// The hostname matters beyond the request: in the bypass routing modes that
+// send most traffic direct, this one host is forced through the tunnel, or the
+// button would cheerfully report the address the VPN is not using. Change the
+// service and that rule has to follow it, which is why the host is derived from
+// the URL rather than written down twice.
+func currentCheckIPURL() string {
+	settingsMu.RLock()
+	u := strings.TrimSpace(appSettings.CheckIPURL)
+	settingsMu.RUnlock()
+	if u == "" {
+		return checkIPURLDefault
+	}
+	return u
+}
+
+func checkIPHost() string {
+	u := currentCheckIPURL()
+	if i := strings.Index(u, "://"); i >= 0 {
+		u = u[i+3:]
+	}
+	if i := strings.IndexAny(u, "/?#"); i >= 0 {
+		u = u[:i]
+	}
+	if h, _, err := net.SplitHostPort(u); err == nil {
+		u = h
+	}
+	if u == "" {
+		return checkExitHost
+	}
+	return u
+}
+
+// Ranking modes for AUTO. Strings rather than an enum: they go through JSON to
+// the settings file and back, and a number there would be unreadable and
+// unstable the first time the order changed.
+const (
+	rankByDelay        = "delay"
+	rankBySpeedLast    = "speed"
+	rankByPingHistory  = "history"
+	rankBySpeedHistory = "speed_history"
+)
+
+// autoRankMode returns the ranking mode, deriving it from the pre-2.6 pair when
+// it has not been set.
+//
+// Both switches on becomes "speed", because that is what the program actually
+// did: speed decided and history only separated equal speeds. Migrating it to
+// "history" would silently change which server AUTO picks for everyone who had
+// both on, which is precisely the kind of surprise an update must not deliver.
+func autoRankMode() string {
+	settingsMu.RLock()
+	m := strings.TrimSpace(appSettings.AutoRankMode)
+	bySpeed, stable := appSettings.AutoRankBySpeed, appSettings.AutoRankStable
+	settingsMu.RUnlock()
+	switch m {
+	case rankByDelay, rankBySpeedLast, rankByPingHistory, rankBySpeedHistory:
+		return m
+	}
+	switch {
+	case bySpeed:
+		return rankBySpeedLast
+	case stable:
+		return rankByPingHistory
+	}
+	return rankByDelay
+}
+
+// rankModeUsesSpeed reports whether the active ranking mode needs a speed
+// measurement — the answer to "should this background sweep run the speed test
+// as well as the ping".
+func rankModeUsesSpeed() bool {
+	m := autoRankMode()
+	return m == rankBySpeedLast || m == rankBySpeedHistory
+}
+
+// syncAutoRankLegacy keeps the two old booleans agreeing with the mode, so a
+// downgrade to a build that only knows them lands on the nearest equivalent
+// rather than on the default.
+func syncAutoRankLegacy(s *AppSettings) {
+	switch strings.TrimSpace(s.AutoRankMode) {
+	case rankBySpeedLast, rankBySpeedHistory:
+		s.AutoRankBySpeed, s.AutoRankStable = true, false
+	case rankByPingHistory:
+		s.AutoRankBySpeed, s.AutoRankStable = false, true
+	case rankByDelay:
+		s.AutoRankBySpeed, s.AutoRankStable = false, false
+	}
+}
+
+// The three answers to "what about IPv6", and what each one means in the
+// engine's configuration:
+//
+//	ipv6Blocked  the tunnel claims ::/0 and refuses it, DNS answers A only.
+//	             Nothing v6 leaves the machine. Refusing rather than dropping
+//	             is deliberate: a browser races v4 and v6 (happy eyeballs) and
+//	             falls back at once on a refusal, after a timeout on silence.
+//	ipv6Tunnel   the tunnel carries ::/0, DNS prefers A but AAAA is allowed.
+//	             Works as far as the server does — see the check after connect.
+//	ipv6Direct   the tunnel takes IPv4 only and v6 goes out the physical
+//	             interface, with the machine's real address on it. What the
+//	             program did before this setting existed.
+const (
+	ipv6Blocked = "blocked"
+	ipv6Tunnel  = "tunnel"
+	ipv6Direct  = "direct"
+)
+
+// ipv6TunAddress is the tunnel's own v6 address. Unique-local (fc00::/7), so
+// it cannot collide with anything routable, and a /126 for the same reason the
+// v4 side uses a /30: the interface needs an address, not a network.
+// tunAddress4 is the tunnel interface's own address, and tunSubnet4 the /30 it
+// lives in. The peer address in that /30 — 172.19.0.2 — belongs to nobody: it
+// exists because an interface needs a subnet, and no program answers on it.
+//
+// Which matters because Windows hands it to applications as the gateway. A
+// program looking for its router (NAT-PMP on 5351, and anything else that asks
+// the gateway a question) then sends packets that come back through the tunnel
+// they were sent into, forever. See the reject rule in singboxRoutingRules.
+const (
+	tunAddress4    = "172.19.0.1/30"
+	ipv6TunAddress = "fdfe:dcba:9876::1/126"
+)
+
+// tunSelfAddresses lists the addresses inside the tunnel's own prefixes that
+// anything can actually be sent to: the interface itself and the peer address
+// the platform derives from it (address + 1) and hands out as the gateway.
+//
+// Each on its own, never the prefix they sit in. The prefix would be shorter to
+// write and wrong to use: on Linux sing-tun registers that same peer address
+// with systemd-resolved as the resolver for "~.", so refusing the whole /30
+// refuses every name lookup on the machine along with the loop.
+func tunSelfAddresses() []string {
+	out := make([]string, 0, 4)
+	for _, prefix := range []string{tunAddress4, ipv6TunAddress} {
+		ip, _, err := net.ParseCIDR(prefix)
+		if err != nil {
+			continue
+		}
+		bits := "/32"
+		if ip.To4() == nil {
+			bits = "/128"
+		}
+		out = append(out, ip.String()+bits)
+		if peer := nextIP(ip); peer != nil {
+			out = append(out, peer.String()+bits)
+		}
+	}
+	return out
+}
+
+// nextIP returns the address one above ip, or nil if it wrapped.
+func nextIP(ip net.IP) net.IP {
+	out := make(net.IP, len(ip))
+	copy(out, ip)
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i]++
+		if out[i] != 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+// ipv6FakeRange is the FakeIP pool for AAAA answers, from the same unique-local
+// space. Only used when v6 is in the tunnel: a fake address the tunnel does not
+// route is an address nothing can connect to.
+const ipv6FakeRange = "fc00::/18"
+
+func ipv6Mode() string {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	switch appSettings.IPv6Mode {
+	case ipv6Tunnel, ipv6Direct:
+		return appSettings.IPv6Mode
+	default:
+		return ipv6Blocked
+	}
+}
+
+// ipv6InTunnel reports whether the TUN interface should take an IPv6 address
+// and the routes that come with it. True for both blocked and tunnel: blocking
+// is done by holding the route and refusing, not by leaving it to the physical
+// interface.
+func ipv6InTunnel() bool { return ipv6Mode() != ipv6Direct }
+
+// dnsAddressStrategy is what the DNS block answers with. ipv4_only is not used
+// for the bootstrap server — the address of a v6-only VPN server has to be
+// resolvable whatever this setting says, or the tunnel cannot be built at all.
+func dnsAddressStrategy() string {
+	if ipv6Mode() == ipv6Tunnel {
+		return "prefer_ipv4"
+	}
+	return "ipv4_only"
+}
+
+// xrayDirectDomainStrategy is how xray resolves the destinations it sends out
+// directly. In proxy mode this is the only half of the IPv6 choice that has
+// anywhere to apply: there is no tunnel to hold a route, and traffic that
+// ignores the system proxy was never ours to route. UseIPv4 asks for A records
+// only; UseIP takes whatever the resolver gives.
+func xrayDirectDomainStrategy() string {
+	if ipv6Mode() == ipv6Blocked {
+		return "UseIPv4"
+	}
+	return "UseIP"
 }

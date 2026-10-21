@@ -317,3 +317,42 @@ func singboxEndpointWireGuard(p *WireGuardParams) map[string]interface{} {
 	}
 	return ep
 }
+
+// serializeWireGuardForm turns the form back into a wireguard:// link, in the
+// spelling parseWireGuard reads.
+//
+// The private key is the userinfo, as in every producer's links, and it is NOT
+// percent-encoded there: base64 contains "/" and "+", and a client that escapes
+// them writes a link half the other clients cannot read. parseWireGuard splits
+// at the first "@" for the same reason.
+func serializeWireGuardForm(f ConfigForm) (string, error) {
+	if strings.TrimSpace(f.UUID) == "" {
+		return "", fmt.Errorf("the private key is required")
+	}
+	if strings.TrimSpace(f.PeerPublicKey) == "" {
+		return "", fmt.Errorf("the peer's public key is required")
+	}
+	q := url.Values{}
+	q.Set("publickey", strings.TrimSpace(f.PeerPublicKey))
+	setNonEmpty(q, "presharedkey", strings.TrimSpace(f.PreSharedKey))
+	setNonEmpty(q, "address", strings.TrimSpace(f.Addresses))
+	setNonEmpty(q, "reserved", strings.TrimSpace(f.Reserved))
+	if f.MTU > 0 {
+		q.Set("mtu", strconv.Itoa(f.MTU))
+	}
+	applyExtra(q, f.Extra)
+	var b strings.Builder
+	b.WriteString("wireguard://")
+	b.WriteString(strings.TrimSpace(f.UUID))
+	b.WriteString("@")
+	b.WriteString(hostPort(f.Address, f.Port))
+	if enc := q.Encode(); enc != "" {
+		b.WriteString("?")
+		b.WriteString(enc)
+	}
+	if f.Name != "" {
+		b.WriteString("#")
+		b.WriteString(url.QueryEscape(f.Name))
+	}
+	return b.String(), nil
+}

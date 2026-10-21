@@ -88,7 +88,9 @@ func startSplitChainProxy(cm *connManager, entry *ConfigEntry, segs []chainSegme
 	vlog("info", "chain: %s carries %d hop(s), %s carries %d — joined on 127.0.0.1:%d",
 		segs[0].Engine, len(segs[0].Nodes), segs[1].Engine, len(segs[1].Nodes), bridgePort)
 
-	finalizeProxyConnection(cm, entry, name, connTab, downCmd, downCancel, downPath,
+	// nil exit channel: a split chain runs two engines and startChainHalf keeps
+	// their exit signals to itself, so there is no single process to follow.
+	finalizeProxyConnection(cm, entry, name, connTab, downCmd, downCancel, downPath, nil,
 		httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort, chain, chainRaws)
 }
 

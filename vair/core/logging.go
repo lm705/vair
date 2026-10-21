@@ -210,41 +210,94 @@ func (l *logStore) clear() {
 	l.mu.Unlock()
 }
 
+// hasLevelWord reports whether a level word (ERROR, WARN, …) appears in the
+// line as a word rather than as a fragment of something else. The infamous
+// something else: sing-box's DNS answers — "dns: exchanged example.org NOERROR
+// 171" — which the old substring test classified as errors, letting ordinary
+// debug narration bypass the rate gate and evict real errors from the
+// important-lines ring.
+//
+// A word starts at the start of the line, after a non-letter, or — the one
+// lettered exception — after the 'm' that closes an ANSI SGR colour sequence:
+// sing-box on Windows colours its level words even into a pipe (see ansiRe),
+// so "\x1b[31mERROR" is an error and must not be filed under its colour code.
+//
+// Deliberately no right-boundary test: the formats this reads are known
+// ("ERROR [id]", "FATAL[0000]", " WARN "), and WARN inside WARNING should
+// match anyway. Allocation-free — it runs on every line of a verbose flood,
+// on raw scanner bytes as well as strings, hence the generic.
+func hasLevelWord[T ~string | ~[]byte](s T, word string) bool {
+	n, w := len(s), len(word)
+scan:
+	for i := 0; i+w <= n; i++ {
+		for k := 0; k < w; k++ {
+			if s[i+k] != word[k] {
+				continue scan
+			}
+		}
+		if levelWordBoundary(s, i) {
+			return true
+		}
+	}
+	return false
+}
+
+func levelWordBoundary[T ~string | ~[]byte](s T, i int) bool {
+	if i == 0 {
+		return true
+	}
+	c := s[i-1]
+	if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z') {
+		return true
+	}
+	if c != 'm' {
+		return false
+	}
+	// Walk back over the SGR parameters ("31", "0;91", …) to the "\x1b[" that
+	// opened them; only then is the 'm' a colour code and not a word.
+	k := i - 2
+	for k >= 0 && (s[k] == ';' || s[k] >= '0' && s[k] <= '9') {
+		k--
+	}
+	return k >= 1 && s[k] == '[' && s[k-1] == 0x1b
+}
+
 // parseLevel classifies a raw stderr line by source so the UI can colour it.
 // xray uses bracketed tags ([Warning]/[Info]/[Error]); sing-box prints the
-// level word (WARN/INFO/ERROR/FATAL). Unrecognised lines are "raw".
+// level word (WARN/INFO/ERROR/FATAL/DEBUG). Unrecognised lines are "raw".
+//
+// DEBUG files under "info" on purpose: isImportant keeps everything that is
+// not "info", so a debug line left as "raw" would sit in the important ring —
+// the ring that exists to survive exactly this kind of flood.
 func parseLevel(src, line string) string {
-	// Match xray's capitalised tags ([Error]/[Warning]/[Info]) and sing-box's
-	// uppercase words (ERROR/WARN/INFO/FATAL) WITHOUT allocating an uppercased
-	// copy of every line — this runs per line under a verbose flood, so the
-	// old strings.ToUpper was a real GC/CPU cost.
 	switch {
-	case strings.Contains(line, "[Error]") || strings.Contains(line, "[Fatal]") || strings.Contains(line, "ERROR") || strings.Contains(line, "FATAL") || strings.Contains(line, "PANIC") || strings.Contains(line, "panic"):
+	case strings.Contains(line, "[Error]") || strings.Contains(line, "[Fatal]") ||
+		hasLevelWord(line, "ERROR") || hasLevelWord(line, "FATAL") ||
+		hasLevelWord(line, "PANIC") || hasLevelWord(line, "panic:"):
 		return "error"
-	case strings.Contains(line, "[Warning]") || strings.Contains(line, "WARN"):
+	case strings.Contains(line, "[Warning]") || hasLevelWord(line, "WARN"):
 		return "warn"
-	case strings.Contains(line, "[Info]") || strings.Contains(line, "INFO"):
+	case strings.Contains(line, "[Info]") || hasLevelWord(line, "INFO") || hasLevelWord(line, "DEBUG"):
 		return "info"
 	}
 	return "raw"
 }
 
-// errWarnTokens mirrors parseLevel's error/warn cases, pre-converted to bytes
-// so the rate-limit gate can classify scanner.Bytes() WITHOUT allocating a
-// string. Under a verbose flood the gate runs on every line; only the lines we
-// actually keep get a string (scanner.Text()) allocated.
-var errWarnTokens = [][]byte{
-	[]byte("[Error]"), []byte("[Fatal]"), []byte("ERROR"), []byte("FATAL"),
-	[]byte("PANIC"), []byte("panic"), []byte("[Warning]"), []byte("WARN"),
-}
+// xray's bracketed tags, as bytes for the gate. sing-box's words go through
+// hasLevelWord, which needs no byte copies of its own.
+var xrayErrWarnTags = [][]byte{[]byte("[Error]"), []byte("[Fatal]"), []byte("[Warning]")}
 
+// levelErrWarnBytes mirrors parseLevel's error/warn cases on raw scanner bytes,
+// so the rate gate can classify a line WITHOUT allocating a string. Only the
+// lines we actually keep get a string (scanner.Text()) allocated.
 func levelErrWarnBytes(b []byte) bool {
-	for _, t := range errWarnTokens {
+	for _, t := range xrayErrWarnTags {
 		if bytes.Contains(b, t) {
 			return true
 		}
 	}
-	return false
+	return hasLevelWord(b, "ERROR") || hasLevelWord(b, "FATAL") ||
+		hasLevelWord(b, "PANIC") || hasLevelWord(b, "panic:") || hasLevelWord(b, "WARN")
 }
 
 // vlog records a Vair diagnostic: still printed to stderr (for console /
@@ -320,6 +373,58 @@ func (w *lineSink) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+// offerToCounters hands one raw line of engine output to the two things that
+// read the engines' log rather than the network: the rule counters and the
+// connections panel.
+//
+// Called BEFORE the rate gate, always. The gate exists to keep the log panel
+// readable under a flood; a line dropped there must not also vanish from a
+// counter, which would undercount exactly when there is most to count.
+//
+// Both readers, not just the counters. In TUN the connections panel has no
+// other source — the traffic never passes through us — and it is on by default
+// while rule statistics are not, so asking only about statistics left the panel
+// empty for everyone who had turned on nothing but verbose logs. The byte test
+// comes first, so a flood of lines neither one wants still costs no string.
+//
+// The TUN paths read their engine's stderr themselves (they keep a crash tail
+// and a file beside it), so this is called from there as well as from
+// pumpProcLog — every line of engine output goes past it exactly once.
+func offerToCounters(src string, raw []byte) {
+	if !engineLineOfInterest(src, raw) {
+		return
+	}
+	if ruleStatsEnabled() || connectionsWatched() {
+		noteEngineLine(src, string(raw))
+	}
+}
+
+// debugToken is how sing-box stamps a debug line. xray has no such level, so
+// the test is only asked of sing-box output.
+var debugToken = []byte(" DEBUG ")
+
+// engineLineWanted reports whether a line of engine output belongs in the log
+// at all — the panel, the file, the SSE stream.
+//
+// "Count rule matches" runs sing-box at debug, because the line naming the rule
+// that matched is printed at no lower level. That is a request for a COUNTER,
+// not for a wall of narration, and the narration arrived anyway: every DNS
+// exchange, every fakeip lookup, several lines per connection, while "Verbose
+// logs" sat switched off and looked broken. The counters read the line first
+// (offerToCounters, always), so nothing is lost by refusing to store it.
+//
+// Errors and warnings are never dropped here; the caller has already asked the
+// gate about those separately.
+func engineLineWanted(src string, raw []byte) bool {
+	if src != "singbox" || !bytes.Contains(raw, debugToken) {
+		return true
+	}
+	settingsMu.RLock()
+	verbose := appSettings.VerboseLogs
+	settingsMu.RUnlock()
+	return verbose
+}
+
 // pumpProcLog reads a child process's stderr pipe line-by-line into the log
 // store, tagged by source ("xray"/"singbox"). It also feeds each line to the
 // optional sink (used by the connection paths to keep a rolling tail for the
@@ -331,15 +436,12 @@ func pumpProcLog(src string, pipe io.Reader, sink func(string)) {
 	scanner := bufio.NewScanner(pipe)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		// Rule statistics read the line BEFORE the rate gate: the gate exists to
-		// keep the log panel readable under a flood, and dropping a match line
-		// there would quietly undercount exactly when there is most to count.
-		// Off by default, and a substring test when on.
-		if ruleStatsEnabled() {
-			noteEngineLine(src, string(scanner.Bytes()))
-		}
-		// Drop/keep decision on the raw bytes first — no string allocation for
+		offerToCounters(src, scanner.Bytes())
+		// Drop/keep decisions on the raw bytes first — no string allocation for
 		// the lines we drop under a verbose flood (the bulk of them).
+		if !engineLineWanted(src, scanner.Bytes()) {
+			continue
+		}
 		if !logs.gate(levelErrWarnBytes(scanner.Bytes())) {
 			continue
 		}

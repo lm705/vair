@@ -37,11 +37,36 @@ func GetSettings() AppSettings {
 // server-authoritative traffic counters. Returns the applied settings; the shell
 // layer reconciles autostart / deeplink (Windows-registry side effects) by
 // comparing the result against the previous GetSettings().
+// SetSelectedMode records the proxy/tun pill on the main window.
+//
+// One field, not a settings save. The pill used to write the whole settings
+// object back, built from whatever the window had loaded — and a click before
+// that load finished sent an object with every other field at its zero value.
+// SetSettings replaces wholesale, so that was every setting reset at once, and
+// the firewall block released along with them because the switch that asked for
+// it had just gone from true to false. A setter that can only touch one field
+// cannot do any of that.
+func SetSelectedMode(mode string) {
+	if mode != "proxy" && mode != "tun" {
+		return
+	}
+	settingsMu.Lock()
+	changed := appSettings.SelectedMode != mode
+	appSettings.SelectedMode = mode
+	settingsMu.Unlock()
+	if changed {
+		saveSettings()
+	}
+}
+
 func SetSettings(s AppSettings) AppSettings {
 	settingsMu.Lock()
 	s.StatsTotalUp = appSettings.StatsTotalUp
 	s.StatsTotalDown = appSettings.StatsTotalDown
 	s.AutoConnect = appSettings.AutoConnect
+	// The ranking mode is the setting; the two old booleans are kept in step so a
+	// downgrade lands on the nearest equivalent instead of the default.
+	syncAutoRankLegacy(&s)
 	appSettings = s
 	settingsMu.Unlock()
 	saveSettings()

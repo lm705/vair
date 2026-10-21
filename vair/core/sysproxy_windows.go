@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -23,25 +24,27 @@ func (wininetProxy) available() bool { return true }
 
 const wininetKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 
-// wininetKeyCmd is the same key in the form reg.exe wants.
-const wininetKeyCmd = `HKCU\` + wininetKey
-
 func (wininetProxy) set(host string, port int) (proxySnapshot, error) {
 	snap := readWininet()
 	addr := fmt.Sprintf("%s:%d", host, port)
 	// WinINET wants one semicolon-separated string, and <local> — the token for
 	// "any name without a dot" — has no equivalent in the neutral list.
 	over := strings.Join(bypassWin(), ";") + ";<local>"
-	for _, c := range [][]string{
-		{"reg", "add", wininetKeyCmd, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "1", "/f"},
-		{"reg", "add", wininetKeyCmd, "/v", "ProxyServer", "/t", "REG_SZ", "/d", addr, "/f"},
-		{"reg", "add", wininetKeyCmd, "/v", "ProxyOverride", "/t", "REG_SZ", "/d", over, "/f"},
-	} {
-		if err := runHidden(c[0], c[1:]...).Run(); err != nil {
-			return snap, fmt.Errorf("reg: %w", err)
-		}
+	k, err := registry.OpenKey(registry.CURRENT_USER, wininetKey, registry.SET_VALUE)
+	if err != nil {
+		return snap, fmt.Errorf("open Internet Settings: %w", err)
 	}
-	flushWininet()
+	defer k.Close()
+	if err := k.SetDWordValue("ProxyEnable", 1); err != nil {
+		return snap, fmt.Errorf("ProxyEnable: %w", err)
+	}
+	if err := k.SetStringValue("ProxyServer", addr); err != nil {
+		return snap, fmt.Errorf("ProxyServer: %w", err)
+	}
+	if err := k.SetStringValue("ProxyOverride", over); err != nil {
+		return snap, fmt.Errorf("ProxyOverride: %w", err)
+	}
+	notifyWininet()
 	return snap, nil
 }
 
@@ -53,28 +56,32 @@ func (wininetProxy) set(host string, port int) (proxySnapshot, error) {
 // they had disconnected. The snapshot comes from the lock file, so this holds
 // after a crash too, when nothing is left in memory.
 func (wininetProxy) revert(snap proxySnapshot) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, wininetKey, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("open Internet Settings: %w", err)
+	}
+	defer k.Close()
+	defer notifyWininet()
+
 	// No snapshot — an old lock file, from before this field existed. Off is the
 	// only safe reading: we know we enabled it, and nothing else.
 	if len(snap) == 0 {
-		runHidden("reg", "add", wininetKeyCmd, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run() //nolint:errcheck
-		flushWininet()
-		return nil
+		return k.SetDWordValue("ProxyEnable", 0)
 	}
-	enable := "0"
+	enable := uint32(0)
 	if snap["enable"] == "1" {
-		enable = "1"
+		enable = 1
 	}
-	runHidden("reg", "add", wininetKeyCmd, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", enable, "/f").Run() //nolint:errcheck
+	k.SetDWordValue("ProxyEnable", enable) //nolint:errcheck
 	// An empty entry means the value did not exist before, so delete it instead
 	// of writing "": a ProxyServer of "" is not the same state as no ProxyServer.
 	for name, v := range map[string]string{"ProxyServer": snap["server"], "ProxyOverride": snap["override"]} {
 		if v == "" {
-			runHidden("reg", "delete", wininetKeyCmd, "/v", name, "/f").Run() //nolint:errcheck
+			k.DeleteValue(name) //nolint:errcheck
 			continue
 		}
-		runHidden("reg", "add", wininetKeyCmd, "/v", name, "/t", "REG_SZ", "/d", v, "/f").Run() //nolint:errcheck
+		k.SetStringValue(name, v) //nolint:errcheck
 	}
-	flushWininet()
 	return nil
 }
 
@@ -112,8 +119,27 @@ func readWininet() proxySnapshot {
 	return snap
 }
 
-// flushWininet clears the WinINET cache so running processes pick the change up
-// now; this broadcasts WM_SETTINGCHANGE to every top-level window.
-func flushWininet() {
-	runHidden("rundll32.exe", "inetcpl.cpl,ClearMyTracksByProcess", "8").Run() //nolint:errcheck
+// notifyWininet tells the machine that the proxy settings changed.
+//
+// This used to run "rundll32 inetcpl.cpl,ClearMyTracksByProcess 8" under a
+// comment claiming it broadcast WM_SETTINGCHANGE. It does not: that command
+// deletes the user's temporary internet files — neither a notification nor
+// ours to do. Programs picked the change up whenever they next happened to
+// re-read the registry.
+//
+// The documented mechanism is two option calls with a null handle: the first
+// says the settings changed, the second makes WinINET re-read them. Chromium
+// watches the registry keys itself and was already covered by the write; this
+// is for everything that goes through WinINET, our own WebView2 window
+// included.
+func notifyWininet() {
+	const (
+		optionSettingsChanged = 39
+		optionRefresh         = 37
+	)
+	for _, opt := range []uintptr{optionSettingsChanged, optionRefresh} {
+		procInternetSetOptionW.Call(0, opt, 0, 0) //nolint:errcheck
+	}
 }
+
+var procInternetSetOptionW = windows.NewLazySystemDLL("wininet.dll").NewProc("InternetSetOptionW")

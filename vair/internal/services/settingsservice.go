@@ -17,6 +17,10 @@ func (s *SettingsService) Get() core.AppSettings {
 	return core.GetSettings()
 }
 
+// SetSelectedMode records the proxy/tun choice on the main window — one field,
+// without sending a whole settings object back for it.
+func (s *SettingsService) SetSelectedMode(mode string) { core.SetSelectedMode(mode) }
+
 // Set applies a settings save and returns the applied settings.
 func (s *SettingsService) Set(ns core.AppSettings) core.AppSettings {
 	old := core.GetSettings()
@@ -106,6 +110,12 @@ func (s *SettingsService) ResetStats() { core.ResetTotalStats() }
 func (s *SettingsService) NotificationsBlocked() string {
 	return core.NotificationsBlockedReason(core.GetSettings().Language)
 }
+
+// BlockNotInForce returns a sentence when the firewall block that was asked for
+// is not actually blocking anything on this machine — the commands succeeded
+// and the profile in use has its firewall switched off, which is a setting that
+// says on while nothing is protected. Empty when there is nothing to report.
+func (s *SettingsService) BlockNotInForce() string { return core.BlockGapReason() }
 
 // RuleStats reports how often each line of the user's rule lists has fired.
 // Polled by the settings screen while the rules section is open — cheap enough

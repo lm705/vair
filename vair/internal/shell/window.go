@@ -37,3 +37,32 @@ func idealWindowSize(workW, workH, pct int32) (int32, int32) {
 	}
 	return w, h
 }
+
+// PanelWindowSize is the size for a secondary window that has a natural size of
+// its own — the AUTO panel — never larger than the screen it has to fit on.
+//
+// The panel used to be created at a flat 620×760. On a 1366×768 laptop, or any
+// machine whose taskbar leaves less than that, the window opened taller than
+// the desktop: its own close button sat below the edge of the screen. There is
+// no floor here on purpose — a panel smaller than it would like to be scrolls,
+// which is what it already does when the settings inside it are expanded.
+func PanelWindowSize(wantW, wantH int) (int, int) {
+	workW, workH := workAreaDIP()
+	// A little back from the very edge: a window exactly the height of the work
+	// area looks like it is stuck to the taskbar, and on Windows the shadow is
+	// then clipped.
+	const margin = 40
+	if int32(wantW) > workW-margin {
+		wantW = int(workW - margin)
+	}
+	if int32(wantH) > workH-margin {
+		wantH = int(workH - margin)
+	}
+	if wantW < 320 {
+		wantW = 320
+	}
+	if wantH < 320 {
+		wantH = 320
+	}
+	return wantW, wantH
+}

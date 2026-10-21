@@ -14,10 +14,14 @@ import "github.com/wailsapp/wails/v3/pkg/application"
 // override the size anyway, and on a smaller screen the compositor shrinks the
 // window to fit.
 func InitialWindowSize() (int, int) {
-	const assumedWorkW, assumedWorkH = 1920, 1040
-	w, h := idealWindowSize(assumedWorkW, assumedWorkH, 80)
+	workW, workH := workAreaDIP()
+	w, h := idealWindowSize(workW, workH, 80)
 	return int(w), int(h)
 }
+
+// workAreaDIP is the assumed usable area — see the note above for why it is not
+// measured here.
+func workAreaDIP() (int32, int32) { return 1920, 1040 }
 
 // ApplyWindowIcon is a no-op here, and deliberately so.
 //

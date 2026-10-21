@@ -26,7 +26,23 @@ func Init() {
 	// means a machine with no way out, and the marker on disk is the only thing
 	// that knows how to undo it. After the data layout is settled, since that is
 	// where the marker lives, and before anything else needs the network.
-	releaseStaleKillSwitch()
+	//
+	// Unless the user still wants it. A block standing from an earlier run is
+	// only stale when nobody asked for it any more: with "keep blocking after
+	// the tunnel is gone" still on, it is doing its job, and lifting it here
+	// would put the machine on the open network for exactly as long as it takes
+	// to notice. It comes down when the user says so — the red chip on the
+	// connection bar, disconnect, or turning the setting off — and a start that
+	// restores the connection simply brings the tunnel back under it.
+	keepBlockAtStart()
+	// And the engine's inbound rule, which belongs to a tunnel that is not
+	// running: it names an adapter this session has not created yet.
+	removeEngineFirewallRule()
+	// The other half of a run that ended without a teardown: an engine still
+	// running and the adapter it made, holding the default route into a tunnel
+	// nothing is driving. After the block is settled, so the machine is never
+	// unblocked and routed at the same time.
+	sweepGhostTunnelAtStart()
 	if s, err := openConfigStore(); err == nil {
 		store = s
 		go s.resultFlusher()
@@ -54,6 +70,9 @@ func Init() {
 	state.broadcast(SSEEvent{Type: "tabs_update", Payload: tabsSnap})
 	state.broadcast(SSEEvent{Type: "active_tab", Payload: activeTabID()})
 	loadedSignal(activeTabID())
+	// Last, with the tabs and configurations in memory: the connection that was
+	// up when the program closed.
+	restoreLastSession()
 }
 
 // recoverOrphanTabs rebuilds tab metadata for any tab_id that has config rows
@@ -110,6 +129,9 @@ type Row struct {
 	PingErr   string  `json:"ping_err"`   // failed-pill text ("timeout", …)
 	SpeedErr  string  `json:"speed_err"`  // failed-pill text ("tiny response", …)
 	Fav       bool    `json:"fav"`        // floated to the top + starred
+	// Stab is the measurement history behind this config — the share of checks
+	// it answered and the last delays — or nil while nothing has been recorded.
+	Stab *StabilityDTO `json:"stab,omitempty"`
 }
 
 // UITheme exposes the colour scheme ("light" or "" / "dark") to the shell — the
@@ -182,6 +204,7 @@ func Window(tabID, sort, filter string, proto []string, offset, limit int) ([]Ro
 			Ping: int(e.Delay), Speed: e.SpeedMBps, SpeedLive: e.SpeedLive,
 			PingSt: string(e.PingStatus), SpeedSt: string(e.SpeedStatus),
 			PingErr: e.PingErr, SpeedErr: e.SpeedErr, Fav: fav,
+			Stab: stabilityFor(hashBody(e.Raw)),
 		}
 	}
 	return rows, total
@@ -308,7 +331,7 @@ func PasteChunk(tabID, raw string) int {
 		return 0
 	}
 	state.mu.Lock()
-	base := len(state.tabEntries[tabID])
+	base := nextEntryIndexLocked(tabID)
 	for i, e := range newEntries {
 		e.Index = base + i
 	}
@@ -340,4 +363,27 @@ func Paste(tabID, raw string) int {
 	n := PasteChunk(tabID, raw)
 	EndPaste(tabID)
 	return n
+}
+
+// entryEvent is what an entry_update carries: the entry itself, plus the things
+// about it that are NOT stored on it.
+//
+// Stability is computed from the measurement history, keyed by the config's
+// body, and so it never travelled with the entry — the table only ever saw it
+// in a window fetch. A manual ping updated the history and patched the row from
+// the entry, which has no stability on it, so the column kept its old value
+// until something re-fetched the window. RELOAD did; nothing else had to.
+//
+// The entry is embedded, so the JSON is the entry's own fields plus this one and
+// the frontend's patch is unchanged apart from reading it.
+type entryEvent struct {
+	ConfigEntry
+	Stab *StabilityDTO `json:"stab,omitempty"`
+}
+
+// entryPayload wraps a snapshot for broadcasting. Every entry_update goes
+// through it, so anything else computed rather than stored has one place to be
+// added.
+func entryPayload(e ConfigEntry) entryEvent {
+	return entryEvent{ConfigEntry: e, Stab: stabilityFor(hashBody(e.Raw))}
 }

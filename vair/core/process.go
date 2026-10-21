@@ -2,6 +2,7 @@ package core
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,9 +23,26 @@ var (
 // awaitTUNReap blocks until no sweep is running. A barrier rather than a guard:
 // what must not overlap is the sweep and the creation of the next adapter, and
 // the creation is everything that follows.
+//
+// Called AFTER the teardown, not before it: the teardown is what starts a
+// sweep, so a barrier in front of it waits for the previous one and lets the
+// new one race the connect that follows.
 func awaitTUNReap() {
 	tunReapMu.Lock()
 	held := tunReapDone
 	tunReapMu.Unlock()
 	_ = held
+}
+
+// The adapter of the session being brought up or already up. The sweep matches
+// vair-* and would otherwise take this one with the ghosts; it is set before
+// the engine is started and cleared by the teardown.
+var tunLiveIface atomic.Value
+
+func setLiveTUNIface(name string) { tunLiveIface.Store(name) }
+func liveTUNIface() string {
+	if v, ok := tunLiveIface.Load().(string); ok {
+		return v
+	}
+	return ""
 }

@@ -1,8 +1,12 @@
 // Tab settings modal — an exact port of the 1.10 openTabSettings() DOM
 // (same classes/sections, live apply debounced 250ms, no Save button).
 import { useEffect, useRef, useState } from 'react'
+import Check from './Check'
 import { TabService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import { IS_REMOTE } from './remote'
+import { Hint } from './hints'
+import type { HintOpt } from './hints'
 import Select from './Select'
 import {
   ExcludeFields,
@@ -31,6 +35,9 @@ export default function TabModal({
   lang: string
 }) {
   const tt = (en: string) => t10(lang, en)
+  // The description under a setting: the paragraph while descriptions are
+  // on, the mark that opens the same text while they are off.
+  const hint = (en: string, opts?: HintOpt[]) => <Hint en={en} opts={opts} />
   const [tab, setTab] = useState<any>(null) // full tab (Detail) — subs are read-only here
   const [name, setName] = useState('')
   const [urls, setUrls] = useState<UrlRow[]>([])
@@ -233,13 +240,12 @@ export default function TabModal({
           <div id="ms-urls">
             {urls.map((r, i) => (
               <div key={i} className={'url-row' + (r.disabled ? ' src-off' : '')}>
-                <input
-                  type="checkbox"
+                <Check
                   className="ms-url-on"
                   checked={!r.disabled}
                   title={tt('Enable / disable this source')}
-                  onChange={(e) => {
-                    setUrls((prev) => prev.map((x, j) => (j === i ? { ...x, disabled: !e.target.checked } : x)))
+                  onChange={(v) => {
+                    setUrls((prev) => prev.map((x, j) => (j === i ? { ...x, disabled: !v } : x)))
                     scheduleApply()
                   }}
                 />
@@ -278,7 +284,7 @@ export default function TabModal({
           </div>
           <button
             className="btn ghost"
-            style={{ fontSize: 9, margin: '4px 0 12px' }}
+            style={{ fontSize: 'calc(var(--modal-fs-base) - 2px)', margin: '4px 0 12px' }}
             onClick={() => setUrls((prev) => [...prev, { url: '', disabled: false }])}
           >
             {tt('+ add URL')}
@@ -292,14 +298,13 @@ export default function TabModal({
             ) : (
               files.map((f, i) => (
                 <div key={i} className={'file-line' + (f.disabled ? ' src-off' : '')}>
-                  <input
-                    type="checkbox"
+                  <Check
                     className="ms-url-on"
                     checked={!f.disabled}
                     title={tt('Enable / disable this source')}
-                    onChange={(e) => {
+                    onChange={(v) => {
                       setFiles((prev) =>
-                        prev.map((x, j) => (j === i ? { ...x, disabled: !e.target.checked } : x)),
+                        prev.map((x, j) => (j === i ? { ...x, disabled: !v } : x)),
                       )
                       scheduleApply()
                     }}
@@ -323,12 +328,15 @@ export default function TabModal({
               ))
             )}
           </div>
-          <button className="btn ghost" style={{ fontSize: 9, margin: '4px 0 12px' }} onClick={pickFiles}>
-            {tt('+ add file')}
-          </button>
-          <div className="modal-hint">
-            {tt('Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.')}
-          </div>
+          {/* The picker opens on the computer, and the paths it returns are
+              the computer's — from a phone the button appears to do nothing.
+              The files already added stay listed above, and still load. */}
+          {!IS_REMOTE && (
+            <button className="btn ghost" style={{ fontSize: 'calc(var(--modal-fs-base) - 2px)', margin: '4px 0 12px' }} onClick={pickFiles}>
+              {tt('+ add file')}
+            </button>
+          )}
+          {hint('Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.')}
         </div>
 
         {/* ── GitHub import ── */}
@@ -350,9 +358,7 @@ export default function TabModal({
               <span className="toggle-thumb" />
             </label>
           </div>
-          <div className="modal-hint">
-            {tt('Pulls a config file from a private GitHub repository on every reload via a personal access token. Loaded after URLs and files.')}
-          </div>
+          {hint('Pulls a config file from a private GitHub repository on every reload via a personal access token. Loaded after URLs and files.')}
           {ghEnabled && (
             <div id="ms-gh-fields">
               <input
@@ -429,9 +435,7 @@ export default function TabModal({
             onChange={(e) => setRefreshMin(+e.target.value || 0)}
             onBlur={scheduleApply}
           />
-          <div className="modal-hint">
-            {tt('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')}
-          </div>
+          {hint('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')}
           <div className="modal-row" style={{ marginTop: 8 }}>
             <span className="modal-row-label">{tt('Test after auto-refresh')}</span>
             <Select
@@ -448,9 +452,7 @@ export default function TabModal({
               <option value="speed">{tt('Speed test')}</option>
             </Select>
           </div>
-          <div className="modal-hint">
-            {tt("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}
-          </div>
+          {hint("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}
         </div>
 
         {/* ── Dedup ── */}
@@ -478,9 +480,7 @@ export default function TabModal({
               ))}
             </div>
           </div>
-          <div className="modal-hint">
-            {tt('Off: show everything. Hide: filter from view, reversible. Delete: permanently remove duplicate entries. Matching is by vless body (ignores the name).')}
-          </div>
+          {hint('Off shows everything, Hide filters duplicates out of the view (reversible), Delete removes them for good. Two configurations count as duplicates when they point at the same server with the same settings; the name is not compared.')}
         </div>
 
         {/* ── Exclude filter ── */}
@@ -502,9 +502,10 @@ export default function TabModal({
               <span className="toggle-thumb" />
             </label>
           </div>
-          <div className="modal-hint ef-hint">
-            {tt('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')}
-          </div>
+          <Hint
+            className="ef-hint"
+            en="Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it."
+          />
           <ExcludeFields
             ef={ef}
             efInput={efInput}

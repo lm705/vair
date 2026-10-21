@@ -6,18 +6,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // ─────────────────────────── xray lifecycle (testing) ────────────
 
 func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transport) error) error {
+	// Through the accessor, not off the struct: a probe runs on its own
+	// goroutine, ten of them at a time, and is the one reader of these paths
+	// that does NOT hold state.mu — every other reader is inside a connect
+	// path, which is called with the lock already held.
+	xrayBin, _ := engineBins()
 	httpPort, err := findFreePort()
 	if err != nil {
 		return fmt.Errorf("no free port")
@@ -40,7 +47,7 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 	defer os.Remove(tmpPath)
 	ctx, cancel := context.WithTimeout(context.Background(), ttl)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, state.xrayBin, "run", "-c", tmpPath)
+	cmd := exec.CommandContext(ctx, xrayBin, "run", "-c", tmpPath)
 	var stderrBuf strings.Builder
 	if traceTest {
 		// xray logs to stdout; also tee stderr into the panel while keeping a
@@ -97,7 +104,9 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 // that xray can't dial. Same lifecycle contract as withXray — process is
 // killed and PID untracked on return regardless of outcome.
 func withSingbox(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transport) error) error {
-	if state.singboxBin == "" {
+	// Same as withXray: a probe is the reader that holds no lock.
+	_, singboxBin := engineBins()
+	if singboxBin == "" {
 		return fmt.Errorf("sing-box not found (pass its path as 2nd arg)")
 	}
 	httpPort, err := findFreePort()
@@ -120,7 +129,7 @@ func withSingbox(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Tran
 	defer os.Remove(tmpPath)
 	ctx, cancel := context.WithTimeout(context.Background(), ttl)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, state.singboxBin, "run", "-c", tmpPath)
+	cmd := exec.CommandContext(ctx, singboxBin, "run", "-c", tmpPath)
 	var stderrBuf strings.Builder
 	if traceTest {
 		// sing-box logs to stderr; tee it into the panel and keep a copy in
@@ -209,7 +218,12 @@ func startProxyConnection(entry *ConfigEntry) {
 // with the right tab.
 func startProxyConnectionOnTab(entry *ConfigEntry, connTab string) {
 	cm := state.conn
-	stopConnectionLocked(cm, true) // proxy→proxy: keep the system proxy set
+	stopConnectionLocked(cm, true, false) // proxy→proxy: keep the system proxy set
+
+	// A proxy session has no adapter, but it does have an engine, and the sweep
+	// that runs at a start kills engines by path — including the one this is
+	// about to spawn. The barrier is the same one the TUN paths take.
+	awaitTUNReap()
 
 	n, err := parseNode(entry.Raw)
 	if err != nil {
@@ -274,7 +288,7 @@ func startChain(entries []*ConfigEntry, mode ConnMode) {
 // conn-bar shows the full "A → B" chain.
 func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 	cm := state.conn
-	stopConnectionLocked(cm, mode != ModeTUN) // keep proxy only for a proxy chain
+	stopConnectionLocked(cm, mode != ModeTUN, false) // keep proxy only for a proxy chain
 
 	if len(entries) < 2 {
 		if len(entries) == 1 {
@@ -339,7 +353,9 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 		cm.state = ConnState{Status: ConnConnecting, Mode: ModeTUN, EntryIndex: entries[0].Index, EntryName: chainName, ConnTab: connTab, ConnRaw: entries[0].Raw, Chain: labels, ChainRaws: raws}
 		cm.mu.Unlock()
 		state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+		awaitTUNReap()
 		tunIface := tunIfaceName()
+		setLiveTUNIface(tunIface) // the ghost sweep skips this one
 		if len(segs) == 2 {
 			setConnError(cm, entries[0], "chain: a chain that needs both engines runs in proxy mode for now — TUN is not wired for it yet", connTab)
 			return
@@ -566,7 +582,7 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 
 	// xray is now listening on the internal ports — hand off to the shared
 	// post-spawn block (byte counters, system proxy, ConnState, tickers).
-	finalizeProxyConnection(cm, entry, name, connTab, cmd, cancel, tmpPath,
+	finalizeProxyConnection(cm, entry, name, connTab, cmd, cancel, tmpPath, exitCh,
 		httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort, chain, chainRaws)
 }
 
@@ -578,10 +594,14 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 // down (mainCancel + tmp cleanup) and reports the error. The engine
 // process must already be listening on intHTTPPort/intSOCKSPort.
 func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab string,
-	mainCmd *exec.Cmd, mainCancel context.CancelFunc, tmpPath string,
+	mainCmd *exec.Cmd, mainCancel context.CancelFunc, tmpPath string, exitCh <-chan error,
 	httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort int, chain, chainRaws []string) {
 
 	counter := &trafficCounter{}
+	// What this session is being built with, for the panel that answers "what is
+	// actually running" — the settings dialog only ever answers "what will run
+	// next time". Taken before anything can change underneath it.
+	facts := captureSessionFacts(engineName(mainCmd))
 	fwdCtx, fwdCancel := context.WithCancel(context.Background())
 	bindHost := proxyBindHost() // 127.0.0.1, or 0.0.0.0 when "allow LAN" is on
 	if _, err := startCountingForwarder(fwdCtx, bindHost, httpPort, intHTTPPort, counter, "proxy-http"); err != nil {
@@ -613,6 +633,7 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 	cm.tmpCfg = tmpPath
 	cm.counter = counter
 	cm.fwdCancel = fwdCancel
+	cm.startedWith = facts
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeProxy, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: name,
@@ -631,7 +652,19 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 		recordLastConnected(entry.Raw, ModeProxy)
 	}
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	// Before the question, not after — see the TUN path. A failed check tears the
+	// session down and takes the system proxy with it; without the block already
+	// on, the machine would be handed straight back to its ordinary connection.
 	engageProxyKillSwitch()
+	// Same question TUN asks before it believes itself: does anything actually
+	// go through? A listener that answers the browser and nothing else is the
+	// proxy-mode shape of "connected with no traffic".
+	if !verifyProxyCarriesTraffic(cm, mainCmd, entry, connTab) {
+		return
+	}
+	// No interface to watch in proxy mode; the engine dying is the whole of it,
+	// and it left "connected" on screen with a listener nobody was serving.
+	watchSession(cm, mainCmd, exitCh, "", ModeProxy)
 	startUptimeTicker(cm)
 	startStatsTicker(cm)
 	if len(chain) > 0 {
@@ -768,7 +801,7 @@ func runSingboxProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab st
 		}
 	}
 
-	finalizeProxyConnection(cm, entry, name, connTab, cmd, cancel, tmpPath,
+	finalizeProxyConnection(cm, entry, name, connTab, cmd, cancel, tmpPath, exitCh,
 		httpPort, socksPort, intHTTPPort, intSOCKSPort, intSrcPort, chain, chainRaws)
 }
 
@@ -801,24 +834,29 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 		setConnError(state.conn, entry, "sing-box not found. Pass path as 2nd arg: vair xray.exe sing-box.exe")
 		return
 	}
-	// Wait for any ghost sweep still running from the last teardown, so it
-	// cannot remove the adapter this connect is about to create.
-	awaitTUNReap()
-
 	cm := state.conn
-	stopConnectionLocked(cm, false) // TUN: drop any system proxy from a prior proxy session
+	stopConnectionLocked(cm, false, false) // TUN: drop any system proxy from a prior proxy session
+
+	// AFTER the teardown, not before it. This barrier is for a sweep an earlier
+	// DISCONNECT left running; the teardown above no longer starts one, because
+	// it was that sweep — a PowerShell launch 300-700ms behind the connect it
+	// was supposed to precede — that removed the adapter the new session had
+	// just created. sing-box then ran with no interface, the window still said
+	// connected, and every packet went out the physical one. Switching again
+	// only repeated it; the sweep on an explicit disconnect is what cleared it,
+	// which is exactly what the user saw.
+	awaitTUNReap()
 
 	// NOTE: no removeTUNAdapter() here. Adapter names are unique per session
 	// (vair-<unixtime>), so a fresh connect never collides with a stale adapter,
-	// and stopConnectionLocked already removed the previous one on teardown.
-	// Dropping this saves a full PowerShell launch (~300–700ms) off every TUN
-	// connect.
+	// and wintun takes the previous one down when its handle closes.
 	//
-	// Ghosts left by a crashed engine are NOT swept at startup, and deliberately
-	// so: the sweep matches vair-* across the whole machine, and another copy of
-	// this program — an older version the user still runs — would lose its live
-	// tunnel to it. They are collected instead by the next ordinary teardown,
-	// which removes every vair-* adapter at once.
+	// Ghosts left by a crashed engine ARE swept at startup — see
+	// sweepGhostTunnelAtStart, which is what gives a machine its network back
+	// after Vair was killed with a tunnel up. What that sweep does not touch is
+	// the 1.10 adapter name, because a copy of 1.10 running right now is the one
+	// thing that could own one; and it holds the same barrier this connect takes,
+	// so it can never overlap the session being started here.
 
 	n, err := parseNode(entry.Raw)
 	if err != nil {
@@ -853,6 +891,7 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 	// Even if Windows hasn't fully cleaned the previous adapter kernel-side,
 	// a new name means sing-box never conflicts with the old one.
 	tunIface := tunIfaceName()
+	setLiveTUNIface(tunIface) // the ghost sweep skips this one
 
 	// Engine branch. TCP-family protocols use the hybrid path (sing-box TUN
 	// front-end → xray outbound). UDP-family (Hysteria2/TUIC) run as a
@@ -969,8 +1008,11 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	// same trick used in proxy mode and gives us per-session traffic
 	// stats with no protocol-specific code.
 	counter := &trafficCounter{}
+	// See finalizeProxyConnection: the configuration this session is built with,
+	// recorded before it can change.
+	facts := captureSessionFacts("xray + sing-box")
 	fwdCtx, fwdCancel := context.WithCancel(context.Background())
-	counterSocksPort, err := startCountingForwarder(fwdCtx, "127.0.0.1", 0, xraySocksPort, counter, "tun-socks")
+	counterSocksPort, err := startCountingForwarder(fwdCtx, "127.0.0.1", 0, xraySocksPort, counter, relayLabelTUN)
 	if err != nil {
 		fwdCancel()
 		xrayCmd.Process.Kill() //nolint:errcheck
@@ -1044,9 +1086,16 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		scanner := bufio.NewScanner(stderrPipe)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
+			// The connections panel and the rule counters read these lines, and
+			// in TUN this pipe is their only source: the traffic itself never
+			// passes through us. Before the gate, for the reason given there.
+			offerToCounters("singbox", scanner.Bytes())
 			// Gate on raw bytes before allocating — and cap the crash-tail
 			// slice. Without the cap, stderrLines grew unbounded under a
 			// verbose TUN flood (the source of the ~1 GB RAM spike).
+			if !engineLineWanted("singbox", scanner.Bytes()) {
+				continue
+			}
 			if !logs.gate(levelErrWarnBytes(scanner.Bytes())) {
 				continue
 			}
@@ -1102,6 +1151,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	cm.xrayTmpCfg = xrayTmpPath
 	cm.counter = counter
 	cm.fwdCancel = fwdCancel
+	cm.startedWith = facts
 	connName := n.Name
 	if isChain {
 		connName = strings.Join(chainLabels, " → ")
@@ -1113,9 +1163,28 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		Chain: chainLabels, ChainRaws: chainRaws,
 	}
 	cm.mu.Unlock()
-	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig);
-	// the firewall-level one, which outlives the engine, is engaged separately.
+	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	// The block goes on BEFORE the tunnel is put to the question, not after.
+	// The check can end the session, and a session ended without the block is a
+	// machine back on its ordinary connection with its own address — which is
+	// the one thing this setting exists to prevent. Engaging first means a
+	// tunnel that turns out to carry nothing leaves the traffic stopped, and the
+	// error says so.
+	//
+	// TUN's other kill-switch is sing-box's own strict_route (see
+	// buildHybridTUNConfig); this is the firewall-level one, which outlives the
+	// engine.
+	// The engine's inbound door, for the stacks that terminate connections in
+	// the operating system. Here rather than at start-up: the rule names the
+	// adapter, and the adapter does not exist until the engine has made it.
+	if engineNeedsFirewallRule() {
+		ensureEngineFirewallRule(tunIface)
+	}
 	engagePersistentKillSwitch(tunIface)
+	if !verifyTUNCarriesTraffic(cm, cmd, entry, connTab) {
+		return
+	}
+	watchSession(cm, cmd, exitCh, tunIface, ModeTUN)
 	// last-connected badge → exit hop for a chain, else the single node.
 	if isChain {
 		recordLastConnected(chainRaws[len(chainRaws)-1], ModeTUN)
@@ -1162,6 +1231,7 @@ func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]inte
 		return
 	}
 
+	facts := captureSessionFacts("sing-box")
 	tmpPath, err := writeTempJSON(cfg, "singbox-tun")
 	if err != nil {
 		setConnError(cm, entry, "singbox config write: "+err.Error())
@@ -1199,9 +1269,16 @@ func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]inte
 		scanner := bufio.NewScanner(stderrPipe)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
+			// The connections panel and the rule counters read these lines, and
+			// in TUN this pipe is their only source: the traffic itself never
+			// passes through us. Before the gate, for the reason given there.
+			offerToCounters("singbox", scanner.Bytes())
 			// Gate on raw bytes before allocating — and cap the crash-tail
 			// slice. Without the cap, stderrLines grew unbounded under a
 			// verbose TUN flood (the source of the ~1 GB RAM spike).
+			if !engineLineWanted("singbox", scanner.Bytes()) {
+				continue
+			}
 			if !logs.gate(levelErrWarnBytes(scanner.Bytes())) {
 				continue
 			}
@@ -1254,6 +1331,7 @@ func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]inte
 	cm.xrayTmpCfg = ""
 	cm.counter = nil
 	cm.fwdCancel = nil
+	cm.startedWith = facts
 	cm.state = ConnState{
 		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: name,
@@ -1262,9 +1340,28 @@ func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]inte
 		Chain:            chain, ChainRaws: chainRaws,
 	}
 	cm.mu.Unlock()
-	// TUN's kill-switch is sing-box's own strict_route (see buildHybridTUNConfig);
-	// the firewall-level one, which outlives the engine, is engaged separately.
+	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	// The block goes on BEFORE the tunnel is put to the question, not after.
+	// The check can end the session, and a session ended without the block is a
+	// machine back on its ordinary connection with its own address — which is
+	// the one thing this setting exists to prevent. Engaging first means a
+	// tunnel that turns out to carry nothing leaves the traffic stopped, and the
+	// error says so.
+	//
+	// TUN's other kill-switch is sing-box's own strict_route (see
+	// buildHybridTUNConfig); this is the firewall-level one, which outlives the
+	// engine.
+	// The engine's inbound door, for the stacks that terminate connections in
+	// the operating system. Here rather than at start-up: the rule names the
+	// adapter, and the adapter does not exist until the engine has made it.
+	if engineNeedsFirewallRule() {
+		ensureEngineFirewallRule(tunIface)
+	}
 	engagePersistentKillSwitch(tunIface)
+	if !verifyTUNCarriesTraffic(cm, cmd, entry, connTab) {
+		return
+	}
+	watchSession(cm, cmd, exitCh, tunIface, ModeTUN)
 	recordLastConnected(entry.Raw, ModeTUN)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
@@ -1277,7 +1374,7 @@ func stopConnection() {
 	// sequence (which would double-kill / clobber cm fields). See connManager.
 	state.conn.actionMu.Lock()
 	defer state.conn.actionMu.Unlock()
-	stopConnectionLocked(state.conn, false)
+	stopConnectionLocked(state.conn, false, true)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: state.conn.snap()})
 	// A verbose connection can churn a lot of transient heap (log lines, JSON
 	// batches). Go won't hand that back to the OS for ~5 min on its own, which
@@ -1293,12 +1390,21 @@ func stopConnection() {
 // proxy was disabled mid-switch — during which apps would leak direct. Every
 // other caller (real disconnect, switch to TUN) passes false so the proxy is
 // properly removed.
-func stopConnectionLocked(cm *connManager, keepProxy bool) {
+// stopConnectionLocked tears the current session down. sweepGhosts asks it to
+// also collect leftover TUN adapters from previous crashes; a teardown that is
+// only making room for the next connect passes false, because wintun removes
+// this session's adapter when the handle closes and the sweep would otherwise
+// be a PowerShell launch racing the connect right behind it.
+func stopConnectionLocked(cm *connManager, keepProxy, sweepGhosts bool) {
 	cm.mu.Lock()
 	if cm.state.Status == ConnIdle {
 		cm.mu.Unlock()
 		return
 	}
+	// Every teardown passes through here, which makes it the one place that can
+	// close the session log's row. What ended it came from the caller (see
+	// noteSessionEndReason); everything else is on the state about to be cleared.
+	noteSessionEnded(cm.state, cm.counter)
 	wasTUN := cm.state.Mode == ModeTUN
 	wasProxy := cm.state.Mode == ModeProxy
 	prevHTTPPort := cm.state.HTTPPort
@@ -1416,6 +1522,11 @@ func stopConnectionLocked(cm *connManager, keepProxy bool) {
 		}
 	}
 	if wasTUN {
+		// The inbound door for the engine closes with the session. It names the
+		// adapter this session had, and the next one gets a rule of its own.
+		removeEngineFirewallRule()
+	}
+	if wasTUN && sweepGhosts {
 		// Off the disconnect path: this is half a second of PowerShell, and the
 		// user is waiting for a button. The engine has already been killed and
 		// wintun removes the adapter when its handle closes, so this is a sweep
@@ -1424,6 +1535,7 @@ func stopConnectionLocked(cm *connManager, keepProxy bool) {
 		// Serialised with tunReapMu, because the sweep matches vair-* and a new
 		// tunnel would match it too: a connect takes the same lock before it
 		// starts an engine, so the sweep can never run beside a live adapter.
+		setLiveTUNIface("") // this session's adapter is a ghost now, sweep it too
 		go func() {
 			tunReapMu.Lock()
 			defer tunReapMu.Unlock()
@@ -1481,7 +1593,8 @@ func connectionLost(reason string, wantMode ConnMode) {
 	}
 
 	vlog("error", "connection lost: %s", reason)
-	stopConnectionLocked(cm, false)
+	noteSessionEndReason(reason)
+	stopConnectionLocked(cm, false, true)
 	if e, tab, ok := memEntryByRaw(connTab, entryRaw); ok {
 		setConnError(cm, e, reason, tab)
 	} else {
@@ -1597,4 +1710,218 @@ func persistCounterDelta(counter *trafficCounter) {
 	counter.LastPersistedUp.Store(curUp)
 	counter.LastPersistedDown.Store(curDown)
 	saveSettings()
+}
+
+// watchSession follows a connection for as long as it is up, and ends it when
+// what it rests on is gone.
+//
+// Two things are watched, and neither costs traffic:
+//
+//   - the engine process. exitCh used to be read only during the startup
+//     window, so an engine that died later — a crash, a driver fault, a
+//     resume from sleep, someone killing it — left "connected" on screen with
+//     the machine back on its ordinary route and the user's own address
+//     showing. This is the same channel, read for the whole session.
+//   - the TUN interface. sing-box does not always exit when its adapter is
+//     removed underneath it, so the process being alive is not proof there is
+//     a tunnel. net.InterfaceByName is a syscall against a list the kernel
+//     already has; every few seconds is nothing.
+//
+// Both end in connectionLost, which tears the session down and puts the reason
+// where the user will see it, rather than leaving a window that says connected.
+//
+// The session is identified by cmd: stopConnectionLocked clears cm.cmd, so a
+// teardown we performed ourselves is seen here as "not ours any more" and the
+// watcher retires quietly instead of reporting a loss.
+// tunWatchEvery is how often the interface is looked for. A variable so a test
+// does not have to wait five seconds to see the watcher act.
+var tunWatchEvery = 5 * time.Second
+
+func watchSession(cm *connManager, cmd *exec.Cmd, exitCh <-chan error, iface string, mode ConnMode) {
+	if exitCh == nil && iface == "" {
+		return // nothing to follow (a split chain: its halves are tracked apart)
+	}
+	go func() {
+		tick := time.NewTicker(tunWatchEvery)
+		defer tick.Stop()
+		for {
+			select {
+			case <-exitCh:
+				if !sessionStillOurs(cm, cmd) {
+					return // we killed it: an ordinary disconnect or switch
+				}
+				connectionLost("the engine stopped", mode)
+				return
+			case <-tick.C:
+				if !sessionStillOurs(cm, cmd) {
+					return
+				}
+				if iface == "" {
+					continue
+				}
+				if _, err := net.InterfaceByName(iface); err != nil {
+					// Re-check that the session is still ours before acting: a
+					// disconnect may have landed between the lookup and here.
+					if !sessionStillOurs(cm, cmd) {
+						return
+					}
+					connectionLost("the tunnel interface is gone", mode)
+					return
+				}
+			}
+		}
+	}()
+}
+
+// sessionStillOurs reports whether the connection the watcher was started for
+// is the one that is up now.
+func sessionStillOurs(cm *connManager, cmd *exec.Cmd) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.state.Status == ConnConnected && cm.cmd == cmd
+}
+
+// verifyTUNCarriesTraffic checks that the tunnel just brought up actually
+// passes something, and ends the session with a readable error when it does
+// not.
+//
+// "Connected" in TUN mode used to mean "sing-box did not crash in the first few
+// seconds" — nothing looked at the interface, the routes, or a single packet.
+// A tunnel whose routes never installed (another VPN adapter with a better
+// metric, auto_route refused, the adapter removed underneath it) reads exactly
+// like a working one, and the user finds out from a website showing their own
+// address.
+//
+// One request, through the same probe AUTO uses, with the warm-up and the one
+// retry it does: about a second on a good link, and up to eight on a dead one —
+// which is time spent telling the truth instead of a session that was never
+// going to carry anything.
+func verifyTUNCarriesTraffic(cm *connManager, cmd *exec.Cmd, entry *ConfigEntry, connTab string) bool {
+	return verifyCarriesTraffic(cm, cmd, entry, connTab, ModeTUN)
+}
+
+// failedOnOurOwnBlock carries one bit from a failed attempt to the AUTO loop
+// that has to decide whether the config deserves the blame for it.
+//
+// It is set only by failures we can see are ours, read once by the attempt that
+// follows, and cleared before every attempt — so a note left by one candidate
+// can never excuse the next.
+var failedOnOurOwnBlock atomic.Bool
+
+func noteFailureWasOurs()  { failedOnOurOwnBlock.Store(true) }
+func clearFailureBlame()   { failedOnOurOwnBlock.Store(false) }
+func failureWasOurs() bool { return failedOnOurOwnBlock.Load() }
+
+// noTrafficMessage is what the row says when a session came up and carried
+// nothing.
+//
+// When the kill-switch is holding, that is the more urgent half of the news:
+// the machine is not back on its ordinary connection, it is stopped, and
+// nothing will load until the user disconnects. Saying only "no traffic goes
+// through it" would leave them looking for a network fault that is the
+// program's own doing.
+func noTrafficMessage(mode ConnMode, blocked bool) string {
+	what := "the tunnel started but no traffic goes through it"
+	if mode == ModeProxy {
+		what = "the proxy started but no traffic goes through it"
+	}
+	if blocked {
+		return what + " — traffic stays blocked (kill-switch); disconnect to release it"
+	}
+	return what
+}
+
+// verifyProxyCarriesTraffic is the same check for a proxy session.
+//
+// It was TUN-only, and the asymmetry showed: a server that accepts the
+// connection and answers nothing — a dead node still listening, an account out
+// of quota, a blocked route — left the proxy "connected", the listener up, and
+// every request through it hanging. The user's evidence was a browser that
+// never loaded, against a program that said everything was fine.
+//
+// The engine is not lying in that case and neither is the port: the only thing
+// that knows is a request, which is what this makes. It costs the same second
+// on a working link that TUN has been paying since 2.6.0.
+func verifyProxyCarriesTraffic(cm *connManager, cmd *exec.Cmd, entry *ConfigEntry, connTab string) bool {
+	return verifyCarriesTraffic(cm, cmd, entry, connTab, ModeProxy)
+}
+
+func verifyCarriesTraffic(cm *connManager, cmd *exec.Cmd, entry *ConfigEntry, connTab string, mode ConnMode) bool {
+	// Twice, with a pause first — the same shape auto-connect uses. Routes are
+	// installed a moment after the engine says it is up, and a single failed
+	// request is a thin reason to throw a session away.
+	for attempt := 0; attempt < 2; attempt++ {
+		// TUN waits before the first try: auto_route installs the routes a moment
+		// after the engine reports itself up, and probing into that gap fails a
+		// tunnel that was about to work. A proxy has no routes to wait for — the
+		// port is already accepting — so its first request goes straight out and
+		// an ordinary connect stays as quick as it was.
+		if mode == ModeTUN || attempt > 0 {
+			time.Sleep(800 * time.Millisecond)
+		}
+		if !sessionStillOurs(cm, cmd) {
+			return true // torn down or replaced while we were probing
+		}
+		if alive, _ := probeLiveTunnel(cm); alive {
+			if mode == ModeTUN {
+				go noteIPv6Reachability(cm, cmd)
+			}
+			return true
+		}
+	}
+	if !sessionStillOurs(cm, cmd) {
+		return true
+	}
+	warn := "tunnel came up but carries no traffic — check for another VPN adapter or a route conflict"
+	if mode == ModeProxy {
+		warn = "the proxy came up but carries no traffic — the server accepts connections and answers nothing"
+	}
+	blocked := PersistentKillSwitchHeld()
+	if blocked {
+		// Do not let AUTO charge this to the server. With our own block standing,
+		// a probe that gets nowhere proves nothing about the far end — the packet
+		// may never have left this machine, and the allow list, not the config,
+		// is the suspect. Marking the row failed there drives a good server down
+		// the ranking over a fault on this side of the wire.
+		noteFailureWasOurs()
+	}
+	msg := noTrafficMessage(mode, blocked)
+	vlog("warning", "%s", warn)
+	noteSessionEndReason("came up but carried no traffic")
+	// The system proxy stays pointed at the local port while AUTO still has
+	// candidates to try, and comes off when it does not.
+	//
+	// Removing it here unconditionally was a hole of its own: between one failed
+	// candidate and the next, applications that honour the setting went out
+	// directly with the machine's own address. Left in place, they get a refused
+	// connection instead — the same fail-closed second an ordinary switch has —
+	// and autoConnectFromPool clears it for good once every candidate is spent.
+	keepProxy := mode == ModeProxy && autoSweepInFlight.Load()
+	stopConnectionLocked(cm, keepProxy, mode == ModeTUN)
+	setConnError(cm, entry, msg, connTab)
+	return false
+}
+
+// noteIPv6Reachability says once, in the log, whether the server actually
+// carries the IPv6 the user asked it to carry.
+//
+// Nothing can be known about this before connecting: an AAAA record on the
+// server's own address says how we reach IT, not what it can reach. So the
+// question is asked afterwards, and only when the answer would matter — the
+// mode where v6 is supposed to go through. A failure is not an error: IPv4
+// works, the session is fine, and only sites that exist solely over IPv6 are
+// affected. But it is said out loud, because a silently half-working setting is
+// the thing this whole area was fixed for.
+func noteIPv6Reachability(cm *connManager, cmd *exec.Cmd) {
+	if ipv6Mode() != ipv6Tunnel {
+		return
+	}
+	if !sessionStillOurs(cm, cmd) {
+		return
+	}
+	if probeIPv6(cm) {
+		vlog("info", "IPv6 goes through this server")
+		return
+	}
+	vlog("warning", "this server does not carry IPv6 — sites reachable only over IPv6 will not open (IPv4 is unaffected)")
 }

@@ -11,7 +11,7 @@ import (
 // appVersion is the running version. 1.10 kept this const in selfupdate.go;
 // relocated here (remove selfupdate.go's copy when it ports). Must stay a const
 // because subFetchUserAgent (fetch.go) concatenates it at compile time.
-const appVersion = "2.5.0"
+const appVersion = "2.6.0"
 
 // Engine timeouts (relocated from the 1.10 main.go const block; the others there
 // are already defined within the ported engine files).
@@ -44,9 +44,15 @@ const (
 // the shell's remote server and the settings UI agree on it.
 func WebPort() int { return webPort }
 
-// checkExitHost is the geo/IP service for the "check IP" button (relocated from
-// handlers.go); routing forces it through the proxy in only-blocked mode.
+// checkExitHost is the fallback hostname for the "check IP" button when the
+// configured URL cannot be parsed. The service itself is a setting — see
+// currentCheckIPURL — and the routing follows it through checkIPHost().
 const checkExitHost = "ip-api.com"
+
+// checkIPURLDefault is the service the "check IP" button asks by default: free,
+// no key, and it answers over plain HTTP, which matters because this request has
+// to survive whatever the routing is doing.
+const checkIPURLDefault = "http://ip-api.com/json/?fields=status,message,country,countryCode,city,query,isp"
 
 // binDir holds the engine binaries (xray/sing-box) + the geo baselines shipped
 // beside them. The shell sets it via SetBinDir once the engines are on disk.
@@ -87,10 +93,35 @@ func ruleSetRoot() string {
 }
 
 // SetEngines records the on-disk paths of the extracted engine binaries so the
-// connect path can spawn them.
+// connect path can spawn them — and so the routing rules can name them.
+//
+// Under the lock: the paths are registered once before anything can connect and
+// then written again by the extraction goroutine, while the kill-switch script
+// and the engine carve-out read them from whichever goroutine is building a
+// configuration.
 func SetEngines(xray, singbox string) {
-	state.xrayBin = xray
-	state.singboxBin = singbox
+	state.mu.Lock()
+	state.xrayBin, state.singboxBin = xray, singbox
+	state.mu.Unlock()
+	// Ask the engine what it is, off this goroutine: it spawns a process, and
+	// this is called on the startup path. What it learns decides one key in
+	// every DNS block we build — see dnsIndependentCache — and answers the
+	// first question of every bug report.
+	go detectSingboxVersion()
+}
+
+// engineBins returns the two engine paths, or empty strings before they are
+// registered (which is every unit test that does not set them).
+//
+// For readers that hold no lock — which is the probe helpers in connection.go
+// and nothing else. Every connect path reads state.xrayBin/state.singboxBin
+// directly and must keep doing so: those run with state.mu already held by
+// their caller (the "…Locked" helpers around them say so), and a second
+// acquisition here would deadlock rather than protect anything.
+func engineBins() (xray, singbox string) {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	return state.xrayBin, state.singboxBin
 }
 
 // proxyAuthUser/Pass are the credentials for Vair's local SOCKS/HTTP inbound,

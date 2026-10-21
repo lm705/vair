@@ -4,6 +4,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { TabService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import { Hint } from './hints'
+import type { HintOpt } from './hints'
 import Select from './Select'
 import {
   ExcludeFields,
@@ -26,6 +28,9 @@ export default function SourcesModal({
   lang: string
 }) {
   const tt = (en: string) => t10(lang, en)
+  // The description under a setting: the paragraph while descriptions are
+  // on, the mark that opens the same text while they are off.
+  const hint = (en: string, opts?: HintOpt[]) => <Hint en={en} opts={opts} />
   const [tab, setTab] = useState<any>(null)
   const [srcUrls, setSrcUrls] = useState<string[] | null>(null) // null = loading
   const [refreshMin, setRefreshMin] = useState(0)
@@ -169,9 +174,7 @@ export default function SourcesModal({
             onChange={(e) => setRefreshMin(+e.target.value || 0)}
             onBlur={scheduleApply}
           />
-          <div className="modal-hint">
-            {tt('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')}
-          </div>
+          {hint('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')}
           <div className="modal-row" style={{ marginTop: 8 }}>
             <span className="modal-row-label">{tt('Test after auto-refresh')}</span>
             <Select
@@ -188,9 +191,7 @@ export default function SourcesModal({
               <option value="speed">{tt('Speed test')}</option>
             </Select>
           </div>
-          <div className="modal-hint">
-            {tt("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}
-          </div>
+          {hint("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}
         </div>
 
         {/* ── Exclude filter ── */}
@@ -212,9 +213,10 @@ export default function SourcesModal({
               <span className="toggle-thumb" />
             </label>
           </div>
-          <div className="modal-hint ef-hint">
-            {tt('Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it.')}
-          </div>
+          <Hint
+            className="ef-hint"
+            en="Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it."
+          />
           <ExcludeFields
             ef={ef}
             efInput={efInput}

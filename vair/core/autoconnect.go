@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -146,24 +147,48 @@ func probeSpacing(fails int) time.Duration {
 // abandon a config — the same probe, the same interval, the same consecutive
 // failure threshold — because the cost of being wrong is dropping a connection
 // the user is happily using.
-func watchIdleConnection(cm *connManager, fails *int, lastProbe *time.Time) {
+func watchIdleConnection(cm *connManager, fails *int, lastProbe *time.Time, live *livenessWatch) {
 	settingsMu.RLock()
 	watching := appSettings.WatchConnection
 	settingsMu.RUnlock()
 	if !watching {
 		*fails = 0
+		live.reset()
 		return
 	}
 	cs := cm.snap()
 	if cs.Status != ConnConnected {
 		*fails = 0
+		live.reset()
 		return
 	}
 	// A manual connect asks for an immediate probe so the panel can show the live
 	// ping straight away; honour it here too, then fall back to the interval.
 	probeNow := autoProbeNow.CompareAndSwap(true, false)
-	if !probeNow && time.Since(*lastProbe) < probeSpacing(*fails) {
-		return
+	up, down := cm.bytes()
+	hint := live.look(cs.ConnRaw, up, down, time.Now())
+	// After a failure the counters are not evidence: a failing probe's own
+	// traffic is counted among them. See the supervisor for the whole story.
+	if *fails > 0 {
+		hint = livenessUnknown
+	}
+	switch hint {
+	case livenessAlive:
+		// The user's own traffic is crossing the tunnel and coming back, which
+		// is a better answer than any probe. Still ask now and then, so the
+		// live round-trip time on the panel does not go stale for a session.
+		*fails = 0
+		if !probeNow && time.Since(*lastProbe) < livenessQuietProbe {
+			return
+		}
+	case livenessSuspect:
+		// Bytes are leaving and nothing is coming back — exactly the failure
+		// this watch exists for. Ask at once instead of waiting out the
+		// interval.
+	default:
+		if !probeNow && time.Since(*lastProbe) < probeSpacing(*fails) {
+			return
+		}
 	}
 	*lastProbe = time.Now()
 
@@ -171,6 +196,7 @@ func watchIdleConnection(cm *connManager, fails *int, lastProbe *time.Time) {
 	if alive {
 		*fails = 0
 		autoLiveRtt.Store(rtt.Milliseconds())
+		autoNoteLivePing(cs, rtt)
 		broadcastAuto("health", cs.EntryName, cs.ConnRaw, "")
 		return
 	}
@@ -216,20 +242,36 @@ func autoStillOn() bool {
 
 func autoEffectiveMode() ConnMode {
 	settingsMu.RLock()
-	m := appSettings.AutoMode
-	last := appSettings.LastConnectedMode
+	m, sel, last := appSettings.AutoMode, appSettings.SelectedMode, appSettings.LastConnectedMode
 	settingsMu.RUnlock()
-	mode := ConnMode(m)
-	if m == "" {
-		mode = ConnMode(last)
-	}
-	if mode != ModeProxy && mode != ModeTUN {
-		mode = ModeProxy
-	}
+	mode := resolveAutoMode(m, sel, last)
+	// The one thing the settings cannot decide: TUN without the rights it needs
+	// is not TUN. Kept out of resolveAutoMode so the order of preference can be
+	// tested on a machine that has no rights to give.
 	if mode == ModeTUN && !isPrivileged() {
-		mode = ModeProxy
+		return ModeProxy
 	}
 	return mode
+}
+
+// resolveAutoMode is that order of preference, and nothing else.
+//
+// The AUTO setting first, because it is explicit. Then the proxy/tun pill on
+// the main window — the one the user can see — because "follow the main window"
+// means the control, not the history: the two disagree for as long as someone
+// selects a mode without connecting in it, and AUTO used to bring servers up in
+// TUN while every control on screen said proxy. The mode of the last session
+// last, for a profile written before the pill was recorded.
+func resolveAutoMode(auto, pill, last string) ConnMode {
+	for _, m := range []string{auto, pill, last} {
+		switch ConnMode(m) {
+		case ModeProxy:
+			return ModeProxy
+		case ModeTUN:
+			return ModeTUN
+		}
+	}
+	return ModeProxy
 }
 
 // autoPool returns the candidate tab IDs, defaulting to the main tab.
@@ -372,16 +414,35 @@ func autoEntryExcluded(es ConfigEntry, rules []string) bool {
 // Ordered: ping-OK first (by descending speed when AutoRankBySpeed is on, else
 // by ascending score), then untested, then ping-failed.
 //
-// The score is the last measured delay, or — with stability ranking on and
-// enough history to mean something — the server's typical delay charged for its
-// jitter and its failures. A node that answers in 80 ms two tries out of three
-// then loses to one that answers in 100 ms every time, which is the right way
-// round for anything interactive and the wrong way round for a leaderboard.
+// What the score MEANS depends on the ranking mode (see autoRankMode), but its
+// direction never does: smaller is always better, so one comparator serves all
+// four. The two speed modes negate their figure into it rather than sorting the
+// other way, because a second comparator is a second thing to keep in step.
+//
+//	delay          the last measured delay
+//	speed          the last measured speed, negated
+//	history        typical delay, charged for jitter and for failed probes — a
+//	               node that answers in 80 ms two tries out of three loses to one
+//	               that answers in 100 ms every time, which is the right way round
+//	               for anything interactive and the wrong way round for a
+//	               leaderboard
+//	speed_history  typical speed less its spread, negated: what the server can be
+//	               relied on to deliver rather than its best moment. With no speed
+//	               figure to go on it falls back to the delay one, which sorts
+//	               behind everything that has a speed and keeps the rest in an
+//	               order that means something
+//
+// unmeasuredScore is where a candidate nothing is known about sorts: behind
+// every candidate something is known about, whatever the figure. Larger than any
+// delay a probe can return plus the full unreliability penalty, and only used
+// when there is no measurement of any kind to put in its place.
+const unmeasuredScore = 1e6
+
 func autoCandidates(pool []string, excludeRaw string, cooldown map[string]time.Time) []autoCand {
-	settingsMu.RLock()
-	rankBySpeed := appSettings.AutoRankBySpeed
-	rankStable := appSettings.AutoRankStable
-	settingsMu.RUnlock()
+	mode := autoRankMode()
+	rankBySpeed := mode == rankBySpeedLast
+	rankStable := mode == rankByPingHistory
+	rankSpeedHistory := mode == rankBySpeedHistory
 	now := time.Now()
 	seen := map[string]bool{}
 	var out []autoCand
@@ -411,16 +472,63 @@ func autoCandidates(pool []string, excludeRaw string, cooldown map[string]time.T
 			} else if es.PingStatus == StatusFailed {
 				rank = 2
 			}
+			// A speed result counts while it still describes anything. The
+			// history mode has always expired its figure after six hours
+			// (SpeedTrusted); the last-measurement mode took whatever was in the
+			// row, and rows are persisted — so after a restart it ranked on a
+			// number from last Tuesday and called it the fastest server. Same
+			// clock for both: the history row is where a measurement's time is
+			// recorded, whichever mode reads it.
 			spd := 0.0
-			if es.SpeedStatus == StatusOK {
+			if es.SpeedStatus == StatusOK && speedResultFresh(hashBody(es.Raw)) {
 				spd = es.SpeedMBps
 			}
 			c := autoCand{entry: e, tabID: tid, raw: es.Raw, delay: es.Delay, speed: spd, rank: rank}
 			c.score = float64(es.Delay)
-			if rankStable {
-				if st, ok := statsFor(hashBody(es.Raw)); ok && st.Trusted() {
-					c.score = st.PingAvg + jitterWeight*st.Jitter() + (1-st.OK)*unreliablePenaltyMs
+			switch {
+			case rankStable:
+				// One expression for both cases: the history score where there is
+				// a history, the raw delay charged for what is unknown about it
+				// where there is not.
+				hash := hashBody(es.Raw)
+				c.score = stableScore(hash, es.Delay)
+				if st, ok := statsFor(hash); ok && st.Trusted() {
 					c.stable = true
+				}
+			case rankSpeedHistory:
+				// The speed a server can be relied on, not the best it ever did.
+				// Ranked descending, so it is negated into the same "smaller is
+				// better" score the comparator already uses — one comparator, one
+				// direction, and no second sort to keep in step with the first.
+				st, hasSt := statsFor(hashBody(es.Raw))
+				if hasSt && st.SpeedTrusted() {
+					c.score = -st.SpeedScore()
+					c.stable = true
+				} else if spd > 0 {
+					// One or two measurements: the last one is a worse answer to
+					// the same question, and better than no answer — but it is not
+					// the same KIND of answer, and it used to be compared as if it
+					// were. A server measured once has no spread to be charged for,
+					// so it entered the order at face value while a server with a
+					// record entered it at "average less its spread", and the
+					// unmeasured one won on the strength of not being measured.
+					// Charged for what is not known about it, the two are at least
+					// judged by the same standard.
+					c.score = -spd * (1 - thinCharge(st.SpeedSeen))
+				} else {
+					// No speed figure at all. Every candidate that has one has
+					// already sorted ahead — those scores are negative — so this
+					// only orders the rest among themselves, and the delay is the
+					// only thing measured about them. Scoring them all zero, as
+					// this used to, threw that away: after a bulk PING with no
+					// speed test anywhere, every row scored the same and the
+					// order fell back to where the configs happen to sit in the
+					// tab, so a server nobody has ever measured could lead a
+					// server with a month of history behind it.
+					c.score = stableScore(hashBody(es.Raw), es.Delay)
+					if c.score <= 0 {
+						c.score = unmeasuredScore
+					}
 				}
 			}
 			out = append(out, c)
@@ -445,9 +553,134 @@ func autoCandidates(pool []string, excludeRaw string, cooldown map[string]time.T
 			}
 			return out[i].score < out[j].score
 		}
+		// Candidates with no fresh ping used to be left in whatever order they
+		// happened to be in — which is the state EVERY config is in at the first
+		// connection after a restart, so history ranking did nothing at the one
+		// moment there is nothing else to go on. A server measured forty times
+		// last week is a better guess than the row above it. Both history modes:
+		// a speed history is as good an answer here as a delay history, and only
+		// the delay one used to be consulted.
+		byHistory := rankStable || rankSpeedHistory
+		if byHistory && out[i].stable && out[j].stable {
+			return out[i].score < out[j].score
+		}
+		if byHistory && out[i].stable != out[j].stable {
+			return out[i].stable
+		}
 		return false
 	})
 	return out
+}
+
+// autoNoteDeadConfig records that a config AUTO was connected to stopped
+// carrying traffic.
+//
+// The health probe used to leave no trace anywhere: the row kept the "ok" from
+// its last bulk ping, the measurement history never heard about the failure,
+// and so the ranking went on offering the same dead server as its best
+// candidate — pick it, watch it fail, switch away, come back a minute later.
+// Writing the failure where a failed ping test would write it fixes both at
+// once: the row drops out of the "answered last time" group until something
+// re-tests it, and the history's success rate falls the way it would for any
+// other failed check.
+//
+// Once per failover, not once per probe: the probe runs every fifteen seconds
+// and folding all of that in would swamp a history built from occasional tests.
+func autoNoteDeadConfig(cs ConnState) {
+	autoNoteFailure(cs.ConnTab, cs.ConnRaw, "no traffic")
+}
+
+// autoNoteFailedAttempt records that AUTO tried this config and it did not come
+// up — the engine never started, the tunnel never appeared, or it appeared and
+// carried nothing.
+//
+// A failed attempt used to be written down nowhere the user could see: the
+// candidate went on a cooldown inside the supervisor and its row kept the ping
+// from its last bulk test. Opening the window then showed a healthy 80 ms next
+// to a server the program had just refused to use — the two disagreed, and the
+// row was the one being read.
+func autoNoteFailedAttempt(c autoCand) {
+	if c.entry == nil {
+		autoNoteFailure("", c.raw, "did not connect")
+		return
+	}
+	autoNoteFailureOn(c.entry, c.tabID, c.raw, "did not connect")
+}
+
+// autoNoteFailure marks the config identified by raw, looking the row up first.
+func autoNoteFailure(tabHint, raw, why string) {
+	if raw == "" {
+		return
+	}
+	entry, tabID, _ := memEntryByRaw(tabHint, raw)
+	if entry == nil {
+		// The config is gone from every tab — no row to mark, but the history is
+		// keyed by the config itself and still worth telling.
+		recordPingStat(hashBody(raw), 0, false)
+		return
+	}
+	autoNoteFailureOn(entry, tabID, raw, why)
+}
+
+// autoNoteFailureOn writes the failure where a failed manual test writes it:
+// the row, the persisted copy of it, and the measurement history.
+func autoNoteFailureOn(entry *ConfigEntry, tabID, raw, why string) {
+	entry.mu.Lock()
+	entry.PingStatus = StatusFailed
+	entry.Delay = -1
+	entry.PingErr = why
+	entry.mu.Unlock()
+	if store != nil {
+		// The same path a failed manual test takes: it persists the row AND folds
+		// the failure into the history, once.
+		mirrorPingResult(tabID, entry)
+	} else {
+		recordPingStat(hashBody(raw), 0, false)
+	}
+	state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
+}
+
+// autoNoteLivePing puts the live probe's round trip on the connected config's
+// row, so the table shows what the link is doing now rather than what a bulk
+// test measured an hour ago.
+//
+// The ROW only — never the measurement history, which is a set of comparable
+// numbers and must stay one. A list ping is a best-of-three on a test engine of
+// its own over an idle tunnel; this is one request through the tunnel the user
+// is working over, and the two differ by tens of milliseconds for the same
+// server (autoHasFasterCandidate keeps them apart for exactly that reason, and
+// takes the live figure where the live figure is the question).
+//
+// Mixing them would have cost more than it gave: in the "steady" modes the
+// connected config's average would climb towards its loaded-link figure, so the
+// switch check would find a "faster candidate" more often than it should — and
+// the inflated average would follow the config after the session ended. Nothing
+// is lost by leaving it out: candidate sweeps do not skip the connected config,
+// so its history keeps growing from measurements taken the same way as
+// everyone else's.
+func autoNoteLivePing(cs ConnState, rtt time.Duration) {
+	if cs.ConnRaw == "" || rtt <= 0 {
+		return
+	}
+	ms := rtt.Milliseconds()
+	if ms < 1 {
+		ms = 1 // a sub-millisecond link still answered; 0 means "no result"
+	}
+	entry, tabID, _ := memEntryByRaw(cs.ConnTab, cs.ConnRaw)
+	if entry == nil {
+		return
+	}
+	entry.mu.Lock()
+	entry.PingStatus = StatusOK
+	entry.Delay = ms
+	entry.PingErr = ""
+	idx := entry.Index
+	entry.mu.Unlock()
+
+	if store != nil {
+		store.queuePingRow(tabID, idx, ms, string(StatusOK), "") // the row, not the history
+	}
+	state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 }
 
 // autoBumpCooldown puts a raw on an exponential cooldown so a flapping config
@@ -466,6 +699,40 @@ func autoBumpCooldown(raw string, cooldown map[string]time.Time, backoff map[str
 	}
 	backoff[raw] = d
 	cooldown[raw] = time.Now().Add(d)
+	publishCooldowns(cooldown)
+}
+
+// The supervisor's pauses, copied out for the panel.
+//
+// The map itself belongs to the supervisor goroutine and is not shared — which
+// is why the panel could not see it, and why its candidate list showed a config
+// at the top that AUTO would not touch for another twenty minutes. A copy taken
+// where the map changes costs nothing and lets the list say so.
+var autoCooldownView atomic.Value // map[string]time.Time
+
+func publishCooldowns(cooldown map[string]time.Time) {
+	cp := make(map[string]time.Time, len(cooldown))
+	now := time.Now()
+	for raw, until := range cooldown {
+		if until.After(now) {
+			cp[raw] = until
+		}
+	}
+	autoCooldownView.Store(cp)
+}
+
+// cooldownLeft is how long a config is still paused for, or zero.
+func cooldownLeft(raw string) time.Duration {
+	m, _ := autoCooldownView.Load().(map[string]time.Time)
+	if m == nil {
+		return 0
+	}
+	if until, ok := m[raw]; ok {
+		if d := time.Until(until); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 func autoLabel(e *ConfigEntry) string {
@@ -485,9 +752,9 @@ func autoLabel(e *ConfigEntry) string {
 // compares like-for-like (clean best-of-3 ping vs ping, speed vs speed) so a
 // spiky single live probe can't make a slower candidate look faster.
 func autoHasFasterCandidate(pool []string, cs ConnState, cooldown map[string]time.Time) bool {
-	settingsMu.RLock()
-	bySpeed := appSettings.AutoRankBySpeed
-	settingsMu.RUnlock()
+	mode := autoRankMode()
+	bySpeed := strings.HasPrefix(mode, "speed")
+	byHistory := mode == rankByPingHistory || mode == rankBySpeedHistory
 	var curDelay int64 = -1
 	var curSpeed float64 = -1
 	state.mu.RLock()
@@ -515,24 +782,75 @@ func autoHasFasterCandidate(pool []string, cs ConnState, cooldown map[string]tim
 	if liveMs > 0 {
 		curDelay = liveMs
 	}
-	// Unknown current metric ⇒ can't prove any candidate is better ⇒ don't move.
+	// Unknown current metric ⇒ fall back to the one that IS known rather than
+	// refuse to answer.
+	//
+	// A speed mode with no speed measurement for the connected config used to
+	// return false here, and the whole latency budget went with it: the probe
+	// said 900 ms, the guard said "nothing better exists", and AUTO sat on it
+	// until something else re-measured the pool. The delay comparison is a
+	// coarser answer to the same question and it is available — the live probe
+	// just produced it.
 	if bySpeed && curSpeed <= 0 {
-		return false
+		if curDelay <= 0 {
+			return false // neither figure known: nothing to prove an improvement against
+		}
+		bySpeed, byHistory = false, false
 	}
 	if !bySpeed && curDelay <= 0 {
 		return false
+	}
+	// In a history mode the same margin is applied to the history score, not to
+	// the last measurement: ranking by what a server has done over time and then
+	// deciding whether to move by what it did once is two different questions
+	// answered about the same switch, and the second one undoes the first.
+	var curScore float64
+	if byHistory {
+		if st, ok := statsFor(hashBody(cs.ConnRaw)); ok {
+			switch {
+			case mode == rankByPingHistory && st.Trusted():
+				curScore = st.PingAvg + jitterWeight*st.Jitter() + (1-st.OK)*unreliablePenaltyMs
+			case mode == rankBySpeedHistory && st.SpeedTrusted():
+				curScore = -st.SpeedScore()
+			}
+		}
+		if curScore == 0 {
+			byHistory = false // nothing to compare against; fall back to the raw figures
+		}
 	}
 	for _, c := range autoCandidates(pool, cs.ConnRaw, cooldown) {
 		es := c.entry.snap()
 		if es.PingStatus != StatusOK {
 			continue
 		}
-		if bySpeed {
-			if c.speed > curSpeed*1.15 { // ≥15% faster download
+		// A candidate with no history of its own is judged on what it does have.
+		//
+		// Requiring c.stable here meant a candidate measured twice could not win,
+		// however good it looked — so a slow-but-alive connection with nothing but
+		// freshly-added candidates around it never moved, and the setting the user
+		// asked for ("rank on history") quietly became "never switch". The
+		// comparison degrades one step instead: history against history where both
+		// have it, last measurement against the live figure where they do not.
+		byHist := byHistory && c.stable
+		switch {
+		case byHist && mode == rankBySpeedHistory:
+			// Both scores are negated speeds, so "enough better" is the same
+			// percentage margin the last-measurement mode uses.
+			if -c.score > -curScore*autoSwitchSpeedFactor() {
 				return true
 			}
-		} else if es.Delay > 0 && es.Delay < curDelay-20 { // ≥20ms lower ping than current live latency
-			return true
+		case byHist:
+			if c.score < curScore-float64(autoSwitchToleranceMs()) {
+				return true
+			}
+		case bySpeed:
+			if c.speed > 0 && c.speed > curSpeed*autoSwitchSpeedFactor() { // enough faster to be worth the switch
+				return true
+			}
+		default:
+			if es.Delay > 0 && es.Delay < curDelay-autoSwitchToleranceMs() { // enough lower than the live latency
+				return true
+			}
 		}
 	}
 	return false
@@ -555,6 +873,18 @@ func broadcastAuto(stateStr, name, raw, reason string) {
 		"rtt_ms":       autoLiveRtt.Load(),
 	}})
 }
+
+// autoSweepInFlight is true while autoConnectFromPool is working through its
+// candidates.
+//
+// It exists for one decision made far from here: a session that fails its
+// traffic check is torn down, and in proxy mode a teardown normally takes the
+// system proxy with it. Between two candidates that would put the machine on
+// its ordinary connection with its own address for a second or two — so while
+// the sweep is still going the setting is left pointing at the local port,
+// where applications get a refused connection instead of a direct route out.
+// The sweep clears it itself once every candidate is spent.
+var autoSweepInFlight atomic.Bool
 
 // autoTryConnect connects to one candidate and verifies the live tunnel.
 // Caller MUST hold cm.actionMu. Returns true only on a verified connection.
@@ -580,12 +910,38 @@ func autoTryConnect(c autoCand, mode ConnMode) bool {
 		if alive, rtt := probeLiveTunnel(state.conn); alive {
 			// Publish THIS config's live RTT immediately so the panel shows the
 			// new config's ping right after a switch, instead of lingering on
-			// the previous (often slow) config's stale value.
+			// the previous (often slow) config's stale value — and put it on the
+			// row too, which is where the user looks after a switch.
 			autoLiveRtt.Store(rtt.Milliseconds())
+			autoNoteLivePing(state.conn.snap(), rtt)
 			return true
 		}
 	}
 	return false
+}
+
+// autoCandidatesForConnect is the ranked list to actually try, with the
+// cooldowns treated as advice rather than as a lock.
+//
+// A pause is stamped on a config that just failed and doubles each time, up to
+// half an hour. That is right when one server is flapping and wrong when the
+// network was down: every candidate failed, every candidate is now paused, and
+// AUTO would sit doing nothing for as long as the longest pause — after the
+// connection came back. "Switch now" walked the same list, so it became a
+// button that did nothing at all.
+//
+// So when the pauses exclude everything, they are ignored for this attempt and
+// the same ranked order is tried anyway. Nothing else changes: the pauses still
+// keep a flapping server out of the way while there is anything else to pick.
+func autoCandidatesForConnect(pool []string, excludeRaw string, cooldown map[string]time.Time) []autoCand {
+	cands := autoCandidates(pool, excludeRaw, cooldown)
+	if len(cands) > 0 || len(cooldown) == 0 {
+		return cands
+	}
+	if cands = autoCandidates(pool, excludeRaw, nil); len(cands) > 0 {
+		vlog("info", "auto: every candidate is cooling down — trying them anyway")
+	}
+	return cands
 }
 
 // autoConnectFromPool tries pool candidates in order until one connects and
@@ -595,7 +951,17 @@ func autoTryConnect(c autoCand, mode ConnMode) bool {
 // cm.actionMu. Returns true on success.
 func autoConnectFromPool(pool []string, preferRaw, excludeRaw string, mode ConnMode, reason string, cooldown map[string]time.Time, backoff map[string]time.Duration) bool {
 	const autoMaxAttempts = 8
-	cands := autoCandidates(pool, excludeRaw, cooldown)
+	// While this runs, a failed candidate's teardown leaves the system proxy
+	// pointed at the local port (see autoSweepInFlight); when it ends without a
+	// connection, there is nothing left to point at and it comes off.
+	autoSweepInFlight.Store(true)
+	defer func() {
+		autoSweepInFlight.Store(false)
+		if state.conn.snap().Status != ConnConnected {
+			unsetSystemProxy()
+		}
+	}()
+	cands := autoCandidatesForConnect(pool, excludeRaw, cooldown)
 	if len(cands) == 0 {
 		broadcastAuto("all_down", "", "", "no candidates")
 		vlog("warning", "auto: no eligible config in pool")
@@ -639,15 +1005,32 @@ func autoConnectFromPool(pool []string, preferRaw, excludeRaw string, mode ConnM
 		name := autoLabel(c.entry)
 		broadcastAuto("switching", name, c.raw, reason)
 		vlog("info", "auto: trying %s (%s)", name, mode)
+		clearFailureBlame()
 		if autoTryConnect(c, mode) {
+			// The cooldown is over — it connected. The BACKOFF is not cleared here
+			// on purpose: "connected" means one probe passed a second after the
+			// tunnel came up, and a server that comes up and dies twenty seconds
+			// later used to have its escalation wiped on every attempt, so its
+			// pause never grew past the first thirty seconds and AUTO returned to
+			// it every couple of minutes for as long as it kept half-working. The
+			// supervisor clears it once the connection has actually lasted.
 			delete(cooldown, c.raw)
-			delete(backoff, c.raw)
 			autoManaged.Store(true) // supervisor owns this connection
 			broadcastAuto("connected", name, c.raw, reason)
 			vlog("info", "auto: connected → %s (%s)", name, reason)
 			return true
 		}
 		autoBumpCooldown(c.raw, cooldown, backoff)
+		// Say so on the row as well as in the cooldown map, which only the
+		// supervisor can see. Not when AUTO has just been switched off, though:
+		// an attempt cut short by the user says nothing about the config, and a
+		// row marked failed there is a lie the ranking would then act on.
+		// Nor when the failure was ours: a session that came up and carried
+		// nothing while our own firewall block was standing says nothing about
+		// the server, and the ranking must not act on it either.
+		if autoStillOn() && !failureWasOurs() {
+			autoNoteFailedAttempt(c)
+		}
 		vlog("warning", "auto: %s did not work, trying next", name)
 		// TUN settle gap: each failed TUN attempt tore down a WinTUN adapter and
 		// rewrote the default route. removeTUNAdapter() returns before Windows
@@ -670,6 +1053,7 @@ func autoConnectFromPool(pool []string, preferRaw, excludeRaw string, mode ConnM
 	for k := range backoff {
 		delete(backoff, k)
 	}
+	publishCooldowns(cooldown)
 	broadcastAuto("all_down", "", "", "all candidates failed")
 	vlog("warning", "auto: all candidates in pool failed")
 	return false
@@ -723,19 +1107,6 @@ func waitAutoSweepIdle(timeout time.Duration) bool {
 	return true
 }
 
-// autoPingTabs pings every config across the given tabs (deduped) so the
-// supervisor has fresh Delay/PingStatus for its "fastest by ping" ordering.
-// A config-list refresh rebuilds entries with no ping data, so this is what
-// keeps ordering meaningful. It yields to any user-initiated bulk test
-// (state.pingRunning / speedRunning) and never overlaps another auto-ping.
-// The currently-connected config is skipped (we already know it works via the
-// live probe, and a parallel test connection could trip per-account limits).
-// Results broadcast as entry_update; it deliberately avoids the bulk_ping_*
-// progress machinery, which is single-tab UI state.
-// autoTestTabs pings (and, when withSpeed, speed-tests) every config across the
-// given tabs. withSpeed runs the full ping→speed measurement so the supervisor
-// can rank by real download speed (AutoRankBySpeed); otherwise it's ping-only
-// (fast, for connect ordering). See autoPingTabs / the refresh path for callers.
 // testTabs is the shared background tester: it pings (and, when withSpeed,
 // speed-tests) every config across the given tabs, deduped and respecting each
 // tab's exclude filter. Results broadcast as entry_update (no bulk-progress UI).
@@ -865,7 +1236,7 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 				ent.SpeedStatus = StatusTestingSpeed
 			}
 			ent.mu.Unlock()
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tab})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(ent.snap()), Tab: tab})
 			if withSpeed {
 				// runSpeedForEntry does ping→speed in one engine session.
 				runSpeedForEntry(ent, tab, nil)
@@ -874,7 +1245,7 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 				runPingForEntry(ent, nil)
 				mirrorPingResult(tab, ent)
 			}
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tab})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(ent.snap()), Tab: tab})
 			atomic.AddInt32(&tested, 1)
 		}(item.e, item.tab)
 	}
@@ -927,6 +1298,11 @@ func runAfterRefreshTest(tabID string) {
 
 // autoPingTabs is the ping-only entry point (connect ordering). Kept as a thin
 // wrapper so existing call sites read clearly.
+//
+// It does NOT skip the connected config, and an older comment here said it did:
+// every test runs its own engine on its own port, so measuring the live one
+// disturbs nothing and the list then shows a fresh figure for it like every
+// other row.
 func autoPingTabs(tabIDs []string) { autoTestTabs(tabIDs, false) }
 
 // autoPingAfterRefresh re-pings a freshly auto-refreshed tab, but only when
@@ -935,8 +1311,10 @@ func autoPingTabs(tabIDs []string) { autoTestTabs(tabIDs, false) }
 func autoPingAfterRefresh(tabID string) {
 	settingsMu.RLock()
 	on := appSettings.AutoConnect && appSettings.AutoPingRefresh
-	withSpeed := appSettings.AutoRankBySpeed
 	settingsMu.RUnlock()
+	// Either speed mode needs fresh Mbps to rank by, so the re-test runs the
+	// full ping→speed pass rather than ping alone.
+	withSpeed := strings.HasPrefix(autoRankMode(), "speed")
 	if !on {
 		return
 	}
@@ -982,10 +1360,16 @@ func startAutoSupervisor() {
 	// AUTO is on or off, and its own schedule is far slower than the tick.
 	var proxyGuard proxyGuardState
 	var lastIdleProbe time.Time
+	// What the byte counters have already shown about the connection, kept
+	// apart for the same reason the failure counters are: the two regimes must
+	// not hand each other evidence.
+	var live, idleLive livenessWatch
+	// When the last wait began, for noticing that the machine slept through it.
+	var lastTick time.Time
 	var lastSwitch, lastProbe, nextRetry, lastTUNSwitch, lastSlowRetest time.Time
 	cooldown := map[string]time.Time{}
 	backoff := map[string]time.Duration{}
-	const minDwell = 60 * time.Second
+	minDwell := autoMinDwell()
 	// When over budget but already on the fastest available config, re-test the
 	// pool no more often than this — enough to promote a faster config once one
 	// appears, without spamming test traffic while stuck on a uniformly-slow net.
@@ -1001,9 +1385,34 @@ func startAutoSupervisor() {
 	}
 
 	for {
+		// Measured across the WAIT, not across the whole round. The round also
+		// contains a health probe, and a probe against a server that has
+		// stopped answering takes as long as its timeouts allow — eight to ten
+		// seconds. Measured end to end, that read as "the machine was away for
+		// 10s", and the counters were wiped every time: the log filled with
+		// "health probe failed (1/2)" over and over, the count never reached
+		// two, and the dead server was never swapped out. The one thing the
+		// supervisor exists for was undone by its own slowness.
+		lastTick = time.Now()
 		select {
 		case <-time.After(2 * time.Second):
 		case <-autoWake: // "Switch now" or similar — react without waiting
+		}
+
+		// A shut laptop opened an hour later arrives here with every timer
+		// fired at once and a measurement an hour old. Nothing from before the
+		// gap describes the connection now, and treating it as evidence cost
+		// the user a working tunnel: two probes that "failed" while the machine
+		// was away, and a switch to another server on waking.
+		now := time.Now()
+		wallGap := now.Round(0).Sub(lastTick.Round(0))
+		if clockJumped(wallGap, now.Sub(lastTick), 2*time.Second) {
+			failCount, idleFails = 0, 0
+			lastProbe, lastIdleProbe = time.Time{}, time.Time{}
+			live.reset()
+			idleLive.reset()
+			vlog("info", "the machine was away for %s — health counters start again", wallGap.Round(time.Second))
+			continue
 		}
 
 		settingsMu.RLock()
@@ -1028,11 +1437,12 @@ func startAutoSupervisor() {
 			// abandon a config over, and it runs on the same interval; the only
 			// difference is what happens at the end, since there is no pool to
 			// switch to.
-			watchIdleConnection(cm, &idleFails, &lastIdleProbe)
+			watchIdleConnection(cm, &idleFails, &lastIdleProbe, &idleLive)
 			continue
 		}
 		// Back under AUTO's own supervision: forget what the off-mode watchdog saw.
 		idleFails, lastIdleProbe = 0, time.Time{}
+		idleLive.reset()
 		// A pending "Switch now" request. Consumed by whichever branch acts on
 		// it; left armed while a transient connect/disconnect settles.
 		forced := autoForce.Load()
@@ -1068,6 +1478,10 @@ func startAutoSupervisor() {
 					autoForce.Store(false)
 					autoBumpCooldown(cs.ConnRaw, cooldown, backoff)
 					vlog("info", "auto: manual switch from %s", cs.EntryName)
+					// The teardown happens inside the connect below, so the reason
+					// has to be left here or the log records the default and every
+					// "Switch now" reads as an ordinary disconnect.
+					noteSessionEndReason("switched by hand")
 					ok := autoConnectFromPool(pool, "", cs.ConnRaw, mode, "manual switch", cooldown, backoff)
 					cm.actionMu.Unlock()
 					failCount = 0
@@ -1101,6 +1515,7 @@ func startAutoSupervisor() {
 					continue
 				}
 				vlog("info", "auto: %s is outside the selected tabs — switching", cs.EntryName)
+				noteSessionEndReason("auto: the candidate tabs changed")
 				ok := autoConnectFromPool(pool, "", cs.ConnRaw, mode, "tabs changed", cooldown, backoff)
 				cm.actionMu.Unlock()
 				failCount = 0
@@ -1126,6 +1541,7 @@ func startAutoSupervisor() {
 				if probeNow {
 					if alive, rtt := probeLiveTunnel(cm); alive {
 						autoLiveRtt.Store(rtt.Milliseconds())
+						autoNoteLivePing(cs, rtt)
 						broadcastAuto("health", cs.EntryName, cs.ConnRaw, "")
 					} else {
 						autoLiveRtt.Store(0)
@@ -1133,21 +1549,61 @@ func startAutoSupervisor() {
 				}
 				continue
 			}
-			// Same reasoning as the idle watchdog: after a failed probe, look
-			// again in seconds rather than waiting out the whole interval.
-			if !probeNow && time.Since(lastProbe) < probeSpacing(failCount) {
-				continue
+			// What the traffic already says, before spending a probe on the
+			// question. Bytes coming back are proof; bytes going out with
+			// nothing coming back are the failure itself, caught sooner than
+			// the interval would have caught it.
+			up, down := cm.bytes()
+			hint := live.look(cs.ConnRaw, up, down, time.Now())
+			// Once a probe has failed, the counters stop being evidence.
+			//
+			// They were, and it cost the feature its point. A failed probe is
+			// not a silent one: it opens a connection, and a server that accepts
+			// and then answers nothing useful — a REALITY handshake, a tiny
+			// response, an error page — still sends bytes back through the
+			// counting relay. The next tick read those bytes as "traffic is
+			// flowing", cleared the failure count and put the next probe two
+			// minutes away: the log repeated "health probe failed (1/2)", the
+			// count never reached two, and a dead server was never left.
+			//
+			// Bytes are excellent evidence that a link works; they are no
+			// evidence at all once something has said it does not. From the
+			// first failure until a probe succeeds, only probes count.
+			if failCount > 0 {
+				hint = livenessUnknown
+			}
+			switch hint {
+			case livenessAlive:
+				failCount = 0
+				if !probeNow && time.Since(lastProbe) < livenessQuietProbe {
+					continue
+				}
+			case livenessSuspect:
+			default:
+				// Same reasoning as the idle watchdog: after a failed probe,
+				// look again in seconds rather than waiting out the interval.
+				if !probeNow && time.Since(lastProbe) < probeSpacing(failCount) {
+					continue
+				}
 			}
 			lastProbe = time.Now()
 			alive, rtt := probeLiveTunnel(cm)
 			if alive {
 				autoLiveRtt.Store(rtt.Milliseconds())
+				autoNoteLivePing(cs, rtt)
 			} else {
 				autoLiveRtt.Store(0)
 			}
 			overBudget := alive && maxLat > 0 && rtt > time.Duration(maxLat)*time.Millisecond
 			if alive && !overBudget {
 				failCount = 0
+				// It has held for longer than the minimum stay, so whatever was
+				// wrong with it before is over: forget the escalating pause. This
+				// is the only place it is forgiven — connecting is not enough,
+				// staying up is.
+				if time.Since(lastSwitch) > minDwell {
+					delete(backoff, cs.ConnRaw)
+				}
 				// Refresh the panel with the live latency of a healthy link.
 				broadcastAuto("health", cs.EntryName, cs.ConnRaw, "")
 				continue
@@ -1190,13 +1646,35 @@ func startAutoSupervisor() {
 					broadcastAuto("health", cs.EntryName, cs.ConnRaw, "slow but best")
 					if atomic.LoadInt32(&autoPingRunning) == 0 && time.Since(lastSlowRetest) > slowRetestEvery {
 						lastSlowRetest = time.Now()
-						settingsMu.RLock()
-						bySpeed := appSettings.AutoRankBySpeed
-						settingsMu.RUnlock()
-						go autoTestTabs(pool, bySpeed)
+						go autoTestTabs(pool, rankModeUsesSpeed())
 					}
 					continue
 				}
+			}
+			// A chain is not replaced, it is ended.
+			//
+			// AUTO picks one config out of a pool; a chain is a route the user
+			// built by hand — through this country, then that one — and there is
+			// nothing in the pool to rebuild it from. Switching would hand back a
+			// single hop in its place: still "connected", quietly weaker than what
+			// was asked for, and easy not to notice. So the session ends and says
+			// why, the same ending the watch gives when there is nowhere to move.
+			if len(cs.ChainRaws) > 1 {
+				failCount = 0
+				blocked := PersistentKillSwitchHeld()
+				desktopNotify("Vair", notifyChainGone(cs.EntryName, blocked))
+				why := "the chain stopped responding — connection closed (auto-connect does not rebuild a chain)"
+				if blocked {
+					why = "the chain stopped responding — traffic stays blocked (kill-switch); disconnect to release it"
+				}
+				noteSessionEndReason("auto: " + reason)
+				connectionLost(why, "")
+				// And it stays ended: without this the next tick would find an idle
+				// connection with the intent still armed and connect a single config
+				// anyway — the same substitution by a longer route.
+				autoWant.Store(false)
+				vlog("warning", "auto: %s was a chain — ended rather than replaced with one hop", cs.EntryName)
+				continue
 			}
 			// A faster candidate exists → switch to the fastest available below.
 			// Pick the failover target by *fresh* ping ranking. If the pool has no
@@ -1204,8 +1682,13 @@ func startAutoSupervisor() {
 			// autoCandidates falls back to tab order — which is the "switched to a
 			// random config, not the fastest" the user reported. Re-ping first so
 			// the sweep ranks by real delay, exactly like the manual "Switch now".
-			// The connected config is skipped inside autoPingTabs, so this is cheap
-			// and safe while still connected.
+			// Safe to run while connected: each test spins up its own engine on
+			// its own port, so it neither touches nor is touched by the live one.
+			// Ping only, even in a speed mode: something has just gone down and
+			// the pool has no order at all. A full speed pass would leave the
+			// machine off the air for as long as it takes to measure every
+			// candidate, and the slow-but-best branch above already kicks a
+			// background sweep that measures what the mode ranks on.
 			if !autoPoolHasPingData(pool) && atomic.LoadInt32(&autoPingRunning) == 0 {
 				autoPingTabs(pool)
 			}
@@ -1214,6 +1697,16 @@ func startAutoSupervisor() {
 			}
 			// Cool down the failing config so we don't immediately flap back.
 			autoBumpCooldown(cs.ConnRaw, cooldown, backoff)
+			// A dead link is a fact about the config; a slow one is not. Only the
+			// first is written down — an over-budget probe means the server works
+			// and something faster exists, which is not a failure to remember.
+			if !alive {
+				autoNoteDeadConfig(cs)
+			}
+			// The session log's row for the connection we are about to replace:
+			// "auto: probe failed" / "auto: too slow 243ms", the same words the
+			// panel and the log already use for the switch.
+			noteSessionEndReason("auto: " + reason)
 			ok := autoConnectFromPool(pool, "", cs.ConnRaw, mode, reason, cooldown, backoff)
 			cm.actionMu.Unlock()
 			failCount = 0
@@ -1246,11 +1739,19 @@ func startAutoSupervisor() {
 			if atomic.LoadInt32(&autoPingRunning) == 1 {
 				continue
 			}
-			// First connect with no ping data yet → ping the whole pool now
-			// (blocking) so ordering is by real delay. A config-list refresh
+			// First connect with no test data yet → test the whole pool now
+			// (blocking) so the order is a real one. A config-list refresh
 			// resets entries to "pending", which re-triggers this next pass.
+			//
+			// What is measured follows the ranking mode, as it does everywhere
+			// else. After a restart in a speed mode this pinged and stopped, so
+			// the first connection of the session — the one the mode exists to
+			// decide — was made without a single speed measurement behind it.
+			// Switching AUTO on has always run the full pass; a restart now does
+			// the same. The failover path above deliberately does not: getting
+			// back online beats measuring throughput first.
 			if !autoPoolHasPingData(pool) {
-				autoPingTabs(pool)
+				autoTestTabs(pool, rankModeUsesSpeed())
 				if !autoWant.Load() {
 					continue // user disconnected while we were pinging
 				}

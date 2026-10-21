@@ -14,8 +14,12 @@ func SetAuto(enabled bool) {
 	settingsMu.Lock()
 	was := appSettings.AutoConnect
 	appSettings.AutoConnect = enabled
-	withSpeed := appSettings.AutoRankBySpeed
 	settingsMu.Unlock()
+	// The ranking mode is the setting. The two pre-2.6 booleans are kept in step
+	// with it for a downgrade and must not be read as if they were the source —
+	// one write path that forgets to sync them and this silently stops measuring
+	// speed in the modes that rank by it.
+	withSpeed := rankModeUsesSpeed()
 
 	if enabled && !was {
 		autoWant.Store(true)
@@ -70,6 +74,16 @@ type AutoCandDTO struct {
 	Status  Status  `json:"status"`
 	Speed   float64 `json:"speed_mbps"`
 	Current bool    `json:"current"`
+	// Stable marks a row whose place in the order came from its measurement
+	// history rather than from a single test. Without it, a ranking mode that
+	// puts a 100 ms server above an 80 ms one — because the 80 answers two
+	// times in three — reads as a bug.
+	Stable bool `json:"stable"`
+	// CooldownSec is how long AUTO will keep skipping this config after a
+	// failure, or 0. The list showed cooled-down configs in their ranked place
+	// with nothing to say they were being skipped, so the top of it could be a
+	// config the supervisor would not touch for another twenty minutes.
+	CooldownSec int `json:"cooldown_sec"`
 }
 
 // AutoCandidates returns the ranked candidate pool the supervisor would choose
@@ -89,13 +103,15 @@ func AutoCandidates() []AutoCandDTO {
 	for _, c := range autoCandidates(autoPool(), "", nil) {
 		es := c.entry.snap()
 		out = append(out, AutoCandDTO{
-			Name:    autoLabel(c.entry),
-			Raw:     es.Raw,
-			Tab:     c.tabID,
-			Delay:   es.Delay,
-			Status:  es.PingStatus,
-			Speed:   es.SpeedMBps,
-			Current: connBody != "" && nodeBody(es.Raw) == connBody,
+			Name:        autoLabel(c.entry),
+			Raw:         es.Raw,
+			Tab:         c.tabID,
+			Delay:       es.Delay,
+			Status:      es.PingStatus,
+			Speed:       es.SpeedMBps,
+			Current:     connBody != "" && nodeBody(es.Raw) == connBody,
+			Stable:      c.stable,
+			CooldownSec: int(cooldownLeft(es.Raw).Seconds()),
 		})
 	}
 	return out
@@ -119,6 +135,15 @@ func AutoConnectCand(raw, mode string) bool {
 	}
 	if found == nil {
 		return false
+	}
+	// An empty mode means "whatever AUTO would use" — which is the only answer
+	// that makes sense from AUTO's own panel, and the one the panel now asks
+	// for. It used to pass the proxy/tun pill from the main window instead, so
+	// a panel whose Connection mode said TUN brought servers up in proxy: two
+	// controls on screen, one of them ignored, and the one being ignored was
+	// the one in the same window as the click.
+	if mode != string(ModeProxy) && mode != string(ModeTUN) {
+		mode = string(autoEffectiveMode())
 	}
 	autoWant.Store(true)
 	autoManaged.Store(false)

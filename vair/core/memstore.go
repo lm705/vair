@@ -118,10 +118,14 @@ func chipProtoOf(protocol, security string) string {
 // sortKey is a per-entry snapshot of every field the filter/comparators read,
 // taken under e.mu so the sort never races a concurrent test mutation.
 type sortKey struct {
-	e                                       *ConfigEntry
-	idx                                     int
-	delay                                   int64
-	speed                                   float64
+	e     *ConfigEntry
+	idx   int
+	delay int64
+	speed float64
+	// stab is the share of checks this server answered, 0..1, or -1 when there
+	// have been too few to judge. Sorting by it is sorting by how a server has
+	// behaved rather than by what it did on the last try.
+	stab                                    float64
 	pStatus, sStatus                        Status
 	fav                                     bool
 	name, host, network, security, protocol string // lowercased
@@ -130,6 +134,9 @@ type sortKey struct {
 	// flag emoji in it. Sorting still uses `name`, so spelling the flags out
 	// can't reorder the table. Aliases `name` when there is no flag.
 	nameSearch string
+	// raw is the config as written, the key the service-check answers are stored
+	// under. Not lowercased: it is an identity, not searchable text.
+	raw string
 }
 
 // Regional indicator symbols — a flag emoji is a pair of them, one per letter.
@@ -179,7 +186,7 @@ func memSig(q windowQuery, favorites []string) string {
 	// version so those views re-sort as results arrive; the other orders keep a
 	// stable cache regardless of tests. (Field-only compare: the direction
 	// suffix doesn't change WHICH data the order depends on.)
-	if f, _ := splitSort(q.sort); f == "ping" || f == "speed" {
+	if f, _ := splitSort(q.sort); f == "ping" || f == "speed" || f == "stab" {
 		s += "\x00" + strconv.FormatInt(atomic.LoadInt64(&memResultVer), 10)
 	}
 	return s
@@ -208,6 +215,8 @@ func canonField(f string) string {
 		return "transport"
 	case "security", "tls", "sec":
 		return "security"
+	case "unlock", "opens":
+		return "unlock"
 	}
 	return ""
 }
@@ -221,7 +230,9 @@ func classifyBare(v string) string {
 		return "transport"
 	case "tls", "reality", "xtls", "none":
 		return "security"
-	case "vless", "vmess", "trojan", "ss", "ss2022", "hysteria2", "hy2", "tuic":
+	// "http" is absent on purpose: as a bare filter word it would classify
+	// itself as a protocol and stop matching hosts and names containing it.
+	case "vless", "vmess", "trojan", "ss", "ss2022", "hysteria2", "hy2", "tuic", "socks", "wireguard", "wg":
 		return "type"
 	}
 	return ""
@@ -271,8 +282,11 @@ func termHitKey(k *sortKey, key, val string) bool {
 		return strings.Contains(k.protocol, val) || strings.Contains(k.chip, val)
 	case "transport":
 		return strings.Contains(k.network, val)
-	case "security":
-		return strings.Contains(k.security, val)
+	case "unlock":
+		// Not a column: the answer of the last service check. "unlock:chatgpt"
+		// means "servers that opened ChatGPT" — a config nobody checked is not a
+		// match, because the honest answer for it is "unknown".
+		return unlockOpens(k.raw, val)
 	default: // general — any column
 		return strings.Contains(k.nameSearch, val) || strings.Contains(k.host, val) ||
 			strings.Contains(k.network, val) || strings.Contains(k.security, val) ||
@@ -353,15 +367,19 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 		e.mu.Lock()
 		nameLower := strings.ToLower(e.Name)
 		k := sortKey{
-			e: e, idx: e.Index, delay: e.Delay, speed: e.SpeedMBps,
+			e: e, idx: e.Index, delay: e.Delay, speed: e.SpeedMBps, stab: -1,
 			pStatus: e.PingStatus, sStatus: e.SpeedStatus,
 			name: nameLower, nameSearch: searchableName(nameLower), host: strings.ToLower(e.Host),
 			network: strings.ToLower(e.Network), security: strings.ToLower(e.Security),
 			protocol: strings.ToLower(e.Protocol),
 		}
 		raw := e.Raw
+		k.raw = raw
 		sec := e.Security
 		e.mu.Unlock()
+		if st, ok := statsFor(hashBody(raw)); ok && st.Trusted() {
+			k.stab = st.OK
+		}
 		// Favorites are matched on the EXACT body (a favorite marks one specific
 		// config), while dedup uses the canonical identity (see dedupKey) so the
 		// same server written differently collapses to one row.
@@ -472,6 +490,17 @@ func lessKey(a, b *sortKey, mode string) bool {
 		}
 		if al && a.delay != b.delay {
 			return flip(a.delay < b.delay) // natural: fastest first
+		}
+		return a.idx < b.idx
+	case "stab":
+		// A server with a history comes before one without, in both directions:
+		// "no data" is not a good score, and it is not a bad one either.
+		ak, bk := a.stab >= 0, b.stab >= 0
+		if ak != bk {
+			return ak
+		}
+		if ak && a.stab != b.stab {
+			return flip(a.stab > b.stab) // natural: steadiest first
 		}
 		return a.idx < b.idx
 	case "speed":

@@ -49,8 +49,8 @@ var ifaceName = regexp.MustCompile(`^vair[0-9]{0,2}$`)
 
 // topLevel is every key allowed at the root of the document.
 //
-// "experimental" is deliberately absent. It is where sing-box keeps the Clash
-// API and the cache file — an HTTP control surface and a file write, both of
+// "experimental" is deliberately absent. It is where sing-box keeps its HTTP
+// control API and the cache file — a control surface and a file write, both of
 // which would be running as root.
 var topLevel = map[string]bool{
 	"log":       true,

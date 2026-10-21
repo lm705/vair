@@ -58,7 +58,7 @@ func configDBPath() string { return dataPath("configs.db") }
 // the full body text (which nearly duplicated raw). The dedup-"hide" view filter
 // compares hashes. Indexing an 8-byte integer instead of a ~200-byte string cuts
 // the largest index — and the column — by ~20×.
-const configSchema = nodeStatsSchema + `
+const configSchema = nodeStatsSchema + sessionsSchema + `
 CREATE TABLE IF NOT EXISTS configs (
 	id          INTEGER PRIMARY KEY,
 	tab_id      TEXT    NOT NULL,
@@ -614,11 +614,31 @@ func (s *configStore) queuePing(tabID string, idx int, hash int64, delay int64, 
 	s.resBuf = append(s.resBuf, resultUpdate{tabID: tabID, idx: idx, hasPing: true, delay: delay, pStatus: status, pErr: errMsg})
 	s.resMu.Unlock()
 }
+
+// queuePingRow is queuePing without the history sample: the row is written, the
+// server's record of "how often it answers" is not touched. For a measurement
+// that repeats on a timer — the live probe of the connected config, every
+// fifteen seconds — where counting each one would drown a history built from
+// occasional tests (see autoNoteLivePing).
+func (s *configStore) queuePingRow(tabID string, idx int, delay int64, status, errMsg string) {
+	if s == nil {
+		return
+	}
+	s.resMu.Lock()
+	s.resBuf = append(s.resBuf, resultUpdate{tabID: tabID, idx: idx, hasPing: true, delay: delay, pStatus: status, pErr: errMsg})
+	s.resMu.Unlock()
+}
+
 func (s *configStore) queueSpeed(tabID string, idx int, hash int64, delay int64, pStatus, pErr string, mbps float64, sStatus, sErr string, live float64) {
 	if s == nil {
 		return
 	}
 	recordPingStat(hash, delay, pStatus == string(StatusOK))
+	// Only a successful measurement: a failed speed test is usually the test
+	// endpoint refusing rather than the server being slow (see recordSpeedStat).
+	if sStatus == string(StatusOK) {
+		recordSpeedStat(hash, mbps)
+	}
 	s.resMu.Lock()
 	s.resBuf = append(s.resBuf, resultUpdate{tabID: tabID, idx: idx,
 		hasPing: true, delay: delay, pStatus: pStatus, pErr: pErr,

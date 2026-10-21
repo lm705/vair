@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -414,6 +415,14 @@ func cleanupLeftovers() error {
 		// in place. This is the only code that will ever remove it: the helper
 		// that started it is gone.
 		removeRouteLeftovers("", nil)
+	}
+	// A block installed by a helper that was killed outlives it, and there is no
+	// tunnel left for it to allow — the machine would come back with no network
+	// and nothing on screen to explain it. This is the only code that will ever
+	// remove it.
+	if killSwitchPresent() {
+		log.Printf("removing a kill-switch left by a previous run")
+		removeKillSwitch()
 	}
 	os.Remove(rulesPath)  //nolint:errcheck
 	os.Remove(configPath) //nolint:errcheck

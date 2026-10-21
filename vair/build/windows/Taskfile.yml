@@ -26,6 +26,7 @@ tasks:
           EXTRA_TAGS: '{{.EXTRA_TAGS}}'
           OBFUSCATED: '{{.OBFUSCATED}}'
           GARBLE_ARGS: '{{.GARBLE_ARGS}}'
+          OUTPUT: '{{.OUTPUT}}'
     vars:
       # Default to CGO_ENABLED=0 if not explicitly set
       CGO_ENABLED: '{{.CGO_ENABLED | default "0"}}'
@@ -51,13 +52,18 @@ tasks:
       - task: generate:syso
         vars:
           ARCH: '{{.ARCH}}'
-      - '{{if eq .OBFUSCATED "true"}}garble {{.GARBLE_ARGS}} build{{else}}go build{{end}} {{.BUILD_FLAGS}} -o "{{.BIN_DIR}}/{{.APP_NAME}}.exe"'
+      - '{{if eq .OBFUSCATED "true"}}garble {{.GARBLE_ARGS}} build{{else}}go build{{end}} {{.BUILD_FLAGS}} -o "{{.OUTPUT}}"'
       - cmd: powershell Remove-item *.syso
         platforms: [windows]
       - cmd: rm -f *.syso
         platforms: [linux, darwin]
     vars:
       BUILD_FLAGS: '{{if eq .DEV "true"}}{{if or .EXTRA_TAGS (eq .OBFUSCATED "true")}}-tags {{if eq .OBFUSCATED "true"}}wails_obfuscated{{if .EXTRA_TAGS}},{{end}}{{end}}{{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l"{{else}}-tags production{{if eq .OBFUSCATED "true"}},wails_obfuscated{{end}}{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -H windowsgui"{{end}}'
+      # Where the exe lands. The installer builds a second flavour of the same
+      # program and must not overwrite the portable one, so this is a variable
+      # rather than a constant — the same shape the Linux build already has.
+      DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}.exe'
+      OUTPUT: '{{.OUTPUT | default .DEFAULT_OUTPUT}}'
     env:
       GOOS: windows
       CGO_ENABLED: '{{.CGO_ENABLED | default "0"}}'
@@ -95,14 +101,56 @@ tasks:
         sh: 'wails3 tool docker-mounts'
 
   package:
-    summary: Packages the application
+    summary: Builds the Windows installer
+    # Not the stock Wails NSIS/MSIX targets (still below, unused): those install
+    # one exe, and Vair installs a program plus the engines beside it. The script
+    # is build/windows/installer/vair.iss.
     cmds:
-      - task: '{{if eq (.FORMAT | default "nsis") "msix"}}create:msix:package{{else}}create:nsis:installer{{end}}'
+      - task: create:inno:installer
+
+  build:portable:
+    summary: Builds the single-file portable exe (engines embedded)
+    # The published Vair.exe: everything inside one file, unpacked into
+    # %LOCALAPPDATA% at first run. `windows:build` produces the other flavour —
+    # the one the installer ships, which finds its engines beside itself.
+    cmds:
+      - task: build
         vars:
-          INSTALL_SCOPE: '{{.INSTALL_SCOPE | default "machine"}}'
+          ARCH: '{{.ARCH}}'
+          EXTRA_TAGS: 'portable{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}}'
+
+  create:inno:installer:
+    summary: Compiles the Inno Setup installer
+    dir: build/windows/installer
+    deps:
+      - task: build
+        vars:
+          # No `portable` tag: the installed build has no payload inside it.
+          OUTPUT: '{{.ROOT_DIR}}/bin/packaged/Vair.exe'
+    preconditions:
+      # test -f, not -x: Task runs preconditions through its own shell, and on
+      # Windows nothing has an execute bit for -x to find.
+      - sh: 'command -v ISCC >/dev/null 2>&1 || test -f "{{.ISCC_PATH}}"'
+        msg: |
+          The Inno Setup compiler (ISCC.exe) was not found. Install Inno Setup 6 or
+          newer, or point ISCC at it:
+            wails3 task windows:package ISCC="C:/path/to/ISCC.exe"
+      - sh: 'test -f "{{.ROOT_DIR}}/bin/sing-box.exe" && test -f "{{.ROOT_DIR}}/bin/xray.exe"'
+        msg: "The engines are missing from bin/. Run download-engines.ps1 first."
+    cmds:
+      # The WebView2 bootstrapper is fetched, not committed — the same rule the
+      # engines follow. It is Microsoft's, it changes on its own schedule, and a
+      # binary in the history is a binary in the history forever.
+      - wails3 generate webview2bootstrapper -dir "{{.ROOT_DIR}}/build/windows/installer"
+      # Only the version is passed in. The paths stay in the script, relative to
+      # it: a Windows path on an ISCC command line loses its backslashes to the
+      # preprocessor, and quoting it back through two shells is a trick nobody
+      # should have to know to build a release.
+      - '"{{.ISCC_PATH}}" /DAppVersion={{.VERSION}} vair.iss'
     vars:
-      FORMAT: '{{.FORMAT | default "nsis"}}'
-      INSTALL_SCOPE: '{{.INSTALL_SCOPE | default "machine"}}'
+      # A portable Inno Setup is the usual arrangement on a build machine that is
+      # not allowed to install one; override for any other location.
+      ISCC_PATH: '{{.ISCC | default "C:/Users/user/AppData/Local/Programs/InnoSetup7/ISCC.exe"}}'
 
   generate:syso:
     summary: Generates Windows `.syso` file

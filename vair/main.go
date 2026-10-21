@@ -34,6 +34,23 @@ func init() {
 }
 
 func main() {
+	// The uninstaller runs us with this before it deletes anything, elevated, to
+	// put the firewall, the system proxy and the network adapters back. It is the
+	// first thing checked because none of the rest — no window, no engines, no
+	// store — has any business starting for it.
+	if shell.HasUninstallCleanupFlag(os.Args) {
+		shell.RunUninstallCleanup()
+		return
+	}
+	// And this one when the installer's "start with Windows" box was ticked: the
+	// program records its own setting rather than the installer writing the
+	// registry behind its back, so the switch in Settings tells the truth.
+	if shell.HasEnableAutostartFlag(os.Args) {
+		core.PreloadSettings()
+		shell.RunEnableAutostart()
+		return
+	}
+
 	// Settings + tabs + configs load SYNCHRONOUSLY so the very first render already
 	// has the active tab's data — no "0 configs" flash before the store finishes
 	// loading (the 1.10 behaviour the user expects). Engine PATHS are registered
@@ -80,7 +97,7 @@ func main() {
 
 	app := application.New(application.Options{
 		Name:        "Vair",
-		Description: "Vair 2.5.0",
+		Description: "Vair 2.6.0",
 		Services: []application.Service{
 			application.NewService(&services.ConfigService{}),
 			application.NewService(&services.TabService{}),
@@ -92,6 +109,8 @@ func main() {
 			application.NewService(&services.QRService{}),
 			application.NewService(&services.ClipboardService{}),
 			application.NewService(&services.UpdateService{}),
+			application.NewService(&services.ConnectionsService{}),
+			application.NewService(&services.UnlockService{}),
 		},
 		Assets: application.AssetOptions{
 			Handler: application.AssetFileServerFS(assets),

@@ -94,9 +94,9 @@ func (h *helperClient) readLoop() {
 		if resp.ID == 0 {
 			if resp.Log != nil {
 				// In TUN mode the engine belongs to the helper, so this socket is
-				// where its output arrives — and rule statistics have no other
-				// source on this path.
-				if ruleStatsEnabled() {
+				// where its output arrives — and the counters and the connections
+				// panel have no other source on this path.
+				if ruleStatsEnabled() || connectionsWatched() {
 					noteEngineLine(resp.Log.Src, resp.Log.Text)
 				}
 				logs.add(resp.Log.Src, resp.Log.Lvl, resp.Log.Text)
@@ -182,11 +182,14 @@ func (h *helperClient) PutRuleSet(name string, data []byte) error {
 // decide we are still here. Stopping it — because this process was killed, or
 // wedged — is what tears the tunnel down, so the goroutine deliberately has no
 // error path that quietly gives up while the process lives.
-func (h *helperClient) StartTUN(cfg []byte) (api.Status, error) {
+func (h *helperClient) StartTUN(cfg []byte, killSwitch, allowLAN bool, serverIPs []string) (api.Status, error) {
 	resp, err := h.call(&api.Request{
-		Op:       api.OpStartTUN,
-		Config:   cfg,
-		LeaseSec: api.DefaultLeaseSec,
+		Op:         api.OpStartTUN,
+		Config:     cfg,
+		LeaseSec:   api.DefaultLeaseSec,
+		KillSwitch: killSwitch,
+		AllowLAN:   allowLAN,
+		ServerIPs:  serverIPs,
 	}, 30*time.Second)
 	if err != nil {
 		return api.Status{}, err

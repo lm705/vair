@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -28,6 +30,8 @@ const (
 	KindHysteria2 NodeKind = "hysteria2"
 	KindTUIC      NodeKind = "tuic"
 	KindWireGuard NodeKind = "wireguard"
+	KindSOCKS     NodeKind = "socks"
+	KindHTTP      NodeKind = "http"
 )
 
 // Node is the engine-agnostic descriptor of a parsed proxy URL. Exactly one
@@ -50,6 +54,7 @@ type Node struct {
 	Hysteria2 *Hysteria2Params
 	TUIC      *TuicParams
 	WireGuard *WireGuardParams
+	Proxy     *ProxyParams
 }
 
 // nodeSchemes lists the URL schemes Vair recognises as proxy node URLs. The
@@ -67,6 +72,23 @@ var nodeSchemes = []string{
 	"tuic://",
 	"wireguard://",
 	"wg://",
+	// A plain proxy. socks5:// before socks:// only for tidiness — the scan
+	// skips past whichever it matched, so either order finds both.
+	"socks5://",
+	"socks://",
+	// http:// and https:// are here, but every match is put to
+	// looksLikeHTTPProxyLink before it is accepted — see splitConfigURLs. A
+	// subscription link is the same scheme, and treating one as a node would turn
+	// a single paste into hundreds of imaginary proxies.
+	"https://",
+	"http://",
+}
+
+// isHTTPScheme reports whether a candidate uses the one scheme that is shared
+// with something that is not a node at all.
+func isHTTPScheme(s string) bool {
+	l := strings.ToLower(s)
+	return strings.HasPrefix(l, "http://") || strings.HasPrefix(l, "https://")
 }
 
 // looseHostPort parses "host:port" tolerating trailing junk after the port
@@ -145,11 +167,27 @@ func base64Prefix(s string) string {
 // whitespace-delimited junk is trimmed from each segment.
 func splitConfigURLs(line string) []string {
 	var starts []int
+	// Whether the scan is inside the QUERY of the config it is currently in —
+	// past its '?' and before its '#'. A scheme there is the value of a
+	// parameter, not the start of another config, and cutting at it destroyed
+	// two real-world shapes: a worker link carrying its upstream in the path
+	// ("?path=/socks5://1.2.3.4:1080…", which became a broken vless plus an
+	// imaginary socks5 proxy) and an ECH parameter naming a DoH server
+	// ("&ech=…+https://dns.example/dns-query#name", which lost its name because
+	// the fragment was cut away with the rest). Two configs really run together
+	// meet at a fragment or at whitespace, both of which end the query.
+	inQuery := false
 	for i := 0; i < len(line); {
 		matched := false
 		for _, s := range nodeSchemes {
 			if strings.HasPrefix(line[i:], s) {
+				if inQuery && len(starts) > 0 {
+					i += len(s) // a parameter value: skip it, do not cut here
+					matched = true
+					break
+				}
 				starts = append(starts, i)
+				inQuery = false
 				// Skip past the scheme so a sub-scheme isn't matched inside it
 				// ("ss://" is a substring of "vmess://").
 				i += len(s)
@@ -157,9 +195,16 @@ func splitConfigURLs(line string) []string {
 				break
 			}
 		}
-		if !matched {
-			i++
+		if matched {
+			continue
 		}
+		switch line[i] {
+		case '?':
+			inQuery = true
+		case '#', ' ', '\t', '\r', '\n':
+			inQuery = false
+		}
+		i++
 	}
 	if len(starts) == 0 {
 		return nil
@@ -186,7 +231,14 @@ func splitConfigURLs(line string) []string {
 			seg = seg[:sp]
 		}
 		if seg = strings.TrimSpace(seg); seg != "" {
-			out = append(out, seg+frag)
+			cfg := seg + frag
+			// The one scheme that is also something else: a subscription link is
+			// an http:// URL too, and turning one into a node would turn a paste
+			// into hundreds of imaginary proxies. Only the endpoint shape passes.
+			if isHTTPScheme(cfg) && !looksLikeHTTPProxyLink(cfg) {
+				continue
+			}
+			out = append(out, cfg)
 		}
 	}
 	return out
@@ -250,6 +302,26 @@ func parseNode(raw string) (*Node, error) {
 			Network:   "udp",
 			Security:  "wireguard",
 			WireGuard: p,
+		}, nil
+	case strings.HasPrefix(raw, "socks://"), strings.HasPrefix(raw, "socks5://"),
+		strings.HasPrefix(raw, "http://"), strings.HasPrefix(raw, "https://"):
+		p, err := parseProxyLink(raw)
+		if err != nil {
+			return nil, err
+		}
+		sec := "none"
+		if p.TLS {
+			sec = "tls"
+		}
+		return &Node{
+			Kind:     p.Kind,
+			Raw:      raw,
+			Name:     p.Name,
+			Host:     p.Host,
+			Port:     p.Port,
+			Network:  "tcp",
+			Security: sec,
+			Proxy:    p,
 		}, nil
 	case strings.HasPrefix(raw, "vless://"):
 		p, err := parseVless(raw)
@@ -370,6 +442,10 @@ type VlessParams struct {
 	PublicKey     string
 	ShortID       string
 	SpiderX       string
+	// Per-transport settings: gRPC/xhttp mode, and mKCP's disguise and seed.
+	Mode       string
+	HeaderType string
+	Seed       string
 }
 
 func parseVless(raw string) (*VlessParams, error) {
@@ -412,6 +488,7 @@ func parseVless(raw string) (*VlessParams, error) {
 	p.AllowInsecure = get("allowInsecure") == "1"
 	p.Flow = get("flow")
 	p.PublicKey, p.ShortID, p.SpiderX = get("pbk"), get("sid"), get("spx")
+	p.Mode, p.HeaderType, p.Seed = get("mode"), get("headerType"), get("seed")
 	return p, nil
 }
 
@@ -445,6 +522,10 @@ type TrojanParams struct {
 	PublicKey     string
 	ShortID       string
 	SpiderX       string
+	// Per-transport settings, as on VlessParams.
+	Mode       string
+	HeaderType string
+	Seed       string
 }
 
 func parseTrojan(raw string) (*TrojanParams, error) {
@@ -560,6 +641,7 @@ func parseTrojan(raw string) (*TrojanParams, error) {
 	p.SNI, p.ALPN, p.Fingerprint = get("sni"), get("alpn"), get("fp")
 	p.AllowInsecure = get("allowInsecure") == "1"
 	p.PublicKey, p.ShortID, p.SpiderX = get("pbk"), get("sid"), get("spx")
+	p.Mode, p.HeaderType, p.Seed = get("mode"), get("headerType"), get("seed")
 	return p, nil
 }
 
@@ -567,7 +649,7 @@ func parseTrojan(raw string) (*TrojanParams, error) {
 //
 // VMess has two URL forms in the wild:
 //
-//   1. v2rayN base64-of-JSON: `vmess://<base64 of {"v":2,"ps":...,"add":...}>`
+//   1. base64-of-JSON: `vmess://<base64 of {"v":2,"ps":...,"add":...}>`
 //      This is what 99% of subscription feeds emit. JSON keys are short
 //      single-letter / lowercase strings. `port` and `aid` may be sent as
 //      either int or string depending on the producer, so we type-switch.
@@ -597,12 +679,14 @@ type VmessParams struct {
 	Fingerprint string
 	AlterID     int
 	Scy         string // user encryption: auto / none / aes-128-gcm / chacha20-poly1305
-	HeaderType  string // tcp obfs: "none" / "http"
+	HeaderType  string // tcp obfs: "none" / "http"; also the mKCP disguise
+	Mode        string // gRPC / xhttp mode
+	Seed        string // mKCP seed
 }
 
-// vmessLink mirrors the v2rayN JSON layout. `Port` and `Aid` are `any` so
-// we can accept either int or string values without unmarshalling errors —
-// v2rayN-export-as-clash sometimes writes "443", v2rayN itself writes 443.
+// vmessLink mirrors the JSON layout that form carries. `Port` and `Aid` are
+// `any` so we can accept either int or string values without unmarshalling
+// errors — some producers write "443", others write 443.
 type vmessLink struct {
 	V    any    `json:"v"`
 	Ps   string `json:"ps"`
@@ -631,7 +715,7 @@ func parseVmess(raw string) (*VmessParams, error) {
 	}
 	// Strip scheme + optional fragment (some producers append #name after
 	// the base64 blob; that fragment is decorative — the inner JSON's "ps"
-	// is authoritative for v2rayN-style links).
+	// is authoritative for links of this form).
 	body := nodeBody(raw[len("vmess://"):])
 	body = strings.TrimSpace(body)
 	frag := ""
@@ -642,7 +726,7 @@ func parseVmess(raw string) (*VmessParams, error) {
 		}
 	}
 
-	// Try base64-of-JSON first (v2rayN form). Match fetchURL's tolerant
+	// Try base64-of-JSON first (the common form). Match fetchURL's tolerant
 	// 4-variant decoder so URL-safe alphabets and missing padding both work.
 	if p, err := tryParseVmessBase64(raw, body, frag); err == nil {
 		return p, nil
@@ -744,8 +828,8 @@ func tryParseVmessStandardURI(raw, fragName string) (*VmessParams, error) {
 	if p.Network == "" {
 		p.Network = "tcp"
 	}
-	// VMess URI sometimes uses `security` (xray-style) and sometimes
-	// `encryption` (clash-style) — accept either.
+	// A VMess URI sometimes carries `security` and sometimes `encryption` for
+	// the same thing, depending on what produced it — accept either.
 	tls := strings.ToLower(get("security"))
 	if tls == "" {
 		tls = strings.ToLower(get("encryption"))
@@ -758,6 +842,7 @@ func tryParseVmessStandardURI(raw, fragName string) (*VmessParams, error) {
 	p.Path, p.Host2, p.ServiceName = get("path"), get("host"), get("serviceName")
 	p.SNI, p.ALPN, p.Fingerprint = get("sni"), get("alpn"), get("fp")
 	p.HeaderType = strings.ToLower(get("headerType"))
+	p.Mode, p.Seed = get("mode"), get("seed")
 	p.Scy = strings.ToLower(get("scy"))
 	if p.Scy == "" {
 		p.Scy = "auto"
@@ -1460,19 +1545,31 @@ func xrayShell(httpPort, socksPort int, socksUser, socksPass, httpUser, httpPass
 			// placeholder for proxy — dispatcher overwrites index 0
 			nil,
 			map[string]interface{}{"tag": "direct", "protocol": "freedom",
-				"settings": map[string]interface{}{"domainStrategy": "UseIPv4"}},
+				"settings": map[string]interface{}{"domainStrategy": xrayDirectDomainStrategy()}},
 			map[string]interface{}{"tag": "block", "protocol": "blackhole", "settings": map[string]interface{}{}},
 		},
 	}
 }
 
 // xrayStreamSettings builds the shared streamSettings stanza used by every
+// transportOpts carries the per-transport settings that only some networks have
+// and that used to be assumed: which gRPC mode the server speaks, which xhttp
+// mode, and mKCP's disguise and seed. Assumptions are the wrong shape here —
+// each of these fails the handshake when it is wrong, with nothing in the log
+// that says which.
+type transportOpts struct {
+	GRPCMode   string // gun | multi
+	XHTTPMode  string // auto | packet-up | stream-up | stream-one
+	HeaderType string // mKCP disguise: none | srtp | utp | wechat-video | dtls | wireguard
+	Seed       string // mKCP shared secret
+}
+
 // xray TCP-family outbound. All transport-level (network, ws path, grpc
 // service name, h2 host, …) and security-level (tls SNI/alpn/fp, reality
 // pbk/sid/spx) knobs go here. Parameters are explicit rather than a single
 // params-struct so this remains scheme-agnostic — Trojan and VMess will
 // pass values from their own param structs.
-func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, fingerprint string, allowInsecure bool, publicKey, shortID, spiderX string) map[string]interface{} {
+func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, fingerprint string, allowInsecure bool, publicKey, shortID, spiderX string, opts transportOpts) map[string]interface{} {
 	if network == "" {
 		network = "tcp"
 	}
@@ -1488,7 +1585,13 @@ func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, 
 		}
 		stream["wsSettings"] = ws
 	case "grpc":
-		stream["grpcSettings"] = map[string]interface{}{"serviceName": serviceName, "multiMode": false}
+		// multi is one connection carrying many streams; gun is one per stream.
+		// The server decides which it speaks, so this has to be settable rather
+		// than assumed — a mismatch fails the handshake with nothing useful said.
+		stream["grpcSettings"] = map[string]interface{}{
+			"serviceName": serviceName,
+			"multiMode":   opts.GRPCMode == "multi",
+		}
 	case "h2", "http":
 		h2 := map[string]interface{}{"path": path}
 		if host2 != "" {
@@ -1507,12 +1610,31 @@ func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, 
 		if host2 != "" {
 			sh["host"] = host2
 		}
+		// xhttp's own mode: auto (the server decides), packet-up, stream-up,
+		// stream-one. Left out entirely when unset, which is auto.
+		if opts.XHTTPMode != "" {
+			sh["mode"] = opts.XHTTPMode
+		}
 		stream["xhttpSettings"] = sh
+	case "kcp", "mkcp":
+		// mKCP is UDP pretending to be something else: the header type is the
+		// disguise (a "wechat-video" stream, a BitTorrent handshake), and the
+		// seed is a shared secret without which the far end sees noise. Both are
+		// part of the address, not tuning — get either wrong and nothing
+		// connects.
+		kcp := map[string]interface{}{
+			"header": map[string]interface{}{"type": firstNonEmpty(opts.HeaderType, "none")},
+		}
+		if opts.Seed != "" {
+			kcp["seed"] = opts.Seed
+		}
+		stream["network"] = "kcp"
+		stream["kcpSettings"] = kcp
 	}
 	// Fall back to the configured uTLS fingerprint (default "chrome") when the
 	// config carries no fp=. Without a fingerprint xray uses Go's TLS stack,
-	// which DPI can fingerprint; chrome ClientHello camouflage is what
-	// v2rayN/Hiddify default to. A config's explicit fp= still wins.
+	// which DPI can fingerprint; a chrome ClientHello is the camouflage the
+	// ecosystem settled on. A config's explicit fp= still wins.
 	if fingerprint == "" {
 		fingerprint = currentTLSFingerprint()
 	}
@@ -1567,8 +1689,8 @@ func xrayRoutingForProxy() map[string]interface{} {
 		refreshBlockedRuleSets()
 		refreshCustomBlocklists(blocklistURLs())
 		// Mode's OWN proxy domains (the user's ProxyDomains are already emitted
-		// above). checkExitHost forces "check IP" through the tunnel exit.
-		extra := append(customBlocklistDomains(), checkExitHost)
+		// above). checkIPHost() forces "check IP" through the tunnel exit.
+		extra := append(customBlocklistDomains(), checkIPHost())
 		rules = append(rules, xrayRules(classifyRules(extra), "proxy")...)
 		rules = append(rules,
 			map[string]interface{}{"type": "field", "domain": []string{"ext:geosite-ru-blocked.dat:ru-blocked"}, "outboundTag": "proxy"},
@@ -1581,7 +1703,7 @@ func xrayRoutingForProxy() map[string]interface{} {
 		refreshCnBlockedList()
 		refreshCustomBlocklists(blocklistURLs())
 		extra := append(gfwDomains(), customBlocklistDomains()...)
-		extra = append(extra, checkExitHost)
+		extra = append(extra, checkIPHost())
 		rules = append(rules, xrayRules(classifyRules(extra), "proxy")...)
 		rules = append(rules,
 			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
@@ -1590,7 +1712,7 @@ func xrayRoutingForProxy() map[string]interface{} {
 		// Whitelist mode: only the user's own lists ride the VPN (already emitted
 		// above); everything else goes direct.
 		refreshCustomBlocklists(blocklistURLs())
-		extra := append(customBlocklistDomains(), checkExitHost)
+		extra := append(customBlocklistDomains(), checkIPHost())
 		rules = append(rules, xrayRules(classifyRules(extra), "proxy")...)
 		rules = append(rules,
 			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
@@ -1659,6 +1781,7 @@ func xrayOutboundVless(p *VlessParams) map[string]interface{} {
 		p.Path, p.Host2, p.ServiceName,
 		p.SNI, p.ALPN, p.Fingerprint, p.AllowInsecure,
 		p.PublicKey, p.ShortID, p.SpiderX,
+		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed},
 	)
 	return map[string]interface{}{
 		"tag":            "proxy",
@@ -1686,6 +1809,7 @@ func xrayOutboundTrojan(p *TrojanParams) map[string]interface{} {
 		p.Path, p.Host2, p.ServiceName,
 		p.SNI, p.ALPN, p.Fingerprint, p.AllowInsecure,
 		p.PublicKey, p.ShortID, p.SpiderX,
+		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed},
 	)
 	return map[string]interface{}{
 		"tag":            "proxy",
@@ -1720,6 +1844,7 @@ func xrayOutboundVmess(p *VmessParams) map[string]interface{} {
 		p.Path, p.Host2, p.ServiceName,
 		p.SNI, p.ALPN, p.Fingerprint, false,
 		"", "", "",
+		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed},
 	)
 	// Legacy TCP HTTP-obfs: rare in practice (predates WS/gRPC) but cheap
 	// to support and harmless when HeaderType is empty/"none".
@@ -1896,6 +2021,8 @@ func xrayOutboundForNode(n *Node) map[string]interface{} {
 		return xrayOutboundVmess(n.Vmess)
 	case KindSS:
 		return xrayOutboundShadowsocks(n.SS)
+	case KindSOCKS, KindHTTP:
+		return xrayOutboundProxy(n.Proxy)
 	}
 	return nil
 }
@@ -2037,9 +2164,11 @@ func buildSingboxChainProxyConfig(nodes []*Node, httpPort, socksPort int) map[st
 		"rules":                   singboxRoutingRules(false),
 	}
 	applySingboxRouteMode(route)
+	dns := buildDNSBlock(false, false)
+	reconcileDNSRuleSets(route, dns)
 	return map[string]interface{}{
 		"log": map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
-		"dns": buildDNSBlock(false, false),
+		"dns": dns,
 		"inbounds": []interface{}{
 			singboxProxyInbound("http", "http-in", httpPort, proxyHttpCreds),
 			singboxProxyInbound("socks", "socks-in", socksPort, proxySocksCreds),
@@ -2150,19 +2279,130 @@ func engineFor(k NodeKind) string {
 // pure-sing-box path (Hysteria2/TUIC) share the routing-rule builder so a
 // settings change behaves identically no matter which engine is active.
 
+// processMatchRegex turns one line of the "apps without VPN" list into the
+// pattern the engine matches against a process's full path. Empty for a blank
+// line.
+//
+// It is a regex rather than sing-box's simpler process_name for one reason:
+// process_name compares byte for byte, and Windows program names are not
+// written the way anyone types them. Our process picker lowercases everything
+// it lists, so "Discord.exe" reached the engine as "discord.exe" and matched
+// nothing, for anyone, ever — measured against sing-box 1.13.16, which finds
+// the process and then rejects the name on case alone. (?i) is the whole fix;
+// the rest of this function is what a regex costs.
+//
+// A line with a separator in it is a full path and is anchored at both ends —
+// that is how two programs with the same file name are told apart. A bare name
+// matches the last path component only. Without an extension it also matches
+// the .exe form, so "firefox" works on both platforms, which is what the field
+// has always claimed.
+//
+// Case is ignored on Linux too, where file names are case-sensitive. This list
+// is a convenience for the person typing it, not a security boundary, and one
+// behaviour is easier to explain than two.
+func processMatchRegex(entry string) string {
+	e := strings.TrimSpace(entry)
+	if e == "" {
+		return ""
+	}
+	if strings.ContainsAny(e, `/\`) {
+		// Either separator matches either, so a Windows path pasted on Linux (or
+		// the reverse) still means what it says.
+		var b strings.Builder
+		for _, r := range e {
+			if r == '/' || r == '\\' {
+				b.WriteString(`[/\\]`)
+				continue
+			}
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+		if isAbsProcessPath(e) {
+			return `(?i)^` + b.String() + `$`
+		}
+		// A partial path ("Program Files\App\app.exe") still has to start where a
+		// path component starts, or "bin\curl.exe" would also match "sbin\curl.exe".
+		return `(?i)(^|[/\\])` + b.String() + `$`
+	}
+	pat := `(?i)[/\\]` + regexp.QuoteMeta(e)
+	if filepath.Ext(e) == "" {
+		pat += `(\.exe)?`
+	}
+	return pat + `$`
+}
+
+// isAbsProcessPath reports whether a line names a path from the root: a leading
+// separator, or a drive letter. Written by hand rather than with filepath.IsAbs
+// because the list is shared between platforms — a Windows path in a list read
+// on Linux is still a Windows path.
+func isAbsProcessPath(e string) bool {
+	if strings.HasPrefix(e, "/") || strings.HasPrefix(e, `\`) {
+		return true
+	}
+	return len(e) >= 2 && e[1] == ':'
+}
+
+// engineCarveOut is the rule that keeps Vair's own engines off Vair's tunnel.
+//
+// By path, not by name. A name is not an identity: "xray.exe" is four bytes
+// anyone can call their program, and the rule hands whoever matches it a route
+// around the tunnel — the one thing in the configuration that must not be
+// available for the asking. The paths are the binaries we spawn, and the same
+// regex the "apps without VPN" list uses (processMatchRegex) anchors them
+// whole and ignores case, because Windows reports a path in whatever case it
+// is written on disk while ours comes from where we found it.
+//
+// Before the paths are registered — in unit tests, and only there, since
+// registration happens at startup before anything can connect — the rule falls
+// back to the names it used to carry, so a test's configuration keeps its
+// shape rather than quietly losing the carve-out.
+func engineCarveOut() map[string]interface{} {
+	xray, singbox := engineBins()
+	var patterns []string
+	for _, bin := range []string{xray, singbox} {
+		if p := processMatchRegex(bin); p != "" {
+			patterns = append(patterns, p)
+		}
+	}
+	if len(patterns) == 0 {
+		return map[string]interface{}{
+			"process_name": []string{"xray.exe", "xray", "sing-box.exe", "sing-box"},
+			"outbound":     "direct",
+		}
+	}
+	return map[string]interface{}{
+		"process_path_regex": patterns,
+		"outbound":           "direct",
+	}
+}
+
 // singboxRoutingRules builds the shared sing-box route.rules array. It is
 // used both by the hybrid TUN config (xray-backed protocols, where sing-box
 // is only the TUN front-end) and — from Stage 6 on — by the pure-sing-box
 // TUN/proxy config for Hysteria2/TUIC. The rules cover, in order: traffic
-// sniffing, DNS hijack, an optional xray-process carve-out, LAN bypass,
-// user direct-apps, RU geosite/geoip bypass, and user direct-domains. The
-// caller is responsible for appending `final` separately.
+// sniffing, DNS hijack, the refusal of the tunnel's own addresses, an
+// engine-process carve-out, LAN bypass, user direct-apps, RU geosite/geoip
+// bypass, and user direct-domains. The caller is responsible for appending
+// `final` separately.
 //
-// includeXrayCarveout adds a `process_name:[xray.exe] → direct` rule so the
-// xray child (which itself dials the real VPN server) is never routed back
-// into the tunnel. Pure-sing-box TUN passes false: there is no xray child,
-// and a stray process_name rule would just be dead weight.
-func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
+// tun says which of the two the rules are for: a tunnel takes everything the
+// machine sends and needs the wider DNS hijack below; a local proxy listener
+// only ever sees what an application handed it on purpose.
+//
+// Every rule set carries a carve-out to `direct` for Vair's own engine
+// binaries, both of them — by the path they were started from, so that a
+// program merely NAMED xray.exe does not inherit a route around the tunnel.
+//
+// The live engine needs it: in the hybrid path the xray child dials the real
+// VPN server, and routing that back into the tunnel is the loop this program
+// spent a long time chasing. But it was built as "is there an xray child", and
+// that is not the only thing running: a PING or a SPEED test starts its OWN
+// engine for the configuration under test, and which binary that is depends on
+// the protocol — sing-box for Hysteria2, TUIC, WireGuard and plugin-carrying
+// Shadowsocks, xray for the rest. So with the tunnel up, tests were measured
+// through it: sing-box-based ones always, and ALL of them while connected to a
+// Hysteria2 or TUIC node, where the rule set was built without the carve-out
+// at all. A measurement taken through the tunnel describes the tunnel.
+func singboxRoutingRules(tun bool) []interface{} {
 	allowLAN := allowLANTraffic()
 
 	mode := routingMode()
@@ -2174,17 +2414,53 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 	}
 	settingsMu.RUnlock()
 
+	// The DNS hijack. In a tunnel it also has to catch what the sniffer did not
+	// recognise: everything on the machine arrives here, and a query the sniffer
+	// misses would fall through to the refusal below (the tunnel's own gateway is
+	// where Windows points its resolver) or out to a resolver of its own choosing.
+	// Port 53 as the second arm is what sing-box's own client manual does.
+	//
+	// Not in proxy mode. There, only what an application deliberately sent to our
+	// local listener arrives, and answering it from the OS resolver — which is
+	// where the proxy configs' DNS block ends — would undo the very thing that
+	// application was proxying for. A service that merely happens to live on
+	// port 53 keeps working too.
+	// Two plain rules rather than one logical OR of the two. The engine accepts
+	// the logical form — `sing-box check` passes it — and then never applies the
+	// action, so nothing is hijacked at all: every query falls through to the
+	// tunnel's outbound, which in hybrid TUN is a SOCKS proxy that carries only
+	// TCP, and DNS times out for the whole machine. Connections by address kept
+	// working, which is what made it look like a routing problem rather than a
+	// DNS one.
+	hijack := []interface{}{map[string]interface{}{"protocol": "dns", "action": "hijack-dns"}}
+	if tun {
+		hijack = append(hijack, map[string]interface{}{"port": 53, "action": "hijack-dns"})
+	}
 	rules := []interface{}{
 		map[string]interface{}{"action": "sniff"},
-		map[string]interface{}{"protocol": "dns", "action": "hijack-dns"},
 	}
-	// Exclude xray process from TUN to prevent a routing loop (hybrid only).
-	if includeXrayCarveout {
-		rules = append(rules, map[string]interface{}{
-			"process_name": []string{"xray.exe", "xray"},
-			"outbound":     "direct",
-		})
-	}
+	rules = append(rules, hijack...)
+	rules = append(rules,
+		// Nothing addressed to the tunnel itself can be routed anywhere: wherever
+		// it is sent, its destination is this interface, so it arrives back here.
+		// Windows hands the peer address to applications as the gateway, so a
+		// program that asks its router a question — NAT-PMP on 5351 is the one
+		// seen in the wild — starts a loop that runs at whatever rate the machine
+		// can sustain: every turn a fresh connection, a process lookup, a rule
+		// pass and a UDP socket, none of it ever reaching anything. It used to be
+		// the private-address rule that sent it back round.
+		//
+		// The addresses one at a time, not the prefix — see tunSelfAddresses.
+		// After the DNS hijack, which legitimately answers on this interface.
+		map[string]interface{}{
+			"ip_cidr": tunSelfAddresses(),
+			"action":  "reject",
+		},
+	)
+	// Vair's engines never travel through Vair's tunnel — not the live one
+	// (that is the routing loop) and not a test's (that is a measurement of the
+	// tunnel rather than of the server it is testing).
+	rules = append(rules, engineCarveOut())
 	// LAN handling: when allowed (default), private IPs bypass the tunnel so
 	// printers / NAS / router admin pages still work. With kill-switch +
 	// BlockLAN, even those go through proxy — usually breaks them, but it's
@@ -2196,17 +2472,16 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 	}
 	// User-configured apps that bypass VPN (direct connection).
 	if len(directApps) > 0 {
-		var appNames []string
+		var appPatterns []string
 		for _, a := range directApps {
-			a = strings.TrimSpace(a)
-			if a != "" {
-				appNames = append(appNames, a)
+			if p := processMatchRegex(a); p != "" {
+				appPatterns = append(appPatterns, p)
 			}
 		}
-		if len(appNames) > 0 {
+		if len(appPatterns) > 0 {
 			rules = append(rules, map[string]interface{}{
-				"process_name": appNames,
-				"outbound":     "direct",
+				"process_path_regex": appPatterns,
+				"outbound":           "direct",
 			})
 		}
 	}
@@ -2240,25 +2515,27 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 		// Mode's OWN "through VPN" domains → proxy (the user's ProxyDomains are
 		// already emitted above), then blocked-in-RU sets → proxy. Everything else
 		// falls through to route.final = "direct" (set by applySingboxRouteMode).
-		// checkExitHost forces "check IP" through the tunnel exit.
-		addSuffix(append(customBlocklistDomains(), checkExitHost), "proxy")
-		rules = append(rules,
-			map[string]interface{}{"rule_set": "geosite-ru-blocked", "outbound": "proxy"},
-			map[string]interface{}{"rule_set": "geoip-ru-blocked", "outbound": "proxy"},
-		)
+		// checkIPHost() forces "check IP" through the tunnel exit.
+		addSuffix(append(customBlocklistDomains(), checkIPHost()), "proxy")
+		// One rule per set that is actually attached — see singboxBlockedRuleSet.
+		for _, tag := range []string{"geosite-ru-blocked", "geoip-ru-blocked"} {
+			if fileExists(ruRuleSetLocalPath(tag + ".srs")) {
+				rules = append(rules, map[string]interface{}{"rule_set": tag, "outbound": "proxy"})
+			}
+		}
 	case "only_blocked_cn":
 		// Default direct (route.final); blocked-in-China (GFW) → proxy. Domains
 		// come from the plain-text list — no rule-sets.
 		refreshCnBlockedList()
 		refreshCustomBlocklists(blocklistURLs())
 		extra := append(gfwDomains(), customBlocklistDomains()...)
-		extra = append(extra, checkExitHost)
+		extra = append(extra, checkIPHost())
 		addSuffix(extra, "proxy")
 	case "only_selected":
 		// Whitelist mode: only the user's own lists → proxy (already emitted
 		// above); everything else falls through to route.final = "direct".
 		refreshCustomBlocklists(blocklistURLs())
-		addSuffix(append(customBlocklistDomains(), checkExitHost), "proxy")
+		addSuffix(append(customBlocklistDomains(), checkIPHost()), "proxy")
 	case "bypass_countries":
 		// Each selected country's TLD zone goes direct (the same trick
 		// category-ru uses via tld-ru; for KZ, which has no geosite set, this IS
@@ -2275,6 +2552,31 @@ func singboxRoutingRules(includeXrayCarveout bool) []interface{} {
 				}
 			}
 		}
+	}
+	// Public IPv6 is refused here, at the end, when the user has asked for v6 to
+	// stay off the machine. Last on purpose: everything above it that says
+	// "direct" — the LAN, the apps without VPN, the bypassed countries — keeps
+	// working over v6, because that traffic was never going through the tunnel
+	// in the first place. What is refused is what WOULD have been tunnelled.
+	//
+	// A refusal rather than a silent drop: a browser races v4 and v6, and takes
+	// hundreds of milliseconds to give up on silence but no time at all on an
+	// answer. And a rule rather than a firewall block, so the engine's own
+	// connection to a v6-only server is never caught by it.
+	//
+	// The same refusal is also the answer when the user asked for IPv6 and this
+	// machine cannot deliver it. In the modes that default to DIRECT, everything
+	// the rules did not claim is dialled from here — and on a link without IPv6
+	// every one of those dials fails on the spot while the application, which
+	// was told IPv6 works the moment the tunnel claimed ::/0, keeps retrying.
+	// See ipv6reach.go: what is refused here is traffic that had nowhere to go.
+	finalDirect := mode == "only_blocked" || mode == "only_blocked_cn" || mode == "only_selected"
+	noRealV6 := finalDirect && ipv6Mode() != ipv6Direct && !hostHasGlobalIPv6()
+	if ipv6Mode() == ipv6Blocked || noRealV6 {
+		if noRealV6 && ipv6Mode() != ipv6Blocked {
+			vlog("info", "ipv6: this machine has no address of its own, so v6 that would go direct is refused (applications fall back to v4)")
+		}
+		rules = append(rules, map[string]interface{}{"ip_version": 6, "action": "reject"})
 	}
 	return rules
 }
@@ -2317,20 +2619,22 @@ func singboxCountryRuleSets(ccs []string) []interface{} {
 func singboxBlockedRuleSet() []interface{} {
 	refreshBlockedRuleSets()
 	refreshCustomBlocklists(blocklistURLs())
-	return []interface{}{
-		map[string]interface{}{
-			"type":   "local",
-			"tag":    "geosite-ru-blocked",
-			"format": "binary",
-			"path":   ruRuleSetLocalPath("geosite-ru-blocked.srs"),
-		},
-		map[string]interface{}{
-			"type":   "local",
-			"tag":    "geoip-ru-blocked",
-			"format": "binary",
-			"path":   ruRuleSetLocalPath("geoip-ru-blocked.srs"),
-		},
+	var out []interface{}
+	for _, tag := range []string{"geosite-ru-blocked", "geoip-ru-blocked"} {
+		// A set whose file is not there is left out, exactly as the country sets
+		// are: a dangling local path is a sing-box FATAL, and a mode that cannot
+		// find its list should still connect and pass everything through, not
+		// refuse to start.
+		path := ruRuleSetLocalPath(tag + ".srs")
+		if !fileExists(path) {
+			vlog("warning", "rule set %s is not on this machine — blocked-site routing runs without it", tag)
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"type": "local", "tag": tag, "format": "binary", "path": path,
+		})
 	}
+	return out
 }
 
 // applySingboxRouteMode sets route.final and route.rule_set according to the
@@ -2750,6 +3054,8 @@ func singboxOutboundForNode(n *Node) map[string]interface{} {
 		return singboxOutboundTrojan(n.Trojan)
 	case KindVMess:
 		return singboxOutboundVmess(n.Vmess)
+	case KindSOCKS, KindHTTP:
+		return singboxOutboundProxy(n.Proxy, "proxy")
 	}
 	return nil
 }
@@ -2825,8 +3131,8 @@ func buildSingboxTestConfig(n *Node, httpPort int) map[string]interface{} {
 // proxy session (system-proxy mode) of a UDP-family node. HTTP + SOCKS
 // inbounds on 127.0.0.1 (apps / system proxy point here, via the byte
 // counter), the protocol outbound plus a direct outbound, and the shared
-// routing rules. singboxRoutingRules(false): no xray carve-out — there is
-// no xray child in the pure-sing-box path. A minimal legacy DNS block (the
+// routing rules (which keep Vair's own engines out of the tunnel, live or
+// under test). A minimal legacy DNS block (the
 // same one hybrid TUN uses with leak-protection off) plus a matching
 // default_domain_resolver keeps sing-box 1.13 from rejecting the config for
 // a missing resolver. Returns nil if sing-box can't build an outbound for n.
@@ -2860,10 +3166,12 @@ func buildSingboxProxyConfig(n *Node, httpPort, socksPort int) map[string]interf
 		"rules":                   singboxRoutingRules(false),
 	}
 	applySingboxRouteMode(route)
+	dns := buildDNSBlock(false, false)
+	reconcileDNSRuleSets(route, dns)
 
 	return map[string]interface{}{
 		"log": map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
-		"dns": buildDNSBlock(false, false),
+		"dns": dns,
 		"inbounds": []interface{}{
 			singboxProxyInbound("http", "http-in", httpPort, proxyHttpCreds),
 			singboxProxyInbound("socks", "socks-in", socksPort, proxySocksCreds),
@@ -2898,15 +3206,19 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 	leakProtect := dnsLeakProtectionEnabled()
 	useFakeIP := fakeIPEnabled()
 
+	tunAddrs := []string{tunAddress4}
+	if ipv6InTunnel() { // see buildHybridTUNConfig
+		tunAddrs = append(tunAddrs, ipv6TunAddress)
+	}
 	tun := map[string]interface{}{
 		"type":           "tun",
 		"tag":            "tun-in",
 		"interface_name": ifaceName,
-		"address":        []string{"172.19.0.1/30"},
+		"address":        tunAddrs,
 		"mtu":            currentMTU(),
 		"auto_route":     true,
 		"strict_route":   killSwitchEnabled(), // kill-switch = fail-closed (see buildHybridTUNConfig)
-		"stack":          "gvisor",
+		"stack":          tunStack(),
 	}
 
 	defaultResolver := "dns-local"
@@ -2915,15 +3227,28 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 	}
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
-		"default_domain_resolver": defaultResolver,
-		"find_process":            true,
-		"rules":                   singboxRoutingRules(false),
+		"default_domain_resolver": domainResolverBlock(defaultResolver),
+		// No find_process: it is not what makes the carve-out below work. A rule
+		// that names a process asks for the lookup itself; this option asks for
+		// it on every connection whether a rule needs the answer or not, and its
+		// only other use is putting a program name in the log. Upstream leaves
+		// it off for the same reason.
+		//
+		// How much this actually saves, measured on a live tunnel rather than
+		// assumed: 186 process lookups in 20 seconds with it off. The carve-out
+		// rule asks for nearly all of them by itself. What is saved is the
+		// traffic that never reaches that rule — hijacked DNS, and the packets
+		// refused at the tunnel's own addresses — so this is a smaller win than
+		// it looks, and worth having only because it costs nothing.
+		"rules": singboxRoutingRules(true),
 	}
 	applySingboxRouteMode(route)
+	dns := buildDNSBlock(leakProtect, useFakeIP)
+	reconcileDNSRuleSets(route, dns)
 
 	cfg := map[string]interface{}{
 		"log":       map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
-		"dns":       buildDNSBlock(leakProtect, useFakeIP),
+		"dns":       dns,
 		"inbounds":  append([]interface{}{tun}, lanProxyInbounds()...),
 		"outbounds": singboxEgress(out),
 		"endpoints": singboxEndpoints(ep),

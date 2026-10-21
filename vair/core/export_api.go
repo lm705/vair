@@ -80,7 +80,9 @@ func ExportSettingsJSON() (data []byte, filename string, err error) {
 // or a human-readable error.
 func ImportSettings(body []byte, includeTabs bool) string {
 	var imp settingsExport
-	if err := json.Unmarshal(body, &imp); err != nil {
+	// The most hand-carried file of the three: an export is mailed, edited and
+	// re-saved, and a mark picked up on the way would make it "not valid JSON".
+	if err := json.Unmarshal(trimBOM(body), &imp); err != nil {
 		return "parse JSON: " + err.Error()
 	}
 	if imp.Version == 0 || imp.Version > settingsExportVersion {

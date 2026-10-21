@@ -103,6 +103,10 @@ type ConnState struct {
 	// highlight every hop row (matched by raw, since names can collide) and to
 	// put the disconnect button on the exit hop only. Last element = exit.
 	ChainRaws []string `json:"chain_raws,omitempty"`
+	// Blocked reports that the firewall block is standing. It matters most when
+	// nothing is connected: the machine has no way out and nothing else on
+	// screen would explain why.
+	Blocked bool `json:"blocked,omitempty"`
 }
 
 type connManager struct {
@@ -135,6 +139,11 @@ type connManager struct {
 	// mode for the HTTP + SOCKS inbounds). Set during connect, called
 	// during disconnect to close the listeners.
 	fwdCancel context.CancelFunc
+	// The settings this session was actually built with, taken when the engine
+	// was started. Nearly every setting applies from the NEXT connection, so
+	// the dialog answers what will happen and this answers what is happening.
+	// nil while idle.
+	startedWith *sessionFacts
 }
 
 func newConnManager() *connManager {
@@ -151,7 +160,23 @@ func (cm *connManager) snap() ConnState {
 	// Filled here rather than at connect time so it stays true after the live
 	// toggle in settings flips it either way (ReapplySystemProxy).
 	s.SystemProxy = s.Status == ConnConnected && s.Mode == ModeProxy && SystemProxyActive()
+	// Derived for the same reason: a marker on disk, read cheaply, rather than
+	// a flag that could be left behind by the run that set it.
+	s.Blocked = blockStanding()
 	return s
+}
+
+// bytes is this session's counters, or zeros while nothing is counting. Read by
+// the supervisor, which uses traffic that has already crossed the tunnel as the
+// answer to "is it still alive" — see livenessWatch.
+func (cm *connManager) bytes() (up, down int64) {
+	cm.mu.Lock()
+	c := cm.counter
+	cm.mu.Unlock()
+	if c == nil {
+		return 0, 0
+	}
+	return c.Up.Load(), c.Down.Load()
 }
 
 // ─────────────────────────── tabs ───────────────────────────────
@@ -427,7 +452,7 @@ func loadTabs() (ok bool) {
 		return true // no file yet → first run; default [main] is fine to persist
 	}
 	var pd persistedData
-	if err := json.Unmarshal(data, &pd); err != nil {
+	if err := json.Unmarshal(trimBOM(data), &pd); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠ loadTabs (keeping file, not overwriting): %v\n", err)
 		return false
 	}

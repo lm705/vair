@@ -53,15 +53,19 @@ func (a *AutoService) OpenAuto() {
 		autoWindow.Focus()
 		return
 	}
+	panelW, panelH := shell.PanelWindowSize(620, 760)
 	autoWindow = shell.App().Window.NewWithOptions(application.WebviewWindowOptions{
 		// Same title as the main window ON PURPOSE: the window is frameless (the
 		// title shows only in Task Manager / Alt-Tab), and Windows 10's Task
 		// Manager kept displaying a distinct title ("Vair — Auto") for the whole
 		// process even after this window was closed. 1.10 always ran under a
 		// single "Vair" title; identical titles reproduce that.
-		Title:            "Vair",
-		Width:            620,
-		Height:           760,
+		Title: "Vair",
+		// Its natural size, or as much of it as the screen has: on a small
+		// laptop 760 tall opened a window whose own close button was below the
+		// bottom of the desktop.
+		Width:            panelW,
+		Height:           panelH,
 		Frameless:        true,
 		BackgroundColour: shell.WindowBackground(), // matches the theme's --bg (resize-lag paint)
 		URL:              "/?view=auto",
@@ -98,3 +102,10 @@ func (a *AutoService) CloseAuto() {
 		autoWindow.Close()
 	}
 }
+
+// Sessions is the connection log, newest first: what was connected, for how
+// long, and what ended it.
+func (a *AutoService) Sessions() []core.SessionRow { return core.SessionLog() }
+
+// ClearSessions forgets every recorded session.
+func (a *AutoService) ClearSessions() { core.ClearSessionLog() }

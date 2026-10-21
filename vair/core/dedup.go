@@ -174,7 +174,7 @@ func dedupKey(raw string) string {
 		net_ := normNetwork(p.Network)
 		scy := strings.ToLower(strings.TrimSpace(p.Scy))
 		if scy == "" {
-			scy = "auto" // v2rayN's default when the field is absent
+			scy = "auto" // what the field means when it is absent
 		}
 		hdr := strings.ToLower(strings.TrimSpace(p.HeaderType))
 		if hdr == "" {

@@ -15,6 +15,14 @@ import "errors"
 func engageKillSwitch(string) error { return errKillSwitchUnavailable }
 func releaseKillSwitch()            {}
 func releaseStaleKillSwitch()       {}
+func forceReleaseBlock()            {}
 func killSwitchHeld() bool          { return false }
 
 var errKillSwitchUnavailable = errors.New("the persistent kill-switch is Windows-only for now")
+
+// noteStrayBlockAtStart has nothing to look at where there is no firewall block
+// to begin with.
+func noteStrayBlockAtStart() {}
+
+// checkBlockAfterRestart has no firewall to reconcile with here.
+func checkBlockAfterRestart() {}

@@ -10,6 +10,11 @@
 // where the build system expects it.
 package engines
 
+import (
+	"os"
+	"strings"
+)
+
 // File is one thing to write into the engine directory.
 type File struct {
 	Name string
@@ -20,3 +25,12 @@ type File struct {
 	// re-writing the shipped copy at every launch would silently undo that.
 	KeepExisting bool
 }
+
+// isRuleSetFile reports whether a name is something the engines READ rather than
+// something they are. The two go to different directories on both platforms —
+// one writable, one not — so the answer has to be the same on both.
+func isRuleSetFile(name string) bool {
+	return strings.HasSuffix(name, ".srs") || strings.HasSuffix(name, ".dat") || name == "gfw.txt"
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }

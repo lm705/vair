@@ -2,6 +2,7 @@
 // ids/classes, so style.css is the verbatim 1.10 stylesheet). The main window
 // stays English on purpose (as in 1.10); context menus/chips translate via t10.
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import Check from './Check'
 import { Events, Window } from '@wailsio/runtime'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { IS_REMOTE } from './remote'
@@ -18,18 +19,26 @@ import {
   ClipboardService,
 } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import { copyText } from './clipboard'
+import { checkExit, exitChecking } from './exitcheck'
 import SettingsModal from './SettingsModal'
 import TabModal from './TabModal'
 import SourcesModal from './SourcesModal'
 import AutoModal from './AutoModal'
 import ConfigModal from './ConfigModal'
+import ConnectionsModal from './ConnectionsModal'
+import HistoryModal from './HistoryModal'
+import SessionModal from './SessionModal'
+import UnlockModal from './UnlockModal'
 import Select from './Select'
+import { HintHost, InfoDot, ex } from './hints'
+import type { Desc } from './hints'
 
 type Row = NonNullable<Awaited<ReturnType<typeof ConfigService.Window>>>[number]
 // Sort is "idx" (original order) or "<column>" / "<column>:desc" — the table
 // header cycles a column through natural → reversed → off. SORT_COLS lists the
 // sortable columns; the backend (core/memstore.go lessKey) knows the same names.
-type SortCol = 'type' | 'name' | 'host' | 'transport' | 'security' | 'ping' | 'speed'
+type SortCol = 'type' | 'name' | 'host' | 'transport' | 'security' | 'ping' | 'stab' | 'speed'
 type Sort = 'idx' | SortCol | `${SortCol}:desc`
 type Menu =
   | { kind: 'row'; x: number; y: number; idx: number }
@@ -52,13 +61,33 @@ const PROTOS: [string, string][] = [
   ['hy2', 'hysteria2'],
   ['tuic', 'tuic'],
   ['wg', 'wireguard'],
+  ['socks', 'socks'],
+  ['http', 'http'],
 ]
 // The detached AUTO window loads the same app at /?view=auto; the 1.10
 // body.auto-standalone CSS then hides everything except the titlebar + panel.
 const STANDALONE_AUTO = new URLSearchParams(window.location.search).get('view') === 'auto'
 
 const FILTER_TITLE =
-  'Filter by name, host, type, transport or security. + combines conditions: germany+ws+tls needs all three (name, transport, security); germany+poland matches either (same column). Use field: to target a column, e.g. name:russia.'
+  'Filter by name, host, type, transport or security. + combines conditions: germany+ws+tls needs all three (name, transport, security); germany+poland matches either (same column). Use field: to target a column, e.g. name:russia. unlock:chatgpt keeps the servers the last service check found it open on.'
+// The same thing said properly, for the mark beside the box. The tooltip above
+// is one line by necessity; a filter with three ways to combine words earns
+// worked examples, and those are the part people copy. The examples themselves
+// are left in English — they are what you type.
+const FILTER_HELP: Desc = {
+  en: 'Hides every row that does not match what you type. One word is searched for everywhere at once: the name, the address, the type, the transport and the security. To search one column only, put its name and a colon in front — name:, host:, type:, transport:, security:. Conditions are joined with a plus. Conditions about different columns must all match; two conditions about the same column mean either of them. Case does not matter and part of a word is enough. The figure beside the box counts the rows left against the tab total.',
+  mono: true,
+  opts: [
+    ex('germany', 'Anywhere: the name, the address or the type.'),
+    ex('name:germany', 'The name only — an address that happens to contain it is left out.'),
+    ex('germany+ws+tls', 'All three at once: the name, the ws transport and TLS security.'),
+    ex('name:germany+host:185.', 'Two columns at once: the name contains germany AND the address starts with 185. Spaces around the plus are allowed.'),
+    ex('germany+poland', 'Either of them — two words for the same column widen the search instead of narrowing it.'),
+    ex('host:185.', 'Every server whose address starts with that.'),
+    ex('type:vless', 'One protocol. Bare vless, ws, reality and the like are recognised without the prefix.'),
+    ex('unlock:chatgpt', 'The servers the last service check found ChatGPT open on. Servers nobody checked are left out — the honest answer for them is unknown.'),
+  ],
+}
 
 // FloatingMenu positions a fixed pop-up at (x, y) but never outside the window.
 //
@@ -121,16 +150,56 @@ function fmtUptime(s: number): string {
   const ss = s % 60
   return h > 0 ? h + 'h ' + m + 'm' : m > 0 ? m + 'm ' + ss + 's' : ss + 's'
 }
-function flagEmoji(cc: string): string {
-  if (!cc || cc.length !== 2) return ''
-  cc = cc.toUpperCase()
-  if (!/^[A-Z]{2}$/.test(cc)) return ''
-  return String.fromCodePoint(0x1f1e6 + (cc.charCodeAt(0) - 65), 0x1f1e6 + (cc.charCodeAt(1) - 65))
-}
 function rawBody(raw: string): string {
   const i = (raw || '').lastIndexOf('#')
   return i >= 0 ? raw.slice(0, i) : raw || ''
 }
+// rawKey is what "the same configuration" means when two rows are compared.
+//
+// The name is already out of it (rawBody drops the #fragment), which is why a
+// server renamed by its subscription still lights up. What was left in was the
+// spelling of the query: the same configuration pasted twice can arrive as
+// `path=%2F` and as `path=/`, or with its parameters in another order, and the
+// row on the second tab then stayed unlit while the first one was connected.
+//
+// Percent-decoded and sorted, both spellings are one key. Nothing else is
+// touched — no lowercasing, because a UUID is case-insensitive but a
+// Shadowsocks key is not.
+function rawKey(raw: string): string {
+  const body = rawBody(raw)
+  const q = body.indexOf('?')
+  const dec = (v: string) => {
+    try {
+      return decodeURIComponent(v)
+    } catch {
+      return v // a stray % is not ours to fix — compare it as written
+    }
+  }
+  if (q < 0) return dec(body)
+  const head = dec(body.slice(0, q))
+  const params = body
+    .slice(q + 1)
+    .split('&')
+    .filter(Boolean)
+    .map((p) => {
+      const e = p.indexOf('=')
+      return e < 0 ? dec(p) : dec(p.slice(0, e)) + '=' + dec(p.slice(e + 1))
+    })
+    .sort()
+  return head + '?' + params.join('&')
+}
+// stabTitle is the same history in words, for the hover.
+function stabTitle(tt: (s: string) => string, st: any): string {
+  const parts = [
+    `${tt('Checks')}: ${st.samples}`,
+    `${tt('Average')}: ${st.avg} ms`,
+    `${tt('Jitter')}: ±${st.jitter} ms`,
+  ]
+  if (st.percent >= 0) parts.push(`${tt('Answered')}: ${st.percent}%`)
+  else parts.push(tt('Too few checks to judge'))
+  return parts.join('\n')
+}
+
 function protoLabel(pr: string): string {
   if (pr === 'hysteria2') return 'hy2'
   if (pr === 'wireguard') return 'wg'
@@ -147,53 +216,44 @@ function fmtLogTime(ms: number): string {
 function isImp(l: any): boolean {
   return l.lvl !== 'info' || l.src === 'vair' || l.src === 'test'
 }
-// copyText copies to the OS clipboard with a WebView2-safe fallback: the async
-// navigator.clipboard API is often blocked in the embedded webview (non-secure
-// custom scheme), so fall back to a hidden-textarea + execCommand('copy').
-function copyText(text: string) {
-  try {
-    if (navigator.clipboard?.writeText) {
-      navigator.clipboard.writeText(text).catch(() => execCopy(text))
-      return
-    }
-  } catch {
-    /* fall through */
-  }
-  execCopy(text)
-}
-function execCopy(text: string) {
-  const ta = document.createElement('textarea')
-  ta.value = text
-  ta.style.position = 'fixed'
-  ta.style.top = '-1000px'
-  ta.style.opacity = '0'
-  document.body.appendChild(ta)
-  ta.select()
-  try {
-    document.execCommand('copy')
-  } catch {
-    /* ignore */
-  }
-  document.body.removeChild(ta)
-}
-
 function containsNodeURL(text: string): boolean {
   if (!text) return false
-  return /(vless|vmess|trojan|ss|hysteria2|hy2|tuic|wireguard|wg):\/\//i.test(text)
+  // socks5 before socks so the alternation cannot match the shorter one first.
+  // http(s) is absent on purpose: a pasted subscription link is a source, not a
+  // node, and subURLsIn below is what handles those.
+  return /(vless|vmess|trojan|ss|hysteria2|hy2|tuic|wireguard|wg|socks5|socks):\/\//i.test(text)
 }
-// subURLsIn returns every bare http(s) link in the text, one per line — so
-// pasting a whole list of subscriptions adds them all. Returns [] when any
-// non-blank line is NOT a bare link (mixed content is configs, not a source
-// list), so config bodies that merely contain a URL never land here.
+// subURLsIn returns every http(s) link in the text, one per line — so pasting a
+// whole list of subscriptions adds them all. Every non-blank line has to BEGIN
+// with a link, and the answer is [] otherwise: mixed content is configs, not a
+// source list, so a config body that merely contains a URL never lands here.
+//
+// What follows the link on its line is ignored rather than fatal. Lists are
+// copied out of chats and READMEs with a comment, a count or a stray word after
+// the address, and refusing the whole paste over one of them threw away
+// nineteen good links to punish the twentieth — silently, because a paste that
+// yields neither sources nor configs does nothing at all.
 function subURLsIn(text: string): string[] {
-  const lines = (text || '').split(/[\r\n]+/).map((l) => l.trim()).filter(Boolean)
+  const lines = sourceLines(text)
   if (lines.length === 0) return []
   const urls: string[] = []
   for (const l of lines) {
-    if (!/^https?:\/\/\S+$/i.test(l)) return []
-    if (!urls.includes(l)) urls.push(l)
+    const link = l.split(/\s+/)[0]
+    if (!/^https?:\/\/\S+$/i.test(link)) return []
+    if (!urls.includes(link)) urls.push(link)
   }
   return urls
+}
+function sourceLines(text: string): string[] {
+  return (text || '')
+    .split(/[\r\n]+/)
+    .map((l) => l.trim())
+    .filter(Boolean)
+}
+// Whether any of those lines carried something after the link, so a paste can
+// say what it left out instead of quietly keeping half of what was written.
+function subURLsHadExtra(text: string): boolean {
+  return sourceLines(text).some((l) => /\s/.test(l))
 }
 function pasteworthy(text: string): boolean {
   if (!text) return false
@@ -204,11 +264,62 @@ function pasteworthy(text: string): boolean {
   return t.length > 50 && /^[A-Za-z0-9+/=\r\n]+$/.test(t)
 }
 
+// A speed reading in at most ten characters: two decimals under 100 MB/s,
+// one above it, none above a thousand. The speed chip is sized to the longest
+// of these, so the cap is what keeps the column from growing for a number
+// nobody has.
+function fmtSpeed(v: number) {
+  const d = v >= 1000 ? 0 : v >= 100 ? 1 : 2
+  return v.toFixed(d) + ' MB/s'
+}
+
+// setFontVar writes one of the two text-size variables. The tab buttons carry
+// `transition:all`, so their text size arrives 150ms after the others — that is
+// the transition doing its job, not a missed repaint.
+function setFontVar(name: string, px: number) {
+  document.documentElement.style.setProperty(name, px + 'px')
+}
+
+// The red chip that stands in for a disconnect when there is nothing to
+// disconnect from.
+//
+// It says "releasing" while it works, and that is not decoration: opening the
+// firewall is a PowerShell run of a second or more, and with the chip sitting
+// there unchanged the first click read as a click that did nothing. The second
+// one then arrived while the first was still working.
+function BlockedChip({ tt }: { tt: (s: string) => string }) {
+  const [busy, setBusy] = useState(false)
+  return (
+    <button
+      className="pchip blocked-chip"
+      disabled={busy}
+      title={tt('Traffic is blocked by the kill-switch. Click to release it.')}
+      onClick={() => {
+        setBusy(true)
+        Promise.resolve(ConnService.ReleaseBlock()).finally(() => setBusy(false))
+      }}
+    >
+      {busy ? tt('releasing…') : tt('traffic blocked ✕')}
+    </button>
+  )
+}
+
 export default function App() {
   // table / view state
   const [total, setTotal] = useState(0)
   const [tabTotal, setTabTotal] = useState(0)
   const [stats, setStats] = useState<any>(null)
+  const [connsOpen, setConnsOpen] = useState(false)
+  const [unlockOpen, setUnlockOpen] = useState(false)
+  // The row whose measurement history is open, or -1 for none. The AUTO panel
+  // opens the same dialog for its own candidates, addressing them by the
+  // configuration rather than by a row of this table — it keeps that state
+  // itself, so the detached window has it too.
+  const [historyIdx, setHistoryIdx] = useState(-1)
+  // "Show setting descriptions" as the dialogs see it. The body class below
+  // still drives the stylesheet; this drives the marks that replace the
+  // paragraphs, which are React's to draw.
+  const [hideHints, setHideHints] = useState(false)
   const [traffic, setTraffic] = useState<any>(null) // live stats_update payload
   const [sort, setSort] = useState<Sort>('idx')
   const [filter, setFilter] = useState('')
@@ -268,6 +379,8 @@ export default function App() {
   const [protoDD, setProtoDD] = useState<{ x: number; y: number } | null>(null)
   // Brief ✓ after copying the connected config from the conn-bar.
   const [connCopied, setConnCopied] = useState(false)
+  // The session panel behind the mark on the connection bar.
+  const [sessionOpen, setSessionOpen] = useState(false)
   const [winW, setWinW] = useState(0)
   // logs
   const [logsOpen, setLogsOpen] = useState(false)
@@ -281,6 +394,18 @@ export default function App() {
   const [logSrc, setLogSrc] = useState('')
   const [logLvl, setLogLvl] = useState('')
   const [logAuto, setLogAuto] = useState(true)
+  // Auto-scroll off means "hold still". The panel used to keep taking lines
+  // while the user was reading one: the ring trims from the top, every row
+  // shifts up, and the line being read walks off the screen — the whole reason
+  // to switch auto-scroll off in the first place. Held lines wait here and go
+  // in when the reader asks for them.
+  const logHeld = useRef<any[]>([])
+  const [logHeldN, setLogHeldN] = useState(0)
+  const logAutoRef = useRef(true)
+  // A monotonic id per line, so React can tell the rows apart. With an index
+  // for a key every row's text changes when the window scrolls, and the whole
+  // list is rewritten several times a second under a flood.
+  const logSeq = useRef(0)
   // modals
   const [qrSrc, setQrSrc] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -434,6 +559,428 @@ export default function App() {
   })
   const items = virtualizer.getVirtualItems()
 
+  // ── columns ───────────────────────────────────────────────────────
+  // One list, and the browser does the arithmetic.
+  //
+  // Each column is a grid track. `minmax(a, b)` is the floor-plus-share we used
+  // to compute by hand, `max-content` is "exactly what is inside" — neither can
+  // be said to a <col>, which is why the table version needed a measuring pass
+  // on every frame and shimmered while the window moved. Here the whole layout
+  // is one string, read by the header and by every row, so they cannot drift
+  // apart and there is nothing to keep in step.
+  //
+  // Floors are in ch — the width of a "0" in the current font — so they follow
+  // the interface font-size setting instead of going stale with it. ACTIONS is
+  // max-content: exactly its buttons, in either language, in either form.
+  // The two flexible columns carry an fr and a floor in characters; the floor
+  // is written in the stylesheet, where the narrow layout can lower it, and is
+  // read back here so the track and the fit check never disagree.
+  const COLSPEC: { cls: string; track: string; floor: number; fr?: number; floorVar?: string }[] = [
+    { cls: 'ci', track: 'max-content', floor: 4 },
+    { cls: 'cpr', track: 'max-content', floor: 8 },
+    { cls: 'cn', track: '', floor: 15, fr: 1.6, floorVar: '--cn-floor' },
+    { cls: 'ch', track: '', floor: 13, fr: 1.1, floorVar: '--ch-floor' },
+    { cls: 'ct', track: 'max-content', floor: 10.5 },
+    { cls: 'cs', track: 'max-content', floor: 10 },
+    { cls: 'cp2', track: 'max-content', floor: 9.5 },
+    { cls: 'cst', track: 'max-content', floor: 10.5 },
+    { cls: 'csp', track: 'max-content', floor: 11.5 },
+    { cls: 'ca', track: 'max-content', floor: 18 },
+  ]
+  // What is given up when the row stops fitting, least useful first. The
+  // decision is taken from the row itself — does it overflow its box — not from
+  // a window width: the same question the layout is already answering.
+  // TYPE is last: on a phone it is the only thing left to give, and the old
+  // stylesheet hid it there for the same reason.
+  const DROP_ORDER = ['ci', 'ct', 'cs', 'ch', 'cpr']
+  const [dropped, setDropped] = useState<Set<string>>(new Set())
+  const actWordsRef = useRef(0)
+  const natRef = useRef<Record<string, number>>({})
+  const wRef = useRef<Record<string, number>>({})
+  const sigRef = useRef('')
+  const droppedRef = useRef(dropped)
+  droppedRef.current = dropped
+
+  useLayoutEffect(() => {
+    // One pass changes one thing — a label form, or one column — and then asks
+    // to be run again. A window dragged from wide to narrow in a single motion
+    // therefore steps through the same sequence it would step through slowly,
+    // instead of stopping at the first change and leaving the row overflowing.
+    let pending = 0
+    const schedule = () => {
+      if (pending) return
+      pending = window.setTimeout(() => {
+        pending = 0
+        write()
+        fit()
+      }, 16)
+    }
+    const cssNum = (name: string, dflt: number) => {
+      const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name))
+      return Number.isFinite(v) && v > 0 ? v : dflt
+    }
+    const write = () => {
+      const el = document.querySelector('.tw') as HTMLElement | null
+      if (!el) return
+      const drop = droppedRef.current
+      // What the stylesheet says the flexible columns may shrink to, and how
+      // much room the action buttons keep. Both change with the layout.
+      for (const c of COLSPEC) {
+        if (c.floorVar) c.floor = cssNum(c.floorVar, c.floor)
+      }
+      // A fade only ever belongs to a column on its way out. If one is still
+      // marked while its column is gone, clear it: a column that is present and
+      // blank reads as a fault, and it is the one state this must never show.
+      for (const cls of DROP_ORDER) {
+        if (document.body.classList.contains('fade-' + cls) && drop.has(cls)) {
+          document.body.classList.remove('fade-' + cls)
+        }
+      }
+      // Each chip is one size for every row, and the size is the widest reading
+      // it can hold — for speed the ten characters fmtSpeed can produce, for
+      // ping four digits, and for both the word shown while the test is still
+      // running. Measured in a chip of its own so the sizes follow the
+      // font-size setting instead of numbers written here.
+      {
+        let sp = document.getElementById('sp-probe') as HTMLElement | null
+        if (!sp) {
+          sp = document.createElement('span')
+          sp.id = 'sp-probe'
+          sp.className = 'pill'
+          sp.style.cssText =
+            'position:absolute;visibility:hidden;pointer-events:none;top:0;left:0;' +
+            'width:auto;min-width:0;max-width:none;white-space:nowrap'
+          el.appendChild(sp)
+        }
+        const widest = (readings: string[]) => {
+          let w = 0
+          for (const reading of readings) {
+            sp!.textContent = reading
+            w = Math.max(w, sp!.getBoundingClientRect().width)
+          }
+          return Math.ceil(w) + 'px'
+        }
+        const root = document.documentElement.style
+        root.setProperty('--speed-w', widest(['99.99 MB/s', 'connecting…']))
+        root.setProperty('--ping-w', widest(['9999ms', 'pinging…', 'timeout']))
+      }
+      // Every column but NAME and HOST is as wide as the widest thing in it,
+      // measured here and written to every row as a pixel count. It cannot be
+      // left to max-content: each row is its own grid, so the rows would each
+      // answer the question for themselves and stop lining up the moment one of
+      // them held a longer word than the rest.
+      // What is measured is the ink — the boxes the content actually draws —
+      // and never the cell, which is as wide as the column already is and would
+      // make each pass record what the pass before it had given away.
+      const INK: Record<string, string> = {
+        cpr: '.pb',
+        ct: '.nb',
+        cs: '.sb',
+        cp2: '.vc > *',
+        cst: '.vc > *',
+        csp: '.vc > *',
+        ca: '.act-cell > *',
+      }
+      const ink = (cell: HTMLElement, sel?: string) => {
+        let l = Infinity
+        let r = -Infinity
+        if (sel) {
+          const parts = cell.querySelectorAll(sel)
+          // A cell holding nothing — no ping taken yet, no history — asks for
+          // nothing. Measuring the cell instead is exactly what would feed a
+          // column's own width back into itself.
+          if (!parts.length) return 0
+          parts.forEach((p) => {
+            const e2 = p as HTMLElement
+            const b = e2.getBoundingClientRect()
+            if (!b.width) return
+            l = Math.min(l, b.left)
+            // What the thing is showing is not always what it has: a badge that
+            // is already cut short would otherwise ask for exactly the width
+            // that is cutting it, and the ellipsis would never come off. Unless
+            // the size was fixed on purpose — the speed chip is one width and
+            // an error inside it is meant to end in an ellipsis.
+            // A ceiling in pixels, or --fixed, says the stylesheet chose this
+            // size on purpose. A ceiling in per cent says only "do not spill
+            // out of the cell", which is not a decision about how wide the
+            // content is and must not stop the column from growing.
+            const cs2 = getComputedStyle(e2)
+            const cap = cs2.maxWidth
+            const capped =
+              (cap !== 'none' && !cap.endsWith('%')) ||
+              cs2.getPropertyValue('--fixed').trim() === '1'
+            r = Math.max(r, b.right + (capped ? 0 : Math.max(0, e2.scrollWidth - e2.clientWidth)))
+          })
+        } else {
+          const range = document.createRange()
+          range.selectNodeContents(cell)
+          const b = range.getBoundingClientRect()
+          range.detach()
+          l = b.left
+          r = b.right
+        }
+        if (!(r > l)) return 0
+        const cs = getComputedStyle(cell)
+        return Math.ceil(r - l + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)) + 2
+      }
+      // The widths are kept while the view is the same, so a column does not
+      // change width under a scroll that brings a longer value into the window.
+      // They are taken again when the view really changes: another tab, another
+      // language, the buttons' labels, the row that is connected.
+      // A row that is fully painted — the placeholder rows a tab switch puts up
+      // for a moment have a number in them and nothing else. Measuring those
+      // and publishing the answer is what made the table blink when a tab was
+      // opened: every column briefly took the width of nothing.
+      const real = !!document.querySelector('.gtable .gc.ca')
+      const sig = [
+        activeTab,
+        lang,
+        getComputedStyle(document.documentElement).getPropertyValue('--app-fs-base'),
+        Array.from(drop).sort().join(','),
+        document.body.classList.contains('acts-tight'),
+        conn?.status ?? '',
+        conn?.conn_raw ?? '',
+      ].join('|')
+      if (sig !== sigRef.current && real) {
+        // The old widths stand until there is something to replace them with:
+        // they are the last honest answer, and one view's columns are close
+        // enough to the next one's that holding them for a frame is invisible.
+        sigRef.current = sig
+        wRef.current = {}
+      }
+      const want = (cls: string, px: number) => {
+        if (px > (wRef.current[cls] ?? 0)) wRef.current[cls] = px
+      }
+      // A column has to hold its heading as well as its values: TRANSPORT,
+      // SECURITY and STABILITY are all longer words than anything under them.
+      // A heading is measured along its own flow — each part's width plus its
+      // margins — rather than edge to edge. Both matter: the slot kept for the
+      // sort arrow is empty, so a range over the text walks straight past it
+      // and STABILITY came out nine pixels short; and on the centred columns
+      // that same slot is pulled back out with a negative margin so the label
+      // sits over its values, which an edge-to-edge reading would charge for
+      // twice and push the label off centre again.
+      const flowInk = (e: HTMLElement) => {
+        if (!e.children.length) return ink(e)
+        let w = 0
+        for (const c of Array.from(e.children)) {
+          const k = c as HTMLElement
+          const cs = getComputedStyle(k)
+          w += k.getBoundingClientRect().width + parseFloat(cs.marginLeft) + parseFloat(cs.marginRight)
+        }
+        const cs = getComputedStyle(e)
+        return Math.ceil(w + parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)) + 2
+      }
+      for (const th of Array.from(document.querySelectorAll('.thw .gh'))) {
+        const e = th as HTMLElement
+        want(e.className.replace('gh ', '').split(' ')[0], flowInk(e))
+      }
+      // The button says connect until it says disconnect, and the difference
+      // between the two words is a column that changes width the moment a
+      // connection opens — under the pointer that opened it. The room for the
+      // longer word is kept from the start, and it is kept by measuring: the
+      // word is swapped into a real button, the cell is read, and the word is
+      // put back, all before anything is painted. Guessing the difference from
+      // a text probe was two pixels out, which is a column that still moves.
+      let caWidest = 0
+      const caInk = (cell: HTMLElement) => {
+        const own = ink(cell, INK.ca)
+        if (!caWidest) {
+          const lbl = Array.from(cell.querySelectorAll('.lbl-full, .lbl-short')).find(
+            (e2) => (e2 as HTMLElement).getBoundingClientRect().width > 0,
+          ) as HTMLElement | undefined
+          if (!lbl) return own
+          const btn = lbl.closest('button')
+          if (!btn) return own
+          // Both forms of the button, not just both words: the disconnect
+          // button is a pixel wider on each side and does not letter-space its
+          // label, so the word alone answers a slightly different question.
+          const short = lbl.classList.contains('lbl-short')
+          const forms = [
+            { cls: 'btn sm ghost', word: short ? 'conn' : 'connect' },
+            { cls: 'btn sm-disc', word: short ? 'disc' : 'disconnect' },
+          ]
+          const wore = btn.className
+          const said = lbl.textContent
+          const seen: number[] = []
+          for (const form of forms) {
+            btn.className = form.cls
+            lbl.textContent = form.word
+            seen.push(ink(cell, INK.ca))
+          }
+          btn.className = wore
+          lbl.textContent = said
+          // The buttons hang from the right-hand end of the column, so PING
+          // and SPEED keep their place and the first button grows leftwards
+          // into the room kept for the longer word. The gap on the right is
+          // that same difference, which puts the shorter form — the one on
+          // screen nearly all the time — squarely in the middle of the column.
+          const gap = Math.max(seen[1] - seen[0], cssNum('--act-gap-min', 10))
+          document.documentElement.style.setProperty('--act-gap', gap + 'px')
+          caWidest = seen[0] + 2 * gap
+        }
+        return Math.max(own, caWidest)
+      }
+      if (real) {
+        for (const cell of Array.from(document.querySelectorAll('.gtable .gc'))) {
+          const e = cell as HTMLElement
+          const cls = e.className.replace('gc ', '').split(' ')[0]
+          if (cls === 'cn' || cls === 'ch') continue
+          want(cls, cls === 'ca' ? caInk(e) : ink(e, INK[cls]))
+        }
+      }
+      const cols = COLSPEC.filter((c) => !drop.has(c.cls))
+        .map((c) =>
+          c.fr
+            ? 'minmax(' + c.floor + 'ch,' + c.fr + 'fr)'
+            : (wRef.current[c.cls] ?? Math.ceil(c.floor * 7)) + 'px',
+        )
+        .join(' ')
+      document.documentElement.style.setProperty('--cols', cols)
+      // The heading row is a second grid in a second box. The two boxes are the
+      // same width — the heading row is padded by the scrollbar's gutter — and
+      // every track but NAME and HOST is now a pixel count, so the same list
+      // resolves to the same numbers in both.
+      document.documentElement.style.setProperty('--cols-head', cols)
+      const row = document.querySelector('.gtable .grow') as HTMLElement | null
+      if (real && row && row.children.length) {
+        const widths = Array.from(row.children).map(
+          (c) => (c as HTMLElement).getBoundingClientRect().width,
+        )
+        // What each column takes at its narrowest, remembered for the two
+        // decisions below: whether the row still fits, and whether a column
+        // that was given up can come back.
+        const vis = COLSPEC.filter((c) => !drop.has(c.cls))
+        vis.forEach((c, i) => {
+          if (c.cls === 'cn' || c.cls === 'ch') return
+          natRef.current[c.cls] = widths[i]
+          // While the buttons wear their words, remember what that costs: it is
+          // the threshold the check below uses to put the words back.
+          if (c.cls === 'ca' && !document.body.classList.contains('acts-tight')) {
+            actWordsRef.current = widths[i]
+          }
+        })
+      }
+      // The gutter the vertical scrollbar occupies, mirrored to the heading row
+      // so the two grids resolve against the same width. Measured, because it
+      // is a system metric — 8px at 100% scaling, more at 125%, zero with
+      // overlay scrollbars.
+      const gutter = Math.max(0, el.offsetWidth - el.clientWidth)
+      document.documentElement.style.setProperty('--sbw', gutter + 'px')
+    }
+
+    // What one "0" is wide in the table's own font. The floors are written in
+    // ch so they follow the font-size setting; this is what turns them into the
+    // pixels the fit check adds up.
+    const chPx = () => {
+      let probe = document.getElementById('ch-probe') as HTMLElement | null
+      const host = document.querySelector('.tw')
+      if (!probe && host) {
+        probe = document.createElement('div')
+        probe.id = 'ch-probe'
+        probe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;width:10ch'
+        host.appendChild(probe)
+      }
+      const w = probe ? probe.getBoundingClientRect().width / 10 : 7
+      return w > 0 ? w : 7
+    }
+    const fit = () => {
+      const el = document.querySelector('.tw') as HTMLElement | null
+      const row = document.querySelector('.gtable .grow') as HTMLElement | null
+      if (!el || !row) return
+      const drop = new Set(droppedRef.current)
+      const tight = document.body.classList.contains('acts-tight')
+      const ch = chPx()
+      // What the row needs at its narrowest: each content-sized column at the
+      // width the browser just gave it — which for a max-content track IS its
+      // content — plus the floors of the two that hold text. Read from the last
+      // layout, never from the current one, so the answer cannot feed itself.
+      const need =
+        COLSPEC.filter((c) => !drop.has(c.cls)).reduce(
+          (a, c) => a + (c.fr ? c.floor * ch : natRef.current[c.cls] ?? c.floor * ch),
+          0,
+        ) + 2
+      const box = el.clientWidth
+      if (need > box) {
+        if (!tight) {
+          document.body.classList.add('acts-tight')
+          schedule()
+          return
+        }
+        for (const cls of DROP_ORDER) {
+          if (!drop.has(cls)) {
+            // Fade first, remove a tenth of a second later. The column cannot
+            // be animated away — its cells stop being rendered — but the moment
+            // can be given an edge to be seen leaving by.
+            document.body.classList.add('fade-' + cls)
+            window.setTimeout(() => {
+              const next = new Set(droppedRef.current)
+              next.add(cls)
+              setDropped(next)
+              // The class comes off with the column, not a moment later: while
+              // both are on, the column is present and blank.
+              document.body.classList.remove('fade-' + cls)
+              schedule()
+            }, 110)
+            return
+          }
+        }
+        return
+      }
+      // Room to spare. Give back what was taken, in reverse order, and only
+      // when what comes back still leaves the row inside its box.
+      const spare = box - need
+      for (const cls of [...DROP_ORDER].reverse()) {
+        if (!drop.has(cls)) continue
+        // What it took when it was last on screen, or its written floor if it
+        // has not been seen yet.
+        const back = natRef.current[cls] ?? (COLSPEC.find((c) => c.cls === cls)?.floor ?? 10) * ch
+        if (spare < back + 24) return
+        // Straight back, at full strength. Fading it up meant one frame with
+        // the column there and nothing in it — which reads as a bug, not as a
+        // transition, and is exactly what it looked like.
+        document.body.classList.remove('fade-' + cls)
+        drop.delete(cls)
+        setDropped(drop)
+        schedule()
+        return
+      }
+      // Last to go is first to return: the words on the buttons. The width they
+      // want is the one they had when they were words — remembered, so this is
+      // not a guess either.
+      const actPx = natRef.current['ca'] ?? 18 * ch
+      if (tight && spare > (actWordsRef.current || 200) - actPx + 16) {
+        document.body.classList.remove('acts-tight')
+        schedule()
+      }
+    }
+    write()
+    fit()
+    // Once more when the first rows have landed: the effect runs as soon as the
+    // count is known, and at that moment the window may still hold placeholder
+    // rows — which have no buttons to measure.
+    const settle = window.setTimeout(() => {
+      write()
+      fit()
+    }, 300)
+    const ro = new ResizeObserver(schedule)
+    ro.observe(document.documentElement)
+    window.addEventListener('resize', schedule)
+    return () => {
+      ro.disconnect()
+      window.removeEventListener('resize', schedule)
+      window.clearTimeout(settle)
+      if (pending) window.clearTimeout(pending)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  // conn is in the list because the connected row's button says "disconnect",
+  // which is wider than "connect": the column resizes itself, but the heading
+  // row is mirrored from the rows and has to be told to look again.
+  // The font size is in the list because nothing else notices it: the window
+  // has not changed size, so no resize arrives, and every width here is
+  // measured in the font the setting just changed.
+  }, [total, loading, activeTab, dropped, conn?.status, conn?.conn_raw, lang, stg?.app_font_size])
+
   useEffect(() => {
     if (items.length === 0) return
     const startW = Math.floor(items[0].index / WINDOW) * WINDOW
@@ -453,7 +1000,15 @@ export default function App() {
       ConfigService.Window(activeTab, sort, filter, protos, w, WINDOW).then((rows) => {
         if (seq !== viewSeqRef.current) return // view moved on — drop stale response
         pendingRef.current.delete(w)
-        ;(rows ?? []).forEach((r, i) => targetCache.set(w + i, r))
+        const got = rows ?? []
+        got.forEach((r, i) => targetCache.set(w + i, Object.assign(r as any, { _seq: seq })))
+        // A window that comes back short is the end of the list — or a list that
+        // has just become shorter. The positions it did not fill do not exist in
+        // this view any more, and leaving the previous view's rows there is what
+        // put phantom rows on the table: a configuration from a filtered list
+        // sitting above the real ones, numbered as if it belonged, doing nothing
+        // when clicked because its index was no longer in the tab.
+        for (let i = got.length; i < WINDOW; i++) targetCache.delete(w + i)
         winFreshRef.current.add(w)
         bump((v) => v + 1)
       })
@@ -628,8 +1183,24 @@ export default function App() {
   }
   const createTab = async () => {
     const nt = await TabService.Create()
-    refreshTabs()
-    switchTab(nt.id)
+    // The list, read back rather than assumed: the tab to switch to is the one
+    // that was just made, and if the call's answer cannot be read for any
+    // reason it is still the last one in the list. Without an id nothing
+    // switched, and the click looked like it had done nothing — a new tab
+    // appeared in the bar (that arrives on its own event) while the table went
+    // on showing the tab being left.
+    const list = (await TabService.List()) ?? []
+    setTabs(list)
+    const id = (nt as any)?.id || list[list.length - 1]?.id
+    if (!id) return
+    // A tab that has just been made holds nothing, and saying so here is what
+    // makes it look made: the counts still describe the tab being left, and
+    // until the new ones come back the view falls through to a table with no
+    // rows in it — an empty rectangle where the four ways to fill the tab
+    // should be.
+    setTotal(0)
+    setTabTotal(0)
+    switchTab(id)
   }
 
   // ── row helpers (exact buildRow logic) ──────────────────────────────
@@ -637,8 +1208,8 @@ export default function App() {
     const cs = conn
     if (!cs || (cs.status !== 'connected' && cs.status !== 'connecting')) return false
     const chainRaws: string[] = cs.chain_raws || []
-    if (chainRaws.length && r.raw && chainRaws.indexOf(r.raw) >= 0) return true
-    if (cs.conn_raw) return rawBody(cs.conn_raw) === rawBody(r.raw)
+    if (chainRaws.length && r.raw && chainRaws.some((h) => rawKey(h) === rawKey(r.raw))) return true
+    if (cs.conn_raw) return rawKey(cs.conn_raw) === rawKey(r.raw)
     return cs.conn_tab === activeTab && cs.entry_index === r.index
   }
   const findRowByIndex = (idx: number): Row | null => {
@@ -680,7 +1251,7 @@ export default function App() {
     const cs = connRef.current
     if (!cs || !cs.conn_raw) return -1
     for (const row of cacheRef.current.values())
-      if (rawBody(row.raw) === rawBody(cs.conn_raw)) return row.index
+      if (rawKey(row.raw) === rawKey(cs.conn_raw)) return row.index
     return -1
   }
 
@@ -891,6 +1462,8 @@ export default function App() {
     const run = (tabId: string) => {
       if (isSub) {
         addSubsToTabSource(tabId, subs)
+        if (subURLsHadExtra(trimmed))
+          showToast(tt('Added the links; anything written after them on the line was ignored.'))
         return
       }
       pasteConfigs(text).then(() => {
@@ -965,6 +1538,14 @@ export default function App() {
   // re-read afterwards or the chip would keep offering an install that has
   // already happened.
   const acquirePrivilege = () => {
+    // From a phone there is nothing to acquire: the elevation prompt, and the
+    // relaunched copy behind it, are on the computer. Doing it anyway would
+    // restart the program under the user's nose and drop this browser session
+    // with no explanation, so it says where the click has to happen instead.
+    if (IS_REMOTE) {
+      showToast(tt('This has to be done on the computer itself — it asks for permission there.'))
+      return
+    }
     ConnService.RestartAdmin().then((why: string) => {
       if (why) {
         showToast(why)
@@ -983,20 +1564,8 @@ export default function App() {
   const doCheckExit = () => {
     if (!connRef.current || connRef.current.status !== 'connected') return
     if (exit?.cls === 'testing') return
-    setExit({ cls: 'testing', label: '🌍 ' + tt('checking…') })
-    ConnService.CheckExit().then((d: any) => {
-      if (!d || d.error) {
-        setExit({ cls: 'failed', label: '🌍 ' + (d?.error || tt('check failed')) + ' ↻' })
-        return
-      }
-      const flag = flagEmoji(d.country_code)
-      const loc = [d.city, d.country].filter(Boolean).join(', ')
-      setExit({
-        cls: 'ok',
-        label: (flag ? flag + ' ' : '') + (loc || d.country_code || '?') + (d.ip ? ' · ' + d.ip : ''),
-        title: (d.isp ? d.isp + ' — ' : '') + 'Exit IP as seen through the tunnel. Click to re-check.',
-      })
-    })
+    setExit(exitChecking(tt))
+    checkExit(tt).then(setExit)
   }
 
   // ── settings modal (instant apply, as in 1.10 — no Save button) ────
@@ -1004,8 +1573,13 @@ export default function App() {
   // One class on <body> rather than a prop threaded through four dialogs: every
   // hint is already a .modal-hint, so hiding them is a stylesheet's job and the
   // setting reaches the tab, settings and auto dialogs — including the
-  // standalone auto window — without any of them knowing about it.
-  const applyHints = (hide?: boolean) => document.body.classList.toggle('no-hints', !!hide)
+  // standalone auto window — without any of them knowing about it. The state
+  // beside it is for the descriptions that can be opened again: those are drawn
+  // by <Hint>, and a stylesheet cannot put a button where a paragraph was.
+  const applyHints = (hide?: boolean) => {
+    setHideHints(!!hide)
+    document.body.classList.toggle('no-hints', !!hide)
+  }
   const openSettings = () => {
     SettingsService.Get().then(setStg)
     setSettingsOpen(true)
@@ -1018,12 +1592,27 @@ export default function App() {
     if ('theme' in patch) applyTheme(patch.theme)
     if ('language' in patch) setLang(patch.language || 'en')
     if ('modal_font_size' in patch)
-      document.documentElement.style.setProperty('--modal-fs-base', (patch.modal_font_size || 11) + 'px')
+      setFontVar('--modal-fs-base', patch.modal_font_size || 12)
+    if ('app_font_size' in patch) setFontVar('--app-fs-base', patch.app_font_size || 13)
     if ('hide_hints' in patch) applyHints(patch.hide_hints)
     SettingsService.Set(merged).then((applied: any) => {
       setStg(applied)
       setAuto(!!applied?.auto_connect)
     })
+  }
+  // Choosing a mode is a decision, so it is written down. AUTO's "remember
+  // last" reads it: without that, the pill said proxy and AUTO connected in TUN
+  // because that was the mode of some earlier session.
+  //
+  // Through a setter that touches ONLY this field. Sending the whole settings
+  // object — as this did — writes every other field as well, and a click before
+  // the window had finished loading them sent an object full of zeroes: every
+  // setting reset, and the firewall block released because the switch holding
+  // it had apparently just been turned off.
+  const pickMode = (m: 'proxy' | 'tun') => {
+    setSelectedMode(m)
+    SettingsService.SetSelectedMode(m)
+    setStg((p: any) => (p ? { ...p, selected_mode: m } : p))
   }
   const setAutoEnabled = (on: boolean) => {
     setAuto(on)
@@ -1031,11 +1620,31 @@ export default function App() {
   }
 
   // ── logs ──────────────────────────────────────────────────────────
+  // tagLines stamps each line with an id of its own; see logSeq.
+  const tagLines = (ls: any[]) => ls.map((l) => ({ ...l, _id: logSeq.current++ }))
   const openLogs = () => {
     logsOpenRef.current = true
     setLogsOpen(true)
-    LogService.Get().then((ls) => setLogLines(ls ?? []))
-    LogService.GetImportant().then((ls) => setImpLines(ls ?? []))
+    logHeld.current = []
+    setLogHeldN(0)
+    LogService.Get().then((ls) => setLogLines(tagLines(ls ?? [])))
+    LogService.GetImportant().then((ls) => setImpLines(tagLines(ls ?? [])))
+  }
+  // releaseHeld puts the lines that arrived while the view was held into the
+  // panel — on demand, or when auto-scroll comes back on.
+  const releaseHeld = () => {
+    const held = logHeld.current
+    logHeld.current = []
+    setLogHeldN(0)
+    if (!held.length) return
+    setLogLines((prev) => [...prev, ...held].slice(-2000))
+    const imp = held.filter(isImp)
+    if (imp.length) setImpLines((prev) => [...prev, ...imp].slice(-500))
+  }
+  const setAutoScroll = (on: boolean) => {
+    logAutoRef.current = on
+    setLogAuto(on)
+    if (on) releaseHeld()
   }
   const closeLogs = () => {
     logsOpenRef.current = false
@@ -1085,8 +1694,12 @@ export default function App() {
       applyHints(s?.hide_hints)
       if (s?.language) setLang(s.language)
       if (s?.last_connected_raw) setLastRaw(s.last_connected_raw)
-      if (s?.last_connected_mode === 'tun') setSelectedMode('tun')
-      document.documentElement.style.setProperty('--modal-fs-base', (s?.modal_font_size || 11) + 'px')
+      // The pill the user last chose, falling back to the mode of the last
+      // session for anyone upgrading into this.
+      const startMode = s?.selected_mode || s?.last_connected_mode
+      if (startMode === 'tun') setSelectedMode('tun')
+      setFontVar('--modal-fs-base', s?.modal_font_size || 12)
+      setFontVar('--app-fs-base', s?.app_font_size || 13)
     })
     refreshTabs()
     TabService.Active().then(setActiveTab)
@@ -1151,7 +1764,8 @@ export default function App() {
         setLang(s.language || 'en')
         applyTheme(s.theme)
         applyHints(s.hide_hints)
-        document.documentElement.style.setProperty('--modal-fs-base', (s.modal_font_size || 11) + 'px')
+        setFontVar('--modal-fs-base', s.modal_font_size || 12)
+        setFontVar('--app-fs-base', s.app_font_size || 13)
       }),
       Events.On('active_tab', (e: any) => {
         const id = e?.data?.payload
@@ -1246,7 +1860,7 @@ export default function App() {
         // conn-bar ping chip below matches by raw, so it stays global.
         if (e?.data?.tab && e.data.tab !== activeTabRef.current) {
           const ccs = connRef.current
-          if (ccs && ccs.status === 'connected' && ccs.conn_raw && p.raw && rawBody(p.raw) === rawBody(ccs.conn_raw))
+          if (ccs && ccs.status === 'connected' && ccs.conn_raw && p.raw && rawKey(p.raw) === rawKey(ccs.conn_raw))
             setConnPing({ st: p.ping_status, delay: p.delay })
           return
         }
@@ -1271,6 +1885,9 @@ export default function App() {
               speed_st: p.speed_status,
               ping_err: p.ping_err || '',
               speed_err: p.speed_err || '',
+              // Absent when the config has no measurement history yet; keeping
+              // the old value then is right, because nothing replaced it.
+              stab: p.stab ?? row.stab,
             })
             bump((v) => v + 1)
             break
@@ -1279,7 +1896,7 @@ export default function App() {
         scheduleStatsRefresh() // live ping ok / failed / best counters
         scheduleResort() // live re-order when sorted by ping/speed
         const cs = connRef.current
-        if (cs && cs.status === 'connected' && cs.conn_raw && p.raw && rawBody(p.raw) === rawBody(cs.conn_raw))
+        if (cs && cs.status === 'connected' && cs.conn_raw && p.raw && rawKey(p.raw) === rawKey(cs.conn_raw))
           setConnPing({ st: p.ping_status, delay: p.delay })
       }),
       // bulk test progress → thin amber bar under the header (1.10 pb-main)
@@ -1321,8 +1938,16 @@ export default function App() {
       }),
       Events.On('log', (e: any) => {
         if (!logsOpenRef.current) return
-        const batch = e?.data?.payload
-        if (!Array.isArray(batch)) return
+        const raw = e?.data?.payload
+        if (!Array.isArray(raw)) return
+        const batch = raw.map((l: any) => ({ ...l, _id: logSeq.current++ }))
+        if (!logAutoRef.current) {
+          // Held, not dropped: the same cap as the panel, so a long read cannot
+          // grow this without bound either.
+          logHeld.current = [...logHeld.current, ...batch].slice(-2000)
+          setLogHeldN(logHeld.current.length)
+          return
+        }
         setLogLines((prev) => [...prev, ...batch].slice(-2000))
         const imp = batch.filter(isImp)
         if (imp.length) setImpLines((prev) => [...prev, ...imp].slice(-500))
@@ -1520,6 +2145,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs, activeTab, winW, stg?.sources_enabled])
 
+  // The active tab is remembered by the backend and defaults to SOURCES, which
+  // the Sources setting can hide. Hidden and still active, it left the window
+  // showing a table nobody could navigate away from — no tab looked selected
+  // and the list was empty. Whenever the active tab is not one of the visible
+  // ones, move to the first that is.
+  useEffect(() => {
+    if (!tabs.length) return
+    const visible = tabs.filter((t) => !(t.id === 'main' && stg?.sources_enabled === false))
+    if (!visible.length) return
+    if (activeTab && visible.some((t) => t.id === activeTab)) return
+    switchTab(visible[0].id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tabs, activeTab, stg?.sources_enabled])
+
   // ── derived ───────────────────────────────────────────────────────
   const connected = !!conn && conn.status === 'connected'
   const connecting = conn?.status === 'connecting'
@@ -1584,9 +2223,10 @@ export default function App() {
   const sortableTH = (cls: string, col: SortCol, label: string) => {
     const active = sort === col || sort === `${col}:desc`
     const desc = sort === `${col}:desc`
+    if (dropped.has(cls)) return null
     return (
-      <th
-        className={cls + ' sortable' + (active ? ' sorted' : '')}
+      <div
+        className={'gh ' + cls + ' sortable' + (active ? ' sorted' : '')}
         onClick={() => cycleSort(col)}
         onContextMenu={(e) => {
           e.preventDefault()
@@ -1601,7 +2241,7 @@ export default function App() {
       >
         <span className="th-label">{label}</span>
         <span className="th-arrow">{active ? (desc ? '▾' : '▴') : ''}</span>
-      </th>
+      </div>
     )
   }
 
@@ -1614,10 +2254,9 @@ export default function App() {
     const pos = vi.index + 1
     if (!r)
       return (
-        <tr key={'p' + vi.index} style={{ height: ROW_H }}>
-          <td className="ci">{pos}</td>
-          <td colSpan={8} />
-        </tr>
+        <div className="grow" key={'p' + vi.index} style={{ height: ROW_H }} role="row">
+          {!dropped.has('ci') && <div className="gc ci">{pos}</div>}
+        </div>
       )
 
     let pp = 'pill pending'
@@ -1637,10 +2276,13 @@ export default function App() {
     let st = '—'
     if (r.speed_st === 'testing_speed') {
       sp = 'pill ts'
-      st = r.speed_live > 0 ? r.speed_live.toFixed(1) + ' MB/s' : 'connecting…'
+      // The chip is one width, and these are the readings it has to hold:
+      // ten characters at most, so a fast link loses a decimal rather than
+      // the chip growing a column for everyone.
+      st = r.speed_live > 0 ? fmtSpeed(r.speed_live) : 'connecting…'
     } else if (r.speed_st === 'ok') {
       sp = 'pill ok-speed'
-      st = r.speed.toFixed(2) + ' MB/s'
+      st = fmtSpeed(r.speed)
     } else if (r.speed_st === 'failed') {
       sp = 'pill failed'
       st = r.speed_err || 'failed'
@@ -1655,24 +2297,33 @@ export default function App() {
     const isChainExit = !!(chainRaws.length > 0 && r.raw === chainRaws[chainRaws.length - 1])
     const rowLit = connLit(r)
     const isConn = rowLit && connected
-    const isLast = !!(r.raw && lastRaw && r.raw === lastRaw)
+    // Painted, because blanking the table on every sort is worse — but not
+    // clickable: this row was fetched under a view that no longer exists, and
+    // its index may belong to a different configuration now. The refetch
+    // replaces it within a round trip.
+    const stale = (r as any)._seq !== undefined && (r as any)._seq !== viewSeqRef.current
+    const isLast = !!(r.raw && lastRaw && rawKey(r.raw) === rawKey(lastRaw))
     const hostport = (r.host || '') + (r.port ? ':' + r.port : '')
     const cls =
       (selected.has(r.index) ? 'selected ' : '') +
       (flashTabRef.current === activeTab && flashIdxRef.current.has(r.index) ? 'row-new ' : '') +
+      (stale ? 'row-stale ' : '') +
       (rowLit ? (conn?.mode === 'tun' ? 'row-ct' : 'row-cp') : '')
 
     return (
-      <tr
+      <div
+        role="row"
         key={r.index}
-        className={cls.trim() || undefined}
+        className={'grow' + (cls.trim() ? ' ' + cls.trim() : '')}
         style={{ height: ROW_H }}
         onClick={(e) => {
+          if (stale) return
           if ((e.target as HTMLElement).closest('.act-cell')) return
           if (consumeLongPress()) return
           toggleRowSelect(r.index, e)
         }}
         onPointerDown={(e) => {
+          if (stale) return
           // Not over the action buttons — a hold there is aimed at the button.
           if ((e.target as HTMLElement).closest('.act-cell')) return
           beginLongPress(e, (x, y) => {
@@ -1701,13 +2352,15 @@ export default function App() {
           setMenu({ kind: 'row', x: e.clientX, y: e.clientY, idx: r.index })
         }}
       >
-        <td className="ci">{pos}</td>
-        <td className="cpr">
-          <span className={'pb ' + (r.proto || '')} title={r.proto}>
-            {protoLabel(r.proto || '?')}
-          </span>
-        </td>
-        <td className="cn">
+        {!dropped.has('ci') && <div className="gc ci">{pos}</div>}
+        {!dropped.has('cpr') && (
+          <div className="gc cpr">
+            <span className={'pb ' + (r.proto || '')} title={r.proto}>
+              {protoLabel(r.proto || '?')}
+            </span>
+          </div>
+        )}
+        <div className="gc cn">
           <div className="nc">
             <div className="nm-row">
               <span
@@ -1746,35 +2399,62 @@ export default function App() {
               )}
             </div>
           </div>
-        </td>
-        <td className="ch">
+        </div>
+        {!dropped.has('ch') && (
+        <div className="gc ch">
           <span className="nh" title={hostport}>
             {hostport}
           </span>
-        </td>
-        <td className="ct">
+        </div>
+        )}
+        {!dropped.has('ct') && (
+        <div className="gc ct">
           <span className={'nb ' + ncls}>{r.net || 'tcp'}</span>
-        </td>
-        <td className="cs">
+        </div>
+        )}
+        {!dropped.has('cs') && (
+        <div className="gc cs">
           <span className={'sb ' + (r.sec || 'none')} title={r.sec || 'none'}>
             {r.sec || 'none'}
           </span>
-        </td>
-        <td className="cp2">
+        </div>
+        )}
+        <div className="gc cp2">
           <div className="vc">
             <span className={pp} title={pt}>
               {pt}
             </span>
           </div>
-        </td>
-        <td className="csp">
+        </div>
+        <div className="gc cst">
+          <div className="vc">
+            {r.stab ? (
+              // The cell is the way into the full record: it already shows the
+              // summary, so the detail belongs behind it rather than behind a
+              // menu item nobody would look for.
+              <span
+                className={
+                  'stab-pct clickable' + (r.stab.percent >= 0 && r.stab.percent < 80 ? ' poor' : '')
+                }
+                title={stabTitle(tt, r.stab)}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setHistoryIdx(r.index)
+                }}
+              >
+                {r.stab.percent >= 0 ? r.stab.percent + '%' : '—'}
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <div className="gc csp">
           <div className="vc">
             <span className={sp} title={st}>
               {st}
             </span>
           </div>
-        </td>
-        <td className="ca">
+        </div>
+        <div className="gc ca">
           <div className="act-cell">
             {isConn && inChain && !isChainExit ? (
               <span className="chain-hop-tag" title={tt('chain hop')}>
@@ -1819,8 +2499,8 @@ export default function App() {
               {copiedSet.has(r.index) ? '✓' : '⎘'}
             </button>
           </div>
-        </td>
-      </tr>
+        </div>
+      </div>
     )
   }
 
@@ -1828,7 +2508,7 @@ export default function App() {
   const selLabel = selCount > 1 ? selCount + ' ' + tt('configs') : tt('config')
 
   return (
-    <>
+    <HintHost lang={lang} hide={hideHints}>
 
       {/* ── Custom title bar ──
           Hidden when the compositor draws its own decorations instead, which
@@ -2000,6 +2680,18 @@ export default function App() {
               <path d="M3 3h10M3 6.3h10M3 9.6h10M3 12.9h6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
             </svg>
           </button>
+          <button
+            className={'btn ghost icon' + (connsOpen ? ' on' : '')}
+            id="btn-conns"
+            title={tt('Connections')}
+            onClick={() => setConnsOpen((v) => !v)}
+          >
+            {/* two arrows passing each other — traffic, going both ways */}
+            <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M2 5.5h9M8.5 3l2.5 2.5L8.5 8M14 10.5H5M7.5 8L5 10.5 7.5 13"
+                stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
           <button className="btn ghost icon" id="btn-settings" title="Settings" onClick={openSettings}>
             ⚙
           </button>
@@ -2086,6 +2778,11 @@ export default function App() {
             onChange={(e) => setFilter(e.target.value)}
             spellCheck={false}
           />
+          {/* The filter has no paragraph anywhere to hide, so its mark does not
+              come and go with the descriptions setting. It sits after the box
+              rather than before it: the label names the box, and a mark between
+              the two would read as belonging to neither. */}
+          <InfoDot className="tl-i" desc={FILTER_HELP} />
           <span id="fc" style={{ fontSize: 11, color: 'var(--dim)' }}>
             {filtering ? total + ' / ' + tabTotal : ''}
           </span>
@@ -2173,46 +2870,46 @@ export default function App() {
       )}
 
       {/* ── Table ── */}
-      {/* Header lives OUTSIDE the scroll viewport (.thw, non-scrolling) so the
-          vertical scrollbar spans only the body rows and never overlaps the
-          column headers. Both tables share table-layout:fixed and the same width
-          classes; .thw's right padding mirrors the body's 8px scrollbar gutter so
-          the columns line up exactly. */}
-      {!loading && (
+      {/* The header sits OUTSIDE the scrolling box again, so the scrollbar runs
+          along the rows and not across the headings. What used to make that
+          impossible — two tables, two widths — is gone: header and rows are two
+          grids reading the same track list from --cols, so they cannot drift.
+          The gutter the scrollbar occupies is measured once and mirrored here as
+          padding, which is the only number the two share. */}
+      {!loading && total > 0 && (
         <div className="thw">
-          <table id="tblh">
-            <colgroup>
-              <col className="ci" />
-              <col className="cpr" />
-              <col className="cn" />
-              <col className="ch" />
-              <col className="ct" />
-              <col className="cs" />
-              <col className="cp2" />
-              <col className="csp" />
-              <col className="ca" />
-            </colgroup>
-            <thead>
-              <tr>
-                <th className="ci">#</th>
-                {sortableTH('cpr', 'type', 'Type')}
-                {sortableTH('cn', 'name', 'Name')}
-                {sortableTH('ch', 'host', 'Host')}
-                {sortableTH('ct', 'transport', 'Transport')}
-                {sortableTH('cs', 'security', 'Security')}
-                {sortableTH('cp2', 'ping', 'Ping')}
-                {sortableTH('csp', 'speed', 'Speed')}
-                <th className="ca">Actions</th>
-              </tr>
-            </thead>
-          </table>
+          <div className="grow ghead" role="row">
+            {!dropped.has('ci') && <div className="gh ci">#</div>}
+            {sortableTH('cpr', 'type', 'Type')}
+            {sortableTH('cn', 'name', 'Name')}
+            {sortableTH('ch', 'host', 'Host')}
+            {sortableTH('ct', 'transport', 'Transport')}
+            {sortableTH('cs', 'security', 'Security')}
+            {sortableTH('cp2', 'ping', 'Ping')}
+            {sortableTH('cst', 'stab', 'Stability')}
+            {sortableTH('csp', 'speed', 'Speed')}
+            <div className="gh ca">Actions</div>
+          </div>
         </div>
       )}
+      {/* The header used to be a table of its own, outside the scrolling box, so
+          the vertical scrollbar would span only the rows. Two tables meant two
+          widths — they differ by the scrollbar's own width — and every attempt
+          to keep their columns in step ended in one of them overflowing its box
+          and putting a scrollbar along the bottom of the window. One table with
+          a sticky header row has neither problem: there is one width, and the
+          columns cannot drift from the headings because they ARE the headings'
+          columns. See sizeColumns for how that width is divided. */}
       <div
         className="tw"
         ref={twRef}
         onContextMenu={(e) => {
-          if ((e.target as HTMLElement).closest('tr')) return
+          // A row handles its own menu; this one is for the space around
+          // them. The test asked for a <tr>, which is what a row was before
+          // the table became a grid — so it never matched, this handler ran
+          // after the row's, and the row's menu was replaced by the short one
+          // for empty space.
+          if ((e.target as HTMLElement).closest('.grow')) return
           if (activeTabRef.current === 'main') return
           e.preventDefault()
           setMenu({ kind: 'empty', x: e.clientX, y: e.clientY })
@@ -2269,32 +2966,11 @@ export default function App() {
             </button>
           </div>
         ) : (
-          <table id="tbl">
-            <colgroup>
-              <col className="ci" />
-              <col className="cpr" />
-              <col className="cn" />
-              <col className="ch" />
-              <col className="ct" />
-              <col className="cs" />
-              <col className="cp2" />
-              <col className="csp" />
-              <col className="ca" />
-            </colgroup>
-            <tbody id="tb">
-              {padTop > 0 && (
-                <tr className="vspacer" style={{ height: padTop }}>
-                  <td colSpan={9} />
-                </tr>
-              )}
-              {items.map((vi) => renderRow(vi))}
-              {padBottom > 0 && (
-                <tr className="vspacer" style={{ height: padBottom }}>
-                  <td colSpan={9} />
-                </tr>
-              )}
-            </tbody>
-          </table>
+          <div id="tbl" className="gtable" role="grid" aria-rowcount={total}>
+            {padTop > 0 && <div className="vspacer" style={{ height: padTop }} />}
+            {items.map((vi) => renderRow(vi))}
+            {padBottom > 0 && <div className="vspacer" style={{ height: padBottom }} />}
+          </div>
         )}
       </div>
 
@@ -2353,10 +3029,17 @@ export default function App() {
                 {logShown.length}/{logBase.length}
               </span>
             )}
-            <label className="log-auto">
-              <input type="checkbox" checked={logAuto} onChange={(e) => setLogAuto(e.target.checked)} />{' '}
-              <span id="log-auto-lbl">auto-scroll</span>
-            </label>
+            <Check
+              className="log-auto"
+              checked={logAuto}
+              onChange={setAutoScroll}
+              label={<span id="log-auto-lbl">auto-scroll</span>}
+            />
+            {logHeldN > 0 && (
+              <button className="btn ghost log-held" onClick={releaseHeld} title={tt('Show the lines that arrived while the view was held')}>
+                +{logHeldN}
+              </button>
+            )}
             <div className="spacer" />
             <button className="btn ghost" id="log-copy" onClick={copyLogs}>
               copy
@@ -2378,7 +3061,7 @@ export default function App() {
           </div>
           <div className="log-view" id="log-view" ref={logViewRef}>
             {logShown.map((l, i) => (
-              <span key={i} className={'log-line lvl-' + (l.lvl || 'raw')}>
+              <span key={l._id ?? i} className={'log-line lvl-' + (l.lvl || 'raw')}>
                 <span className="lt">{fmtLogTime(l.t)}</span>
                 <span className={'ls src-' + (l.src || '')}>{l.src === 'singbox' ? 'sing-box' : l.src}</span>
                 {l.msg}
@@ -2396,6 +3079,17 @@ export default function App() {
         <span id="clabel" className={stateCls}>
           {clabel}
         </span>
+        {/* What the running session was actually built with. One mark rather
+            than a row of chips: the bar is narrow, and the panel behind it has
+            room to grow. */}
+        <button
+          className="hint-i sess-i"
+          title={tt('What this session is running with')}
+          aria-label={tt('What this session is running with')}
+          onClick={() => setSessionOpen(true)}
+        >
+          i
+        </button>
         <span id="cdetail">
           {connected &&
             (conn.chain && conn.chain.length > 1 ? (
@@ -2416,8 +3110,20 @@ export default function App() {
               </>
             ))}
           {connecting && <span>{conn?.entry_name}</span>}
-          {isError && <span style={{ color: 'var(--red)' }}>{conn?.error || 'unknown error'}</span>}
+          {/* An error longer than the bar is cut off by the layout, and the part
+              that gets cut is usually the half that says what to do about it.
+              The whole sentence is on the hover. */}
+          {isError && (
+            <span className="conn-err" style={{ color: 'var(--red)' }} title={conn?.error || 'unknown error'}>
+              {conn?.error || 'unknown error'}
+            </span>
+          )}
         </span>
+        {/* The firewall block is standing with nothing connected: the machine
+            has no way out, and without this nothing on screen would say why.
+            Clicking it releases the block — the same thing disconnecting does,
+            reachable when there is nothing to disconnect from. */}
+        {!connected && conn?.blocked && <BlockedChip tt={tt} />}
         {connected && (conn.conn_raw || (conn.chain_raws && conn.chain_raws.length > 0)) && (
           /* Copy the CONNECTED config — handy when its row is gone from the tab
              (source refreshed, filtered out, deleted). Copies every hop for a
@@ -2493,7 +3199,7 @@ export default function App() {
             <button
               className={'mpill' + (selectedMode === 'proxy' ? ' sel-proxy' : '')}
               id="mp-proxy"
-              onClick={() => setSelectedMode('proxy')}
+              onClick={() => pickMode('proxy')}
             >
               proxy
             </button>
@@ -2517,7 +3223,7 @@ export default function App() {
                   if (why === 'not_admin' || why === 'no_helper') acquirePrivilege()
                   return
                 }
-                setSelectedMode('tun')
+                pickMode('tun')
               }}
             >
               tun
@@ -2657,27 +3363,42 @@ export default function App() {
         <FloatingMenu className="ctx-menu" x={menu.x} y={menu.y}>
           {menu.kind === 'row' && (
             <>
+              {/* Ordered by what each item acts on, and inside that by how often
+                  it is wanted: this row, then the measurements of it, then the
+                  destructive ones, then the things that are about the TAB and
+                  merely happen to have been opened over a row. Before this,
+                  "rename" sat between the service check and delete, and adding a
+                  config was three items below deleting one. */}
+              {selCount > 1 && (
+                <>
+                  <div className="ctx-menu-item" onClick={connectChain}>
+                    {tt('Connect as chain')} ({selCount})
+                  </div>
+                  <div className="ctx-sep" />
+                </>
+              )}
               <div className="ctx-menu-item" onClick={copySelected}>
                 {tt('Copy')} {selLabel}
               </div>
-              <div className="ctx-menu-item" onClick={selectAllInView}>
-                {tt('Select all')}
-              </div>
-              {selCount <= 1 && (
-                <div className="ctx-menu-item" onClick={() => showQR(menu.idx)}>
-                  {tt('Show QR')}
-                </div>
-              )}
               {selCount <= 1 && (
                 <div className="ctx-menu-item" onClick={() => openConfigEditView(menu.idx, activeTab === 'main')}>
                   {tt(activeTab === 'main' ? 'View config…' : 'Edit config…')}
                 </div>
               )}
-              {selCount > 1 && (
-                <div className="ctx-menu-item" onClick={connectChain}>
-                  {tt('Connect as chain')} ({selCount})
+              {selCount <= 1 && activeTab !== 'main' && (
+                <div className="ctx-menu-item" onClick={() => startRename(menu.idx)}>
+                  {tt('Rename')}
                 </div>
               )}
+              {selCount <= 1 && (
+                <div className="ctx-menu-item" onClick={() => showQR(menu.idx)}>
+                  {tt('Show QR')}
+                </div>
+              )}
+              <div className="ctx-menu-item" onClick={selectAllInView}>
+                {tt('Select all')}
+              </div>
+
               <div className="ctx-sep" />
               <div className="ctx-menu-item" onClick={() => testSelected(menu.idx, false)}>
                 {tt('Test ping')} — {selLabel}
@@ -2685,30 +3406,53 @@ export default function App() {
               <div className="ctx-menu-item" onClick={() => testSelected(menu.idx, true)}>
                 {tt('Test speed')} — {selLabel}
               </div>
+              <div className="ctx-menu-item" onClick={() => setUnlockOpen(true)}>
+                {tt('Service check…')}
+              </div>
+              {selCount <= 1 && (
+                <div
+                  className="ctx-menu-item"
+                  onClick={() => {
+                    const i = menu.idx
+                    setMenu(null)
+                    setHistoryIdx(i)
+                  }}
+                >
+                  {tt('Measurement history…')}
+                </div>
+              )}
+
               {activeTab !== 'main' && (
                 <>
-                  {selCount <= 1 && (
-                    <div className="ctx-menu-item" onClick={() => startRename(menu.idx)}>
-                      {tt('Rename')}
-                    </div>
-                  )}
+                  <div className="ctx-sep" />
                   <div className="ctx-menu-item danger" onClick={() => deleteSelectedRows(menu.idx)}>
                     {tt('Delete')} {selLabel}
                   </div>
-                  {(stats?.failed ?? 0) > 0 && (
-                    <>
-                      <div className="ctx-sep" />
-                      <div
-                        className="ctx-menu-item danger"
-                        onClick={() => {
-                          ConfigService.DeleteFailed(activeTab)
-                          clearSelection()
-                        }}
-                      >
-                        {tt('Delete failed ping/speed')} ({stats.failed})
-                      </div>
-                    </>
+                  {selCount <= 1 && (
+                    <div
+                      className="ctx-menu-item danger"
+                      onClick={() => {
+                        setMenu(null)
+                        ConfigService.DeleteDuplicatesOf(menu.idx).then((n: number) =>
+                          showToast(n > 0 ? tt('Duplicates removed') + ': ' + n : tt('No duplicates of this one')),
+                        )
+                      }}
+                    >
+                      {tt('Delete duplicates of this one')}
+                    </div>
                   )}
+                  {(stats?.failed ?? 0) > 0 && (
+                    <div
+                      className="ctx-menu-item danger"
+                      onClick={() => {
+                        ConfigService.DeleteFailed(activeTab)
+                        clearSelection()
+                      }}
+                    >
+                      {tt('Delete failed ping/speed')} ({stats.failed})
+                    </div>
+                  )}
+
                   <div className="ctx-sep" />
                   <div className="ctx-menu-item" onClick={openConfigAdd}>
                     {tt('Add config…')}
@@ -2724,14 +3468,18 @@ export default function App() {
                       left to fail with "no QR found" — which reads as "your QR
                       is bad", not "this cannot work here". Scanning from a FILE
                       is unaffected and stays. */}
-                  {appInfo?.caps?.qr_screen !== false && (
+                  {!IS_REMOTE && appInfo?.caps?.qr_screen !== false && (
                     <div className="ctx-menu-item" onClick={scanQRScreen}>
                       {tt('Scan QR from screen')}
                     </div>
                   )}
-                  <div className="ctx-menu-item" onClick={scanQRFile}>
-                    {tt('Scan QR from file')}
-                  </div>
+                  {/* The screen scanned and the file chosen are the computer's,
+                      so from a phone both are gestures with no visible result. */}
+                  {!IS_REMOTE && (
+                    <div className="ctx-menu-item" onClick={scanQRFile}>
+                      {tt('Scan QR from file')}
+                    </div>
+                  )}
                 </>
               )}
             </>
@@ -2749,14 +3497,16 @@ export default function App() {
               <div className="ctx-menu-item" onClick={addWARP}>
                 {warpBusy ? tt('Getting WARP…') : tt('Get a free WARP config')}
               </div>
-              {appInfo?.caps?.qr_screen !== false && (
+              {!IS_REMOTE && appInfo?.caps?.qr_screen !== false && (
                 <div className="ctx-menu-item" onClick={scanQRScreen}>
                   {tt('Scan QR from screen')}
                 </div>
               )}
-              <div className="ctx-menu-item" onClick={scanQRFile}>
-                {tt('Scan QR from file')}
-              </div>
+              {!IS_REMOTE && (
+                <div className="ctx-menu-item" onClick={scanQRFile}>
+                  {tt('Scan QR from file')}
+                </div>
+              )}
             </>
           )}
           {menu.kind === 'tab' &&
@@ -2829,6 +3579,30 @@ export default function App() {
       )}
 
       {/* ── Settings modal (exact 1.10 port, instant apply) ── */}
+      {unlockOpen && (
+        <UnlockModal
+          onClose={() => setUnlockOpen(false)}
+          lang={lang}
+          tabId={activeTab}
+          selected={[...selected]}
+          total={total}
+          sort={sort}
+          filter={filter}
+          proto={protos}
+        />
+      )}
+      {sessionOpen && <SessionModal onClose={() => setSessionOpen(false)} lang={lang} />}
+      {historyIdx >= 0 && (
+        <HistoryModal idx={historyIdx} onClose={() => setHistoryIdx(-1)} lang={lang} />
+      )}
+      {connsOpen && (
+        <ConnectionsModal
+          onClose={() => setConnsOpen(false)}
+          lang={lang}
+          mode={conn?.mode || ''}
+          verbose={!!stg?.rule_stats || !!stg?.verbose_logs}
+        />
+      )}
       {settingsOpen && stg && (
         <SettingsModal
           stg={stg}
@@ -2852,7 +3626,6 @@ export default function App() {
           autoLast={autoLast}
           conn={conn}
           tabs={tabs}
-          selectedMode={selectedMode}
           lang={lang}
           onClose={() => AutoService.CloseAuto()}
         />
@@ -2869,11 +3642,10 @@ export default function App() {
           autoLast={autoLast}
           conn={conn}
           tabs={tabs}
-          selectedMode={selectedMode}
           lang={lang}
           onClose={() => setRemoteAutoOpen(false)}
         />
       )}
-    </>
+    </HintHost>
   )
 }

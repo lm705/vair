@@ -25,7 +25,7 @@ var allowedPaths = []string{"/usr/lib/vair/rulesets", api.DirPath}
 
 // version is reported in the hello response. It is the protocol that decides
 // compatibility; this is for humans reading logs.
-const version = "2.5.0"
+const version = "2.6.0"
 
 func run(cleanupOnly bool) error {
 	if cleanupOnly {
@@ -173,6 +173,7 @@ func (srv *server) serve(nc net.Conn) {
 		if owned {
 			log.Printf("owner disconnected (%s): tearing the tunnel down", peer)
 			srv.tunnel.stop()
+			removeKillSwitch() // the tunnel is gone; a block over nothing is a machine offline
 		}
 		// Staged rule-sets belong to the session that sent them, and this is
 		// where they go — NOT in stop(). Switching servers is stop-then-start on
@@ -253,6 +254,7 @@ func (srv *server) handle(s *session, req *api.Request) {
 			return
 		}
 		srv.tunnel.stop()
+		removeKillSwitch()
 		srv.mu.Lock()
 		if srv.owner == s {
 			srv.owner = nil
@@ -317,6 +319,17 @@ func (srv *server) startTUN(s *session, req *api.Request) error {
 		return fmt.Errorf("config rejected: %w", err)
 	}
 
+	if len(req.ServerIPs) > api.MaxServerIPs {
+		return fmt.Errorf("at most %d server addresses", api.MaxServerIPs)
+	}
+	for _, ip := range req.ServerIPs {
+		if net.ParseIP(ip) == nil {
+			// Straight into an nftables script if it were let through, so it is
+			// checked here rather than escaped there.
+			return fmt.Errorf("%q is not an address", ip)
+		}
+	}
+
 	srv.mu.Lock()
 	other := srv.owner != nil && srv.owner != s
 	srv.mu.Unlock()
@@ -344,7 +357,20 @@ func (srv *server) startTUN(s *session, req *api.Request) error {
 			}
 			srv.mu.Unlock()
 		}); err != nil {
+		removeKillSwitch() // never leave a block over a tunnel that did not start
 		return err
+	}
+
+	// After the engine, not before: the block names the tunnel interface, and
+	// until the engine has created it there is nothing to allow.
+	if req.KillSwitch {
+		if err := installKillSwitch(iface, req.ServerIPs, req.AllowLAN,
+			func(l api.LogLine) { s.write(&api.Response{Log: &l}) }); err != nil {
+			srv.tunnel.stop()
+			return err
+		}
+	} else {
+		removeKillSwitch()
 	}
 
 	srv.mu.Lock()
@@ -379,6 +405,7 @@ func (srv *server) watchLease(s *session, lease time.Duration) {
 			// it first put a blocking write in front of the teardown — which is
 			// how a 3-second lease survived twenty seconds in testing.
 			srv.tunnel.stop()
+			removeKillSwitch()
 			s.write(&api.Response{Log: &api.LogLine{
 				Src: "helper", Lvl: "warn",
 				Text: "lease expired — the app stopped pinging, tunnel closed",

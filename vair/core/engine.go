@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -86,15 +87,24 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 
 	dns := buildDNSBlock(leakProtect, useFakeIP)
 
+	// The interface takes an IPv6 address unless the user asked for v6 to go
+	// around the tunnel. That address is what makes auto_route claim ::/0 — and
+	// therefore what decides whether v6 can leave this machine outside the
+	// tunnel at all. It is also what gives strict_route's filter something to
+	// cover on the v6 side; without it the kill-switch was IPv4-only.
+	tunAddrs := []string{tunAddress4}
+	if ipv6InTunnel() {
+		tunAddrs = append(tunAddrs, ipv6TunAddress)
+	}
 	tun := map[string]interface{}{
 		"type":           "tun",
 		"tag":            "tun-in",
 		"interface_name": ifaceName,
-		"address":        []string{"172.19.0.1/30"},
+		"address":        tunAddrs,
 		"mtu":            currentMTU(),
 		"auto_route":     true,
 		"strict_route":   killSwitch, // WFP-filter on Windows when true (kill-switch)
-		"stack":          "gvisor",
+		"stack":          tunStack(),
 	}
 
 	proxyOut := map[string]interface{}{
@@ -107,8 +117,9 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 	}
 
 	// Routing rules are shared with the pure-sing-box path; build them via
-	// the common helper. true = include the xray-process carve-out (this is
-	// the hybrid path, an xray child is dialling the real server).
+	// the common helper. They carry the carve-out for Vair's own engines — the
+	// xray child dialling the real server here, and whichever engine a running
+	// test has started for the configuration it is measuring.
 	rules := singboxRoutingRules(true)
 
 	// Exclude the real VPN server IP from the tunnel. In hybrid mode sing-box
@@ -117,9 +128,11 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 	// child's own connection to the server can be re-captured by the TUN and
 	// looped back through the proxy. That loop manifests as an endless storm
 	// of "creating connection to <server>" lines and 100% CPU even while idle.
-	// The process_name carve-out above is meant to prevent it, but Windows
-	// find_process is unreliable; pinning the server IP to direct is the
-	// bulletproof backstop. Prepended so it wins over `final: proxy`.
+	// The engine carve-out above is meant to prevent it, but process matching
+	// on Windows is unreliable — with the gvisor stack the engine asks who owns
+	// a connection before the connection exists, which is an upstream bug we
+	// cannot fix from here. Pinning the server IP to direct is the backstop that
+	// always holds. Prepended so it wins over `final: proxy`.
 	if ip := net.ParseIP(serverIP); ip != nil {
 		bits := "/32"
 		if ip.To4() == nil {
@@ -135,9 +148,9 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 	// mode a browser's HTTP/3 (QUIC) requests die and the site fails to load —
 	// even though it works in proxy mode (where the browser only speaks TCP to
 	// the HTTP proxy). Rejecting UDP/443 makes the browser fall back to TCP /
-	// HTTP-2, which the tunnel handles fine. This is what v2rayN does by
-	// default. Appended after the bypass rules so direct-routed QUIC (e.g. RU
-	// sites) is unaffected; only proxy-bound QUIC is rejected.
+	// HTTP-2, which the tunnel handles fine. Appended after the bypass rules so
+	// direct-routed QUIC (e.g. RU sites) is unaffected; only proxy-bound QUIC is
+	// rejected.
 	if blockQUIC {
 		rules = append(rules, map[string]interface{}{
 			"network": "udp", "port": 443, "action": "reject",
@@ -156,14 +169,33 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 	}
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
-		"default_domain_resolver": defaultResolver,
-		"find_process":            true,
-		"rules":                   rules,
+		"default_domain_resolver": domainResolverBlock(defaultResolver),
+		// No find_process: it is not what makes the carve-out below work. A rule
+		// that names a process asks for the lookup itself; this option asks for
+		// it on every connection whether a rule needs the answer or not, and its
+		// only other use is putting a program name in the log. Upstream leaves
+		// it off for the same reason.
+		//
+		// How much this actually saves, measured on a live tunnel rather than
+		// assumed: 186 process lookups in 20 seconds with it off. The carve-out
+		// rule asks for nearly all of them by itself. What is saved is the
+		// traffic that never reaches that rule — hijacked DNS, and the packets
+		// refused at the tunnel's own addresses — so this is a smaller win than
+		// it looks, and worth having only because it costs nothing.
+		"rules": rules,
 	}
 	applySingboxRouteMode(route)
+	reconcileDNSRuleSets(route, dns)
 
 	cfg := map[string]interface{}{
-		"log":      map[string]interface{}{"level": "warn", "timestamp": true},
+		// The level follows the settings, like every other generated sing-box
+		// config. It was pinned to "warn" here, which is the level at which the
+		// engine says nothing about individual connections — so in the hybrid
+		// path (VLESS/VMess/Trojan/Shadowsocks, i.e. most configs) the
+		// connections panel had nothing to read and the rule counters nothing to
+		// count, however the two settings that are supposed to turn them on were
+		// set.
+		"log":      map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
 		"dns":      dns,
 		"inbounds": append([]interface{}{tun}, lanProxyInbounds()...),
 		"outbounds": []interface{}{
@@ -225,13 +257,14 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 		return buildDNSBlockOnlyBlocked()
 	}
 	if !leakProtect {
-		return map[string]interface{}{
+		m := map[string]interface{}{
 			"servers": []interface{}{
 				map[string]interface{}{"tag": "dns-local", "type": "local"},
 			},
-			"final":             "dns-local",
-			"independent_cache": true,
+			"final": "dns-local",
 		}
+		withIndependentCache(m)
+		return m
 	}
 
 	servers := []interface{}{
@@ -255,14 +288,17 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 	}
 
 	if useFakeIP {
-		servers = append(servers, map[string]interface{}{
+		fake := map[string]interface{}{
 			"tag":         "dns-fakeip",
 			"type":        "fakeip",
 			"inet4_range": "198.18.0.0/15",
-			// IPv6 fake range left out for now — adding it requires
-			// also routing the range through TUN. v6 isn't always
-			// available anyway; v4 is sufficient for the common case.
-		})
+		}
+		// A v6 pool only when the tunnel carries v6: a fake address nothing
+		// routes is an address nothing can connect to.
+		if ipv6Mode() == ipv6Tunnel {
+			fake["inet6_range"] = ipv6FakeRange
+		}
+		servers = append(servers, fake)
 	}
 
 	rules := []interface{}{}
@@ -322,19 +358,55 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 	// 3. FakeIP for the common case: A/AAAA queries for tunnelled
 	// hostnames. Must be a rule, not final — sing-box rejects fakeip
 	// in the final slot.
+	//
+	// Ahead of it, the names a fake answer breaks. A fake address is a promise
+	// that the tunnel will carry whatever is sent there, and for these the
+	// tunnel is the wrong place or no place at all: the connectivity probes
+	// Windows uses to decide whether it is behind a captive portal, the clock
+	// (time.*, ntp) which cannot be set through an address that does not
+	// resolve until something connects to it, the LAN suffixes, and wpad —
+	// where a fake answer sends the machine to fetch its proxy configuration
+	// from an address in the fake range. Such a list is standard practice and
+	// ours had none, so switching FakeIP on quietly broke all of it.
+	//
+	// Not the probe URL AUTO uses (www.gstatic.com): that one is supposed to
+	// go through the tunnel — measuring it anywhere else measures nothing.
+	//
+	// The honest limit: dns-direct is a public resolver, so this stops the
+	// poisoning but does not make "printer.lan" resolvable. That would need a
+	// local-type server, which this branch does not have.
 	if useFakeIP {
-		rules = append(rules, map[string]interface{}{
-			"query_type": []string{"A", "AAAA"},
-			"server":     "dns-fakeip",
-		})
+		rules = append(rules,
+			map[string]interface{}{
+				"domain_suffix": fakeIPExcluded,
+				"server":        "dns-direct",
+			},
+			map[string]interface{}{
+				"query_type": []string{"A", "AAAA"},
+				"server":     "dns-fakeip",
+			},
+		)
 	}
 
-	return map[string]interface{}{
-		"servers":           servers,
-		"rules":             rules,
-		"final":             "dns-remote",
-		"independent_cache": true,
-		"strategy":          "ipv4_only", // avoid AAAA round-trips
+	m := map[string]interface{}{
+		"servers": servers,
+		"rules":   rules,
+		"final":   "dns-remote",
+		// ipv4_only unless v6 goes through the tunnel, in which case AAAA is
+		// allowed but A is still preferred: most of the web is reachable both
+		// ways and the v4 path is the one we know works.
+		"strategy": dnsAddressStrategy(),
+	}
+	withIndependentCache(m)
+	return m
+}
+
+// withIndependentCache adds the per-server DNS cache key to a DNS block, on the
+// engines that need to be told. See dnsIndependentCache for which those are and
+// why it is not simply always written.
+func withIndependentCache(m map[string]interface{}) {
+	if dnsIndependentCache() {
+		m["independent_cache"] = true
 	}
 }
 
@@ -371,13 +443,86 @@ func buildDNSBlockOnlyBlocked() map[string]interface{} {
 	}
 	// Blocked-in-RU domains → resolve through the tunnel (clean IP).
 	rules = append(rules, map[string]interface{}{"rule_set": "geosite-ru-blocked", "server": "dns-remote"})
-	return map[string]interface{}{
-		"servers":           servers,
-		"rules":             rules,
-		"final":             "dns-direct",
-		"independent_cache": true,
-		"strategy":          "ipv4_only",
+	m := map[string]interface{}{
+		"servers":  servers,
+		"rules":    rules,
+		"final":    "dns-direct",
+		"strategy": dnsAddressStrategy(),
 	}
+	withIndependentCache(m)
+	return m
+}
+
+// reconcileDNSRuleSets makes sure every rule-set a DNS rule names is one the
+// route actually attaches.
+//
+// The two halves are decided by different things, and nothing was keeping them
+// in step: a DNS rule follows a SETTING ("Russian sites directly"), while the
+// attached sets follow the ROUTING MODE. Turn the setting on in a mode that
+// attaches none of them — "everything through the VPN", "only selected sites" —
+// and the engine refuses to start at all:
+//
+//	FATAL start service: initialize DNS rule[0]: rule-set not found: geosite-ru
+//
+// A set the machine has a file for is attached here; one it does not takes its
+// DNS rule down with it, because a dangling path is the same FATAL by another
+// route.
+func reconcileDNSRuleSets(route, dns map[string]interface{}) {
+	rules, _ := dns["rules"].([]interface{})
+	if len(rules) == 0 {
+		return
+	}
+	sets, _ := route["rule_set"].([]interface{})
+	attached := make(map[string]bool, len(sets))
+	for _, raw := range sets {
+		if m, ok := raw.(map[string]interface{}); ok {
+			if tag, _ := m["tag"].(string); tag != "" {
+				attached[tag] = true
+			}
+		}
+	}
+	kept := make([]interface{}, 0, len(rules))
+	for _, raw := range rules {
+		m, ok := raw.(map[string]interface{})
+		if !ok {
+			kept = append(kept, raw)
+			continue
+		}
+		tag, _ := m["rule_set"].(string)
+		if tag == "" || attached[tag] {
+			kept = append(kept, raw)
+			continue
+		}
+		path := ruRuleSetLocalPath(tag + ".srs")
+		if !fileExists(path) {
+			vlog("warning", "dns: rule set %s is not on this machine — its DNS rule is left out", tag)
+			continue
+		}
+		sets = append(sets, map[string]interface{}{
+			"type": "local", "tag": tag, "format": "binary", "path": path,
+		})
+		attached[tag] = true
+		kept = append(kept, raw)
+	}
+	dns["rules"] = kept
+	if len(sets) > 0 {
+		route["rule_set"] = sets
+	}
+}
+
+// fakeIPExcluded are the domain suffixes that must resolve to a real address
+// even when FakeIP is on. See the rule that uses it in buildDNSBlock.
+var fakeIPExcluded = []string{
+	// Local names: nothing in the tunnel answers to them.
+	"lan", "local", "arpa", "home", "internal",
+	// Proxy auto-discovery: a fake answer sends Windows to fetch a PAC file
+	// from the fake range.
+	"wpad",
+	// Windows' own captive-portal and connectivity probes.
+	"msftconnecttest.com", "msftncsi.com",
+	// The clock. NTP over a fake address is a clock that never sets.
+	"ntp.org", "time.windows.com", "time.apple.com",
+	"time.nist.gov", "time.cloudflare.com", "time.google.com",
 }
 
 // bootstrapDNSIP returns just the IP component of the bootstrap DNS
@@ -522,7 +667,9 @@ func makeSharedTransport(httpPort int, user, pass string) *http.Transport {
 // connectivitycheck host routes/throttles unpredictably (observed 300–800ms),
 // while www.gstatic.com over TLS tracks the real path latency (~100–200ms) and
 // reuses the kept-alive connection so the handshake cost is paid only once.
-const autoProbeURL = "https://www.gstatic.com/generate_204"
+// A var, not a const, only so a test can point it at a local server: nothing in
+// the program writes it.
+var autoProbeURL = "https://www.gstatic.com/generate_204"
 
 // probeLiveTunnel makes one small request through the *live* connection to
 // decide whether the current config still works. Unlike handlePingConnected
@@ -655,4 +802,60 @@ func writeTempJSON(data interface{}, prefix string) (string, error) {
 	}
 	tmp.Close()
 	return tmp.Name(), nil
+}
+
+// domainResolverBlock is what sing-box uses when it has to resolve a name for
+// its own purposes — the outbound's server address above all.
+//
+// An object rather than a bare tag so it can carry a strategy of its own: the
+// DNS block asks for A records only when v6 is blocked, and applying that here
+// too would make a VPN server whose hostname has only an AAAA record
+// unresolvable — the tunnel could not be built at all, on a setting that is
+// about what goes THROUGH the tunnel. Whatever the user chose for their
+// traffic, the server's own address is resolved either way, v4 first.
+func domainResolverBlock(tag string) map[string]interface{} {
+	return map[string]interface{}{"server": tag, "strategy": "prefer_ipv4"}
+}
+
+// ipv6ProbeURL answers only over IPv6 — it has no A record at all, so a request
+// to it either goes out over v6 or fails to resolve. Cloudflare's, because it
+// is the one such endpoint that is reliably up and returns nothing.
+const ipv6ProbeURL = "https://ipv6.icanhazip.com"
+
+// probeIPv6 asks whether IPv6 actually reaches the outside from here. Dialled
+// with "tcp6" so it cannot quietly succeed over IPv4 and report the wrong
+// answer. Used for a message, never to end a session.
+func probeIPv6(cm *connManager) bool {
+	cs := cm.snap()
+	if cs.Status != ConnConnected {
+		return false
+	}
+	d := &net.Dialer{Timeout: dialTimeout}
+	tr := &http.Transport{
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp6", addr)
+		},
+		TLSHandshakeTimeout: warmupTimeout,
+	}
+	if cs.Mode == ModeProxy && cs.HTTPPort > 0 {
+		// Through our own proxy: the engine decides the family at the exit, so
+		// the dialler above would be answering about the wrong hop.
+		hu, hp := proxyHttpCreds()
+		tr = makeSharedTransport(cs.HTTPPort, hu, hp)
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 6 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, err := http.NewRequest("GET", ipv6ProbeURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 512)) //nolint:errcheck
+	resp.Body.Close()
+	return resp.StatusCode < 500
 }

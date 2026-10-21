@@ -11,3 +11,9 @@ package core
 // after the GUI died — and that is killTree's job (see process_linux.go), not
 // this function's.
 func removeTUNAdapter() {}
+
+// sweepGhostTunnelAtStart is likewise nothing to do here. The tun device is
+// owned by the process that opened it and the kernel takes it back, with its
+// routes, the moment that process ends — there is no equivalent of a registered
+// adapter outliving its engine.
+func sweepGhostTunnelAtStart() {}

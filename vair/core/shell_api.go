@@ -58,7 +58,7 @@ func PingConnected() {
 		entry.mu.Lock()
 		entry.PingStatus = StatusTestingPing
 		entry.mu.Unlock()
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -86,6 +86,6 @@ func PingConnected() {
 			// whatever row occupies that index now.
 			mirrorPingResult(tabID, entry)
 		}
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 	}()
 }

@@ -27,7 +27,17 @@ func (c *ConnService) Disconnect() {
 	core.Disconnect()
 }
 
+// ReleaseBlock is the red "traffic blocked" button: it opens the firewall even
+// when there is no connection to disconnect from and no marker left to work
+// from — the case where the ordinary release quietly did nothing.
+func (c *ConnService) ReleaseBlock() { core.ForceReleaseBlock() }
+
 // State returns the current connection state.
+// SessionInfo is what the running session was actually built with — the panel
+// behind the mark on the connection bar. Answers from the settings when nothing
+// is running, which is the same question asked in advance.
+func (c *ConnService) SessionInfo() core.SessionInfoDTO { return core.SessionInfo() }
+
 func (c *ConnService) State() core.ConnState {
 	return core.ConnSnapshot()
 }

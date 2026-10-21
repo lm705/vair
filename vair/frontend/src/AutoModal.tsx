@@ -5,16 +5,42 @@
 // Detach hides the main window, Back-to-app restores it (swap driven by
 // mainVisible), the titlebar ✕ closes just this window.
 import { useEffect, useRef, useState } from 'react'
+import Check from './Check'
 import { Events } from '@wailsio/runtime'
 import { AutoService, LogService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import { Hint, opt } from './hints'
+import type { HintOpt } from './hints'
 import { IS_REMOTE } from './remote'
 import Select from './Select'
+import HistoryModal from './HistoryModal'
+import { checkExit, exitChecking } from './exitcheck'
+import type { ExitView } from './exitcheck'
 
 function fmtLogTime(ms: number): string {
   const d = new Date(ms)
   const p = (n: number) => (n < 10 ? '0' + n : '' + n)
   return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds())
+}
+
+// A session's start: the day only when it was not today, because most of the
+// log is today and repeating the date on every line hides the time.
+function fmtSessTime(unixSec: number): string {
+  const d = new Date(unixSec * 1000)
+  const p = (n: number) => (n < 10 ? '0' + n : '' + n)
+  const hm = p(d.getHours()) + ':' + p(d.getMinutes())
+  const now = new Date()
+  const sameDay =
+    d.getDate() === now.getDate() && d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear()
+  return sameDay ? hm : p(d.getDate()) + '.' + p(d.getMonth() + 1) + ' ' + hm
+}
+
+// How long it held, in the largest unit that still says something.
+function fmtDur(sec: number): string {
+  if (sec < 60) return sec + 's'
+  if (sec < 3600) return Math.floor(sec / 60) + 'm ' + (sec % 60) + 's'
+  const h = Math.floor(sec / 3600)
+  return h + 'h ' + Math.floor((sec % 3600) / 60) + 'm'
 }
 
 function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
@@ -27,6 +53,8 @@ function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void 
   )
 }
 
+
+
 export default function AutoModal({
   stg,
   apply,
@@ -35,7 +63,6 @@ export default function AutoModal({
   autoLast,
   conn,
   tabs,
-  selectedMode,
   lang,
   onClose,
 }: {
@@ -46,22 +73,46 @@ export default function AutoModal({
   autoLast: any
   conn: any
   tabs: any[]
-  selectedMode: string
   lang: string
   onClose: () => void
 }) {
   const tt = (en: string) => t10(lang, en)
+  // The description under a setting: the paragraph while descriptions are
+  // on, the mark that opens the same text while they are off.
+  const hint = (en: string, opts?: HintOpt[]) => <Hint en={en} opts={opts} />
   const [cands, setCands] = useState<any[]>([])
+  // The last check IP, for the connection it was made on: a new server or a
+  // disconnect makes it stale, so it goes.
+  const connected = conn?.status === 'connected'
+  const [exit, setExit] = useState<ExitView | null>(null)
+  useEffect(() => setExit(null), [conn?.status, conn?.conn_raw])
+  const doCheckExit = () => {
+    if (!connected || exit?.cls === 'testing') return
+    setExit(exitChecking(tt))
+    checkExit(tt).then(setExit)
+  }
+  // The candidate whose measurement history is open. Held here rather than in
+  // the app: this panel also runs in its own window, where the app's dialogs
+  // are not on screen at all.
+  const [histRaw, setHistRaw] = useState('')
   // Collapse state persists across open/close and detach (localStorage) — the
   // 1.10 defaults (settings expanded, logs collapsed) apply only the first time.
   const [settingsOpen, setSettingsOpen] = useState(() => localStorage.getItem('auto.settingsOpen') !== '0')
   const [logsOpen, setLogsOpen] = useState(() => localStorage.getItem('auto.logsOpen') === '1')
+  const [sessOpen, setSessOpen] = useState(() => localStorage.getItem('auto.sessOpen') === '1')
+  const [sessions, setSessions] = useState<any[]>([])
   useEffect(() => {
     localStorage.setItem('auto.settingsOpen', settingsOpen ? '1' : '0')
   }, [settingsOpen])
   useEffect(() => {
     localStorage.setItem('auto.logsOpen', logsOpen ? '1' : '0')
   }, [logsOpen])
+  // The connection log: read when the section is opened, and again whenever a
+  // connection ends — that is the moment a row appears.
+  useEffect(() => {
+    localStorage.setItem('auto.sessOpen', sessOpen ? '1' : '0')
+    if (sessOpen) AutoService.Sessions().then((r: any) => setSessions(r ?? []))
+  }, [sessOpen, conn?.status, conn?.conn_raw])
   const [logLines, setLogLines] = useState<any[]>([])
   const [impLines, setImpLines] = useState<any[]>([])
   const [logSrc, setLogSrc] = useState('vair') // 1.10 default for the AUTO panel
@@ -216,7 +267,12 @@ export default function AutoModal({
     apply({ auto_tabs: cur })
   }
 
-  const bySpeed = !!stg?.auto_rank_by_speed
+  // The candidate list shows the figure the ranking is USING, so either speed
+  // mode shows speed and either delay mode shows delay.
+  // Derived exactly as core.autoRankMode does, so a settings file written by an
+  // older build shows the mode that is actually in force rather than a default.
+  const rankMode: string =
+    stg?.auto_rank_mode || (stg?.auto_rank_by_speed ? 'speed' : stg?.auto_rank_stable ? 'history' : 'delay')
   const num = (v: string, min: number, def: number) => {
     const n = parseInt(v, 10)
     return isNaN(n) || n < min ? def : n
@@ -256,9 +312,7 @@ export default function AutoModal({
             <span className="modal-row-label">{tt('Enable auto-connect')}</span>
             <Toggle on={auto} onChange={setAutoEnabled} />
           </div>
-          <div className="modal-hint">
-            {tt('Connects to the fastest working config on launch and keeps it connected. While connected, the live link is monitored and, if it stops passing traffic, the app switches to another working config automatically.')}
-          </div>
+          {hint('Connects to the fastest working config on launch and keeps it connected. While connected, the live link is monitored and, if it stops passing traffic, the app switches to another working config automatically.')}
         </div>
 
         {/* STATUS — live state + ranked candidates */}
@@ -279,22 +333,59 @@ export default function AutoModal({
                 const ms = c.status === 'ok' && c.delay > 0 ? c.delay + ' ms' : ''
                 let metric: string
                 if (c.status === 'failed') metric = tt('failed')
-                else if (bySpeed && c.speed_mbps > 0)
+                else if (rankMode.startsWith('speed') && c.speed_mbps > 0)
                   metric = c.speed_mbps.toFixed(1) + ' MB/s' + (ms ? ' · ' + ms : '')
                 else if (ms) metric = ms
                 else metric = tt('untested')
+                // A config AUTO is still skipping after a failure, and how long
+                // for: without it the top of this list could be one the
+                // supervisor would not touch for another twenty minutes.
+                const paused = (c as any).cooldown_sec > 0 ? fmtDur((c as any).cooldown_sec) : ''
                 return (
                   <div
                     key={c.raw || i}
-                    className={'auto-cand' + (c.current ? ' current' : '')}
-                    title={tt('Click to connect to this config')}
-                    onClick={() => AutoService.ConnectCand(c.raw, selectedMode)}
+                    className={
+                      'auto-cand' + (c.current ? ' current' : '') + (paused ? ' cooling' : '')
+                    }
+                    title={
+                      paused
+                        ? tt('Skipped after a failure — auto-connect will try it again in') + ' ' + paused
+                        : tt('Click to connect to this config')
+                    }
+                    onClick={() => AutoService.ConnectCand(c.raw, '')}
                   >
                     <span className="ac-rank">{i + 1}</span>
                     <span className="ac-name">
                       {c.name}
                       {c.current ? ' •' : ''}
                     </span>
+                    {/* Why this row sits where it does, when it was the history
+                        that decided: a 100 ms server above an 80 ms one reads as
+                        a bug until something says the 80 keeps failing — and one
+                        click opens the record it was decided on. The flag alone
+                        is clickable; anywhere else on the row still connects, so
+                        the stop below is what keeps the two apart. */}
+                    {(c as any).stable ? (
+                      <span
+                        className="ac-flag click"
+                        role="button"
+                        tabIndex={0}
+                        title={tt('Ranked on its measurement history — click to see it')}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setHistRaw(c.raw)
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key !== 'Enter' && e.key !== ' ') return
+                          e.stopPropagation()
+                          e.preventDefault()
+                          setHistRaw(c.raw)
+                        }}
+                      >
+                        {tt('history')}
+                      </span>
+                    ) : null}
+                    {paused ? <span className="ac-flag cooling">{tt('paused') + ' ' + paused}</span> : null}
                     <span className="ac-metric">{metric}</span>
                   </div>
                 )
@@ -311,6 +402,25 @@ export default function AutoModal({
           >
             {tt('Reload')}
           </button>
+          {/* The connection bar's check IP, here as well: after a switch this
+              is where you are, and the panel may be the only window open. */}
+          <button
+            className="btn ghost auto-switch-now"
+            disabled={!connected || exit?.cls === 'testing'}
+            title={
+              connected
+                ? tt('Check the public exit IP and country as seen from the other end of the tunnel')
+                : tt('Connect first: the address is checked through the connection.')
+            }
+            onClick={doCheckExit}
+          >
+            {tt('Check IP')}
+          </button>
+          {exit && (
+            <div className={'auto-exit ' + exit.cls} title={exit.title} onClick={doCheckExit}>
+              {exit.label}
+            </div>
+          )}
         </div>
 
         {/* Collapsible SETTINGS (expanded by default) */}
@@ -338,9 +448,7 @@ export default function AutoModal({
                 </button>
               ))}
             </div>
-            <div className="modal-hint">
-              {tt("Which tabs' configs auto-connect may choose from. Defaults to Sources. Each tab's exclude filter is respected (hidden configs are never chosen), and each tab's own auto-refresh interval keeps its candidates up to date.")}
-            </div>
+            {hint("Which tabs' configs auto-connect may choose from. Defaults to Sources. Each tab's exclude filter is respected (hidden configs are never chosen), and each tab's own auto-refresh interval keeps its candidates up to date.")}
             <div className="modal-row">
               <span className="modal-row-label">{tt('Re-test candidates after refresh')}</span>
               <Toggle
@@ -348,27 +456,54 @@ export default function AutoModal({
                 onChange={(v) => apply({ auto_ping_refresh: v })}
               />
             </div>
-            <div className="modal-hint">
-              {tt('After a candidate tab refreshes its config list, re-run ping on its configs so failover can rank them by real delay. Adds some test traffic on each refresh.')}
-            </div>
+            {hint('After a candidate tab refreshes its config list, re-test its configs so failover has something real to rank them by — ping, and the speed test as well when the ranking uses speed. Adds test traffic on each refresh, and more of it in a speed mode.')}
+            {/* One question — what to rank candidates by — instead of two
+                switches that were never independent: speed decided and history
+                only broke ties, so four states meant three things and one of
+                them could not be reached at all. */}
             <div className="modal-row">
-              <span className="modal-row-label">
-                {tt('Prefer faster (by speed test)')} <span className="rec-badge">{tt('recommended')}</span>
-              </span>
-              <Toggle on={!!stg?.auto_rank_by_speed} onChange={(v) => apply({ auto_rank_by_speed: v })} />
+              <span className="modal-row-label">{tt('Rank candidates by')}</span>
+              <Select
+                className="modal-input"
+                style={{ marginBottom: 0, width: 'auto' }}
+                value={rankMode}
+                onChange={(e) => apply({ auto_rank_mode: e.target.value })}
+              >
+                <option value="delay">{tt('Delay (last ping)')}</option>
+                <option value="speed">{tt('Speed (last test)')}</option>
+                <option value="history">{tt('Delay, steady (history)')}</option>
+                <option value="speed_history">{tt('Speed, steady (history)')}</option>
+              </Select>
             </div>
-            <div className="modal-hint">
-              {tt('Rank candidates by measured download speed (Mbps) instead of ping delay. Configs without a speed result fall back to ping order.')}
-            </div>
-            <div className="modal-row">
-              <span className="modal-row-label">{tt('Prefer steadier (by measurement history)')}</span>
-              <Toggle on={!!stg?.auto_rank_stable} onChange={(v) => apply({ auto_rank_stable: v })} />
-            </div>
-            <div className="modal-hint">
-              {tt(
-                'Rank on what a server has done over several measurements — its typical delay, charged for how much that delay varies and for probes it failed — instead of on the last measurement alone. A config that answers in 80 ms two tries out of three then ranks below one that answers in 100 ms every time, which is what you want for a call or a page load and not what you want for a leaderboard. Needs a few measurements per config before it changes anything; off by default because it changes which server AUTO picks.',
-              )}
-            </div>
+            {/* One line per mode, said where the choice is made rather than in
+                four paragraphs nobody finishes — and all four in the mark, where
+                they have been asked for. Written out rather than looked up in a
+                map: the translation checker reads literals, and a hint it cannot
+                see is a hint that ships in English. */}
+            <Hint
+              en="What auto-connect compares when it ranks the candidates, and what it re-compares before leaving the server you are on. The two steady modes weigh several measurements instead of the last one."
+              opts={[
+                opt('Delay (last ping)', 'The last measured ping. Cheap and quick to react, and as noisy as one measurement taken under load.'),
+                opt('Speed (last test)', 'The last measured download speed. Configs with no speed result fall back to ping order.'),
+                opt('Delay, steady (history)', 'Typical delay over several measurements, charged for how much it varies and for probes that failed. A server answering in 80 ms two tries out of three ranks below one answering in 100 ms every time — right for a call or a page load, wrong for a leaderboard. Needs a few measurements per config.'),
+                opt('Speed, steady (history)', 'The speed a server can be relied on: its typical speed less how much that varies, so steady beats bursty at the same average. A failed speed test is not counted against the server — that is usually the test endpoint refusing. Needs a few speed tests per config, and forgets them after six hours, because a speed measured this morning describes this morning.'),
+              ]}
+            >
+              {(tt) =>
+                rankMode === 'speed'
+                  ? tt('The last measured download speed. Configs with no speed result fall back to ping order.')
+                  : rankMode === 'history'
+                    ? tt(
+                        'Typical delay over several measurements, charged for how much it varies and for probes that failed. A server answering in 80 ms two tries out of three ranks below one answering in 100 ms every time — right for a call or a page load, wrong for a leaderboard. Needs a few measurements per config.',
+                      )
+                    : rankMode === 'speed_history'
+                      ? tt(
+                          'The speed a server can be relied on: its typical speed less how much that varies, so steady beats bursty at the same average. A failed speed test is not counted against the server — that is usually the test endpoint refusing. Needs a few speed tests per config, and forgets them after six hours, because a speed measured this morning describes this morning.',
+                        )
+                      : tt('The last measured ping. Cheap and quick to react, and as noisy as one measurement taken under load.')
+              }
+            </Hint>
+
             {/* The same two settings as Settings → Testing, deliberately: this is
                 where the user is when they watch auto-connect test a pool, and
                 sending them to another dialog to change how wide it tests is a
@@ -386,6 +521,14 @@ export default function AutoModal({
                 onBlur={(e) => apply({ ping_concurrency: num(e.target.value, 1, 10) })}
               />
             </div>
+            <Hint>
+              {(tt) => (
+                <>
+                  {tt('How many candidates are pinged at once. Default 10. Higher gets through a large pool sooner and makes each number noisier, since the tests share one channel.')}{' '}
+                  <b>{tt('The same setting as Settings → Testing: changing it here changes it there, and it applies to manual PING ALL runs too.')}</b>
+                </>
+              )}
+            </Hint>
             <div className="modal-row">
               <span className="modal-row-label">{tt('Speed concurrency')}</span>
               <input
@@ -397,10 +540,14 @@ export default function AutoModal({
                 onBlur={(e) => apply({ speed_concurrency: num(e.target.value, 1, 5) })}
               />
             </div>
-            <div className="modal-hint">
-              {tt('How many candidates auto-connect tests at once — ping when ranking by delay, speed when ranking by speed. Defaults: ping 10, speed 5.')}{' '}
-              <b>{tt('These are the same settings as Settings → Testing: changing them here changes them there, and they apply to manual PING ALL / SPEED ALL runs too.')}</b>
-            </div>
+            <Hint>
+              {(tt) => (
+                <>
+                  {tt('How many candidates are speed-tested at once — only used by the ranking modes that measure speed. Default 5. This one divides your bandwidth rather than sharing a channel: several at once each measure a fraction of what they would reach alone.')}{' '}
+                  <b>{tt('The same setting as Settings → Testing: changing it here changes it there, and it applies to manual SPEED ALL runs too.')}</b>
+                </>
+              )}
+            </Hint>
           </div>
           <div className="settings-section">
             <div className="modal-row" style={{ display: 'block', marginBottom: 12 }}>
@@ -413,11 +560,12 @@ export default function AutoModal({
                 value={stg?.auto_mode || ''}
                 onChange={(e) => apply({ auto_mode: e.target.value })}
               >
-                <option value="">{tt('Remember last')}</option>
+                <option value="">{tt('Follow the main window')}</option>
                 <option value="proxy">Proxy</option>
                 <option value="tun">TUN</option>
               </Select>
             </div>
+            {hint('Which mode auto-connect brings a server up in, including when it switches on its own. "Follow the main window" uses the proxy/tun choice showing there, so an auto switch never comes up in a mode you did not pick.')}
             <div className="modal-row">
               <span className="modal-row-label">{tt('Health-check interval (s)')}</span>
               <input
@@ -429,6 +577,7 @@ export default function AutoModal({
                 onBlur={(e) => apply({ auto_health_sec: num(e.target.value, 5, 15) })}
               />
             </div>
+            {hint('How long the live connection may go unasked, while auto-connect is on. A limit rather than a schedule: while your own traffic is crossing the tunnel and coming back it has already answered the question, and no probe is sent. The probe is for a quiet connection — and for one that has been sending with nothing coming back, which is asked about at once whatever this says. Default 15 s.')}
             <div className="modal-row">
               <span className="modal-row-label">{tt('Failure threshold')}</span>
               <input
@@ -440,9 +589,7 @@ export default function AutoModal({
                 onBlur={(e) => apply({ auto_fail_threshold: num(e.target.value, 1, 2) })}
               />
             </div>
-            <div className="modal-hint">
-              {tt('How often the live connection is probed, and how many checks in a row must fail before switching. Defaults: 15 s, 2.')}
-            </div>
+            {hint('How many probes in a row have to fail before auto-connect gives up on the server and moves to the next one. Default 2 — one failure is often just a lost packet, and switching on it would move you off a working server.')}
             <div className="modal-row">
               <span className="modal-row-label">{tt('Max latency (ms, 0 = off)')}</span>
               <input
@@ -454,9 +601,89 @@ export default function AutoModal({
                 onBlur={(e) => apply({ auto_max_latency_ms: num(e.target.value, 0, 0) })}
               />
             </div>
-            <div className="modal-hint">
-              {tt('Treat the current config as failing when the live probe is slower than this, then switch to the fastest available config. 0 disables the speed check.')}
+            {hint('Treat the current config as failing when the live probe is slower than this, then switch to the fastest available config. 0 disables the speed check.')}
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('Switch tolerance (ms)')}</span>
+              <input
+                className="modal-input num-input"
+                type="number"
+                min={0}
+                max={5000}
+                defaultValue={stg?.auto_switch_tolerance_ms || 20}
+                onBlur={(e) => apply({ auto_switch_tolerance_ms: num(e.target.value, 0, 20) })}
+              />
             </div>
+            {hint('How much lower a candidate has to be before AUTO leaves a working server. Used by the two ping modes: in "by ping" that is the live round-trip against the candidate\'s ping, in "by ping, steady" it is history against history. Below this margin the two are the same server as far as you are concerned, and switching only costs you the connection you had.')}
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('Switch tolerance (speed, %)')}</span>
+              <input
+                className="modal-input num-input"
+                type="number"
+                min={0}
+                max={500}
+                defaultValue={stg?.auto_switch_speed_pct || 15}
+                onBlur={(e) => apply({ auto_switch_speed_pct: num(e.target.value, 0, 15) })}
+              />
+            </div>
+            {hint('The same margin for the two speed modes: how much faster a candidate has to be, in per cent. In "by speed" that compares the last two measurements, in "by speed, steady" the two history scores — the average less its spread. The millisecond margin above is not used in these modes.')}
+            <div className="modal-row">
+              <span className="modal-row-label">{tt('Minimum time on a server (s)')}</span>
+              <input
+                className="modal-input num-input"
+                type="number"
+                min={0}
+                max={3600}
+                defaultValue={stg?.auto_min_dwell_sec || 60}
+                onBlur={(e) => apply({ auto_min_dwell_sec: num(e.target.value, 0, 60) })}
+              />
+            </div>
+            {hint('How long AUTO must stay on a server before it may leave for a faster one. Both margins and this delay hold back the slow-but-alive case only — a server that stops answering is left as soon as the failure threshold is reached.')}
+
+          </div>
+        </div>
+
+        {/* Collapsible CONNECTION LOG — what was connected, for how long, and
+            what ended it. Collapsed by default; it answers a question that is
+            only asked afterwards. */}
+        <div
+          className={'auto-collapse-head' + (sessOpen ? '' : ' collapsed')}
+          title={tt('Show / hide the connection log')}
+          onClick={() => setSessOpen((v) => !v)}
+        >
+          <span className="auto-collapse-arrow">▾</span>
+          <span>{tt('Connection log')}</span>
+        </div>
+        <div className={'auto-collapse-body' + (sessOpen ? '' : ' collapsed')}>
+          <Hint
+            style={{ marginBottom: 6 }}
+            en="The last hundred connections and what ended each one. Kept on this computer; nothing about the traffic itself is recorded."
+          />
+          {sessions.length === 0 ? (
+            <div className="sess-empty">{tt('No connections recorded yet')}</div>
+          ) : (
+            <div className="sess-list">
+              {sessions.map((s, i) => (
+                <div className="sess-row" key={i}>
+                  <span className="sess-when">{fmtSessTime(s.started_at)}</span>
+                  <span className="sess-name" title={s.name}>
+                    {s.name || '—'}
+                  </span>
+                  <span className="sess-mode">{s.mode === 'tun' ? 'TUN' : 'proxy'}</span>
+                  <span className="sess-dur">{fmtDur(s.seconds)}</span>
+                  <span className="sess-why" title={s.reason}>
+                    {s.reason}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="sess-actions">
+            <button
+              className="btn ghost"
+              onClick={() => AutoService.ClearSessions().then(() => setSessions([]))}
+            >
+              {tt('clear')}
+            </button>
           </div>
         </div>
 
@@ -485,10 +712,7 @@ export default function AutoModal({
               <option value="warn">warn+</option>
               <option value="error">error</option>
             </Select>
-            <label className="log-auto">
-              <input type="checkbox" checked={logAuto} onChange={(e) => setLogAuto(e.target.checked)} />{' '}
-              auto-scroll
-            </label>
+            <Check className="log-auto" checked={logAuto} onChange={setLogAuto} label="auto-scroll" />
             <div className="spacer" style={{ flex: 1 }} />
             <button className="btn ghost" onClick={copyLogs}>
               copy
@@ -522,6 +746,9 @@ export default function AutoModal({
           </button>
         </div>
       </div>
+      {histRaw ? (
+        <HistoryModal raw={histRaw} nested onClose={() => setHistRaw('')} lang={lang} />
+      ) : null}
     </div>
   )
 }

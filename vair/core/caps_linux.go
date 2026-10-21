@@ -23,8 +23,8 @@ func isPrivileged() bool { return os.Geteuid() == 0 }
 //     tun_block_reason "no_helper", which the UI turns into an install button
 //     rather than the "requires admin" it used to claim, because no amount of
 //     elevation makes an absent service appear.
-//   - SplitTunnel: measured, not assumed. sing-box matches process_name on
-//     Linux by reading /proc, which needs CAP_SYS_PTRACE + CAP_DAC_READ_SEARCH
+//   - SplitTunnel: measured, not assumed. sing-box matches a process on Linux
+//     by reading /proc, which needs CAP_SYS_PTRACE + CAP_DAC_READ_SEARCH
 //     — those arrive with the helper, and so does TUN mode, which is the only
 //     mode the rules apply in. Verified end to end rather than reasoned about:
 //     with "curl" in the list, curl exits on the local address while wget and
@@ -67,10 +67,19 @@ func platformCaps() Capabilities {
 		// xdg-mime's job. Without xdg-utils there is nothing to drive — the
 		// scheme still works if a packaged desktop entry claims it, but the
 		// switch would be a lie.
-		DeepLinkToggle:       deepLinkToggleAvailable(),
-		QRScreen:             false,
-		OpenFolder:           true,
-		KillSwitch:           false,
+		DeepLinkToggle: deepLinkToggleAvailable(),
+		QRScreen:       false,
+		OpenFolder:     true,
+		// The helper installs an nftables table with the tunnel and removes it
+		// with the tunnel — see killswitch_linux.go there. It needs a helper
+		// that knows how (protocol 3), and nft to install it with; without
+		// either, a switch that changes nothing is worse than no switch.
+		KillSwitch: nftAvailable(),
+		// Still Windows-only: holding the block past the tunnel means a machine
+		// that comes back with no network, and the way out of that has to be as
+		// reliable as the block itself. On Windows that is a marker file the app
+		// reads at startup; here it would have to survive a helper restart that
+		// is deliberately allowed to clean up everything else.
 		KillSwitchPersistent: false,
 		FirewallRules:        false,
 		SelfUpdate:           installKind(),
@@ -127,4 +136,11 @@ func tunNotReadyReason() string {
 		return reason
 	}
 	return ""
+}
+
+// nftAvailable reports whether the tool the kill-switch is built from is here.
+// Ubuntu, Debian and Fedora ship it; a minimal container may not.
+func nftAvailable() bool {
+	_, err := exec.LookPath("nft")
+	return err == nil
 }

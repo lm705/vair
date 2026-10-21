@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,7 @@ func Disconnect() {
 	autoWant.Store(false)
 	autoManaged.Store(false)
 	autoLiveRtt.Store(0)
+	noteSessionEndReason("disconnected by hand")
 	broadcastAuto("paused", "", "", "manual")
 	cm := state.conn
 	cm.mu.Lock()
@@ -53,10 +55,13 @@ func Disconnect() {
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: s})
 	go func() {
 		stopConnection()
-		// The user said they are done, so the firewall block goes too — after
-		// the tunnel, not before it, so there is no moment where the routes are
-		// back and the block is already gone. A connection that merely died does
-		// NOT come through here; that case is what the block is for.
+		// The user said they are done, so nothing is restored on the next start
+		// either.
+		markSessionActive(false)
+		// And the firewall block goes too — after the tunnel, not before it, so
+		// there is no moment where the routes are back and the block is already
+		// gone. A connection that merely died does NOT come through here; that
+		// case is what the block is for.
 		releasePersistentKillSwitch()
 	}()
 }
@@ -71,9 +76,21 @@ func ConnSnapshot() ConnState {
 // on real quit, or a proxy-mode session would leave the system proxy pointing at
 // a dead port and break the user's internet.
 func Shutdown() {
-	// A clean exit is a decision too: leaving the machine blocked because Vair
-	// was closed on purpose would be a trap, not a safety net.
-	releasePersistentKillSwitch()
+	// The block does NOT come down here.
+	//
+	// "Keep blocking after the tunnel is gone" means what it says, and closing
+	// the program is the plainest case of the tunnel being gone: releasing it
+	// on the way out put the machine back on the open network with its real
+	// address, which is the exact thing the switch was turned on to prevent.
+	// Whether the next start reconnects changes nothing about that — an
+	// unprotected minute is unprotected whether or not it ends.
+	//
+	// It is a decision with teeth, so it is only ever undone deliberately:
+	// pressing disconnect, turning the setting off, clicking the red chip that
+	// appears while a block is standing, or the PowerShell line the settings
+	// screen prints in red. A start finds the block still there and says so
+	// rather than quietly lifting it.
+	releaseBlockOnExit()
 	stopConnection()
 	KillOrphanedXray()
 	// Flush + close the optional log file. Without this the last few seconds of
@@ -126,10 +143,12 @@ func CheckExit() ExitInfo {
 	client := &http.Client{Transport: tr, Timeout: 8 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
-	// ip-api.com: free, no key, HTTP/JSON. fields filters the payload to what we
-	// show. We hit it THROUGH the tunnel, so the reported IP is the exit IP.
-	exitURL := "http://" + checkExitHost + "/json/?fields=status,message,country,countryCode,city,query,isp"
-	req, _ := http.NewRequest("GET", exitURL, nil)
+	// The service is the user's choice (Settings → Testing), so the answer is
+	// read by field NAME rather than by a struct that only fits one of them: the
+	// half-dozen services that do this each spell the same five facts
+	// differently, and a preset list whose entries need code is a preset list
+	// that cannot take a custom URL.
+	req, _ := http.NewRequest("GET", currentCheckIPURL(), nil)
 	resp, err := client.Do(req)
 	if err != nil {
 		msg := err.Error()
@@ -139,24 +158,51 @@ func CheckExit() ExitInfo {
 		return ExitInfo{Error: "request failed: " + msg}
 	}
 	defer resp.Body.Close()
-	var raw struct {
-		Status      string `json:"status"`
-		Message     string `json:"message"`
-		Country     string `json:"country"`
-		CountryCode string `json:"countryCode"`
-		City        string `json:"city"`
-		Query       string `json:"query"` // the IP
-		ISP         string `json:"isp"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8192)).Decode(&raw); err != nil {
+	var raw map[string]interface{}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16384)).Decode(&raw); err != nil {
 		return ExitInfo{Error: "bad response from geo service"}
 	}
-	if raw.Status != "success" {
-		msg := raw.Message
+	// ip-api says so in the body rather than in the status code.
+	if st, _ := raw["status"].(string); st == "fail" {
+		msg, _ := raw["message"].(string)
 		if msg == "" {
 			msg = "geo lookup failed"
 		}
 		return ExitInfo{Error: msg}
 	}
-	return ExitInfo{IP: raw.Query, Country: raw.Country, CountryCode: raw.CountryCode, City: raw.City, ISP: raw.ISP}
+	info := ExitInfo{
+		IP:          pickString(raw, "query", "ip", "ip_addr", "YourFuckingIPAddress"),
+		Country:     pickString(raw, "country", "country_name", "YourFuckingCountry"),
+		CountryCode: pickString(raw, "countryCode", "country_code", "country_iso", "country"),
+		City:        pickString(raw, "city", "YourFuckingCity"),
+		ISP:         pickString(raw, "isp", "org", "asn_org", "YourFuckingISP"),
+	}
+	// ipwho.is and friends nest the network details one level down.
+	if info.ISP == "" {
+		if conn, ok := raw["connection"].(map[string]interface{}); ok {
+			info.ISP = pickString(conn, "isp", "org")
+		}
+	}
+	if info.IP == "" {
+		return ExitInfo{Error: "the answer had no address in it"}
+	}
+	// A two-letter country is a code, not a name: several services return only
+	// the code, and it belongs in the field the flag is drawn from.
+	if info.Country != "" && len(info.Country) == 2 && info.CountryCode == "" {
+		info.CountryCode, info.Country = info.Country, ""
+	}
+	if info.CountryCode != "" && len(info.CountryCode) != 2 {
+		info.CountryCode = ""
+	}
+	return info
+}
+
+// pickString returns the first of the given keys that holds a non-empty string.
+func pickString(m map[string]interface{}, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }

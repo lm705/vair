@@ -256,6 +256,10 @@ function ExcludeChipField({
             </span>
           </span>
         ))}
+        {/* The leftover of the last chip row — see the same spacer in the
+            settings dialog. After the input, which takes a row of its own, it
+            was a third row with nothing in it. */}
+        {ef[col].length > 0 && <span className="chip-fill" aria-hidden="true" />}
         <input
           className="chip-input ef-chip-input"
           placeholder={EXCLUDE_PLACEHOLDERS[col]}
@@ -279,7 +283,6 @@ function ExcludeChipField({
             setEfInput((prev) => ({ ...prev, [col]: '' }))
           }}
         />
-        <span className="chip-fill" aria-hidden="true" />
       </div>
     </div>
   )

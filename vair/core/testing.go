@@ -376,7 +376,7 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 			entry.SpeedStatus = StatusSkipped
 			entry.SpeedErr = "ping failed"
 			entry.mu.Unlock()
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 			return nil
 		}
 		entry.PingStatus = StatusOK
@@ -385,7 +385,7 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 		entry.SpeedStatus = StatusTestingSpeed
 		entry.SpeedLive = 0
 		entry.mu.Unlock()
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 		mbps, e := measureSpeed(tr, func(live float64) {
 			entry.mu.Lock()
 			entry.SpeedLive = live
@@ -393,7 +393,7 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 			// Lossy: a later live callback (every ~250ms) supersedes this
 			// one. Dropping under buffer pressure is harmless; the FINAL
 			// terminal update below is reliable.
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID, Lossy: true})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID, Lossy: true})
 		}, cancel)
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
@@ -780,13 +780,13 @@ func runPingAll(onlyIndices []int) {
 			ent.Delay = -1
 			ent.PingErr = ""
 			ent.mu.Unlock()
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(ent.snap()), Tab: tabID})
 			runPingForEntry(ent, cancelCh)
 			n := atomic.AddInt64(&done, 1)
 			mirrorPingResult(tabID, ent) // persist final result so a tab switch-back reads it
 			// Terminal entry update — reliable (this is the row's final
 			// status; missing it leaves the UI on a stale "testing" pill).
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(ent.snap()), Tab: tabID})
 			// Bulk-progress tick is lossy: only the latest done/total matters
 			// for the progress bar, and bulk_ping_done at the end is reliable.
 			state.broadcast(SSEEvent{Type: "bulk_ping_progress", Payload: map[string]interface{}{"done": n, "total": int64(len(entries))}, Tab: tabID, Lossy: true})
@@ -879,7 +879,7 @@ func runSpeedAll(onlyIndices []int) {
 			ent.SpeedLive = 0
 			ent.SpeedErr = ""
 			ent.mu.Unlock()
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(ent.snap()), Tab: tabID})
 			runSpeedForEntry(ent, tabID, cancelCh)
 			// Watchdog: runSpeedForEntry should have set a terminal status
 			// (ok/failed/skipped). If for any reason it didn't, force-fail
@@ -909,7 +909,7 @@ func runSpeedAll(onlyIndices []int) {
 			mirrorSpeedResult(tabID, ent) // persist final result so a tab switch-back reads it
 			// Terminal entry update — reliable. This is the very fix point
 			// for the "connecting…" / "ping" stuck-pill class of bugs.
-			state.broadcast(SSEEvent{Type: "entry_update", Payload: ent.snap(), Tab: tabID})
+			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(ent.snap()), Tab: tabID})
 			// Progress tick is lossy — only the latest done/total matters,
 			// and bulk_speed_done at the end is the reliable terminal.
 			state.broadcast(SSEEvent{Type: "bulk_speed_progress", Payload: map[string]interface{}{"done": n, "total": int64(len(entries))}, Tab: tabID, Lossy: true})
@@ -953,6 +953,6 @@ func reconcileBulkResults(entries []*ConfigEntry, tabID string, includeSpeed boo
 			}
 		}
 		e.mu.Unlock()
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: e.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(e.snap()), Tab: tabID})
 	}
 }

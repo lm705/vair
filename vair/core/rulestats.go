@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"net/netip"
 	"regexp"
 	"strconv"
@@ -210,7 +211,15 @@ func ruleEntryTracked(entry string) bool {
 // generated rules array, which changes with the mode, and the action already
 // says which list fired — a value can appear in two lists, but not with the
 // same outcome.
-var singboxMatchRe = regexp.MustCompile(`router: match\[\d+\] ([a-z_]+)=(\[[^\]]*\]|\S+) => (route\(([a-z0-9_-]+)\)|reject)`)
+//
+// The value is taken as everything up to the trailing " => ", greedily, rather
+// than as "a bracketed set or a run of non-spaces". Both of the narrower forms
+// were wrong the moment the apps list started generating regexes: a pattern
+// contains "]" (in [/\\]) and can contain a space (a path under Program Files),
+// and either one made the whole line unparseable — the counter then stayed at
+// zero while the rule itself worked, which is the most misleading failure this
+// file can have.
+var singboxMatchRe = regexp.MustCompile(`router: match\[\d+\] ([a-z_]+)=(.+) => (route\(([a-z0-9_-]+)\)|reject)\s*$`)
 
 // The connection id sing-box stamps on every line about one connection, and the
 // two lines that name where that connection is going. The sniffed domain is the
@@ -330,21 +339,62 @@ func xrayDestHost(dest string) string {
 	return dest
 }
 
+// engineLineOfInterest is the cheap rejection, done on the raw bytes before the
+// line is a string at all: the shapes below are every line either reader here
+// looks at, and under a verbose flood almost nothing else is worth allocating.
+//
+// The colour sing-box wraps its connection id in sits between these phrases,
+// never inside one, so a raw test still finds them.
+var (
+	xrayMark     = []byte("accepted ")
+	singboxMarks = [][]byte{
+		[]byte("inbound connection to "),
+		[]byte("router: match["),
+		[]byte("connection closed"),
+		[]byte("sniffed protocol:"),
+		[]byte("found process path:"),
+	}
+)
+
+func engineLineOfInterest(src string, raw []byte) bool {
+	switch src {
+	case "xray":
+		return bytes.Contains(raw, xrayMark)
+	case "singbox":
+		for _, m := range singboxMarks {
+			if bytes.Contains(raw, m) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // noteEngineLine offers one line of engine output to the counters.
 //
 // Called for every line the engines print, so the cheap rejection comes first:
 // a substring test on the raw bytes before any regular expression runs, and the
 // whole thing short-circuits when the feature is off.
 func noteEngineLine(src, line string) {
+	// sing-box colours its output even into a pipe, and the colour sits around
+	// the connection id — "[\x1b[38;5;148m3400311066\x1b[0m 0ms]" — which is the
+	// field BOTH readers key on. Stripped here, before either sees the line: it
+	// used to be stripped inside the rule-counter branch below, so the
+	// connections panel was handed the coloured line, found no connection id on
+	// it and recorded nothing at all in TUN mode.
+	if src == "singbox" {
+		line = stripANSI(line)
+	}
+	// The live connections panel reads the same lines, and it may be open while
+	// the rule counters are off.
+	if connectionsWatched() {
+		noteEngineConnLine(src, line)
+	}
 	if !ruleStatsEnabled() {
 		return
 	}
 	switch src {
 	case "singbox":
-		// sing-box colours its output even into a pipe, and the colour sits
-		// around the connection id — "[\x1b[38;5;148m3400311066\x1b[0m 0ms]" —
-		// which is exactly the field the value-set lines are matched by.
-		line = stripANSI(line)
 		switch {
 		case strings.Contains(line, "inbound connection to "):
 			if d := singboxDestRe.FindStringSubmatch(line); d != nil {
@@ -403,7 +453,7 @@ func attributeMatch(key, value, outbound string, conn connFacts) {
 	switch {
 	case outbound == "": // "=> reject"
 		list = ruleListBlock
-	case key == "process_name":
+	case isProcessMatcher(key):
 		list = ruleListApps
 	case outbound == "direct":
 		list = ruleListDirect
@@ -412,17 +462,31 @@ func attributeMatch(key, value, outbound string, conn connFacts) {
 	default:
 		return // an outbound of ours that no user list can name
 	}
-	// A whole value set: the engine matched one of them and did not say which,
-	// so the destination decides — the same first-match walk the engine did.
-	if strings.HasPrefix(value, "[") {
-		var entry string
-		if key == "process_name" {
+	// The apps list is answered twice over. One line becomes one regex, so a
+	// single-value match names its line exactly; a set names none of them, and
+	// then the program the engine looked up decides. The second also covers an
+	// engine session started before the upgrade, which is still logging the
+	// process_name rules it was given.
+	if list == ruleListApps {
+		entry := ""
+		if !strings.HasPrefix(value, "[") {
+			entry = entryForMatcher(list, key, value)
+		}
+		if entry == "" {
 			entry = entryMatchingProcess(list, conn.proc)
-		} else if conn.host != "" {
-			entry = entryMatchingHost(list, conn.host)
 		}
 		if entry != "" {
 			noteRuleHit(list, entry)
+		}
+		return
+	}
+	// A whole value set: the engine matched one of them and did not say which,
+	// so the destination decides — the same first-match walk the engine did.
+	if strings.HasPrefix(value, "[") {
+		if conn.host != "" {
+			if entry := entryMatchingHost(list, conn.host); entry != "" {
+				noteRuleHit(list, entry)
+			}
 		}
 		return
 	}
@@ -514,15 +578,27 @@ func entryMatchingProcess(list, proc string) string {
 		return ""
 	}
 	trim := func(s string) string {
-		return strings.TrimSuffix(strings.ToLower(s), ".exe")
+		return strings.TrimSuffix(strings.ToLower(baseName(strings.TrimSpace(s))), ".exe")
 	}
 	want := trim(proc)
 	for _, e := range ruleListEntries(list) {
-		if trim(strings.TrimSpace(e)) == want {
+		// baseName on both sides: a line may name a whole path, and the engine
+		// reports one. Two programs with the same file name under different paths
+		// are told apart by the engine, not here — this is a counter, and crediting
+		// the line the user would point at is the whole job.
+		if trim(e) == want {
 			return e
 		}
 	}
 	return ""
+}
+
+// isProcessMatcher reports whether a sing-box matcher name is one the apps list
+// generates. process_name is not generated any more (see processMatchRegex) but
+// is still recognised: an engine session started before an upgrade keeps logging
+// the rules it was given.
+func isProcessMatcher(key string) bool {
+	return key == "process_path_regex" || key == "process_name" || key == "process_path"
 }
 
 // baseName is filepath.Base for both separators — the engine reports a path in
@@ -548,7 +624,7 @@ func hostHasSuffix(host, suffix string) bool {
 func lineMatcher(list, entry string) (key, value string) {
 	e := strings.TrimSpace(entry)
 	if list == ruleListApps {
-		return "process_name", e
+		return "process_path_regex", processMatchRegex(e)
 	}
 	lower := strings.ToLower(e)
 	switch {

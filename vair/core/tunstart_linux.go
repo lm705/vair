@@ -3,9 +3,12 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
+
+	"vair/helper/api"
 )
 
 // tunRunsInHelper — the app never becomes root here, so the TUN engine belongs
@@ -34,7 +37,7 @@ func startTUNInHelper(cfg map[string]interface{}) (tunStopper, error) {
 		h.Close()
 		return nil, fmt.Errorf("serialise config: %w", err)
 	}
-	st, err := h.StartTUN(raw)
+	st, err := h.StartTUN(raw, killSwitchEnabled(), allowLANTraffic(), serverIPsFromConfig(cfg))
 	if err != nil {
 		h.Close()
 		return nil, err
@@ -104,9 +107,10 @@ func tunPreconditionError() string {
 //
 // Which leaves the loop this arrangement invites: xray's own connection to the
 // server would itself be captured by the tunnel and fed back through the proxy.
-// buildHybridTUNConfig already guards it twice — a process_name carve-out
-// (which works here, since the unit grants CAP_SYS_PTRACE) and, as the backstop
-// that actually carries the weight, a direct route for the server's IP.
+// buildHybridTUNConfig already guards it twice — a carve-out for the engine
+// binaries by path (which works here, since the unit grants CAP_SYS_PTRACE)
+// and, as the backstop that actually carries the weight, a direct route for
+// the server's IP.
 func startHybridTUNViaHelper(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIface string, cfg map[string]interface{}, parts hybridParts) {
 	if data, err := json.MarshalIndent(cfg, "", "  "); err == nil {
 		os.WriteFile(runtimePath("last-singbox-hybrid.json"), data, 0o600) //nolint:errcheck
@@ -163,3 +167,45 @@ func startHybridTUNViaHelper(cm *connManager, entry *ConfigEntry, n *Node, connT
 // Restricted to TUN: the helper only ever speaks about the tunnel it runs, and
 // by the time its message arrives the user may have connected in proxy mode.
 func tunnelLost(reason string) { connectionLost(reason, ModeTUN) }
+
+// serverIPsFromConfig collects the addresses the engine will dial, for the
+// kill-switch allow-list.
+//
+// Read out of the configuration rather than passed alongside it, so the two can
+// never disagree: what the block permits is exactly what the engine was told to
+// connect to. The app resolves a server's name before connecting (see
+// preResolveHost), so these are addresses by the time they get here; anything
+// that is still a name is skipped rather than guessed at, and the cgroup rule
+// in the helper is what covers that case.
+func serverIPsFromConfig(cfg map[string]interface{}) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(v interface{}) {
+		s, _ := v.(string)
+		if s == "" || seen[s] || net.ParseIP(s) == nil {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, key := range []string{"outbounds", "endpoints"} {
+		list, _ := cfg[key].([]interface{})
+		for _, o := range list {
+			m, _ := o.(map[string]interface{})
+			add(m["server"])
+			// A WireGuard endpoint carries its address under a different name,
+			// and a chain's hops are outbounds of their own — all of them are
+			// dialled, so all of them are allowed.
+			if peers, ok := m["peers"].([]interface{}); ok {
+				for _, p := range peers {
+					pm, _ := p.(map[string]interface{})
+					add(pm["address"])
+				}
+			}
+		}
+	}
+	if len(out) > api.MaxServerIPs {
+		out = out[:api.MaxServerIPs]
+	}
+	return out
+}

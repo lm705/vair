@@ -103,6 +103,14 @@ type winRect struct{ Left, Top, Right, Bottom int32 }
 // itself (a small laptop must never get a window pushed past its edges). Wails
 // centers the window on the work area.
 func InitialWindowSize() (int, int) {
+	workW, workH := workAreaDIP()
+	w, h := idealWindowSize(workW, workH, 80)
+	return int(w), int(h)
+}
+
+// workAreaDIP is the primary monitor's usable area in Wails DIPs — what any
+// window has to fit inside.
+func workAreaDIP() (int32, int32) {
 	// Physical work area of the primary monitor (excludes the taskbar).
 	var r winRect
 	workW, workH := int32(1920), int32(1040)
@@ -111,12 +119,21 @@ func InitialWindowSize() (int, int) {
 	}
 	// Wails v3 window sizes are DIPs (it scales by the screen DPI itself), so
 	// convert the physical work area to DIPs first.
-	if dpi, _, _ := procGetDpiForSystem.Call(); dpi > 0 {
-		workW = workW * 96 / int32(dpi)
-		workH = workH * 96 / int32(dpi)
+	//
+	// Find() before Call(): GetDpiForSystem arrived in Windows 10 1607, and
+	// LazyProc.Call panics when the procedure is not there — so on anything older
+	// the program died at startup, before its first window, with a stack trace
+	// nobody would see (it is a GUI binary; there is no console to print to).
+	// Measured on Windows 10 build 10240. Below 1607 the work area stays in
+	// physical pixels, which is exactly right for the 96-DPI displays those
+	// machines have.
+	if procGetDpiForSystem.Find() == nil {
+		if dpi, _, _ := procGetDpiForSystem.Call(); dpi > 0 {
+			workW = workW * 96 / int32(dpi)
+			workH = workH * 96 / int32(dpi)
+		}
 	}
-	w, h := idealWindowSize(workW, workH, 80)
-	return int(w), int(h)
+	return workW, workH
 }
 
 // RaiseWindow brings the window back from the tray or the taskbar. Show covers

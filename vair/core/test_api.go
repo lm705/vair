@@ -68,7 +68,7 @@ func PingOne(idx int) {
 		entry.mu.Lock()
 		entry.PingStatus = StatusTestingPing
 		entry.mu.Unlock()
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -87,7 +87,7 @@ func PingOne(idx int) {
 		}
 		entry.mu.Unlock()
 		mirrorPingResult(tabID, entry)
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 	}()
 }
 
@@ -109,7 +109,7 @@ func SpeedOne(idx int) {
 		entry.SpeedMBps = 0
 		entry.SpeedLive = 0
 		entry.mu.Unlock()
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
@@ -136,7 +136,7 @@ func SpeedOne(idx int) {
 		}
 		entry.mu.Unlock()
 		mirrorSpeedResult(tabID, entry)
-		state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+		state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 	}()
 }
 

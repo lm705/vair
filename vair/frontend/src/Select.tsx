@@ -70,7 +70,13 @@ export default function Select({
   const [active, setActive] = useState(0)
   const btnRef = useRef<HTMLButtonElement | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
-  const [pos, setPos] = useState<{ left: number; top: number; width: number; drop: 'down' | 'up' } | null>(null)
+  // fs travels with the position: the list is portalled to <body>, so it
+  // inherits the page's size rather than the trigger's, and a dialog scaled up
+  // to 18px dropped a 13px list. Taken from the trigger itself, so it is right
+  // for the settings dialog and for the small selects in the log bar alike.
+  const [pos, setPos] = useState<
+    { left: number; top: number; width: number; drop: 'down' | 'up'; fs: string } | null
+  >(null)
 
   const current = opts.find((o) => o.value === value)
 
@@ -80,7 +86,10 @@ export default function Select({
   useLayoutEffect(() => {
     if (!open || !btnRef.current) return
     const r = btnRef.current.getBoundingClientRect()
-    const wanted = Math.min(opts.length * 26 + 8, 260)
+    const fs = getComputedStyle(btnRef.current).fontSize
+    // Row height tracks the font: padding 8px plus a line and a half.
+    const rowH = (parseFloat(fs) || 12) * 1.5 + 8
+    const wanted = Math.min(opts.length * rowH + 8, 260)
     const below = window.innerHeight - r.bottom
     const drop = below < wanted && r.top > below ? 'up' : 'down'
     setPos({
@@ -88,6 +97,7 @@ export default function Select({
       top: drop === 'down' ? r.bottom + 2 : Math.max(4, r.top - wanted - 2),
       width: r.width,
       drop,
+      fs,
     })
   }, [open, opts.length])
 
@@ -177,7 +187,7 @@ export default function Select({
           <div
             ref={listRef}
             className="vsel-list"
-            style={{ left: pos.left, top: pos.top, minWidth: pos.width }}
+            style={{ left: pos.left, top: pos.top, minWidth: pos.width, fontSize: pos.fs }}
             role="listbox"
           >
             {opts.map((o, i) => (

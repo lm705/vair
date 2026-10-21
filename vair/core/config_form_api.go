@@ -61,10 +61,39 @@ func AddManualConfig(tabID string, f ConfigForm) string {
 	if _, err := parseNode(u); err != nil {
 		return "the config didn't validate: " + err.Error()
 	}
-	if Paste(tabID, u) == 0 {
-		return "failed to add the config"
+	// Not Paste: that scans arbitrary text for things that look like node URLs,
+	// and the scanner deliberately ignores http:// — every subscription link and
+	// half the comments in a config file start with one, and treating those as
+	// nodes would turn a pasted subscription into hundreds of imaginary proxies.
+	// A URL this function built a line ago needs no scanning; adding it directly
+	// is both correct and the only way an http proxy can be added at all.
+	if addBuiltConfig(tabID, u) == 0 {
+		return "the config was built but could not be stored — the tab may be missing"
 	}
 	return ""
+}
+
+// addBuiltConfig appends one already-validated URL to a tab, with the same
+// bookkeeping a paste does: indices, the active-tab mirror, the window cache and
+// the persist. Returns how many were added (0 or 1).
+func addBuiltConfig(tabID, raw string) int {
+	n, err := parseNode(raw)
+	if err != nil || n == nil {
+		return 0
+	}
+	e := &ConfigEntry{Raw: raw, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
+	fillEntryFromNode(e, n)
+	BeginPaste(tabID)
+	state.mu.Lock()
+	e.Index = nextEntryIndexLocked(tabID)
+	state.tabEntries[tabID] = append(state.tabEntries[tabID], e)
+	if state.activeTab == tabID {
+		state.entries = state.tabEntries[tabID]
+	}
+	state.mu.Unlock()
+	memInvalidate(tabID)
+	EndPaste(tabID)
+	return 1
 }
 
 // UpdateConfig replaces config idx in a user tab with a freshly serialised URL
@@ -80,11 +109,16 @@ func UpdateConfig(tabID string, idx int, f ConfigForm) string {
 	if err != nil {
 		return err.Error()
 	}
-	built := parseConfigLines(newRaw)
-	if len(built) == 0 {
-		return "the config didn't validate"
+	// parseNode, not the list scanner: the scanner searches arbitrary text for
+	// things that look like node URLs and deliberately ignores http://, so an
+	// http proxy could never be saved no matter what was typed into the form —
+	// and the message blamed the address, which was never the problem.
+	n, err := parseNode(newRaw)
+	if err != nil {
+		return "the config didn't validate: " + err.Error()
 	}
-	ne := built[0]
+	ne := &ConfigEntry{Raw: newRaw}
+	fillEntryFromNode(ne, n)
 	entry, ok := memEntry(tabID, idx)
 	if !ok {
 		return "config not found"
@@ -123,7 +157,7 @@ func UpdateConfig(tabID string, idx int, f ConfigForm) string {
 
 	memInvalidate(tabID)
 	dbPersist(tabID, loadTabEntries(tabID)) // whole-tab write (host/port/etc. columns)
-	state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+	state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 	loadedSignal(tabID)
 	saveTabs()
 	saveSettings()

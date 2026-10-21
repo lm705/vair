@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows && portable
 
 package main
 
@@ -8,8 +8,11 @@ import (
 	"vair/internal/engines"
 )
 
-// The engines, geo data and rule-set baselines that ship inside the Windows
-// binary.
+// The engines, geo data and rule-set baselines that ship inside the PORTABLE
+// Windows binary — one file that needs nothing beside it, and pays for that
+// with 110 MB of payload and a first run that writes all of it into the user's
+// profile. The installed build has none of this: its engines are files the
+// installer put beside the exe (see embed_windows_packaged.go).
 //
 // These directives are the reason this file exists at the repository root
 // rather than inside internal/engines: //go:embed can only name paths under the

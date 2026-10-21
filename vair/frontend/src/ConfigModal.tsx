@@ -1,14 +1,18 @@
 import { useEffect, useState } from 'react'
+import Check from './Check'
 import { ConfigService } from '../bindings/vair/internal/services'
 import type { ConfigForm } from '../bindings/vair/core'
 import { t10 } from './i18n'
+import { Hint } from './hints'
+import type { HintOpt } from './hints'
 import Select from './Select'
 
 type Mode = 'add' | 'edit' | 'view'
 
-const PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'tuic']
+const PROTOCOLS = ['vless', 'vmess', 'trojan', 'ss', 'hysteria2', 'tuic', 'wireguard', 'socks', 'http']
 const PROTO_LABEL: Record<string, string> = {
   vless: 'VLESS', vmess: 'VMess', trojan: 'Trojan', ss: 'Shadowsocks', hysteria2: 'Hysteria2', tuic: 'TUIC',
+  wireguard: 'WireGuard', socks: 'SOCKS5', http: 'HTTP',
 }
 const FP_OPTS = ['', 'chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'random', 'randomized']
 const SS_METHODS = [
@@ -24,6 +28,13 @@ function protoDefaults(p: string): Record<string, any> {
     case 'vmess': return { security: 'tls', network: 'tcp', encryption: 'auto', header_type: 'none' }
     case 'trojan': return { security: 'tls', network: 'tcp' }
     case 'ss': return { method: 'aes-256-gcm' }
+    // A plain proxy has no transport and no security of its own; the port is the
+    // one thing that is almost always the same.
+    // WireGuard configures an interface, so it needs an address of its own:
+    // without one the tunnel comes up and carries nothing.
+    case 'wireguard': return { port: 51820, addresses: '172.16.0.2/32', mtu: 1420 }
+    case 'socks': return { security: 'none', port: 1080 }
+    case 'http': return { security: 'none', port: 8080 }
     default: return {}
   }
 }
@@ -41,6 +52,9 @@ export default function ConfigModal({
   notify: (t: string) => void
 }) {
   const tt = (en: string) => t10(lang, en)
+  // The description under a setting: the paragraph while descriptions are
+  // on, the mark that opens the same text while they are off.
+  const hint = (en: string, opts?: HintOpt[]) => <Hint en={en} opts={opts} />
   const readOnly = mode === 'view'
   const [form, setForm] = useState<Record<string, any>>(() => ({
     protocol: 'vless', name: '', address: '', port: 443, ...protoDefaults('vless'),
@@ -106,11 +120,13 @@ export default function ConfigModal({
     </Select>
   )
   const chk = (k: string) => (
-    <input type="checkbox" checked={!!form[k]} disabled={readOnly} onChange={(e) => set(k, e.target.checked)} />
+    <Check checked={!!form[k]} disabled={readOnly} onChange={(v) => set(k, v)} />
   )
 
   const p = form.protocol
   const hasStream = p === 'vless' || p === 'vmess' || p === 'trojan'
+  const isProxy = p === 'socks' || p === 'http'
+  const isWG = p === 'wireguard'
   const net = form.network
   const isReality = p === 'vless' && form.security === 'reality'
   const title = mode === 'add' ? 'Add configuration' : mode === 'edit' ? 'Edit configuration' : 'View configuration'
@@ -135,15 +151,32 @@ export default function ConfigModal({
         {row('Port', num('port'))}
         {(p === 'vless' || p === 'vmess' || p === 'tuic') && row('UUID', txt('uuid'))}
         {(p === 'trojan' || p === 'ss' || p === 'hysteria2' || p === 'tuic') && row('Password', txt('password'))}
+        {isWG && row('Private key', txt('uuid', 'base64, 32 bytes'))}
+        {isWG && row("Peer's public key", txt('peer_public_key', 'base64, 32 bytes'))}
+        {isWG && row('Pre-shared key', txt('pre_shared_key'))}
+        {isWG && row('Interface address', txt('addresses', '172.16.0.2/32'))}
+        {isWG && row('MTU', num('mtu'))}
+        {isWG && row('Reserved', txt('reserved', '1,2,3'))}
+        {isWG && hint('WireGuard has no handshake to fail politely: a wrong key, a missing interface address or the wrong reserved bytes all look the same from here — the tunnel comes up and nothing crosses it.')}
+        {isProxy && row('User name', txt('uuid'))}
+        {isProxy && row('Password', txt('password'))}
         {p === 'ss' && row('Encryption method', sel('method', SS_METHODS))}
+        {p === 'ss' && row('Plugin', txt('ss_plugin', 'obfs-local;obfs=tls;obfs-host=example.com'))}
 
         {hasStream && (
           <>
             <div className="section-header">{tt('Transport')}</div>
-            {row('Network', sel('network', ['tcp', 'ws', 'grpc', 'http']))}
+            {row('Network', sel('network', ['tcp', 'ws', 'grpc', 'http', 'httpupgrade', 'xhttp', 'kcp']))}
             {(net === 'ws' || net === 'http') && row('Path', txt('path', '/path'))}
             {(net === 'ws' || net === 'http') && row('Host header', txt('host_header', 'cdn.example.com'))}
             {net === 'grpc' && row('Service name', txt('service_name'))}
+            {net === 'grpc' && row('gRPC mode', sel('grpc_mode', ['', 'gun', 'multi']))}
+            {(net === 'httpupgrade' || net === 'xhttp') && row('Path', txt('path', '/path'))}
+            {(net === 'httpupgrade' || net === 'xhttp') && row('Host header', txt('host_header', 'cdn.example.com'))}
+            {net === 'xhttp' && row('xhttp mode', sel('grpc_mode', ['', 'auto', 'packet-up', 'stream-up', 'stream-one']))}
+            {net === 'kcp' && row('mKCP header', sel('header_type_kcp', ['none', 'srtp', 'utp', 'wechat-video', 'dtls', 'wireguard']))}
+            {net === 'kcp' && row('mKCP seed', txt('seed'))}
+            {(net === 'xhttp' || net === 'kcp') && hint('This transport is xray-only: a configuration using it connects through xray in both modes, and cannot be an intermediate hop of a sing-box chain.')}
             {p === 'vmess' && net === 'tcp' && row('Header type', sel('header_type', ['none', 'http']))}
           </>
         )}
@@ -164,9 +197,24 @@ export default function ConfigModal({
               <>
                 {row('Public key', txt('public_key'))}
                 {row('Short ID', txt('short_id'))}
+                {row('SpiderX', txt('spider_x', '/'))}
                 {row('Flow', sel('flow', ['', 'xtls-rprx-vision']))}
               </>
             )}
+          </>
+        )}
+
+        {isProxy && (
+          <>
+            <div className="section-header">{tt('Security')}</div>
+            {row('Security', sel('security', ['none', 'tls']))}
+            {form.security === 'tls' && (
+              <>
+                {row('SNI', txt('sni', 'example.com'))}
+                {row('Allow insecure', chk('allow_insecure'))}
+              </>
+            )}
+            {hint('A plain proxy, with no encryption of its own: TLS here only wraps the connection to the proxy itself. Everything it carries is as protected as the protocol inside it.')}
           </>
         )}
 
@@ -189,6 +237,11 @@ export default function ConfigModal({
 
         {p === 'hysteria2' && (
           <>
+            <div className="section-header">{tt('Bandwidth and ports')}</div>
+            {row('Upload (Mbps)', txt('up_mbps', '50'))}
+            {row('Download (Mbps)', txt('down_mbps', '200'))}
+            {row('Port hopping', txt('port_hopping', '443-450'))}
+            {row('Certificate pin', txt('pin_sha256'))}
             <div className="section-header">{tt('Obfuscation')}</div>
             {row('Obfs type', sel('obfs_type', ['', 'salamander']))}
             {form.obfs_type && row('Obfs password', txt('obfs_password'))}
@@ -206,7 +259,7 @@ export default function ConfigModal({
         <div className="section-header">{tt('Share link')}</div>
         <div style={{
           background: 'var(--bg)', border: '1px solid var(--border2)', borderRadius: 4, padding: '8px 10px',
-          fontSize: 11, lineHeight: 1.5, color: err ? 'var(--red)' : 'var(--green)', wordBreak: 'break-all',
+          fontSize: 'var(--modal-fs-base)', lineHeight: 1.5, color: err ? 'var(--red)' : 'var(--green)', wordBreak: 'break-all',
           maxHeight: 90, overflowY: 'auto',
           // The app disables text selection globally; let this preview be selected
           // so the generated link can be copied with the mouse.

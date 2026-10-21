@@ -303,8 +303,8 @@ func (m *subMeta) isEmpty() bool {
 // subFetchUserAgent is sent on every subscription fetch. Some panels / hosts
 // reject the Go default "Go-http-client" UA with 403 as an anti-bot measure and
 // only answer a "real" client. Our own "Vair/<version>" passes that and, being
-// unknown to panels, gets the plain URI / base64 list rather than a clash-YAML /
-// sing-box-JSON variant we don't parse. No host is special-cased; we don't
+// unknown to panels, gets the plain URI / base64 list rather than one of the
+// YAML or JSON variants we don't parse. No host is special-cased; we don't
 // impersonate another product.
 const subFetchUserAgent = "Vair/" + appVersion
 
@@ -728,12 +728,7 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 				e.SpeedStatus = StatusFailed
 				e.SpeedErr = parseErr.Error()
 			} else {
-				e.Name = n.Name
-				e.Host = n.Host
-				e.Port = n.Port
-				e.Network = internLow(n.Network)
-				e.Security = internLow(n.Security)
-				e.Protocol = internLow(string(n.Kind))
+				fillEntryFromNode(e, n)
 			}
 			entries = append(entries, e)
 		}
@@ -885,4 +880,16 @@ func disambiguateNames(entries []*ConfigEntry) {
 			}
 		}
 	}
+}
+
+// fillEntryFromNode copies the display fields off a parsed node. Shared by the
+// list scanner and by the manual add, so a hand-built config is indistinguishable
+// from an imported one in the table.
+func fillEntryFromNode(e *ConfigEntry, n *Node) {
+	e.Name = n.Name
+	e.Host = n.Host
+	e.Port = n.Port
+	e.Network = internLow(n.Network)
+	e.Security = internLow(n.Security)
+	e.Protocol = internLow(string(n.Kind))
 }

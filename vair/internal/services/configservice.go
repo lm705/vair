@@ -88,6 +88,14 @@ func (c *ConfigService) ToggleFavorite(idx int) bool {
 	return core.ToggleFavorite(idx)
 }
 
+// Favorites is every starred configuration, whether or not a tab still holds
+// it — a star outlives the configuration it was put on, and this is the only
+// place the ones left behind can be seen.
+func (c *ConfigService) Favorites() []core.FavoriteDTO { return core.Favorites() }
+
+// RemoveFavorites unstars the given node bodies; returns how many went.
+func (c *ConfigService) RemoveFavorites(bodies []string) int { return core.RemoveFavorites(bodies) }
+
 // RenameEntry renames config idx in the active tab; returns false if not allowed.
 func (c *ConfigService) RenameEntry(idx int, name string) bool {
 	return core.RenameEntry(idx, name)
@@ -132,3 +140,16 @@ func (c *ConfigService) AddWARP(tabId string) string {
 	}
 	return ""
 }
+
+// DeleteDuplicatesOf removes the other copies of one configuration, keeping it.
+// Returns how many were removed.
+func (c *ConfigService) DeleteDuplicatesOf(idx int) int { return core.DeleteDuplicatesOf(idx) }
+
+// History is everything measured about config idx of the displayed tab — the
+// record behind the Stability column. Nil when the row is gone.
+func (c *ConfigService) History(idx int) *core.HistoryDTO { return core.ConfigHistory(idx) }
+
+// HistoryRaw is the same record for a configuration that has no row on screen:
+// the AUTO panel lists candidates from every candidate tab. Nil when the
+// configuration is no longer in any tab.
+func (c *ConfigService) HistoryRaw(raw string) *core.HistoryDTO { return core.ConfigHistoryRaw(raw) }

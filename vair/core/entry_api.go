@@ -49,10 +49,32 @@ func RenameEntry(idx int, name string) bool {
 		}
 		cm.mu.Unlock()
 	}
-	state.broadcast(SSEEvent{Type: "entry_update", Payload: entry.snap(), Tab: tabID})
+	state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 	saveTabs()
 	saveSettings()
 	return true
+}
+
+// nextEntryIndexLocked is the index the next config added to a tab should take:
+// one past the highest one in use.
+//
+// NOT the number of entries. A delete leaves the survivors their indices (see
+// DeleteEntries), so after one the count is smaller than the highest index and
+// counting hands a new config an index another row already owns. Two rows with
+// one index is not a cosmetic problem: memEntry answers with whichever the
+// positional lookup lands on, so connecting to one row started the other config
+// — and an entry_update about either rewrote both rows, which is the "the row
+// showed something else for a moment" of it.
+//
+// Caller holds state.mu.
+func nextEntryIndexLocked(tabID string) int {
+	next := 0
+	for _, e := range state.tabEntries[tabID] {
+		if e.Index >= next {
+			next = e.Index + 1
+		}
+	}
+	return next
 }
 
 // DeleteEntries removes the given config indices from the active tab (not the
@@ -111,4 +133,49 @@ func DeleteEntries(indices []int) {
 	}
 	loadedSignal(id)
 	saveTabs()
+}
+
+// DeleteDuplicatesOf removes every other copy of one configuration, keeping the
+// one the user pointed at.
+//
+// "Another copy" is dedupKey's answer, not string equality: the same server
+// arrives from different sources with its parameters in a different order, a
+// transport spelled by an alias, defaults written out or left off, and a
+// different name after the #. All of those are one server, and the table's own
+// "hide duplicates" already treats them as one — this is the same question,
+// asked destructively.
+//
+// The kept row keeps its index; the rest are removed by the ordinary delete
+// path, so the tab is persisted and the table reloads exactly as it does for a
+// manual delete. Returns how many went.
+func DeleteDuplicatesOf(idx int) int {
+	tabID := activeTabID()
+	if tabID == "main" {
+		return 0
+	}
+	keep, ok := memEntry(tabID, idx)
+	if !ok {
+		return 0
+	}
+	want := dedupKey(keep.snap().Raw)
+
+	state.mu.RLock()
+	entries := append([]*ConfigEntry(nil), state.tabEntries[tabID]...)
+	state.mu.RUnlock()
+
+	var doomed []int
+	for _, e := range entries {
+		es := e.snap()
+		if es.Index == idx {
+			continue
+		}
+		if dedupKey(es.Raw) == want {
+			doomed = append(doomed, es.Index)
+		}
+	}
+	if len(doomed) == 0 {
+		return 0
+	}
+	DeleteEntries(doomed)
+	return len(doomed)
 }

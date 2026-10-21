@@ -58,27 +58,48 @@ type proxySnapshot map[string]string
 // wildcards and has no idea what a CIDR block is, while GNOME wants real
 // prefixes and would treat "10.*" as a hostname. A translator would have to
 // guess the mask from the number of octets, and get 172.16.0.0/12 wrong.
+// And one rule can need several wildcards where the other needs one prefix:
+// 172.16.0.0/12 is sixteen second octets, and "172.16.*" — which is what this
+// list used to say — covered exactly one of them, leaving 172.17 through
+// 172.31 pointed at the proxy. The tunnel's own address lives in that range.
 var proxyBypass = []bypassRule{
-	{win: "localhost", unix: "localhost"},
-	{win: "127.*", unix: "127.0.0.0/8"},
-	{win: "10.*", unix: "10.0.0.0/8"},
-	{win: "172.16.*", unix: "172.16.0.0/12"},
-	{win: "192.168.*", unix: "192.168.0.0/16"},
-	{win: "*.local", unix: "*.local"},
+	{win: []string{"localhost"}, unix: "localhost"},
+	{win: []string{"127.*"}, unix: "127.0.0.0/8"},
+	{win: []string{"10.*"}, unix: "10.0.0.0/8"},
+	{win: []string{
+		"172.16.*", "172.17.*", "172.18.*", "172.19.*",
+		"172.20.*", "172.21.*", "172.22.*", "172.23.*",
+		"172.24.*", "172.25.*", "172.26.*", "172.27.*",
+		"172.28.*", "172.29.*", "172.30.*", "172.31.*",
+	}, unix: "172.16.0.0/12"},
+	{win: []string{"192.168.*"}, unix: "192.168.0.0/16"},
+	// Link-local: a machine talking to 169.254.x.x has no router, and a proxy
+	// is the last thing that can help it.
+	{win: []string{"169.254.*"}, unix: "169.254.0.0/16"},
+	{win: []string{"*.local"}, unix: "*.local"},
 }
 
-type bypassRule struct{ win, unix string }
+type bypassRule struct {
+	win  []string
+	unix string
+}
 
 //lint:ignore U1000 the Windows backend uses this; the Linux one uses bypassUnix
-func bypassWin() []string { return renderBypass(func(r bypassRule) string { return r.win }) }
+func bypassWin() []string {
+	out := make([]string, 0, len(proxyBypass)+16)
+	for _, r := range proxyBypass {
+		out = append(out, r.win...)
+	}
+	return out
+}
 
 //lint:ignore U1000 the Linux backends use this; Windows uses bypassWin
-func bypassUnix() []string { return renderBypass(func(r bypassRule) string { return r.unix }) }
-
-func renderBypass(pick func(bypassRule) string) []string {
+func bypassUnix() []string {
 	out := make([]string, 0, len(proxyBypass))
 	for _, r := range proxyBypass {
-		out = append(out, pick(r))
+		if r.unix != "" {
+			out = append(out, r.unix)
+		}
 	}
 	return out
 }
