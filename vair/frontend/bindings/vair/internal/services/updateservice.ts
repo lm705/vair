@@ -37,3 +37,11 @@ export function Check(): $CancellablePromise<core$0.UpdateInfo> {
 export function Dismiss(version: string): $CancellablePromise<void> {
     return $Call.ByID(3914435442, version);
 }
+
+/**
+ * Pending is what the automatic check found — it runs once per start, through
+ * the first session's tunnel — for a window opened after it ran.
+ */
+export function Pending(): $CancellablePromise<core$0.UpdateInfo> {
+    return $Call.ByID(173861641);
+}

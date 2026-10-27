@@ -13,6 +13,8 @@
 // "remote browser" branch: it hid its own window controls, opened a redundant
 // event stream, and took the browser path everywhere IS_REMOTE is checked.
 // Asking the server is platform-neutral and can't drift with the webview.
+import { SettingsService } from '../bindings/vair/internal/services'
+
 export const IS_REMOTE = (window as any).__VAIR_REMOTE__ === true
 
 // startRemoteEvents pipes Server-Sent Events from /wails/events into the Wails
@@ -31,4 +33,16 @@ export function startRemoteEvents() {
     }
   }
   // EventSource reconnects automatically on transient network errors.
+}
+
+// openLink opens a web address where the person is: in the browser they are
+// holding when the interface is opened over the network, in the computer's
+// default browser from the desktop window. From a phone it used to open on the
+// computer, out of sight.
+export function openLink(url: string) {
+  if (IS_REMOTE) {
+    window.open(url, '_blank', 'noopener,noreferrer')
+    return
+  }
+  SettingsService.OpenURL(url)
 }

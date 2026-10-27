@@ -36,6 +36,15 @@ import (
 // exe, or the exe's own folder. "" when neither holds an engine. Symlinks are
 // resolved first so a shortcut target does not send us to the wrong folder.
 func installedBinDir() string {
+	// With the helper service: its own bin\ — the engines it runs and the
+	// ones its blocks let out are those, so the app runs the same files. A
+	// portable copy on a machine with an installed Vair uses them too.
+	if dir := core.ServiceInstallDir(); dir != "" {
+		bin := filepath.Join(dir, "bin")
+		if fileExists(filepath.Join(bin, "sing-box.exe")) && fileExists(filepath.Join(bin, "xray.exe")) {
+			return bin
+		}
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return ""

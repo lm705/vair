@@ -11,6 +11,9 @@ package core
 type ConfigURLResult struct {
 	URL   string `json:"url"`
 	Error string `json:"error,omitempty"`
+	// Summary is what a JSON config was recognised as — engine, protocol,
+	// server, transport — shown in place of its link, which is unreadable.
+	Summary string `json:"summary,omitempty"`
 }
 
 // ConfigFormResult carries a form prefilled from an existing config, or an error.
@@ -27,10 +30,11 @@ func BuildConfigURL(f ConfigForm) ConfigURLResult {
 	if err != nil {
 		return ConfigURLResult{Error: err.Error()}
 	}
-	if _, err := parseNode(u); err != nil {
+	n, err := parseNode(u)
+	if err != nil {
 		return ConfigURLResult{Error: "the config didn't validate: " + err.Error()}
 	}
-	return ConfigURLResult{URL: u}
+	return ConfigURLResult{URL: u, Summary: jsonSummary(n)}
 }
 
 // ParseConfigToForm parses an existing raw config into a form (edit / view
@@ -101,7 +105,7 @@ func addBuiltConfig(tabID, raw string) int {
 // its stale test results, migrates raw-keyed references (last-connected / live
 // connection), persists the whole tab, and emits entry_update. Returns "" on
 // success or an error string.
-func UpdateConfig(tabID string, idx int, f ConfigForm) string {
+func UpdateConfig(tabID string, idx int, raw string, f ConfigForm) string {
 	if tabID == "" || tabID == "main" {
 		return "Sources-tab configs can't be edited"
 	}
@@ -119,7 +123,9 @@ func UpdateConfig(tabID string, idx int, f ConfigForm) string {
 	}
 	ne := &ConfigEntry{Raw: newRaw}
 	fillEntryFromNode(ne, n)
-	entry, ok := memEntry(tabID, idx)
+	// raw is the configuration the form was opened on: the tab's source may
+	// have been refreshed while it was open, and the index then names another.
+	entry, ok := entryFor(tabID, idx, raw)
 	if !ok {
 		return "config not found"
 	}
@@ -129,9 +135,12 @@ func UpdateConfig(tabID string, idx int, f ConfigForm) string {
 	entry.Name = ne.Name
 	entry.Host, entry.Port = ne.Host, ne.Port
 	entry.Network, entry.Security, entry.Protocol = ne.Network, ne.Security, ne.Protocol
-	// The server/params changed, so any prior ping/speed result is stale.
-	entry.PingStatus, entry.Delay, entry.PingErr = StatusPending, 0, ""
-	entry.SpeedStatus, entry.SpeedMBps, entry.SpeedErr, entry.SpeedLive = StatusPending, 0, "", 0
+	// A changed server makes its ping and speed stale. A changed name does not:
+	// renaming through the form used to throw the results away as well.
+	if dedupKey(oldRaw) != dedupKey(ne.Raw) {
+		entry.PingStatus, entry.Delay, entry.PingErr = StatusPending, 0, ""
+		entry.SpeedStatus, entry.SpeedMBps, entry.SpeedErr, entry.SpeedLive = StatusPending, 0, "", 0
+	}
 	entry.mu.Unlock()
 
 	// Migrate raw-keyed references so an edit of the connected config doesn't
@@ -140,6 +149,11 @@ func UpdateConfig(tabID string, idx int, f ConfigForm) string {
 		settingsMu.Lock()
 		if appSettings.LastConnectedRaw == oldRaw {
 			appSettings.LastConnectedRaw = ne.Raw
+		}
+		for i, r := range appSettings.LastConnectedChain {
+			if r == oldRaw {
+				appSettings.LastConnectedChain[i] = ne.Raw
+			}
 		}
 		settingsMu.Unlock()
 		cm := state.conn

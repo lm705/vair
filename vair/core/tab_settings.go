@@ -215,7 +215,11 @@ type TabSettingsReq struct {
 	GitHubOwner   string `json:"github_owner"`
 	GitHubRepo    string `json:"github_repo"`
 	GitHubFile    string `json:"github_file"`
-	GitHubPAT     string `json:"github_pat"`
+	// GitHubPAT replaces the stored token when not empty; empty keeps it, unless
+	// GitHubPATClear asks for it to be removed. The dialog never receives the
+	// stored token (Tab.MarshalJSON), so an empty field means "unchanged".
+	GitHubPAT      string `json:"github_pat"`
+	GitHubPATClear bool   `json:"github_pat_clear"`
 }
 
 func strSlicesEqual(a, b []string) bool {
@@ -252,7 +256,10 @@ func tabFilesKey(files []TabFile) string {
 // GitHub import config. A disabled import collapses to "" so toggling it off
 // (or editing fields while disabled) is treated as "no GitHub source".
 func githubKey(enabled bool, owner, repo, file, pat string) string {
-	if !enabled {
+	// Only a complete import is a source. The switch on with the fields still
+	// empty — or half filled — used to count as a change of sources, and on a
+	// tab of its own configurations that change emptied it.
+	if !enabled || owner == "" || repo == "" || file == "" || pat == "" {
 		return ""
 	}
 	return owner + "\x00" + repo + "\x00" + file + "\x00" + pat
@@ -273,11 +280,12 @@ func SetTabSettings(id string, req TabSettingsReq) {
 		newMode = ""
 	}
 
-	// Clean URLs
+	// Clean URLs. Each once: the same link twice was fetched twice and put
+	// every one of its configurations in the tab twice.
 	var cleanURLs []string
 	for _, u := range req.URLs {
 		u = strings.TrimSpace(u)
-		if u != "" {
+		if u != "" && !strInSlice(u, cleanURLs) {
 			cleanURLs = append(cleanURLs, u)
 		}
 	}
@@ -316,12 +324,16 @@ func SetTabSettings(id string, req TabSettingsReq) {
 	ghRepo := strings.TrimSpace(req.GitHubRepo)
 	ghFile := strings.TrimLeft(strings.TrimSpace(req.GitHubFile), "/")
 	ghPAT := strings.TrimSpace(req.GitHubPAT)
+	if ghPAT == "" && !req.GitHubPATClear {
+		ghPAT = TabDetail(id).GitHubPAT // unchanged: the dialog does not have it
+	}
 	ghReady := ghEnabled && ghOwner != "" && ghRepo != "" && ghFile != "" && ghPAT != ""
 	hasSource := len(cleanURLs) > 0 || len(cleanFiles) > 0 || ghReady
 
 	var sourcesChanged bool
 	var excludeChanged bool
 	var oldMode string
+	var loaded bool
 	state.mu.Lock()
 	for i, t := range state.tabs {
 		if t.ID == id {
@@ -341,6 +353,7 @@ func SetTabSettings(id string, req TabSettingsReq) {
 				sourcesChanged = (oldURLs != newURLs) || (oldDisabled != newDisabled) ||
 					(oldFilesKey != newFilesKey) || (oldGH != newGH)
 				oldMode = t.DedupMode
+				loaded = t.SourceLoaded
 				state.tabs[i].SourceURLs = cleanURLs
 				state.tabs[i].SourceDisabled = cleanDisabled
 				state.tabs[i].SourceFiles = cleanFiles
@@ -394,16 +407,22 @@ func SetTabSettings(id string, req TabSettingsReq) {
 		}
 		go fetchTabURLs(id, cleanURLs, cleanFiles)
 	} else {
-		// All sources removed — clear the subscription info too.
+		// All sources removed — clear the subscription info too, and the rows
+		// when they came from those sources. A tab whose rows are its own (a
+		// link typed and erased that never loaded) keeps them.
 		state.mu.Lock()
 		for i := range state.tabs {
 			if state.tabs[i].ID == id {
 				state.tabs[i].Subs = nil
+				state.tabs[i].GitHubError = ""
+				state.tabs[i].SourceLoaded = false
 				break
 			}
 		}
 		state.mu.Unlock()
-		storeReplace(id, nil) // all sources removed, no re-fetch → clear the store now
+		if loaded {
+			storeReplace(id, nil) // all sources removed, no re-fetch → clear the store now
+		}
 		state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 		loadedSignal(id)
 		saveTabs()
@@ -511,19 +530,26 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	// One record per ENABLED URL source: its metadata on success, or
 	// {URL, Error} on failure — rebuilt every fetch (reconciliation).
 	var subs []subMeta
+	prevSubs := tabSubs(tabID)
 	for _, u := range urls {
 		if strInSlice(u, disabled) {
 			continue
 		}
 		enabledSources++
+		// Not a link at all: said in words, not as the HTTP client's
+		// "unsupported protocol scheme".
+		if !isSubscriptionURL(u) {
+			subs = append(subs, failedMeta(prevSubs, u, errNotALink))
+			continue
+		}
 		lines, meta, err := fetchURLMeta(u)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "⚠ tab %s fetch %s: %v\n", tabID, u, err)
-			subs = append(subs, subMeta{URL: u, Error: err.Error()})
+			fmt.Fprintf(os.Stderr, "⚠ tab %s fetch %s: %s\n", tabID, sourceForLog(u), fetchErrText(err))
+			subs = append(subs, failedMeta(prevSubs, u, fetchErrText(err)))
 			continue
 		}
 		if len(lines) == 0 {
-			subs = append(subs, subMeta{URL: u, Error: "no configs found"})
+			subs = append(subs, failedMeta(prevSubs, u, "no configs found"))
 			continue
 		}
 		rec := subMeta{URL: u}
@@ -567,7 +593,13 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		entries, err := parseConfigFile(f.Path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "⚠ tab %s read %s: %v\n", tabID, f.Path, err)
+			f.Error = fileErrText(err)
+			vlog("warning", "tab: file source %s did not load: %s", f.Name, f.Error)
 			continue
+		}
+		f.Error = ""
+		if len(entries) == 0 {
+			f.Error = "no configs found"
 		}
 		allEntries = append(allEntries, entries...)
 	}
@@ -585,12 +617,14 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		}
 	}
 	state.mu.RUnlock()
+	ghErr := ""
 	if ghReady {
 		enabledSources++
 		ghLines, err := fetchGitHubPATContent(ghOwner, ghRepo, ghFile, ghPAT)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "⚠ tab %s GitHub import: %v\n", tabID, err)
-			vlog("warning", "tab: GitHub import failed (%s/%s): %v", ghOwner, ghRepo, err)
+			fmt.Fprintf(os.Stderr, "⚠ tab %s GitHub import: %s\n", tabID, fetchErrText(err))
+			vlog("warning", "tab: GitHub import failed (%s/%s): %s", ghOwner, ghRepo, fetchErrText(err))
+			ghErr = fetchErrText(err)
 		} else {
 			entries := parseConfigLines(strings.Join(ghLines, "\n"))
 			allEntries = append(allEntries, entries...)
@@ -598,11 +632,31 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		}
 	}
 
+	// What this fetch learned about the files and the GitHub import — why one
+	// did not load — goes back to the tab whatever the outcome, so the settings
+	// show it next to the source.
+	loaded := false
+	state.mu.Lock()
+	for i := range state.tabs {
+		if state.tabs[i].ID == tabID {
+			state.tabs[i].SourceFiles = updatedFiles
+			state.tabs[i].GitHubError = ghErr
+			loaded = state.tabs[i].SourceLoaded
+			break
+		}
+	}
+	state.mu.Unlock()
+
 	if len(allEntries) == 0 {
 		if enabledSources == 0 {
 			// Every source was explicitly switched off/removed — clear the tab.
 			// (Deliberate 2.0 change from 1.10, which kept the old configs here.)
-			storeReplace(tabID, nil)
+			// Only rows that came from those sources: a tab whose rows are its
+			// own keeps them (see Tab.SourceLoaded).
+			if loaded {
+				storeReplace(tabID, nil)
+				setSourceLoaded(tabID, false)
+			}
 			state.broadcast(SSEEvent{Type: "tabs_update", Payload: state.tabs})
 			loadedSignal(tabID)
 			saveTabs()
@@ -619,11 +673,21 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 		//    gets fresh data instead of the values it just invalidated.
 		//  * report it: this used to go only to stderr and the tab-settings modal,
 		//    which is invisible while you're looking at the table.
+		// Every source that failed, named: a missing file used to raise a bare
+		// "Source unavailable".
 		var errs []string
 		for _, s := range subs {
 			if s.Error != "" {
 				errs = append(errs, s.Error)
 			}
+		}
+		for _, f := range updatedFiles {
+			if f.Error != "" && !f.Disabled {
+				errs = append(errs, f.Name+": "+f.Error)
+			}
+		}
+		if ghErr != "" {
+			errs = append(errs, "GitHub: "+ghErr)
 		}
 		vlog("warn", "tab %s: source unreachable — configs kept, test results cleared", tabID)
 		resetTabResultsMem(tabID)
@@ -653,7 +717,7 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	state.mu.RUnlock()
 
 	if dedupMode == "delete" {
-		allEntries = dedupByBody(allEntries)
+		allEntries = dedupByBody(allEntries, tabExcludeFilter(tabID))
 	}
 
 	// Rename duplicate display names so each entry is uniquely identifiable.
@@ -663,15 +727,8 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	for i, e := range allEntries {
 		e.Index = i
 	}
-	state.mu.Lock()
-	// Persist updated file metadata back to the tab (size/mtime refresh).
-	for i := range state.tabs {
-		if state.tabs[i].ID == tabID {
-			state.tabs[i].SourceFiles = updatedFiles
-			break
-		}
-	}
-	state.mu.Unlock()
+	// The rows are the sources' now.
+	setSourceLoaded(tabID, true)
 	addedN, removedN, addedIdx := reloadDelta(tabID, allEntries) // reads the OLD DB set first
 	// Serve the UI from memory immediately, THEN write to SQLite. Crucially clear
 	// the "fetching" flag BEFORE the (slow, 200k-row) write: the configs are
@@ -692,4 +749,32 @@ func fetchTabURLs(tabID string, urls []string, files []TabFile) {
 	go autoPingAfterRefresh(tabID)
 	// Hint at returning the parse spike's memory to the OS right away.
 	debug.FreeOSMemory()
+}
+
+// setSourceLoaded records whether a tab's rows came from its sources.
+func setSourceLoaded(tabID string, v bool) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	for i := range state.tabs {
+		if state.tabs[i].ID == tabID {
+			state.tabs[i].SourceLoaded = v
+			return
+		}
+	}
+}
+
+// errNotALink is a URL source that is not an http(s) link.
+const errNotALink = "not a link — a source address starts with https://"
+
+// fileErrText is why a file source did not load, in words the interface
+// translates: the operating system's own message names the path and differs
+// by system language.
+func fileErrText(err error) string {
+	switch {
+	case os.IsNotExist(err):
+		return "file not found"
+	case os.IsPermission(err):
+		return "no permission to read the file"
+	}
+	return "could not read the file: " + err.Error()
 }

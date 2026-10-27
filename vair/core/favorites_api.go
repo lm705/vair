@@ -137,3 +137,35 @@ func RemoveFavorites(bodies []string) int {
 	loadedSignal(TableTab()) // stars float to the top → re-sort what is on screen
 	return removed
 }
+
+// RestoreFavorites stars the given bodies again — the "Undo" after a removal in
+// the list. A star is set by hand and the list is where the ones with no row
+// can be found at all, so a mis-click there used to lose one for good. Bodies
+// already starred are left alone; returns how many were added back.
+func RestoreFavorites(bodies []string) int {
+	if len(bodies) == 0 {
+		return 0
+	}
+	settingsMu.Lock()
+	have := make(map[string]bool, len(appSettings.Favorites))
+	for _, f := range appSettings.Favorites {
+		have[nodeBody(f)] = true
+	}
+	added := 0
+	for _, b := range bodies {
+		body := nodeBody(b)
+		if body == "" || have[body] {
+			continue
+		}
+		have[body] = true
+		appSettings.Favorites = append(appSettings.Favorites, body)
+		added++
+	}
+	settingsMu.Unlock()
+	if added == 0 {
+		return 0
+	}
+	saveSettings()
+	loadedSignal(TableTab())
+	return added
+}

@@ -112,14 +112,25 @@ export interface AppSettings {
     "speed_test_url"?: string;
 
     /**
-     * Fallback speed URL — used ONLY when the primary speed URL returns HTTP
-     * 429 (rate-limit). "" / unset → the CacheFly default (on by default);
+     * Fallback speed URL — used ONLY when the primary speed URL answers with
+     * one of the SpeedFallbackOn statuses (429 by default). "" / unset → the
+     * CacheFly default (on by default);
      * "__none" → fallback explicitly disabled; anything else → that URL. See
      * currentSpeedFallbackURL. Each attempt has its own bounded
      * http.Client.Timeout, so an unreachable fallback cannot extend the test
      * indefinitely or leak goroutines.
      */
     "speed_test_url_fallback"?: string;
+
+    /**
+     * SpeedFallbackOn is which HTTP statuses from the primary speed URL send the
+     * test to the fallback: codes, ranges and classes, comma-separated —
+     * "429, 403, 500-599" or "429, 5xx". "" means 429, the rate limit the
+     * fallback was made for. Only answers from the test file's server count: a
+     * connection that fails says something about the configuration, and a
+     * second URL would not change it. See speedFallbackOn.
+     */
+    "speed_fallback_on"?: string;
 
     /**
      * CheckIPURL is what the "check IP" button asks. Empty → the built-in
@@ -134,6 +145,14 @@ export interface AppSettings {
      * one config carries it at a time.
      */
     "last_connected_raw"?: string;
+
+    /**
+     * LastConnectedChain is every hop of the last session when it was a chain,
+     * entry first; empty for a single configuration. LastConnectedRaw holds
+     * only the exit (the badge), and restoring from it alone brought the exit
+     * back connected directly — the one thing a chain is there to avoid.
+     */
+    "last_connected_chain"?: string[] | null;
 
     /**
      * Favorite configs, keyed by their raw URL (stable across reload/sort).
@@ -188,13 +207,14 @@ export interface AppSettings {
     "watch_connection"?: boolean;
 
     /**
-     * ConnTrackingOff stops the connections panel collecting anything: no row
-     * per connection, no peek at the first bytes to learn where it is going, no
-     * parsing of the engine's log for it. Inverted, so the zero value is the
-     * normal case — tracking on — and the switch in the panel is the only way to
-     * turn it off.
+     * ConnTracking lets the connections panel collect: a row per connection,
+     * the bytes read to learn where it is going, the engine's log parsed for it.
+     * Off by default — what it collects is a list of the sites visited, with the
+     * program and the traffic, kept for the whole run and readable through the
+     * web interface — so it starts only when the switch in the panel ("record")
+     * is turned on. Replaces conn_tracking_off, which had it on by default.
      */
-    "conn_tracking_off"?: boolean;
+    "conn_tracking"?: boolean;
 
     /**
      * RuleStats, when on, counts how often each line of the user's rule lists
@@ -299,11 +319,20 @@ export interface AppSettings {
 
     /**
      * HideHints removes the explanatory paragraph under each setting in the
-     * Settings, Tab-settings and auto-connect dialogs. Stored as the negative so
-     * the zero value keeps them — a new user should read what a switch does; it
-     * is the user who already knows who wants the dialogs short.
+     * Settings, Tab-settings and auto-connect dialogs; an i mark beside each
+     * name opens it instead. On by default since 2.7.0 (the user's call: the
+     * dialogs are long, and a description is one click away). Not omitempty:
+     * with the default on, an explicit "show them" is a false that has to be
+     * written down, or the next start would read the default back.
      */
-    "hide_hints"?: boolean;
+    "hide_hints": boolean;
+
+    /**
+     * SettingsRev is the revision of the settings file, set by migrateSettings.
+     * Zero in a file written before revisions existed. Program-owned: no
+     * dialog writes it.
+     */
+    "settings_rev"?: number;
 
     /**
      * Theme is the UI colour scheme: "" / "dark" (default) or "light". Applied
@@ -383,10 +412,11 @@ export interface AppSettings {
      * All zero-valued → 1.4.0 behaviour. Opt-in for now; once we have
      * field reports we'll consider flipping defaults in 1.6.0.
      * 
-     * DNSLeakProtection is the master switch. When ON we install a real
-     * DNS routing block in sing-box, hijack port 53, and turn on
-     * strict_route so the WFP filter (Windows) prevents anything from
-     * escaping. When OFF the program behaves like 1.4.0.
+     * DNSLeakProtection is the master switch. When ON the names of the sites
+     * behind the tunnel are resolved through it, and strict_route's WFP filter
+     * (Windows) stops every other program asking a resolver outside it — the
+     * lookups Windows otherwise sends to the physical adapter's resolver in
+     * parallel. When OFF those names go to the system resolver.
      * On by default (see appSettings initialiser). No omitempty: an explicit
      * "off" must round-trip to disk, otherwise it would silently revert to the
      * default on next launch.
@@ -394,14 +424,11 @@ export interface AppSettings {
     "dns_leak_protection": boolean;
 
     /**
-     * KillSwitch (TUN, only meaningful with DNSLeakProtection on) drives
-     * sing-box strict_route: on Windows a WFP filter that drops any traffic
-     * trying to leave OUTSIDE the tunnel, so nothing falls back to the physical
-     * NIC if the VPN drops (fail-closed) and DNS can't leak either. OFF = DNS is
-     * still tunnelled but traffic can fall back to direct on a tunnel drop.
-     * ON by default: before 2.1 strict_route silently followed DNSLeakProtection,
-     * so this default preserves that behaviour while making the toggle real. No
-     * omitempty — an explicit "off" must round-trip to disk.
+     * KillSwitch (TUN, only meaningful with DNSLeakProtection on): Vair's own
+     * block of everything that tries to leave OUTSIDE the tunnel, so nothing
+     * falls back to the physical NIC (tunnelblock_windows.go; the helper's
+     * nftables table on Linux). DNS is DNSLeakProtection's, not this. ON by
+     * default. No omitempty — an explicit "off" must round-trip to disk.
      */
     "kill_switch": boolean;
 
@@ -461,9 +488,16 @@ export interface AppSettings {
     /**
      * DNS server overrides. Empty falls back to the built-in default
      * for the slot (see dnsServerOr* helpers).
-     * plain UDP, IP-only
      */
     "bootstrap_dns"?: string;
+
+    /**
+     * BootstrapStrict forbids the fallback to the system resolver when the
+     * bootstrap server does not answer: the connection fails instead, and the
+     * VPN server's name never reaches the provider's resolver.
+     * plain UDP, IP-only
+     */
+    "bootstrap_strict"?: boolean;
 
     /**
      * for bypass traffic
@@ -560,11 +594,13 @@ export interface AppSettings {
      * The switch tolerance: how much better a candidate has to be before AUTO
      * leaves a working connection, and how long it must stay before it may leave
      * at all. Without them AUTO flaps between servers that differ by noise.
-     * Zero means the built-in default (20 ms / 15 % / 60 s).
+     * Absent means the built-in default (20 ms / 15 % / 60 s); zero is a value.
+     * They were plain numbers with omitempty, so a 0 typed into the panel was
+     * never written, and "no wait" quietly became sixty seconds.
      */
-    "auto_switch_tolerance_ms"?: number;
-    "auto_switch_speed_pct"?: number;
-    "auto_min_dwell_sec"?: number;
+    "auto_switch_tolerance_ms"?: number | null;
+    "auto_switch_speed_pct"?: number | null;
+    "auto_min_dwell_sec"?: number | null;
 
     /**
      * AutoMaxLatencyMs is the live-probe round-trip budget in milliseconds.
@@ -607,6 +643,17 @@ export interface AppSettings {
      * fields are still written, so a downgrade keeps the setting.
      */
     "auto_rank_mode"?: string;
+
+    /**
+     * AutoPreferLast makes AUTO try the last connected config first when it
+     * connects from nothing — at start, when switched on, after a disconnect —
+     * as long as that config is a candidate and passed its latest ping. Off by
+     * default since 2.7.0: the first connection goes to the top of the ranking,
+     * the row the panel's candidate list shows first. It used to be the only
+     * behaviour, and a server the ranking had long since left behind kept being
+     * chosen just for having been used. Failover always follows the ranking.
+     */
+    "auto_prefer_last"?: boolean;
 
     /**
      * LastConnectedMode records the mode ("proxy"/"tun") of the most
@@ -704,6 +751,49 @@ export interface AutoCandDTO {
 }
 
 /**
+ * AutoSweepProgress is how far AUTO's test of its pool has got. A big pool is
+ * tested before the first connection, and without a count the panel said
+ * "waiting" for minutes with nothing to show that it was getting anywhere.
+ * 
+ * Seq orders the updates. The events that carry them are delivered each on a
+ * goroutine of its own, so they can arrive out of order — and the last count
+ * of a sweep, reported from a test goroutine a moment before the sweep's end,
+ * could land after "finished" and leave the panel showing a full bar that
+ * never went away. The panel keeps the highest Seq it has seen and drops
+ * anything older.
+ */
+export interface AutoSweepProgress {
+    "running": boolean;
+    "done": number;
+    "total": number;
+    "speed": boolean;
+    "seq": number;
+}
+
+/**
+ * BackupProgress is how far an export or an import has got. With a few
+ * hundred thousand configurations either takes a while, and the buttons gave
+ * no sign of working or of having finished.
+ * 
+ * Op is "export" or "import"; Phase is what is being done now — "read" (the
+ * file, which has no count), "parse" (the configurations, read back), "save"
+ * (written to the database) or "write" (the export file). Done and Total
+ * count configurations within the phase. Path is set once the work is over;
+ * Error, if it failed. Seq orders the updates, which can arrive out of order
+ * (see AutoSweepProgress).
+ */
+export interface BackupProgress {
+    "op": string;
+    "phase"?: string;
+    "running": boolean;
+    "done": number;
+    "total": number;
+    "path"?: string;
+    "error"?: string;
+    "seq": number;
+}
+
+/**
  * BypassRow is one connection that did not go through the proxy.
  */
 export interface BypassRow {
@@ -743,6 +833,13 @@ export interface Capabilities {
     "tun": boolean;
     "tun_ready": boolean;
     "tun_block_reason"?: string;
+
+    /**
+     * HelperService is the Windows helper service's state: "running",
+     * "stopped" or "absent". Empty where there is none to speak of (Linux has
+     * its own helper flow, through TUNBlockReason).
+     */
+    "helper_service"?: string;
 
     /**
      * SplitTunnel — per-application routing rules ("apps without VPN") are
@@ -828,6 +925,16 @@ export interface Capabilities {
      * "appimage", or "none" (check and link only).
      */
     "self_update": string;
+
+    /**
+     * Portable is the single-file Windows build, which carries its engines
+     * inside the exe. Told by the build itself rather than guessed from where
+     * the exe sits: a portable exe in a folder it cannot write to reads as
+     * "installer" to SelfUpdate, and one an older setup left behind is
+     * portable in an installed folder. The Settings use it to say that the
+     * helper service comes with the setup version only.
+     */
+    "portable"?: boolean;
 }
 
 /**
@@ -881,6 +988,12 @@ export interface ConfigForm {
     "alpn"?: string;
     "fingerprint"?: string;
     "allow_insecure"?: boolean;
+
+    /**
+     * PinnedCert is the SHA-256 of the server's certificate (pcs= in VLESS and
+     * Trojan links): what xray offers in place of allowInsecure.
+     */
+    "pinned_cert"?: string;
 
     /**
      * vless reality/xtls
@@ -1018,6 +1131,13 @@ export interface ConfigForm {
      * meant, and what they never saw survives untouched.
      */
     "extra"?: { [_ in string]?: string } | null;
+
+    /**
+     * JSON is the outbound object itself, for Protocol "json": an xray or a
+     * sing-box outbound, or a whole configuration with one server in it. None
+     * of the fields above apply to it — see jsonconfig.go.
+     */
+    "json"?: string;
 }
 
 /**
@@ -1036,6 +1156,12 @@ export interface ConfigFormResult {
 export interface ConfigURLResult {
     "url": string;
     "error"?: string;
+
+    /**
+     * Summary is what a JSON config was recognised as — engine, protocol,
+     * server, transport — shown in place of its link, which is unreadable.
+     */
+    "summary"?: string;
 }
 
 export enum ConnMode {
@@ -1116,6 +1242,29 @@ export interface ConnState {
      * screen would explain why.
      */
     "blocked"?: boolean;
+
+    /**
+     * NoAnswer reports that the server of a live connection has stopped
+     * answering — bytes leave and nothing comes back, and a probe confirmed it —
+     * while nothing is set to act on that (no AUTO, no "Monitor the connected
+     * server"). The connection is left up; the bar says what is wrong with it.
+     */
+    "no_answer"?: boolean;
+
+    /**
+     * Checking is set while a session that has just come up is still being
+     * asked whether anything goes through it (verifyCarriesTraffic). The bar
+     * says so instead of "connected" until the answer is in: a dead server read
+     * as connected, with an uptime, for up to twenty seconds.
+     */
+    "checking"?: boolean;
+
+    /**
+     * AllRouted is whether this session sends everything through the tunnel:
+     * "all traffic through VPN", with no own rules and no programs kept out.
+     * The bar said "all traffic routed" in every routing mode.
+     */
+    "all_routed"?: boolean;
 }
 
 export enum ConnStatus {
@@ -1159,6 +1308,13 @@ export interface ExitInfo {
     "city": string;
     "isp": string;
     "error"?: string;
+
+    /**
+     * Reason is what went wrong, as a key the interface words in the user's
+     * language: "unreachable", "http", "unreadable", "no_address", "refused".
+     * Error carries the detail for the tooltip.
+     */
+    "reason"?: string;
 }
 
 /**
@@ -1345,6 +1501,22 @@ export interface OrderedRaws {
 }
 
 /**
+ * PortCheck is what a proxy port field shows under it: whether the port can be
+ * used, and if not, what has it.
+ */
+export interface PortCheck {
+    /**
+     * State is one of: free, ours (Vair's own current connection), busy
+     * (another program — Owner/PID when known), reserved (the system will not
+     * let it be taken), same (equal to the other proxy port), remote (the
+     * remote-access port), invalid (outside 1–65535).
+     */
+    "state": string;
+    "owner"?: string;
+    "pid"?: number;
+}
+
+/**
  * Row is the table DTO sent to the frontend (clean — no mutex; JSON keys match
  * the Ф0 ConfigService so the existing virtual table renders it unchanged).
  */
@@ -1406,6 +1578,18 @@ export interface Row {
 }
 
 /**
+ * RuleCheck is the settings screen's answer for one typed line: the line as it
+ * will be stored, or the kind of mistake in it ("host" or "regexp") and the
+ * engine's own words for a regexp.
+ */
+export interface RuleCheck {
+    "entry": string;
+    "value": string;
+    "error"?: string;
+    "detail"?: string;
+}
+
+/**
  * RuleHitDTO is one line as the settings screen needs it.
  */
 export interface RuleHitDTO {
@@ -1431,6 +1615,13 @@ export interface RuleHitDTO {
      * carries no value we could tie back to the line.
      */
     "tracked": boolean;
+
+    /**
+     * Unused marks an apps-list line while the running connection is in proxy
+     * mode, which cannot tell programs apart: it is not pending — the next
+     * proxy connection will not load it either.
+     */
+    "unused"?: boolean;
 }
 
 /**
@@ -1462,6 +1653,12 @@ export interface SessionFactRow {
      * otherwise. The panel draws it as "…, settings say X".
      */
     "now"?: string;
+
+    /**
+     * Note is a sentence under the row saying why the value is what it is —
+     * a fixed English phrase the panel translates. Empty for most rows.
+     */
+    "note"?: string;
 }
 
 /**
@@ -1536,6 +1733,13 @@ export interface StatsDTO {
     "failed": number;
 
     /**
+     * Removable is how many rows "Delete failed" removes. Failed counts failed
+     * pings in the filtered view; this counts failed pings and failed speed
+     * tests across the whole tab, because that is what the action removes.
+     */
+    "removable": number;
+
+    /**
      * ms; 0 = none
      */
     "best_ping": number;
@@ -1562,68 +1766,7 @@ export enum Status {
     StatusSkipped = "skipped",
 };
 
-export interface Tab {
-    "id": string;
-    "name": string;
-    "is_main": boolean;
-    "closable": boolean;
-    "source_url"?: string;
-    "source_urls"?: string[] | null;
-
-    /**
-     * SourceDisabled lists URL sources the user switched OFF in tab settings.
-     * They stay in SourceURLs (so the row and its subscription info persist) but
-     * are skipped on fetch. Matched by exact URL string.
-     */
-    "source_disabled"?: string[] | null;
-    "source_files"?: TabFile[] | null;
-    "refresh_min"?: number;
-    "exclude_filter"?: string[] | null;
-
-    /**
-     * ExcludeDisabled / RefreshDisabled turn OFF the exclude filter / auto-refresh
-     * for this tab WITHOUT clearing their values (the filter rules and refresh
-     * interval persist but aren't applied while off). Inverted bool so the JSON
-     * zero value (omitted) means "enabled": both default ON for every tab.
-     */
-    "exclude_disabled"?: boolean;
-    "refresh_disabled"?: boolean;
-
-    /**
-     * DedupMode is "" (off), "hide" (client-side view filter, reversible),
-     * or "delete" (server-side removal, not reversible). The Tab.Dedup
-     * boolean from earlier dev builds is auto-migrated to "hide" on load.
-     */
-    "dedup_mode"?: string;
-
-    /**
-     * AutoRefreshTest runs a background test of the tab's configs after a
-     * SCHEDULED auto-refresh (never on a manual RELOAD): "" (off), "ping"
-     * (ping only), or "speed" (full ping→speed). Independent of AUTO mode.
-     */
-    "auto_refresh_test"?: string;
-
-    /**
-     * Subs holds subscription metadata (title, traffic quota, expiry, …) parsed on
-     * the last fetch from the response headers / "#"-comments — one entry per
-     * source URL that carried any. Empty when none. Persisted so it shows
-     * immediately on startup before the next re-fetch.
-     */
-    "subs"?: subMeta[] | null;
-
-    /**
-     * GitHub private-repo import (per-tab). When GitHubEnabled and owner/repo/
-     * file/PAT are all set, the tab additionally pulls a config file from a
-     * private GitHub repository via the Contents API on every fetch/refresh,
-     * appended after URL + file sources. The PAT is stored in plaintext in
-     * tabs.json (same trust level as the configs themselves).
-     */
-    "github_enabled"?: boolean;
-    "github_owner"?: string;
-    "github_repo"?: string;
-    "github_file"?: string;
-    "github_pat"?: string;
-}
+export type Tab = any;
 
 /**
  * TabDTO is a tab for the frontend tab bar.
@@ -1644,6 +1787,20 @@ export interface TabDTO {
      * "" | hide | delete — view re-queries on change
      */
     "dedup_mode"?: string;
+
+    /**
+     * All counts the tab's configurations including the ones its exclude filter
+     * and "hide duplicates" keep out of view: a tab whose filter hid everything
+     * read as "This tab is empty", with hints to add configurations it had.
+     */
+    "all": number;
+
+    /**
+     * SourceError is why the tab's source did not load the last time, or "".
+     * The table learned it only from a one-time event, so a window or web page
+     * opened afterwards showed an empty tab with nothing to say why.
+     */
+    "source_error"?: string;
 }
 
 export interface TabFile {
@@ -1674,6 +1831,12 @@ export interface TabFile {
      * same on/off behaviour URL sources have via SourceDisabled).
      */
     "disabled"?: boolean;
+
+    /**
+     * Error is why the file did not load on the last fetch ("" when it did):
+     * a missing file used to show as "Source unavailable" with no name.
+     */
+    "error"?: string;
 }
 
 /**
@@ -1705,7 +1868,30 @@ export interface TabSettingsReq {
     "github_owner": string;
     "github_repo": string;
     "github_file": string;
+
+    /**
+     * GitHubPAT replaces the stored token when not empty; empty keeps it, unless
+     * GitHubPATClear asks for it to be removed. The dialog never receives the
+     * stored token (Tab.MarshalJSON), so an empty field means "unchanged".
+     */
     "github_pat": string;
+    "github_pat_clear": boolean;
+}
+
+/**
+ * TabUndoResult is UndoDeleteTab's answer for the window.
+ */
+export interface TabUndoResult {
+    "name": string;
+    "reason"?: string;
+}
+
+/**
+ * UndoResult is UndoDelete's answer for the table.
+ */
+export interface UndoResult {
+    "restored": number;
+    "reason"?: string;
 }
 
 /**
@@ -1783,38 +1969,4 @@ export interface UpdateInfo {
      * to the .deb rather than to a page to hunt through.
      */
     "download_url"?: string;
-}
-
-/**
- * subMeta holds optional subscription metadata: traffic quota / expiry (from the
- * Subscription-Userinfo response header used by Marzban/3x-ui/Remnawave panels)
- * and title / update-interval / date / count (from those response headers OR the
- * leading "#"-comment lines static raw files embed, since a static file can't set
- * its own HTTP headers). All fields are best-effort — anything missing stays zero.
- */
-export interface subMeta {
-    "title"?: string;
-
-    /**
-     * source URL this metadata came from
-     */
-    "url"?: string;
-
-    /**
-     * set by the caller when the source failed to load
-     */
-    "error"?: string;
-    "upload"?: number;
-    "download"?: number;
-    "total"?: number;
-    "expire"?: number;
-    "update_interval"?: string;
-    "updated"?: string;
-    "count"?: number;
-    "info"?: string;
-
-    /**
-     * any other leading "#"-comment lines, verbatim
-     */
-    "notes"?: string[] | null;
 }

@@ -26,7 +26,17 @@ export function keepBlockNoticeWanted(): boolean {
   return localStorage.getItem(SUPPRESS) !== '1'
 }
 
-export default function KeepBlockNotice({ lang, onClose }: { lang: string; onClose: () => void }) {
+// service: the Windows helper service is installed, and takes the block down
+// for an ordinary user — no administrator needed for the command line either.
+export default function KeepBlockNotice({
+  lang,
+  service,
+  onClose,
+}: {
+  lang: string
+  service?: boolean
+  onClose: () => void
+}) {
   const [cur, setCur] = useState(lang === 'ru' ? 'ru' : 'en')
   // Read once already? Then the text is not new and the wait is not owed.
   const [left, setLeft] = useState(() => (localStorage.getItem(READ) === '1' ? 0 : DELAY))
@@ -54,39 +64,47 @@ export default function KeepBlockNotice({ lang, onClose }: { lang: string; onClo
     <div className="kb-veil">
       <div className="kb-box" role="alertdialog" aria-modal="true">
         <div className="kb-head">
-          <span className="kb-title">{tt('Before you leave this on')}</span>
-          <button className={'hint-lang' + (cur === 'en' ? ' on' : '')} onClick={() => setCur('en')}>
-            EN
-          </button>
-          <button className={'hint-lang' + (cur === 'ru' ? ' on' : '')} onClick={() => setCur('ru')}>
-            RU
-          </button>
+          <span className="kb-title">{tt('Persistent kill-switch')}</span>
+          <span className="bgroup">
+            <button className={'hint-lang' + (cur === 'en' ? ' on' : '')} onClick={() => setCur('en')}>
+              EN
+            </button>
+            <button className={'hint-lang' + (cur === 'ru' ? ' on' : '')} onClick={() => setCur('ru')}>
+              RU
+            </button>
+          </span>
         </div>
         <div className="kb-body">
           <p>
             {tt(
-              'With this on, the block lives in the firewall and not in the engine — so it stays after the tunnel is gone. It stays when Vair crashes, when you close Vair, and after a restart of the computer.',
+              'With this setting on, the block does not depend on Vair running. It stays in place after Vair is closed or crashes, and after Windows restarts.',
             )}
           </p>
           <p>
             {tt(
-              'While it stands, this machine has no internet at all except through the tunnel. Not a slower connection, not some sites: nothing loads.',
+              'While the block is in place, this computer has no internet access except through the VPN tunnel. Nothing opens outside it — not slowly, not partially.',
             )}
           </p>
           <p>
-            {tt('It comes down when you say so, and only then:')}
+            {tt('Only you can lift it:')}
           </p>
           <ul>
             <li>{tt('disconnect, or turn this setting off;')}</li>
             <li>{tt('press the red "traffic blocked ✕" button on the connection bar;')}</li>
             <li>
-              {tt('without Vair — in PowerShell as administrator:')}{' '}
-              <code>Set-NetFirewallProfile -All -DefaultOutboundAction Allow</code>
+              {service
+                ? tt('without the Vair window — from its folder:')
+                : tt('without the Vair window — from its folder, as administrator:')}{' '}
+              <code>Vair.exe --release-block</code>
+            </li>
+            <li>
+              {tt('if Vair has been removed — in Command Prompt, as administrator:')}{' '}
+              <code>powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\vair\data\release-block.ps1"</code>
             </li>
           </ul>
           <p className="kb-calm">
             {tt(
-              'Connection → Restore the connection on start changes who ends that: on, the next start brings the same tunnel back under the block; off, the machine stays blocked until you connect or press the red button. Either way nothing goes out unprotected.',
+              'To have the tunnel come back by itself after a restart, also turn on Launch at system startup and Restore the connection on start: Vair will reconnect under the block. Otherwise the computer stays offline until you connect or lift the block.',
             )}
           </p>
         </div>
@@ -101,7 +119,7 @@ export default function KeepBlockNotice({ lang, onClose }: { lang: string; onClo
           >
             {tt('Do not show again')}
           </button>
-          <button className="kb-ok" disabled={!ready} onClick={onClose}>
+          <button className="btn red kb-ok" disabled={!ready} onClick={onClose}>
             {ready ? tt('I understand') : tt('I understand') + ' (' + left + ')'}
           </button>
         </div>

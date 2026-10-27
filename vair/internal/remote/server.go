@@ -54,7 +54,20 @@ var (
 	remoteMu     sync.Mutex
 	remoteServer *http.Server
 	remoteHub    = &sseHub{clients: map[chan []byte]struct{}{}}
+	// listenErr is why the server is not running although it is switched on,
+	// "" otherwise. The settings screen shows it under the port: a server that
+	// could not start used to leave a link and a QR code there that led
+	// nowhere, with the reason only on stderr.
+	listenErr string
 )
+
+// Status reports whether the server is accepting connections and, when it
+// was asked to and is not, why.
+func Status() (listening bool, reason string) {
+	remoteMu.Lock()
+	defer remoteMu.Unlock()
+	return remoteServer != nil, listenErr
+}
 
 const remoteCookie = "vair_remote"
 
@@ -106,19 +119,22 @@ func start() {
 	// IPv4 interface with no dual-stack ambiguity.
 	ln, err := net.Listen("tcp4", fmt.Sprintf("0.0.0.0:%d", port))
 	if err != nil {
-		log.Printf("remote: listen 0.0.0.0:%d: %v", port, err)
+		listenErr = fmt.Sprintf("port %d is taken by another program", port)
+		core.LogEvent("error", "web interface: cannot listen on port %d: %v", port, err)
 		shell.RemoveFirewallRule()
 		remoteServer = nil
 		return
 	}
+	listenErr = ""
 	remoteServer = &http.Server{Handler: remoteAuth(token, mux)}
 	srv := remoteServer
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			log.Printf("remote: server: %v", err)
+			core.LogEvent("error", "web interface: the server stopped: %v", err)
 			remoteMu.Lock()
 			if remoteServer == srv {
 				remoteServer = nil
+				listenErr = "the server stopped; the log says why"
 			}
 			remoteMu.Unlock()
 		}
@@ -163,6 +179,7 @@ func stop() {
 	remoteMu.Lock()
 	srv := remoteServer
 	remoteServer = nil
+	listenErr = ""
 	remoteMu.Unlock()
 	if srv == nil {
 		return

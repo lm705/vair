@@ -10,6 +10,13 @@ export interface RemoteInfo {
     "token": string;
     "port": number;
     "ips": string[] | null;
+
+    /**
+     * Listening is whether the server is accepting connections; Problem is
+     * why it is not although it is switched on (a fixed English phrase).
+     */
+    "listening": boolean;
+    "problem"?: string;
 }
 
 /**

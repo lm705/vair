@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,6 +108,20 @@ type ConnState struct {
 	// nothing is connected: the machine has no way out and nothing else on
 	// screen would explain why.
 	Blocked bool `json:"blocked,omitempty"`
+	// NoAnswer reports that the server of a live connection has stopped
+	// answering — bytes leave and nothing comes back, and a probe confirmed it —
+	// while nothing is set to act on that (no AUTO, no "Monitor the connected
+	// server"). The connection is left up; the bar says what is wrong with it.
+	NoAnswer bool `json:"no_answer,omitempty"`
+	// Checking is set while a session that has just come up is still being
+	// asked whether anything goes through it (verifyCarriesTraffic). The bar
+	// says so instead of "connected" until the answer is in: a dead server read
+	// as connected, with an uptime, for up to twenty seconds.
+	Checking bool `json:"checking,omitempty"`
+	// AllRouted is whether this session sends everything through the tunnel:
+	// "all traffic through VPN", with no own rules and no programs kept out.
+	// The bar said "all traffic routed" in every routing mode.
+	AllRouted bool `json:"all_routed,omitempty"`
 }
 
 type connManager struct {
@@ -163,12 +178,16 @@ func (cm *connManager) snap() ConnState {
 	// Derived for the same reason: a marker on disk, read cheaply, rather than
 	// a flag that could be left behind by the run that set it.
 	s.Blocked = blockStanding()
+	if cm.startedWith != nil {
+		s.AllRouted = cm.startedWith.AllTunnelled
+	}
 	return s
 }
 
 // bytes is this session's counters, or zeros while nothing is counting. Read by
 // the supervisor, which uses traffic that has already crossed the tunnel as the
-// answer to "is it still alive" — see livenessWatch.
+// answer to "is it still alive" — see livenessWatch. Down is what came from the
+// server (ServerDown), not what the local engine answered on its behalf.
 func (cm *connManager) bytes() (up, down int64) {
 	cm.mu.Lock()
 	c := cm.counter
@@ -176,7 +195,7 @@ func (cm *connManager) bytes() (up, down int64) {
 	if c == nil {
 		return 0, 0
 	}
-	return c.Up.Load(), c.Down.Load()
+	return c.Up.Load(), c.ServerDown.Load()
 }
 
 // ─────────────────────────── tabs ───────────────────────────────
@@ -195,6 +214,9 @@ type TabFile struct {
 	// Disabled skips this file on fetch while keeping it in the tab's list (the
 	// same on/off behaviour URL sources have via SourceDisabled).
 	Disabled bool `json:"disabled,omitempty"`
+	// Error is why the file did not load on the last fetch ("" when it did):
+	// a missing file used to show as "Source unavailable" with no name.
+	Error string `json:"error,omitempty"`
 }
 
 type Tab struct {
@@ -239,7 +261,28 @@ type Tab struct {
 	GitHubOwner   string `json:"github_owner,omitempty"`
 	GitHubRepo    string `json:"github_repo,omitempty"`
 	GitHubFile    string `json:"github_file,omitempty"`
-	GitHubPAT     string `json:"github_pat,omitempty"`
+	// The token never leaves the program: not in the tab list every window and
+	// web page receives, not in the settings dialog — it says only that one is
+	// stored (github_pat_set, see MarshalJSON). The web interface runs over
+	// plain HTTP, and it carried the token on every change of any tab.
+	GitHubPAT string `json:"-"`
+	// GitHubError is why the import failed on the last fetch ("" when it did not).
+	GitHubError string `json:"github_error,omitempty"`
+	// SourceLoaded says the tab's rows came from its sources: set by a fetch
+	// that loaded, cleared when the rows are cleared. Removing every source
+	// clears only such a tab — a tab of its own configurations was emptied by
+	// GitHub import switched on and off, or a link typed and erased.
+	SourceLoaded bool `json:"-"`
+}
+
+// MarshalJSON is the tab as the interface sees it: the GitHub token replaced
+// by whether one is stored.
+func (t Tab) MarshalJSON() ([]byte, error) {
+	type plain Tab
+	return json.Marshal(struct {
+		plain
+		GitHubPATSet bool `json:"github_pat_set,omitempty"`
+	}{plain(t), t.GitHubPAT != ""})
 }
 
 // gitHubReady reports whether a tab's GitHub import is enabled and fully
@@ -275,9 +318,44 @@ type persistedTab struct {
 	GitHubRepo    string `json:"github_repo,omitempty"`
 	GitHubFile    string `json:"github_file,omitempty"`
 	GitHubPAT     string `json:"github_pat,omitempty"`
+	// SourceLoaded (see Tab). Absent in files written before it existed: a tab
+	// with sources is then taken to hold what they loaded.
+	SourceLoaded *bool `json:"source_loaded,omitempty"`
 }
 type persistedData struct {
 	Tabs []persistedTab `json:"tabs"`
+	// Deleting lists tabs deleted whose rows are still being removed from the
+	// database. A start that finds one removes the rows; it used to take them
+	// for a tab whose settings had been lost and bring them back as
+	// "Recovered N" — configurations the user had deleted.
+	Deleting []string `json:"deleting,omitempty"`
+}
+
+// pendingTabDeletes is that list in memory.
+var pendingTabDeletes = struct {
+	sync.Mutex
+	ids map[string]bool
+}{ids: map[string]bool{}}
+
+func markTabDeleting(id string, on bool) {
+	pendingTabDeletes.Lock()
+	if on {
+		pendingTabDeletes.ids[id] = true
+	} else {
+		delete(pendingTabDeletes.ids, id)
+	}
+	pendingTabDeletes.Unlock()
+}
+
+func tabsBeingDeleted() []string {
+	pendingTabDeletes.Lock()
+	defer pendingTabDeletes.Unlock()
+	out := make([]string, 0, len(pendingTabDeletes.ids))
+	for id := range pendingTabDeletes.ids {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // strInSlice reports whether s is present in list (exact match).
@@ -402,6 +480,8 @@ func saveTabs() {
 			GitHubEnabled: t.GitHubEnabled, GitHubOwner: t.GitHubOwner,
 			GitHubRepo: t.GitHubRepo, GitHubFile: t.GitHubFile, GitHubPAT: t.GitHubPAT,
 		}
+		loaded := t.SourceLoaded
+		pt.SourceLoaded = &loaded
 		if len(t.SourceURLs) == 1 {
 			pt.SourceURL = t.SourceURLs[0]
 		}
@@ -411,6 +491,7 @@ func saveTabs() {
 		pd.Tabs = append(pd.Tabs, pt)
 	}
 	state.mu.RUnlock()
+	pd.Deleting = tabsBeingDeleted()
 	dir := tabsDir()
 	os.MkdirAll(dir, 0755)
 	data, err := json.MarshalIndent(pd, "", "  ")
@@ -452,6 +533,11 @@ func loadTabs() (ok bool) {
 		return true // no file yet → first run; default [main] is fine to persist
 	}
 	var pd persistedData
+	defer func() {
+		for _, id := range pd.Deleting {
+			markTabDeleting(id, true)
+		}
+	}()
 	if err := json.Unmarshal(trimBOM(data), &pd); err != nil {
 		fmt.Fprintf(os.Stderr, "⚠ loadTabs (keeping file, not overwriting): %v\n", err)
 		return false
@@ -493,6 +579,11 @@ func loadTabs() (ok bool) {
 			AutoRefreshTest: pt.AutoRefreshTest, Subs: pt.subsOf(),
 			GitHubEnabled: pt.GitHubEnabled, GitHubOwner: pt.GitHubOwner,
 			GitHubRepo: pt.GitHubRepo, GitHubFile: pt.GitHubFile, GitHubPAT: pt.GitHubPAT,
+		}
+		if pt.SourceLoaded != nil {
+			tab.SourceLoaded = *pt.SourceLoaded
+		} else {
+			tab.SourceLoaded = len(urls) > 0 || len(pt.SourceFiles) > 0 || tab.gitHubReady()
 		}
 		state.tabs = append(state.tabs, tab)
 		// One-time migration: older tabs.json embedded the configs (pt.Configs).

@@ -35,6 +35,9 @@ type ConfigForm struct {
 	ALPN          string `json:"alpn,omitempty"`
 	Fingerprint   string `json:"fingerprint,omitempty"`
 	AllowInsecure bool   `json:"allow_insecure,omitempty"`
+	// PinnedCert is the SHA-256 of the server's certificate (pcs= in VLESS and
+	// Trojan links): what xray offers in place of allowInsecure.
+	PinnedCert string `json:"pinned_cert,omitempty"`
 
 	Flow      string `json:"flow,omitempty"`       // vless reality/xtls
 	PublicKey string `json:"public_key,omitempty"` // reality pbk
@@ -94,6 +97,11 @@ type ConfigForm struct {
 	// fields above win where they overlap: what the user edited is what they
 	// meant, and what they never saw survives untouched.
 	Extra map[string]string `json:"extra,omitempty"`
+
+	// JSON is the outbound object itself, for Protocol "json": an xray or a
+	// sing-box outbound, or a whole configuration with one server in it. None
+	// of the fields above apply to it — see jsonconfig.go.
+	JSON string `json:"json,omitempty"`
 }
 
 // linkQuery returns the query parameters of a share link, flattened. Written by
@@ -155,6 +163,9 @@ func setNonEmpty(q url.Values, k, v string) {
 // by TestConfigFormRoundTrip.
 func formToURL(f ConfigForm) (string, error) {
 	f.Name = strings.TrimSpace(f.Name)
+	if f.Protocol == "json" {
+		return jsonFormToURL(f)
+	}
 	f.Address = strings.TrimSpace(f.Address)
 	if f.Address == "" {
 		return "", fmt.Errorf("address is required")
@@ -210,6 +221,9 @@ func serializeVless(f ConfigForm) (string, error) {
 	if f.AllowInsecure {
 		q.Set("allowInsecure", "1")
 	}
+	if err := setCertPin(q, f.PinnedCert); err != nil {
+		return "", err
+	}
 	applyExtra(q, f.Extra)
 	u := url.URL{Scheme: "vless", User: url.User(f.UUID), Host: hostPort(f.Address, f.Port), RawQuery: q.Encode(), Fragment: f.Name}
 	return u.String(), nil
@@ -235,6 +249,9 @@ func serializeTrojan(f ConfigForm) (string, error) {
 	setNonEmpty(q, "headerType", f.HeaderTypeKCP)
 	if f.AllowInsecure {
 		q.Set("allowInsecure", "1")
+	}
+	if err := setCertPin(q, f.PinnedCert); err != nil {
+		return "", err
 	}
 	applyExtra(q, f.Extra)
 	// The trojan parser hand-carves the URL (password taken literally up to the
@@ -349,6 +366,9 @@ func serializeTuic(f ConfigForm) (string, error) {
 
 // configToForm maps a parsed Node back into the flat form (edit/view prefill).
 func configToForm(n *Node) ConfigForm {
+	if n.Kind == KindJSON && n.JSON != nil {
+		return ConfigForm{Protocol: "json", Name: n.Name, JSON: prettyJSON(n.JSON.Outbound)}
+	}
 	f := ConfigForm{Name: n.Name, Address: n.Host, Port: n.Port}
 	// Parameters the parsers do not keep but the form now edits, read straight
 	// off the link. Anything still not named here stays in Extra and survives
@@ -370,21 +390,23 @@ func configToForm(n *Node) ConfigForm {
 	case n.Vless != nil:
 		p := n.Vless
 		f.Protocol, f.UUID = "vless", p.UUID
-		f.Network, f.Security = p.Network, p.Security
+		f.Network, f.Security = shownNetwork(p.Network), p.Security
 		f.Path, f.HostHeader, f.ServiceName = p.Path, p.Host2, p.ServiceName
 		f.SNI, f.ALPN, f.Fingerprint, f.AllowInsecure = p.SNI, p.ALPN, p.Fingerprint, p.AllowInsecure
+		f.PinnedCert = p.PinnedCertSHA256
 		f.Flow, f.PublicKey, f.ShortID = p.Flow, p.PublicKey, p.ShortID
 	case n.Trojan != nil:
 		p := n.Trojan
 		f.Protocol, f.Password = "trojan", p.Password
-		f.Network, f.Security = p.Network, p.Security
+		f.Network, f.Security = shownNetwork(p.Network), p.Security
 		f.Path, f.HostHeader, f.ServiceName = p.Path, p.Host2, p.ServiceName
 		f.SNI, f.ALPN, f.Fingerprint, f.AllowInsecure = p.SNI, p.ALPN, p.Fingerprint, p.AllowInsecure
+		f.PinnedCert = p.PinnedCertSHA256
 		f.PublicKey, f.ShortID = p.PublicKey, p.ShortID // trojan has no flow field
 	case n.Vmess != nil:
 		p := n.Vmess
 		f.Protocol, f.UUID = "vmess", p.UUID
-		f.Network, f.Security = p.Network, p.Security
+		f.Network, f.Security = shownNetwork(p.Network), p.Security
 		// VmessParams.ServiceName is just a copy of Path (grpc producers cram
 		// serviceName into "path"), so we don't map it back — Path carries it.
 		f.Path, f.HostHeader = p.Path, p.Host2
@@ -500,5 +522,19 @@ func checkAddress(addr string) error {
 	if numeric {
 		return fmt.Errorf("%q looks like an incomplete IP address", addr)
 	}
+	return nil
+}
+
+// setCertPin writes a certificate pin into a link, refusing one xray could not
+// read: the form says so on saving rather than the engine on connecting.
+func setCertPin(q url.Values, pin string) error {
+	pin = strings.TrimSpace(pin)
+	if pin == "" {
+		return nil
+	}
+	if !validCertPins(pin) {
+		return fmt.Errorf("certificate SHA-256: expected 64 hexadecimal characters")
+	}
+	q.Set("pcs", pin)
 	return nil
 }

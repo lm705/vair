@@ -15,6 +15,9 @@ import { t10 } from './i18n'
 import { Hint } from './hints'
 import Check from './Check'
 import DataTable, { type Col } from './DataTable'
+import CloseX from './closex'
+import BinIcon from './binicon'
+import ConfirmDiscard from './confirm'
 
 type Svc = {
   id: string
@@ -66,6 +69,17 @@ export default function UnlockModal({
   const [count, setCount] = useState(0)
   const [err, setErr] = useState('')
   const [editing, setEditing] = useState(false)
+  // Unsaved edits in the editor, and what to do once the user has answered
+  // the "leave without saving?" question.
+  const [editorDirty, setEditorDirty] = useState(false)
+  const [askLeave, setAskLeave] = useState<null | (() => void)>(null)
+  // Closing the editor, or the whole dialog, with edits on screen asks first:
+  // "done" used to close the editor and drop them without a word.
+  const leaveEditor = (then: () => void) => {
+    if (editing && editorDirty) setAskLeave(() => then)
+    else then()
+  }
+  const closeDialog = () => leaveEditor(onClose)
   const [query, setQuery] = useState('')
 
   const loadServices = () => Unlock.Services().then((s: any) => setServices(s || []))
@@ -174,9 +188,12 @@ export default function UnlockModal({
   })
 
   return (
-    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="modal-overlay" onClick={(e) => e.target === e.currentTarget && closeDialog()}>
       <div className="modal-box unlock-box">
-        <div className="modal-title">{tt('Service check')}</div>
+        <div className="modal-head">
+          <div className="modal-title">{tt('Service check')}</div>
+          <CloseX onClick={closeDialog} title={tt('Close')} />
+        </div>
 
         <div className="unlock-picks">
           {services.map((s) => (
@@ -189,8 +206,11 @@ export default function UnlockModal({
               label={s.name}
             />
           ))}
-          <button className="btn ghost tiny" onClick={() => setEditing((v) => !v)}>
-            {editing ? tt('done') : tt('edit list')}
+          <button
+            className="btn ghost tiny"
+            onClick={() => (editing ? leaveEditor(() => setEditing(false)) : setEditing(true))}
+          >
+            {editing ? tt('close the editor') : tt('edit list')}
           </button>
         </div>
 
@@ -201,23 +221,32 @@ export default function UnlockModal({
             tt={tt}
             onSave={saveServices}
             onReset={resetServices}
+            onDirty={setEditorDirty}
           />
         )}
 
         <div className="unlock-scope">
-          <label className={scope === 'selected' ? 'on' : ''}>
-            <input
-              type="radio"
-              checked={scope === 'selected'}
+          <div className="seg-group" role="radiogroup">
+            <button
+              type="button"
+              role="radio"
+              aria-checked={scope === 'selected'}
+              className={'seg-btn' + (scope === 'selected' ? ' active' : '')}
               disabled={selected.length === 0}
-              onChange={() => setScope('selected')}
-            />
-            {tt('Selected')} ({selected.length})
-          </label>
-          <label className={scope === 'all' ? 'on' : ''}>
-            <input type="radio" checked={scope === 'all'} onChange={() => setScope('all')} />
-            {tt('Whole tab')} ({total})
-          </label>
+              onClick={() => setScope('selected')}
+            >
+              {tt('Selected')} ({selected.length})
+            </button>
+            <button
+              type="button"
+              role="radio"
+              aria-checked={scope === 'all'}
+              className={'seg-btn' + (scope === 'all' ? ' active' : '')}
+              onClick={() => setScope('all')}
+            >
+              {tt('Whole tab')} ({total})
+            </button>
+          </div>
           {running ? (
             <>
               <span className="unlock-prog">
@@ -228,12 +257,12 @@ export default function UnlockModal({
               </button>
             </>
           ) : (
-            <button className="btn" onClick={start} disabled={shown.length === 0}>
+            <button className="btn primary" onClick={start} disabled={shown.length === 0}>
               {tt('check')}
             </button>
           )}
         </div>
-        {err && <div className="modal-hint" style={{ color: 'var(--red)' }}>{tt(err)}</div>}
+        {err && <div className="msg-note" style={{ color: 'var(--red)' }}>{tt(err)}</div>}
 
         <div className="conns-search">
           <input
@@ -243,7 +272,7 @@ export default function UnlockModal({
             onChange={(e) => setQuery(e.target.value)}
           />
           {query && (
-            <button className="btn ghost tiny" onClick={() => setQuery('')}>
+            <button className="btn ghost" onClick={() => setQuery('')}>
               {tt('clear')}
             </button>
           )}
@@ -271,12 +300,21 @@ export default function UnlockModal({
           <span className="unlock-tip">{tt('Filter the table by an answer: unlock:chatgpt')}</span>
         </div>
 
-        <div className="modal-btns">
-          <button className="btn ghost" onClick={onClose}>
-            {tt('close')}
-          </button>
-        </div>
       </div>
+      {askLeave && (
+        <ConfirmDiscard
+          text={tt('The list has unsaved changes. Leave without saving them?')}
+          discardLabel={tt('Leave without saving')}
+          keepLabel={tt('Keep editing')}
+          onDiscard={() => {
+            const then = askLeave
+            setAskLeave(null)
+            setEditorDirty(false)
+            then()
+          }}
+          onKeep={() => setAskLeave(null)}
+        />
+      )}
     </div>
   )
 }
@@ -290,36 +328,70 @@ function ServiceEditor({
   tt,
   onSave,
   onReset,
+  onDirty,
 }: {
   services: Svc[]
   resetSeq: number
   tt: (s: string) => string
   onSave: (next: Svc[]) => void
   onReset: () => void
+  onDirty: (dirty: boolean) => void
 }) {
-  const [draft, setDraft] = useState<Svc[]>(() => services.map((s) => ({ ...s })))
+  // The markers are held as the text in their boxes and turned into lists only
+  // when the list is saved. They used to be split and trimmed on every
+  // keystroke, so a space or a new line vanished as it was typed: "not
+  // available" could not be entered, nor a second marker.
+  type Draft = Svc & { openText: string; blockedText: string }
+  const toDraft = (list: Svc[]): Draft[] =>
+    list.map((s) => ({ ...s, openText: (s.open_if || []).join('\n'), blockedText: (s.blocked_if || []).join('\n') }))
+  const [draft, setDraft] = useState<Draft[]>(() => toDraft(services))
+  const [saveErr, setSaveErr] = useState('')
   // The draft is a copy, so that half-typed rows are not saved on every
   // keystroke — but a copy taken once never noticed the list being REPLACED
   // underneath it. "Restore defaults" did exactly that: the backend forgot the
   // saved list, the panel above reloaded, and the editor went on showing the
   // edits it had made from the copy it took when it opened. Re-taken whenever
   // the list identity changes; a keystroke does not change it.
-  const identity = services.map((s) => s.id + ' ' + s.name + ' ' + s.url).join('')
+  const identity = services.map((s) => s.id + '\u0000' + s.name + '\u0000' + s.url).join('\u0001')
   useEffect(() => {
-    setDraft(services.map((s) => ({ ...s })))
+    setDraft(toDraft(services))
+    setSaveErr('')
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity, resetSeq])
+  // Unsaved: the draft says something the saved list does not.
+  const parse = (v: string) => v.split('\n').map((s) => s.trim()).filter(Boolean)
+  const fromDraft = (d: Draft[]): Svc[] =>
+    d.map(({ openText, blockedText, ...s }) => ({ ...s, open_if: parse(openText), blocked_if: parse(blockedText) }))
+  const norm = (list: Svc[]) =>
+    JSON.stringify(list.map((s) => [s.id, s.name.trim(), s.url.trim(), s.open_if || [], s.blocked_if || []]))
+  const dirty = norm(fromDraft(draft)) !== norm(services)
+  useEffect(() => {
+    onDirty(dirty)
+  }, [dirty, onDirty])
 
-  const set = (i: number, patch: Partial<Svc>) =>
+  const set = (i: number, patch: Partial<Draft>) =>
     setDraft((d) => d.map((s, j) => (j === i ? { ...s, ...patch } : s)))
   const remove = (i: number) => setDraft((d) => d.filter((_, j) => j !== i))
+  // An id nobody has: numbering by the length of the list gave a second "svc9"
+  // after a removal, and two services with one id overwrote each other's
+  // answers and were picked together.
   const add = () =>
-    setDraft((d) => [...d, { id: 'svc' + (d.length + 1), name: '', url: 'https://', builtin: false }])
-
-  // The markers are one per line in the box and a list in the message: a service
-  // can have several ways of saying no.
-  const lines = (v?: string[]) => (v || []).join('\n')
-  const parse = (v: string) => v.split('\n').map((s) => s.trim()).filter(Boolean)
+    setDraft((d) => {
+      let n = d.length + 1
+      while (d.some((s) => s.id === 'svc' + n)) n++
+      return [...d, { id: 'svc' + n, name: '', url: 'https://', builtin: false, openText: '', blockedText: '' }]
+    })
+  // Saved only when every address is a web address: "https://" left as it was
+  // gave a service that every configuration failed to answer.
+  const save = () => {
+    const bad = draft.find((s) => !/^https?:\/\/[^\s/]+\.[^\s/]+/i.test(s.url.trim()))
+    if (bad) {
+      setSaveErr(tt('Not a web address') + ': ' + (bad.name.trim() || bad.url))
+      return
+    }
+    setSaveErr('')
+    onSave(fromDraft(draft))
+  }
 
   return (
     <div className="unlock-editor">
@@ -348,19 +420,19 @@ function ServiceEditor({
           <textarea
             className="modal-input"
             rows={1}
-            value={lines(s.open_if)}
+            value={s.openText}
             placeholder={tt('(any answer)')}
-            onChange={(e) => set(i, { open_if: parse(e.target.value) })}
+            onChange={(e) => set(i, { openText: e.target.value })}
           />
           <textarea
             className="modal-input"
             rows={1}
-            value={lines(s.blocked_if)}
+            value={s.blockedText}
             placeholder={tt('(only 403)')}
-            onChange={(e) => set(i, { blocked_if: parse(e.target.value) })}
+            onChange={(e) => set(i, { blockedText: e.target.value })}
           />
-          <button className="btn ghost tiny" title={tt('Remove')} onClick={() => remove(i)}>
-            ✕
+          <button className="url-rm" title={tt('Remove')} onClick={() => remove(i)}>
+            <BinIcon />
           </button>
         </div>
       ))}
@@ -376,10 +448,15 @@ function ServiceEditor({
         <button className="btn ghost" onClick={onReset}>
           {tt('restore defaults')}
         </button>
-        <button className="btn" onClick={() => onSave(draft)}>
+        <button className="btn" onClick={save}>
           {tt('save')}
         </button>
       </div>
+      {saveErr && (
+        <div className="msg-note" style={{ color: 'var(--red)', marginTop: 6 }}>
+          {saveErr}
+        </div>
+      )}
     </div>
   )
 }

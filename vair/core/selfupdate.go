@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"runtime"
 	"strconv"
@@ -75,6 +74,13 @@ func (m *updateManifest) pickAsset(kind string) (updateAsset, bool) {
 			return a, true
 		}
 	}
+	// A copy the setup program installed is updated by the setup program.
+	// Without one in the manifest there is nothing to offer: the plain entry and
+	// the top-level url are the portable exe, which its Download button used to
+	// hand out under a note promising the setup program.
+	if kind == "installer" {
+		return updateAsset{}, false
+	}
 	if a, ok := m.Assets[base]; ok && a.URL != "" {
 		return a, true
 	}
@@ -135,16 +141,10 @@ func semverNewer(a, b string) bool {
 }
 
 // updateHTTPClient routes update traffic through the live tunnel when we're
-// connected, so the check/download works when GitHub is blocked on the bare link.
+// connected, so the check/download works when GitHub is blocked on the bare
+// link — and is not made from the real address when it need not be.
 func updateHTTPClient(timeout time.Duration) *http.Client {
-	tr := &http.Transport{}
-	cs := state.conn.snap()
-	if cs.Status == ConnConnected && cs.Mode == ModeProxy && cs.HTTPPort > 0 {
-		if pu, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", cs.HTTPPort)); err == nil {
-			tr.Proxy = http.ProxyURL(pu)
-		}
-	}
-	return &http.Client{Timeout: timeout, Transport: tr}
+	return ownHTTPClient(timeout)
 }
 
 // fetchUpdateManifest pulls version.json from one URL, checks its signature,

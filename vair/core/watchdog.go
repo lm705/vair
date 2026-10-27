@@ -45,6 +45,11 @@ const (
 	// rarely: the panel shows a live round-trip time and the "too slow" check
 	// reads it, so it must not go stale for the whole session.
 	livenessQuietProbe = 2 * time.Minute
+	// The least time between two probes asked for by suspicion alone. A
+	// client that keeps opening short connections whose answers are too small
+	// to count (serverReplyMin) looks suspect again seconds after every probe
+	// that clears it.
+	livenessSuspectRecheck = 10 * time.Second
 )
 
 // livenessWatch remembers the counters between ticks. Zero value is ready.
@@ -78,12 +83,21 @@ func (w *livenessWatch) look(raw string, up, down int64, now time.Time) liveness
 		}
 		return livenessUnknown
 	default:
-		// An idle connection. Neither alive nor suspect: nobody asked it for
-		// anything, so it has not failed to answer.
-		w.sentAt = time.Time{}
+		// Nothing moved. An idle connection has not failed to answer — unless
+		// what it sent last is still unanswered: a request does not stop
+		// waiting for its reply because the client paused. Clearing it here
+		// meant a client sending every few seconds, with quiet ticks between,
+		// never had its silence add up, and a dead server was never suspected.
+		if !w.sentAt.IsZero() && now.Sub(w.sentAt) >= livenessSuspectAfter {
+			return livenessSuspect
+		}
 		return livenessUnknown
 	}
 }
+
+// answered forgets the unanswered bytes: a probe has just come back, which
+// answers the question they raised.
+func (w *livenessWatch) answered() { w.sentAt = time.Time{} }
 
 // reset forgets the counters, for a caller that knows the evidence is stale.
 func (w *livenessWatch) reset() { *w = livenessWatch{} }

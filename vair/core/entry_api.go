@@ -1,24 +1,30 @@
 package core
 
-import "strings"
+import (
+	"strings"
+	"unicode/utf8"
+)
 
 // RenameEntry renames config idx in the active tab (not the Sources tab). It
 // rewrites the node name in the raw URL, persists, migrates raw-keyed references
 // (last-connected + live ConnState), and emits entry_update. Ported from 1.10
 // handleRenameEntry. Returns false on the Sources tab / bad idx / empty name.
-func RenameEntry(idx int, name string) bool {
+// raw is the configuration the table showed at idx (see resolveRows).
+func RenameEntry(idx int, raw, name string) bool {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return false
 	}
-	if len(name) > 120 {
-		name = name[:120]
+	// 120 characters, not bytes: a cut by bytes split a Cyrillic letter in two
+	// and left half of it in the name.
+	if utf8.RuneCountInString(name) > maxEntryName {
+		name = string([]rune(name)[:maxEntryName])
 	}
 	tabID := activeTabID()
 	if tabID == "main" {
 		return false
 	}
-	entry, ok := memEntry(tabID, idx)
+	entry, ok := entryFor(tabID, idx, raw)
 	if !ok {
 		return false
 	}
@@ -35,6 +41,11 @@ func RenameEntry(idx int, name string) bool {
 		settingsMu.Lock()
 		if appSettings.LastConnectedRaw == oldRaw {
 			appSettings.LastConnectedRaw = newRaw
+		}
+		for i, r := range appSettings.LastConnectedChain {
+			if r == oldRaw {
+				appSettings.LastConnectedChain[i] = newRaw
+			}
 		}
 		settingsMu.Unlock()
 		cm := state.conn
@@ -54,6 +65,9 @@ func RenameEntry(idx int, name string) bool {
 	saveSettings()
 	return true
 }
+
+// maxEntryName is the longest name a rename keeps, in characters.
+const maxEntryName = 120
 
 // nextEntryIndexLocked is the index the next config added to a tab should take:
 // one past the highest one in use.
@@ -79,11 +93,17 @@ func nextEntryIndexLocked(tabID string) int {
 
 // DeleteEntries removes the given config indices from the active tab (not the
 // Sources tab) in place — survivors keep their idx (consumers look up by idx, not
-// position). Ported from 1.10 handleTabDeleteEntries.
-func DeleteEntries(indices []int) {
+// position). Ported from 1.10 handleTabDeleteEntries. raws, when given, are the
+// configurations the table showed at those indices (see resolveRows). Returns
+// how many were removed; the delete can be undone (UndoDelete).
+func DeleteEntries(indices []int, raws []string) int {
 	id := activeTabID()
 	if id == "main" || len(indices) == 0 {
-		return
+		return 0
+	}
+	indices = resolveRows(id, indices, raws)
+	if len(indices) == 0 {
+		return 0
 	}
 	// Big deletes take a moment (the in-place rebuild + the SQLite delete of up
 	// to 260k rows), so show the "Deleting configs…" spinner — 1.10 only above
@@ -112,6 +132,8 @@ func DeleteEntries(indices []int) {
 		state.entries = kept
 	}
 	deletedAll := len(kept) == 0
+	removed := len(src) - len(kept)
+	rememberDelete(id, append([]*ConfigEntry(nil), src...), kept, entryIndices(src), entryIndices(kept))
 	state.mu.Unlock()
 	memInvalidate(id)
 	// Persist. Deleting EVERYTHING (select-all) is a single whole-tab DELETE —
@@ -133,6 +155,7 @@ func DeleteEntries(indices []int) {
 	}
 	loadedSignal(id)
 	saveTabs()
+	return removed
 }
 
 // DeleteDuplicatesOf removes every other copy of one configuration, keeping the
@@ -147,16 +170,18 @@ func DeleteEntries(indices []int) {
 //
 // The kept row keeps its index; the rest are removed by the ordinary delete
 // path, so the tab is persisted and the table reloads exactly as it does for a
-// manual delete. Returns how many went.
-func DeleteDuplicatesOf(idx int) int {
+// manual delete. Returns how many went. raw is the configuration the table
+// showed at idx (see resolveRows).
+func DeleteDuplicatesOf(idx int, raw string) int {
 	tabID := activeTabID()
 	if tabID == "main" {
 		return 0
 	}
-	keep, ok := memEntry(tabID, idx)
+	keep, ok := entryFor(tabID, idx, raw)
 	if !ok {
 		return 0
 	}
+	idx = keep.snap().Index
 	want := dedupKey(keep.snap().Raw)
 
 	state.mu.RLock()
@@ -176,6 +201,5 @@ func DeleteDuplicatesOf(idx int) int {
 	if len(doomed) == 0 {
 		return 0
 	}
-	DeleteEntries(doomed)
-	return len(doomed)
+	return DeleteEntries(doomed, nil)
 }

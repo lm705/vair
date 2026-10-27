@@ -35,4 +35,24 @@ if command -v apparmor_parser >/dev/null 2>&1 && [ -f /etc/apparmor.d/vair ]; th
   fi
 fi
 
+# The helper, when the user has installed it: enabled and restarted on the new
+# binary. The app and the helper must speak the same protocol version, and an
+# update replaces the app's binary at once while the running service would
+# otherwise keep the old code until the next boot — TUN refused with
+# "reinstall the helper" in the meantime.
+#
+# "Installed" is the drop-in vair-helper-install writes (and its uninstall
+# removes), not the unit's enabled state: packages up to 2.6.0 disabled the
+# unit in their prerm on every upgrade — and on an upgrade it is the OLD
+# package's prerm that runs — so the state is not to be trusted here. Without
+# the drop-in nothing is started: installing the helper is the user's decision,
+# taken through the app, and a package never makes it.
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [ -f /etc/systemd/system/vair-helper.service.d/10-group.conf ]; then
+    systemctl enable vair-helper.service >/dev/null 2>&1 || true
+    systemctl restart vair-helper.service >/dev/null 2>&1 || true
+  fi
+fi
+
 exit 0

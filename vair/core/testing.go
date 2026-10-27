@@ -44,6 +44,12 @@ func measurePing(tr *http.Transport, cancel <-chan struct{}) (int64, error) {
 	// reqCtx returns a request whose context is cancelled when either the given
 	// timeout elapses or the bulk `cancel` channel closes. The watcher goroutine
 	// exits when the request finishes (done closed) so it never leaks.
+	// The address is checked when it is saved (validTestURL), but a value from
+	// before that check can still be stored: building the request fails, and
+	// the request handed on was nil — a crash in the middle of PING ALL.
+	if _, err := http.NewRequest("GET", url, nil); err != nil {
+		return -1, fmt.Errorf("ping URL: %w", err)
+	}
 	reqCtx := func(timeout time.Duration) (*http.Request, context.CancelFunc, chan struct{}) {
 		ctx, cf := context.WithTimeout(context.Background(), timeout)
 		done := make(chan struct{})
@@ -140,10 +146,25 @@ func withCacheBuster(u string) string {
 	return u + sep + "vcb=" + strconv.FormatInt(time.Now().UnixNano(), 10)
 }
 
-// err429 marks a measurement that ended because the upstream answered with
-// HTTP 429. The outer measureSpeed checks for it via errors.Is to decide
-// whether to fall back to a secondary URL.
-var err429 = errors.New("HTTP 429")
+// testFileError is a speed test that ended because the test file's server
+// answered with an HTTP error. The answer came back through the tunnel, so the
+// configuration works — what failed is the file. The row says "no speed"
+// rather than "failed", so "Delete failed" does not remove a working
+// configuration because a public test file rate-limited a tab (HTTP 429) or
+// was down. A 429 is also what measureSpeed falls back to the second URL on.
+type testFileError struct{ code int }
+
+func (e testFileError) Error() string { return fmt.Sprintf("HTTP %d", e.code) }
+
+// testFileStatus returns the HTTP status a test file refused with, 0 if err is
+// not such a refusal.
+func testFileStatus(err error) int {
+	var tf testFileError
+	if errors.As(err, &tf) {
+		return tf.code
+	}
+	return 0
+}
 
 // errSpeedCancelled is returned by measureSpeedOne when the bulk run is
 // cancelled mid-download (e.g. RELOAD). Callers treat it as "stop", not a real
@@ -167,9 +188,11 @@ func measureSpeed(tr *http.Transport, onProgress func(float64), cancel <-chan st
 	if err == nil {
 		return mbps, nil
 	}
-	// Only retry on a clean 429 from the primary. Connect errors, slow
-	// responses, cancellation, etc. stay as the user-visible/terminal result.
-	if !errors.Is(err, err429) {
+	// Retry only on an answer from the test file's server with a status the
+	// user listed (429 by default). Connect errors, slow responses and
+	// cancellation stay the result: they are about the configuration, not the
+	// file.
+	if !speedFallbackOn(testFileStatus(err)) {
 		return mbps, err
 	}
 	fb := currentSpeedFallbackURL()
@@ -200,13 +223,8 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 		return 0, fmt.Errorf("connect: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == 429 {
-		// Wrap the sentinel so measureSpeed can detect 429 unambiguously
-		// without string-matching on the error message.
-		return 0, fmt.Errorf("%w", err429)
-	}
 	if resp.StatusCode >= 400 {
-		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return 0, testFileError{resp.StatusCode}
 	}
 	buf := make([]byte, 64*1024)
 	var total int64
@@ -232,7 +250,7 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 		}
 		now := time.Now()
 		if onProgress != nil && now.Sub(lastReport) >= 400*time.Millisecond && total > 0 {
-			onProgress(round2(float64(total) / now.Sub(start).Seconds() / 1024 / 1024))
+			onProgress(round2(float64(total) / now.Sub(start).Seconds() / bytesPerMB))
 			lastReport = now
 		}
 		if rerr != nil {
@@ -259,7 +277,32 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 	if secs < 0.001 {
 		secs = 0.001
 	}
-	return round2(float64(total) / secs / 1024 / 1024), nil
+	return round2(float64(total) / secs / bytesPerMB), nil
+}
+
+// bytesPerMB is the megabyte of the "MB/s" the table shows: 10^6 bytes. The
+// figures were mebibytes (2^20), 4.6% below what the column claimed.
+const bytesPerMB = 1e6
+
+// pingTestBudget and speedTestBudget are how long one configuration's test may
+// take with the current settings: the engine's start, the warm-up, the timed
+// rounds and, for speed, the download window. The engine's own lifetime and the
+// single-row buttons' watchdog are both built from them — the buttons used fixed
+// 20 and 25 seconds, so a longer speed test was marked "timeout" while it ran
+// and its result never reached the row.
+func pingTestBudget() time.Duration {
+	return startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + 3*time.Second
+}
+
+func speedTestBudget() time.Duration {
+	return startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
+}
+
+// testPanicked is what a row says when its test stopped on a fault in the
+// program rather than in the configuration. Said once in the log with the
+// detail; the row only has room for the fact.
+func testPanicked(entry *ConfigEntry, what string, r interface{}) {
+	vlog("error", "%s %s: the test stopped on an internal error: %v", what, entry.snap().Name, r)
 }
 
 // ─────────────────────────── entry runners ───────────────────────
@@ -268,6 +311,17 @@ func measureSpeedOne(tr *http.Transport, urlStr string, onProgress func(float64)
 // callers) lets a bulk RELOAD abort the ping promptly — a cancelled ping leaves
 // the row pending rather than marking it failed.
 func runPingForEntry(entry *ConfigEntry, cancel <-chan struct{}) {
+	// A fault inside a test ends that test, not the program: these run on their
+	// own goroutines (PING ALL, AUTO), where an unrecovered panic takes the
+	// whole process — and the connection — with it.
+	defer func() {
+		if r := recover(); r != nil {
+			testPanicked(entry, "ping", r)
+			entry.mu.Lock()
+			entry.PingStatus, entry.Delay, entry.PingErr = StatusFailed, -1, "internal error"
+			entry.mu.Unlock()
+		}
+	}()
 	n, err := parseNode(entry.Raw)
 	if err != nil {
 		entry.mu.Lock()
@@ -288,8 +342,7 @@ func runPingForEntry(entry *ConfigEntry, cancel <-chan struct{}) {
 		entry.mu.Unlock()
 		return
 	}
-	ttl := startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + 3*time.Second
-	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
+	if err = withEngine(n, pingTestBudget(), func(_ int, tr *http.Transport) error {
 		delay, e := measurePing(tr, cancel)
 		entry.mu.Lock()
 		defer entry.mu.Unlock()
@@ -331,6 +384,17 @@ func runPingForEntry(entry *ConfigEntry, cancel <-chan struct{}) {
 // cancel (nil for single-config / auto callers) lets a bulk RELOAD abort the
 // download promptly instead of waiting out the full speed window.
 func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) {
+	defer func() { // see runPingForEntry
+		if r := recover(); r != nil {
+			testPanicked(entry, "speed", r)
+			entry.mu.Lock()
+			if entry.PingStatus == StatusTestingPing {
+				entry.PingStatus, entry.Delay, entry.PingErr = StatusFailed, -1, "internal error"
+			}
+			entry.SpeedStatus, entry.SpeedMBps, entry.SpeedLive, entry.SpeedErr = StatusFailed, 0, 0, "internal error"
+			entry.mu.Unlock()
+		}
+	}()
 	n, err := parseNode(entry.Raw)
 	if err != nil {
 		entry.mu.Lock()
@@ -353,8 +417,7 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 		entry.mu.Unlock()
 		return
 	}
-	ttl := startupTimeout + currentWarmupTimeout() + currentPingTimeout()*time.Duration(pingRounds) + currentSpeedDuration() + 10*time.Second
-	if err = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
+	if err = withEngine(n, speedTestBudget(), func(_ int, tr *http.Transport) error {
 		// Always re-ping — gives fresh delay AND warms the tunnel for speed test
 		delay, pingErr := measurePing(tr, cancel)
 		entry.mu.Lock()
@@ -403,6 +466,11 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 			// reload is about to replace this entry anyway. Leave it as-is.
 			entry.SpeedStatus = StatusPending
 			entry.SpeedErr = ""
+		} else if testFileStatus(e) != 0 {
+			// The configuration answered; the test file's server refused.
+			entry.SpeedStatus = StatusSkipped
+			entry.SpeedMBps = 0
+			entry.SpeedErr = e.Error()
 		} else if e != nil {
 			entry.SpeedStatus = StatusFailed
 			entry.SpeedMBps = 0
@@ -451,7 +519,11 @@ func logTestResult(entry *ConfigEntry) {
 	case StatusOK:
 		fmt.Fprintf(&b, ", speed %.2f MB/s", mbps)
 	case StatusSkipped:
-		fmt.Fprintf(&b, ", speed skipped")
+		if ps == StatusOK && serr != "" {
+			fmt.Fprintf(&b, ", no speed: the test file answered %s", serr)
+		} else {
+			fmt.Fprintf(&b, ", speed skipped")
+		}
 	case StatusFailed:
 		fmt.Fprintf(&b, ", speed failed (%s)", serr)
 	}

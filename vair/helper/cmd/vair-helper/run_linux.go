@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"regexp"
 	"sync"
 	"syscall"
 	"time"
@@ -23,12 +22,11 @@ import (
 // of chasing symlinks — see helper/validate.
 var allowedPaths = []string{"/usr/lib/vair/rulesets", api.DirPath}
 
-// version is reported in the hello response. It is the protocol that decides
-// compatibility; this is for humans reading logs.
-const version = "2.6.0"
-
-func run(cleanupOnly bool) error {
-	if cleanupOnly {
+func run(o options) error {
+	if o.install || o.uninstall || o.repair || o.stop {
+		return errors.New("the service flags are for Windows; on Linux the package manages the helper")
+	}
+	if o.cleanup {
 		return cleanupLeftovers()
 	}
 	if os.Geteuid() != 0 {
@@ -106,16 +104,56 @@ type server struct {
 	// owner is the connection that started the running tunnel. Only it may stop
 	// or replace the tunnel, and when it goes away the tunnel goes with it.
 	owner *session
+	// kept takes down a kill-switch left standing for the next tunnel (a stop
+	// with keep_block) if none has come by then. Nil when nothing is waiting.
+	kept *time.Timer
+	// blockIface and blockNets are the running tunnel's interface and prefixes,
+	// which a kill_switch request after start_tun builds the block from.
+	blockIface string
+	blockNets  []string
 }
 
-// writeTimeout bounds every write to a client.
+// dropBlock takes the kill-switch down now and stops waiting for a successor.
+func (srv *server) dropBlock() {
+	srv.mu.Lock()
+	if srv.kept != nil {
+		srv.kept.Stop()
+		srv.kept = nil
+	}
+	srv.mu.Unlock()
+	removeKillSwitch()
+}
+
+// keepBlock leaves the kill-switch standing for the tunnel that comes next.
 //
-// Without it a client that has stopped READING wedges the helper: the socket
-// buffer fills, the write blocks forever, and it blocks while holding the
-// session lock. That is not a hypothetical — a GUI that has stopped reading is
-// exactly the case the lease exists to clean up after, so the cleanup path was
-// the one guaranteed to hit it.
-const writeTimeout = 5 * time.Second
+// A switch to another server is a stop and a start. The block used to go with
+// the stop and come back after the start, and between the two the machine had
+// neither a tunnel nor a block: everything went out with its own address while
+// the new engine came up. Kept, the block holds through the gap — the engine is
+// let out by its cgroup to reach the next server — and the next start replaces
+// it in one transaction. If nothing comes within BlockHandoverSec it goes: a
+// block over no tunnel is a machine with no network and no explanation.
+func (srv *server) keepBlock() {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	if srv.kept != nil {
+		srv.kept.Stop()
+	}
+	var t *time.Timer
+	t = time.AfterFunc(time.Duration(api.BlockHandoverSec)*time.Second, func() {
+		srv.mu.Lock()
+		mine := srv.kept == t
+		if mine {
+			srv.kept = nil
+		}
+		srv.mu.Unlock()
+		if mine && !srv.tunnel.running() {
+			removeKillSwitch()
+			log.Printf("no tunnel came back within %ds: kill-switch down", api.BlockHandoverSec)
+		}
+	})
+	srv.kept = t
+}
 
 // session is one client connection.
 type session struct {
@@ -173,7 +211,7 @@ func (srv *server) serve(nc net.Conn) {
 		if owned {
 			log.Printf("owner disconnected (%s): tearing the tunnel down", peer)
 			srv.tunnel.stop()
-			removeKillSwitch() // the tunnel is gone; a block over nothing is a machine offline
+			srv.dropBlock() // the tunnel is gone; a block over nothing is a machine offline
 		}
 		// Staged rule-sets belong to the session that sent them, and this is
 		// where they go — NOT in stop(). Switching servers is stop-then-start on
@@ -235,7 +273,9 @@ func (srv *server) handle(s *session, req *api.Request) {
 			s.write(&api.Response{ID: req.ID, Error: err.Error()})
 			return
 		}
-		s.write(&api.Response{ID: req.ID, OK: true})
+		// Protocol 5 says where the set went, so a client does not have to
+		// know the helper's directories; here it is the fixed one.
+		s.write(&api.Response{ID: req.ID, OK: true, Path: api.RuleSetPath(req.Name)})
 
 	case api.OpStartTUN:
 		if err := srv.startTUN(s, req); err != nil {
@@ -254,7 +294,11 @@ func (srv *server) handle(s *session, req *api.Request) {
 			return
 		}
 		srv.tunnel.stop()
-		removeKillSwitch()
+		if req.KeepBlock && killSwitchPresent() {
+			srv.keepBlock()
+		} else {
+			srv.dropBlock()
+		}
 		srv.mu.Lock()
 		if srv.owner == s {
 			srv.owner = nil
@@ -262,18 +306,17 @@ func (srv *server) handle(s *session, req *api.Request) {
 		srv.mu.Unlock()
 		s.write(&api.Response{ID: req.ID, OK: true})
 
+	case api.OpKillSwitch:
+		if err := srv.setKillSwitch(s, req); err != nil {
+			s.write(&api.Response{ID: req.ID, Error: err.Error()})
+			return
+		}
+		s.write(&api.Response{ID: req.ID, OK: true})
+
 	default:
 		s.write(&api.Response{ID: req.ID, Error: fmt.Sprintf("unknown op %q", req.Op)})
 	}
 }
-
-// ruleSetName is the only shape of name accepted from the socket.
-//
-// Deliberately narrow. The helper builds the path itself, so a name is not
-// supposed to be able to express one — and this is the check that makes that
-// true rather than merely intended. No slash, no leading dot, no traversal, one
-// extension, and a length a filesystem will not argue with.
-var ruleSetName = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}\.srs$`)
 
 // putRuleSet stores one rule-set for this session's next tunnel.
 func (srv *server) putRuleSet(s *session, req *api.Request) error {
@@ -307,6 +350,47 @@ func (srv *server) putRuleSet(s *session, req *api.Request) error {
 	return nil
 }
 
+// setKillSwitch is kill_switch: the block put up or taken down for the running
+// tunnel, so a switch turned on mid-session protects that session rather than
+// the next one. Taking a block down with no tunnel running is allowed too: it
+// is how a disconnect ends a block kept for a successor that is not coming.
+func (srv *server) setKillSwitch(s *session, req *api.Request) error {
+	srv.mu.Lock()
+	owned, other := srv.owner == s, srv.owner != nil && srv.owner != s
+	iface, nets := srv.blockIface, srv.blockNets
+	srv.mu.Unlock()
+	if other {
+		return errors.New("another client owns the tunnel")
+	}
+	if !req.KillSwitch {
+		srv.dropBlock()
+		return nil
+	}
+	if !owned || !srv.tunnel.running() {
+		return errors.New("no tunnel of this connection to protect")
+	}
+	if err := checkServerIPs(req.ServerIPs); err != nil {
+		return err
+	}
+	return installKillSwitch(iface, nets, req.ServerIPs, req.AllowLAN,
+		func(l api.LogLine) { s.write(&api.Response{Log: &l}) })
+}
+
+// checkServerIPs is the gate before an address list reaches an nftables script.
+func checkServerIPs(ips []string) error {
+	if len(ips) > api.MaxServerIPs {
+		return fmt.Errorf("at most %d server addresses", api.MaxServerIPs)
+	}
+	for _, ip := range ips {
+		if net.ParseIP(ip) == nil {
+			// Straight into an nftables script if it were let through, so it is
+			// checked here rather than escaped there.
+			return fmt.Errorf("%q is not an address", ip)
+		}
+	}
+	return nil
+}
+
 func (srv *server) startTUN(s *session, req *api.Request) error {
 	if len(req.Config) == 0 {
 		return errors.New("start_tun needs a config")
@@ -319,19 +403,17 @@ func (srv *server) startTUN(s *session, req *api.Request) error {
 		return fmt.Errorf("config rejected: %w", err)
 	}
 
-	if len(req.ServerIPs) > api.MaxServerIPs {
-		return fmt.Errorf("at most %d server addresses", api.MaxServerIPs)
-	}
-	for _, ip := range req.ServerIPs {
-		if net.ParseIP(ip) == nil {
-			// Straight into an nftables script if it were let through, so it is
-			// checked here rather than escaped there.
-			return fmt.Errorf("%q is not an address", ip)
-		}
+	if err := checkServerIPs(req.ServerIPs); err != nil {
+		return err
 	}
 
 	srv.mu.Lock()
 	other := srv.owner != nil && srv.owner != s
+	if !other && srv.kept != nil {
+		// A block kept for this start: it stands until the new one replaces it.
+		srv.kept.Stop()
+		srv.kept = nil
+	}
 	srv.mu.Unlock()
 	if other {
 		return errors.New("another client owns the tunnel")
@@ -357,16 +439,29 @@ func (srv *server) startTUN(s *session, req *api.Request) error {
 			}
 			srv.mu.Unlock()
 		}); err != nil {
-		removeKillSwitch() // never leave a block over a tunnel that did not start
+		srv.dropBlock() // never leave a block over a tunnel that did not start
 		return err
+	}
+
+	nets := tunNetsFromConfig(req.Config)
+	srv.mu.Lock()
+	srv.blockIface, srv.blockNets = iface, nets
+	srv.mu.Unlock()
+
+	// With every tunnel, whatever the settings: see guard_linux.go.
+	if err := installGuard(iface, nets); err != nil {
+		srv.tunnel.stop()
+		srv.dropBlock()
+		return fmt.Errorf("tunnel guard: %w", err)
 	}
 
 	// After the engine, not before: the block names the tunnel interface, and
 	// until the engine has created it there is nothing to allow.
 	if req.KillSwitch {
-		if err := installKillSwitch(iface, req.ServerIPs, req.AllowLAN,
+		if err := installKillSwitch(iface, nets, req.ServerIPs, req.AllowLAN,
 			func(l api.LogLine) { s.write(&api.Response{Log: &l}) }); err != nil {
 			srv.tunnel.stop()
+			srv.dropBlock() // a kept block included: nothing is coming to take it over
 			return err
 		}
 	} else {
@@ -405,7 +500,7 @@ func (srv *server) watchLease(s *session, lease time.Duration) {
 			// it first put a blocking write in front of the teardown — which is
 			// how a 3-second lease survived twenty seconds in testing.
 			srv.tunnel.stop()
-			removeKillSwitch()
+			srv.dropBlock()
 			s.write(&api.Response{Log: &api.LogLine{
 				Src: "helper", Lvl: "warn",
 				Text: "lease expired — the app stopped pinging, tunnel closed",
@@ -420,31 +515,32 @@ func (srv *server) watchLease(s *session, lease time.Duration) {
 	}
 }
 
-func leaseDuration(sec int) time.Duration {
-	if sec <= 0 {
-		sec = api.DefaultLeaseSec
-	}
-	return time.Duration(sec) * time.Second
-}
-
-// ifaceFromConfig pulls the interface name out of the validated config for
-// reporting. The validator has already confirmed it is one of ours.
-func ifaceFromConfig(raw []byte) string {
+// tunNetsFromConfig returns the tunnel's own prefixes — the addresses of the
+// TUN inbound, masked — which the kill-switch lets through by destination (see
+// killSwitchScript). Only prefixes that parse: this names what the block
+// allows, so anything else is left out rather than guessed at.
+func tunNetsFromConfig(raw []byte) []string {
 	var doc struct {
 		Inbounds []struct {
-			Type  string `json:"type"`
-			Iface string `json:"interface_name"`
+			Type    string   `json:"type"`
+			Address []string `json:"address"`
 		} `json:"inbounds"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return ""
+		return nil
 	}
+	var out []string
 	for _, in := range doc.Inbounds {
-		if in.Type == "tun" {
-			return in.Iface
+		if in.Type != "tun" {
+			continue
+		}
+		for _, a := range in.Address {
+			if _, n, err := net.ParseCIDR(a); err == nil {
+				out = append(out, n.String())
+			}
 		}
 	}
-	return ""
+	return out
 }
 
 // peerDescription names the process on the other end for the journal. Purely

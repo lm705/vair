@@ -97,7 +97,7 @@ func autoHealthInterval() time.Duration {
 	s := appSettings.AutoHealthSec
 	settingsMu.RUnlock()
 	if s <= 0 {
-		s = 30
+		s = 15 // the default the panel and the wiki state
 	} else if s < 5 {
 		s = 5
 	}
@@ -129,6 +129,57 @@ func probeSpacing(fails int) time.Duration {
 	return autoHealthInterval()
 }
 
+// noticeSilentServer is what is left of the health check while it is off. Not a
+// probe every fifteen seconds and not a teardown — the switch is off because
+// dropping a connection on a probe is a decision the user has not made — but
+// the free evidence of the byte counters: bytes leaving with nothing coming
+// back. Then one probe (at most one a minute) to be sure, and if the server is
+// silent the connection bar says so, once with a notification, until bytes come
+// back. A dead server used to read "connected" for as long as anyone looked.
+func noticeSilentServer(cm *connManager, live *livenessWatch, lastProbe *time.Time) {
+	cs := cm.snap()
+	if cs.Status != ConnConnected {
+		live.reset()
+		return
+	}
+	up, down := cm.bytes()
+	switch live.look(cs.ConnRaw, up, down, time.Now()) {
+	case livenessAlive:
+		markNoAnswer(cm, cs.ConnRaw, false)
+	case livenessSuspect:
+		if cs.NoAnswer || time.Since(*lastProbe) < silentServerRecheck {
+			return
+		}
+		*lastProbe = time.Now()
+		if alive, _ := probeLiveTunnel(cm); alive {
+			live.answered()
+			markNoAnswer(cm, cs.ConnRaw, false)
+			return
+		}
+		if markNoAnswer(cm, cs.ConnRaw, true) {
+			vlog("warning", "%s: the server is not answering — the connection is still up; \"Monitor the connected server\" closes such a connection, AUTO moves to another server", cs.EntryName)
+			desktopNotify("Vair", notifyServerSilent(cs.EntryName))
+		}
+	}
+}
+
+// silentServerRecheck is how often a connection that looks silent is probed.
+const silentServerRecheck = time.Minute
+
+// markNoAnswer sets the session's NoAnswer, for the session it was measured on
+// only, and reports whether it changed.
+func markNoAnswer(cm *connManager, raw string, on bool) bool {
+	cm.mu.Lock()
+	if cm.state.Status != ConnConnected || cm.state.ConnRaw != raw || cm.state.NoAnswer == on {
+		cm.mu.Unlock()
+		return false
+	}
+	cm.state.NoAnswer = on
+	cm.mu.Unlock()
+	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
+	return true
+}
+
 // autoEffectiveMode resolves the mode for auto actions: explicit AutoMode, else
 // the last-connected mode, else proxy. TUN downgrades to proxy without admin.
 // watchIdleConnection is the health check for a connection AUTO is not managing.
@@ -153,7 +204,7 @@ func watchIdleConnection(cm *connManager, fails *int, lastProbe *time.Time, live
 	settingsMu.RUnlock()
 	if !watching {
 		*fails = 0
-		live.reset()
+		noticeSilentServer(cm, live, lastProbe)
 		return
 	}
 	cs := cm.snap()
@@ -183,8 +234,11 @@ func watchIdleConnection(cm *connManager, fails *int, lastProbe *time.Time, live
 		}
 	case livenessSuspect:
 		// Bytes are leaving and nothing is coming back — exactly the failure
-		// this watch exists for. Ask at once instead of waiting out the
-		// interval.
+		// this watch exists for. Ask now instead of waiting out the interval
+		// (but not at every tick: see livenessSuspectRecheck).
+		if !probeNow && time.Since(*lastProbe) < livenessSuspectRecheck {
+			return
+		}
 	default:
 		if !probeNow && time.Since(*lastProbe) < probeSpacing(*fails) {
 			return
@@ -195,6 +249,7 @@ func watchIdleConnection(cm *connManager, fails *int, lastProbe *time.Time, live
 	alive, rtt := probeLiveTunnel(cm)
 	if alive {
 		*fails = 0
+		live.answered()
 		autoLiveRtt.Store(rtt.Milliseconds())
 		autoNoteLivePing(cs, rtt)
 		broadcastAuto("health", cs.EntryName, cs.ConnRaw, "")
@@ -221,10 +276,12 @@ func watchIdleConnection(cm *connManager, fails *int, lastProbe *time.Time, live
 	// firewall block held, the connection is gone but the machine is NOT back on
 	// its ordinary network — saying "connection closed" and leaving it there
 	// would have them wondering why nothing loads.
-	blocked := PersistentKillSwitchHeld()
+	blocked := trafficHeldNow()
 	desktopNotify("Vair", notifyServerGone(cs.EntryName, blocked))
 	reason := "the server stopped responding — connection closed"
-	if blocked {
+	if blocked && blockWillLapse() {
+		reason = "the server stopped responding — traffic stays blocked for 20 s (kill-switch), then the normal connection returns"
+	} else if blocked {
 		reason = "the server stopped responding — traffic stays blocked (kill-switch); disconnect to release it"
 	}
 	connectionLost(reason, "")
@@ -244,14 +301,63 @@ func autoEffectiveMode() ConnMode {
 	settingsMu.RLock()
 	m, sel, last := appSettings.AutoMode, appSettings.SelectedMode, appSettings.LastConnectedMode
 	settingsMu.RUnlock()
-	mode := resolveAutoMode(m, sel, last)
-	// The one thing the settings cannot decide: TUN without the rights it needs
-	// is not TUN. Kept out of resolveAutoMode so the order of preference can be
-	// tested on a machine that has no rights to give.
-	if mode == ModeTUN && !isPrivileged() {
-		return ModeProxy
+	// TUN without the rights it needs used to become proxy here, silently: no
+	// TUN kill-switch, and every program that ignores the system proxy went out
+	// directly while the setting said TUN. The supervisor now says so and does
+	// not connect (autoNeedsAdmin).
+	return resolveAutoMode(m, sel, last)
+}
+
+// autoNeedsAdmin is the mode auto-connect is set to — TUN — and the rights the
+// program runs with — none to create a tunnel.
+func autoNeedsAdmin(mode ConnMode) bool {
+	return mode == ModeTUN && !tunAvailable()
+}
+
+// autoAdminNoted keeps the "TUN is not available" notice to once per time AUTO
+// is switched on (SetAuto clears it) or the program starts.
+var autoAdminNoted atomic.Bool
+
+// autoNoteNeedsAdmin says why AUTO does not connect in TUN mode, with the way
+// out that fits this copy (autoTUNMissing): administrator rights for a
+// portable copy on Windows, the helper service for an installed one, the
+// helper on Linux. Telling an installed copy to run as administrator sent
+// people round the service the setup program put there for exactly this.
+func autoNoteNeedsAdmin() {
+	if autoAdminNoted.Swap(true) {
+		return
 	}
-	return mode
+	state := autoTUNMissing()
+	switch state {
+	case "needs_service":
+		vlog("warning", "auto: the connection mode is TUN and the Vair helper service is missing — auto-connect does not connect. Repair it in Settings → System, or set auto-connect's connection mode to proxy")
+	case "needs_helper":
+		vlog("warning", "auto: the connection mode is TUN and the helper is not installed — auto-connect does not connect. Install it from the TUN switch, or set auto-connect's connection mode to proxy")
+	default:
+		vlog("warning", "auto: the connection mode is TUN and Vair runs without administrator rights — auto-connect does not connect. Restart Vair as administrator, or set auto-connect's connection mode to proxy")
+	}
+	broadcastAuto(state, "", "", "")
+	desktopNotify("Vair", notifyAutoNeedsAdmin(state))
+}
+
+func notifyAutoNeedsAdmin(state string) string {
+	settingsMu.RLock()
+	lang := appSettings.Language
+	settingsMu.RUnlock()
+	ru := lang == "ru"
+	switch {
+	case state == "needs_service" && ru:
+		return "Авто-подключение не подключается: для режима TUN нужна служба-помощник Vair, а её нет. Восстановите её в «Настройки → Система» или выберите режим прокси в окне AUTO"
+	case state == "needs_service":
+		return "Auto-connect is not connecting: TUN mode needs the Vair helper service, and it is missing. Repair it in Settings → System, or choose proxy mode in the AUTO window"
+	case state == "needs_helper" && ru:
+		return "Авто-подключение не подключается: для режима TUN нужен служебный помощник. Установите его кнопкой у переключателя TUN или выберите режим прокси в окне AUTO"
+	case state == "needs_helper":
+		return "Auto-connect is not connecting: TUN mode needs the helper. Install it with the button next to the TUN switch, or choose proxy mode in the AUTO window"
+	case ru:
+		return "Авто-подключение не подключается: для режима TUN нужны права администратора. Перезапустите Vair от имени администратора или выберите режим прокси в окне AUTO"
+	}
+	return "Auto-connect is not connecting: TUN mode needs administrator rights. Restart Vair as administrator, or choose proxy mode in the AUTO window"
 }
 
 // resolveAutoMode is that order of preference, and nothing else.
@@ -277,8 +383,22 @@ func resolveAutoMode(auto, pill, last string) ConnMode {
 // autoPool returns the candidate tab IDs, defaulting to the main tab.
 func autoPool() []string {
 	settingsMu.RLock()
-	pool := append([]string(nil), appSettings.AutoTabs...)
+	chosen := append([]string(nil), appSettings.AutoTabs...)
 	settingsMu.RUnlock()
+	// Only tabs that still exist: a deleted tab stayed in the list, and a pool of
+	// deleted tabs had nothing in it while the panel said to run a ping.
+	// (DeleteTab also takes it out of the setting.)
+	var pool []string
+	state.mu.RLock()
+	for _, id := range chosen {
+		for _, t := range state.tabs {
+			if t.ID == id {
+				pool = append(pool, id)
+				break
+			}
+		}
+	}
+	state.mu.RUnlock()
 	if len(pool) == 0 {
 		pool = []string{"main"}
 	}
@@ -334,22 +454,36 @@ func autoConnInPool(cs ConnState, pool []string) bool {
 	if cs.ConnRaw == "" {
 		return true // nothing to evaluate — don't force a switch
 	}
-	inPool := map[string]bool{}
-	for _, tid := range pool {
-		inPool[tid] = true
-	}
-	// Fast path: the connection's own tab is in the pool.
-	if inPool[cs.ConnTab] {
-		return true
-	}
-	// Otherwise, see if the connected raw appears in any pool tab.
 	state.mu.RLock()
 	defer state.mu.RUnlock()
+	// The connected config counts as a candidate where a pool tab holds it and
+	// that tab's exclude filter does not hide it — the same test autoCandidates
+	// applies. Checking only the tab left AUTO on a server the user had just
+	// filtered out of the pool, for as long as that server kept working.
+	rules := autoTabExcludeRulesLocked(pool)
+	found := false
 	for _, tid := range pool {
 		for _, e := range state.tabEntries[tid] {
-			if e.snap().Raw == cs.ConnRaw {
+			es := e.snap()
+			if es.Raw != cs.ConnRaw {
+				continue
+			}
+			found = true
+			if !autoEntryExcluded(es, rules[tid]) {
 				return true
 			}
+		}
+	}
+	if found {
+		return false // present, but hidden everywhere it is
+	}
+	// Not in any pool tab's list at all. A refresh can rewrite the raw of the
+	// very config still connected (a renamed #fragment); its tab being in the
+	// pool is then the best evidence left, and a switch on that alone would be
+	// a switch for nothing.
+	for _, tid := range pool {
+		if tid == cs.ConnTab {
+			return true
 		}
 	}
 	return false
@@ -660,6 +794,12 @@ func autoNoteFailureOn(entry *ConfigEntry, tabID, raw, why string) {
 // everyone else's.
 func autoNoteLivePing(cs ConnState, rtt time.Duration) {
 	if cs.ConnRaw == "" || rtt <= 0 {
+		return
+	}
+	// A chain's round trip crosses every server in it. Written on the row of
+	// the first, it replaced that server's own figure, and the ranking then
+	// read the whole chain's delay as the first server's.
+	if len(cs.ChainRaws) > 1 {
 		return
 	}
 	ms := rtt.Milliseconds()
@@ -1107,15 +1247,60 @@ func waitAutoSweepIdle(timeout time.Duration) bool {
 	return true
 }
 
+// AutoSweepProgress is how far AUTO's test of its pool has got. A big pool is
+// tested before the first connection, and without a count the panel said
+// "waiting" for minutes with nothing to show that it was getting anywhere.
+//
+// Seq orders the updates. The events that carry them are delivered each on a
+// goroutine of its own, so they can arrive out of order — and the last count
+// of a sweep, reported from a test goroutine a moment before the sweep's end,
+// could land after "finished" and leave the panel showing a full bar that
+// never went away. The panel keeps the highest Seq it has seen and drops
+// anything older.
+type AutoSweepProgress struct {
+	Running bool   `json:"running"`
+	Done    int    `json:"done"`
+	Total   int    `json:"total"`
+	Speed   bool   `json:"speed"`
+	Seq     uint64 `json:"seq"`
+}
+
+var (
+	autoSweepMuP sync.Mutex
+	autoSweepNow AutoSweepProgress
+	autoSweepSeq uint64
+)
+
+// AutoSweep is the current state, for a panel opened in the middle of a sweep;
+// every change after that arrives as an auto_sweep event.
+func AutoSweep() AutoSweepProgress {
+	autoSweepMuP.Lock()
+	defer autoSweepMuP.Unlock()
+	return autoSweepNow
+}
+
+func setAutoSweep(p AutoSweepProgress) {
+	autoSweepMuP.Lock()
+	autoSweepSeq++
+	p.Seq = autoSweepSeq
+	autoSweepNow = p
+	autoSweepMuP.Unlock()
+	state.broadcast(SSEEvent{Type: "auto_sweep", Payload: p})
+}
+
 // testTabs is the shared background tester: it pings (and, when withSpeed,
 // speed-tests) every config across the given tabs, deduped and respecting each
-// tab's exclude filter. Results broadcast as entry_update (no bulk-progress UI).
+// tab's exclude filter. Results broadcast as entry_update; progress, when the
+// caller asks for it, goes to progress(done, total) — once with done=0 when the
+// queue is known, then after every config.
 // It yields to any user-initiated bulk test and never overlaps another
 // background sweep (autoPingRunning guard). keepGoing, when non-nil, is checked
 // before each config and stops the sweep early when it returns false — AUTO uses
 // it to bail if auto-connect is switched off mid-sweep; the per-tab
 // "test after auto-refresh" passes nil (always run to completion).
-func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
+// It reports whether it ran at all: a sweep that found another one in progress,
+// or nothing to test, returns false.
+func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool, progress func(done, total int)) bool {
 	// manualBulkOverlaps reports whether a manual PING/SPEED-ALL run is testing
 	// one of THIS sweep's tabs. A manual bulk on a DIFFERENT tab must NOT stop the
 	// sweep (each probe runs its own isolated engine, so they coexist fine) — the
@@ -1135,10 +1320,10 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 		return sweepSet[tt]
 	}
 	if manualBulkOverlaps() {
-		return
+		return false
 	}
 	if !atomic.CompareAndSwapInt32(&autoPingRunning, 0, 1) {
-		return
+		return false
 	}
 	defer atomic.StoreInt32(&autoPingRunning, 0)
 
@@ -1188,7 +1373,10 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 	}
 	state.mu.RUnlock()
 	if len(list) == 0 {
-		return
+		return false
+	}
+	if progress != nil {
+		progress(0, len(list))
 	}
 
 	// The setting that matches the work actually being done. A speed sweep holds
@@ -1246,7 +1434,10 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 				mirrorPingResult(tab, ent)
 			}
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(ent.snap()), Tab: tab})
-			atomic.AddInt32(&tested, 1)
+			n := atomic.AddInt32(&tested, 1)
+			if progress != nil {
+				progress(int(n), len(list))
+			}
 		}(item.e, item.tab)
 	}
 	wg.Wait()
@@ -1259,17 +1450,37 @@ func testTabs(tabIDs []string, withSpeed bool, keepGoing func() bool) {
 	} else {
 		vlog("info", "refreshed %s for %d config(s)", what, n)
 	}
+	return true
 }
 
 // autoTestTabs is the AUTO-supervisor entry point: same as testTabs but bails if
 // auto-connect is switched off mid-sweep.
 func autoTestTabs(tabIDs []string, withSpeed bool) {
-	testTabs(tabIDs, withSpeed, func() bool {
+	// done arrives from goroutines finishing in any order; under the lock a
+	// count older than the one already shown is dropped, so it only ever moves
+	// forward on screen.
+	var mu sync.Mutex
+	last, total := 0, 0
+	ran := testTabs(tabIDs, withSpeed, func() bool {
 		settingsMu.RLock()
 		on := appSettings.AutoConnect
 		settingsMu.RUnlock()
 		return on
+	}, func(done, n int) {
+		mu.Lock()
+		defer mu.Unlock()
+		if done != 0 && done < last {
+			return
+		}
+		last, total = done, n
+		setAutoSweep(AutoSweepProgress{Running: true, Done: done, Total: n, Speed: withSpeed})
 	})
+	if ran {
+		mu.Lock()
+		p := AutoSweepProgress{Running: false, Done: last, Total: total, Speed: withSpeed}
+		mu.Unlock()
+		setAutoSweep(p)
+	}
 }
 
 // runAfterRefreshTest runs the per-tab "test after auto-refresh" (Tab.
@@ -1292,7 +1503,7 @@ func runAfterRefreshTest(tabID string) {
 		// in-flight pings; wait it out so the fresh test actually starts instead
 		// of being skipped by the autoPingRunning guard.
 		waitAutoSweepIdle(30 * time.Second)
-		testTabs([]string{tabID}, mode == "speed", nil)
+		testTabs([]string{tabID}, mode == "speed", nil, nil)
 	}
 }
 
@@ -1369,6 +1580,9 @@ func startAutoSupervisor() {
 	var lastSwitch, lastProbe, nextRetry, lastTUNSwitch, lastSlowRetest time.Time
 	cooldown := map[string]time.Time{}
 	backoff := map[string]time.Duration{}
+	// Read again on every pass below, like the threshold and the latency
+	// budget: read once here, a changed "Minimum time on a server" waited for
+	// the next start of the program.
 	minDwell := autoMinDwell()
 	// When over budget but already on the fastest available config, re-test the
 	// pool no more often than this — enough to promote a faster config once one
@@ -1422,8 +1636,18 @@ func startAutoSupervisor() {
 		sw := on
 		threshold := appSettings.AutoFailThreshold
 		maxLat := appSettings.AutoMaxLatencyMs
-		lastRaw := appSettings.LastConnectedRaw
+		// Tried first only when the user asked for it (AutoPreferLast); by
+		// default the first connection goes to the top of the ranking.
+		lastRaw := ""
+		// Not after a chain: its last raw is the exit server, and connecting that
+		// one alone put a single hop in place of the route that was built —
+		// the substitution auto-connect refuses everywhere else. The ranking
+		// decides instead.
+		if appSettings.AutoPreferLast && len(appSettings.LastConnectedChain) <= 1 {
+			lastRaw = appSettings.LastConnectedRaw
+		}
 		settingsMu.RUnlock()
+		minDwell = autoMinDwell()
 		guardSystemProxy(&proxyGuard)
 
 		if !on {
@@ -1439,6 +1663,20 @@ func startAutoSupervisor() {
 			// switch to.
 			watchIdleConnection(cm, &idleFails, &lastIdleProbe, &idleLive)
 			continue
+		}
+		// Set to TUN with no rights to create a tunnel: auto-connect cannot do its
+		// job, says so once, and the connection is watched as with AUTO off.
+		if autoNeedsAdmin(autoEffectiveMode()) {
+			failCount = 0
+			autoForce.Store(false)
+			autoNoteNeedsAdmin()
+			watchIdleConnection(cm, &idleFails, &lastIdleProbe, &idleLive)
+			continue
+		}
+		// The mode was changed to proxy (or the rights arrived): take the notice
+		// off the panel rather than leave it until the next connection.
+		if autoAdminNoted.Swap(false) {
+			broadcastAuto("idle", "", "", "")
 		}
 		// Back under AUTO's own supervision: forget what the off-mode watchdog saw.
 		idleFails, lastIdleProbe = 0, time.Time{}
@@ -1466,6 +1704,12 @@ func startAutoSupervisor() {
 			// "Switch now" — leave the current config (cooled down so we don't
 			// bounce straight back) and grab the next-best, ignoring threshold
 			// and min-dwell. Works for user- and auto-owned connections alike.
+			// "Switch now" with nothing in the pool is spent here, not kept: left
+			// armed, it fired whenever the pool next had configs — minutes or
+			// hours later — and took a connection the user had made by hand.
+			if forced && !autoPoolHasEntries(pool) {
+				autoForce.Store(false)
+			}
 			if forced && autoPoolHasEntries(pool) {
 				// Respect the TUN switch floor even for a forced switch — but keep
 				// autoForce armed and retry soon so it fires the moment the floor
@@ -1514,8 +1758,8 @@ func startAutoSupervisor() {
 				if !cm.actionMu.TryLock() {
 					continue
 				}
-				vlog("info", "auto: %s is outside the selected tabs — switching", cs.EntryName)
-				noteSessionEndReason("auto: the candidate tabs changed")
+				vlog("info", "auto: %s is no longer among the candidates (its tab was deselected, or its exclude filter hides it) — switching", cs.EntryName)
+				noteSessionEndReason("auto: no longer among the candidates")
 				ok := autoConnectFromPool(pool, "", cs.ConnRaw, mode, "tabs changed", cooldown, backoff)
 				cm.actionMu.Unlock()
 				failCount = 0
@@ -1579,6 +1823,9 @@ func startAutoSupervisor() {
 					continue
 				}
 			case livenessSuspect:
+				if !probeNow && time.Since(lastProbe) < livenessSuspectRecheck {
+					continue
+				}
 			default:
 				// Same reasoning as the idle watchdog: after a failed probe,
 				// look again in seconds rather than waiting out the interval.
@@ -1594,9 +1841,15 @@ func startAutoSupervisor() {
 			} else {
 				autoLiveRtt.Store(0)
 			}
-			overBudget := alive && maxLat > 0 && rtt > time.Duration(maxLat)*time.Millisecond
+			// Not for a chain. Two servers in a row are slower than one, and the
+			// only thing auto-connect does with a chain is end it: a working chain
+			// over the budget was closed as "stopped responding" whenever any
+			// single server in the pool was faster. A chain is left only when it
+			// stops answering.
+			overBudget := alive && maxLat > 0 && rtt > time.Duration(maxLat)*time.Millisecond && len(cs.ChainRaws) <= 1
 			if alive && !overBudget {
 				failCount = 0
+				live.answered()
 				// It has held for longer than the minimum stay, so whatever was
 				// wrong with it before is over: forget the escalating pause. This
 				// is the only place it is forgiven — connecting is not enough,
@@ -1615,7 +1868,14 @@ func startAutoSupervisor() {
 			reason := "probe failed"
 			if overBudget {
 				reason = fmt.Sprintf("too slow %dms", rtt.Milliseconds())
-				vlog("warning", "auto: %s too slow (%dms > %dms) (%d/%d)", cs.EntryName, rtt.Milliseconds(), maxLat, failCount, threshold)
+				// Past the threshold but inside the minimum stay, the count keeps
+				// climbing (3/2, 4/2 …) with no switch; say why, or it reads as
+				// AUTO ignoring its own threshold.
+				hold := ""
+				if failCount >= threshold && time.Since(lastSwitch) < minDwell {
+					hold = fmt.Sprintf(" — staying for the minimum time on a server, %ds left", int((minDwell-time.Since(lastSwitch)).Seconds())+1)
+				}
+				vlog("warning", "auto: %s too slow (%dms > %dms) (%d/%d)%s", cs.EntryName, rtt.Milliseconds(), maxLat, failCount, threshold, hold)
 			} else {
 				vlog("warning", "auto: health probe failed (%d/%d) for %s", failCount, threshold, cs.EntryName)
 			}
@@ -1661,10 +1921,12 @@ func startAutoSupervisor() {
 			// why, the same ending the watch gives when there is nowhere to move.
 			if len(cs.ChainRaws) > 1 {
 				failCount = 0
-				blocked := PersistentKillSwitchHeld()
+				blocked := trafficHeldNow()
 				desktopNotify("Vair", notifyChainGone(cs.EntryName, blocked))
 				why := "the chain stopped responding — connection closed (auto-connect does not rebuild a chain)"
-				if blocked {
+				if blocked && blockWillLapse() {
+					why = "the chain stopped responding — traffic stays blocked for 20 s (kill-switch), then the normal connection returns"
+				} else if blocked {
 					why = "the chain stopped responding — traffic stays blocked (kill-switch); disconnect to release it"
 				}
 				noteSessionEndReason("auto: " + reason)

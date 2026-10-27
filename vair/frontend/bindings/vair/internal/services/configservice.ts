@@ -30,15 +30,6 @@ export function AddConfig(tabId: string, form: core$0.ConfigForm): $CancellableP
 }
 
 /**
- * AddWARP enrols a free Cloudflare WARP account and adds it to the tab as a
- * WireGuard configuration. Slow (a network round trip), so the frontend shows
- * it working; returns the error text for the toast rather than swallowing it.
- */
-export function AddWARP(tabId: string): $CancellablePromise<string> {
-    return $Call.ByID(2322268706, tabId);
-}
-
-/**
  * BeginPaste resolves the paste target ONCE (configs can't go into the main
  * "Sources" tab — ensure/switch to a user tab first), marks it loading, and
  * returns its id. Subsequent PasteChunk/EndPaste calls carry this id, so
@@ -75,20 +66,21 @@ export function Count(tabId: string, filter: string, proto: string[] | null): $C
  * DeleteDuplicatesOf removes the other copies of one configuration, keeping it.
  * Returns how many were removed.
  */
-export function DeleteDuplicatesOf(idx: number): $CancellablePromise<number> {
-    return $Call.ByID(1568974385, idx);
+export function DeleteDuplicatesOf(idx: number, raw: string): $CancellablePromise<number> {
+    return $Call.ByID(1568974385, idx, raw);
 }
 
 /**
- * DeleteEntries removes the given config indices from the active tab.
+ * DeleteEntries removes the given config indices from the active tab; raws are
+ * the configurations the table showed at them. Returns how many were removed.
  */
-export function DeleteEntries(indices: number[] | null): $CancellablePromise<void> {
-    return $Call.ByID(1290126986, indices);
+export function DeleteEntries(indices: number[] | null, raws: string[] | null): $CancellablePromise<number> {
+    return $Call.ByID(1290126986, indices, raws);
 }
 
 /**
  * DeleteFailed removes every config in tabId whose ping OR speed test failed
- * (whole tab, server-side). Returns the number of remaining configs.
+ * (whole tab, server-side). Returns how many were removed.
  */
 export function DeleteFailed(tabId: string): $CancellablePromise<number> {
     return $Call.ByID(1823187427, tabId);
@@ -133,6 +125,23 @@ export function Indices(tabId: string, sort: string, filter: string, proto: stri
 }
 
 /**
+ * IndicesOf is where each configuration sits in the tab now (-1 when gone):
+ * the table's selection follows its rows through a refresh.
+ */
+export function IndicesOf(tabId: string, raws: string[] | null): $CancellablePromise<number[] | null> {
+    return $Call.ByID(3988508955, tabId, raws);
+}
+
+/**
+ * MoveEntries moves configs of a tab to just before the config at target (or
+ * after it, with after set) — target -1 is the end, -2 the start — and returns
+ * their new indices (nil when nothing moved). The table's drag-and-drop.
+ */
+export function MoveEntries(tabId: string, indices: number[] | null, target: number, after: boolean): $CancellablePromise<number[] | null> {
+    return $Call.ByID(2078060404, tabId, indices, target, after);
+}
+
+/**
  * PasteChunk parses one ≤40MB chunk into tabId (in memory); EndPaste persists
  * the whole tab with a single write and clears the spinner.
  */
@@ -164,18 +173,23 @@ export function Reload(tabId: string): $CancellablePromise<void> {
     return $Call.ByID(4130626660, tabId);
 }
 
-/**
- * RemoveFavorites unstars the given node bodies; returns how many went.
- */
 export function RemoveFavorites(bodies: string[] | null): $CancellablePromise<number> {
     return $Call.ByID(3210467114, bodies);
 }
 
 /**
  * RenameEntry renames config idx in the active tab; returns false if not allowed.
+ * raw is the configuration the table showed at idx.
  */
-export function RenameEntry(idx: number, name: string): $CancellablePromise<boolean> {
-    return $Call.ByID(394721237, idx, name);
+export function RenameEntry(idx: number, raw: string, name: string): $CancellablePromise<boolean> {
+    return $Call.ByID(394721237, idx, raw, name);
+}
+
+/**
+ * RemoveFavorites unstars the given node bodies; returns how many went.
+ */
+export function RestoreFavorites(bodies: string[] | null): $CancellablePromise<number> {
+    return $Call.ByID(2591368414, bodies);
 }
 
 /**
@@ -193,11 +207,20 @@ export function ToggleFavorite(idx: number): $CancellablePromise<boolean> {
 }
 
 /**
- * UpdateConfig replaces config idx in a user tab from the edited form. Returns ""
- * on success or an error string.
+ * UndoDelete puts the last delete back; returns how many came back, or why
+ * none did.
  */
-export function UpdateConfig(tabId: string, idx: number, form: core$0.ConfigForm): $CancellablePromise<string> {
-    return $Call.ByID(1638703194, tabId, idx, form);
+export function UndoDelete(): $CancellablePromise<core$0.UndoResult> {
+    return $Call.ByID(3361228884);
+}
+
+/**
+ * UpdateConfig replaces config idx in a user tab from the edited form; raw is
+ * the configuration the form was opened on. Returns "" on success or an error
+ * string.
+ */
+export function UpdateConfig(tabId: string, idx: number, raw: string, form: core$0.ConfigForm): $CancellablePromise<string> {
+    return $Call.ByID(1638703194, tabId, idx, raw, form);
 }
 
 /**

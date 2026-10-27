@@ -1,12 +1,7 @@
 package core
 
 import (
-	"net"
-	"strconv"
 	"strings"
-	"sync"
-	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -18,40 +13,8 @@ import (
 // netstat -b reads — so the live list can say "chrome.exe" instead of a number
 // nobody can act on.
 //
-// The table is a syscall over every TCP connection on the machine, so it is
-// read at most a few times a second and cached; a browser opening forty
-// connections at once must not mean forty scans.
-
-var procPortCache = struct {
-	sync.Mutex
-	m    map[uint16]string
-	when time.Time
-}{m: map[uint16]string{}}
-
-const procPortTTL = 2 * time.Second
-
-// processForLocalPort maps "127.0.0.1:54321" to the name of the program that
-// owns that port, or "" when it cannot be told.
-func processForLocalPort(localAddr string) string {
-	_, portStr, err := net.SplitHostPort(localAddr)
-	if err != nil {
-		return ""
-	}
-	p, err := strconv.Atoi(portStr)
-	if err != nil || p <= 0 || p > 65535 {
-		return ""
-	}
-	port := uint16(p)
-
-	procPortCache.Lock()
-	if time.Since(procPortCache.when) > procPortTTL {
-		procPortCache.m = tcpPortOwners()
-		procPortCache.when = time.Now()
-	}
-	name := procPortCache.m[port]
-	procPortCache.Unlock()
-	return name
-}
+// The table is a syscall over every TCP connection on the machine; procport.go
+// keeps it cached.
 
 // MIB_TCPROW_OWNER_PID, in the order the API returns it.
 type tcpRowOwnerPID struct {
@@ -64,49 +27,15 @@ type tcpRowOwnerPID struct {
 }
 
 // tcpPortOwners reads the whole table once and returns local port → program.
+// Names come from a cache of their own (processNameCached): when a burst of new
+// connections makes the table be read several times in a second, the processes
+// in it are mostly the same ones, and opening each again is the expensive part.
 func tcpPortOwners() map[uint16]string {
-	const (
-		afINet                   = 2
-		tcpTableOwnerPIDAll      = 5
-		errInsufficientBuffer    = 122
-		processQueryLimitedInfo  = 0x1000
-		maxProcessNameBufferSize = 260
-	)
 	out := map[uint16]string{}
-
-	mod := windows.NewLazySystemDLL("iphlpapi.dll")
-	proc := mod.NewProc("GetExtendedTcpTable")
-
-	var size uint32
-	r, _, _ := proc.Call(0, uintptr(unsafe.Pointer(&size)), 0, afINet, tcpTableOwnerPIDAll, 0)
-	if r != errInsufficientBuffer || size == 0 {
-		return out
-	}
-	buf := make([]byte, size)
-	r, _, _ = proc.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0,
-		afINet, tcpTableOwnerPIDAll, 0)
-	if r != 0 {
-		return out
-	}
-
-	n := *(*uint32)(unsafe.Pointer(&buf[0]))
-	rowSize := unsafe.Sizeof(tcpRowOwnerPID{})
-	names := map[uint32]string{}
-	for i := uint32(0); i < n; i++ {
-		off := unsafe.Sizeof(uint32(0)) + uintptr(i)*rowSize
-		if off+rowSize > uintptr(len(buf)) {
-			break
-		}
-		row := (*tcpRowOwnerPID)(unsafe.Pointer(&buf[off]))
+	for _, r := range tableRows[tcpRowOwnerPID](tcpTable(2)) {
 		// The port arrives with its bytes the other way round.
-		port := uint16(row.localPort<<8) | uint16(row.localPort>>8&0xff)
-		pid := row.owningPID
-		name, seen := names[pid]
-		if !seen {
-			name = processName(pid)
-			names[pid] = name
-		}
-		if name != "" {
+		port := uint16(r.localPort<<8) | uint16(r.localPort>>8&0xff)
+		if name := processNameCached(r.owningPID); name != "" {
 			out[port] = name
 		}
 	}

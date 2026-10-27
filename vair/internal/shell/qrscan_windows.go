@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"image"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"vair/core"
@@ -125,7 +126,19 @@ func captureVirtualScreen() (image.Image, error) {
 }
 
 // ScanQRFromScreen captures the virtual desktop and decodes a QR found on it.
+//
+// The scan is started from Vair's own menu, so Vair's window is in front of
+// whatever shows the code, and a code under it was not found. The window steps
+// aside for the capture and comes back.
 func ScanQRFromScreen() (string, error) {
+	if w := mainWindow; w != nil && w.IsVisible() {
+		w.Hide()
+		time.Sleep(350 * time.Millisecond) // the desktop repaints what was under it
+		defer func() {
+			w.Show()
+			RaiseWindow(w)
+		}()
+	}
 	img, err := captureVirtualScreen()
 	if err != nil {
 		return "", err

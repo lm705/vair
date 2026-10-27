@@ -3,6 +3,11 @@
 import React from 'react'
 import { t10 } from './i18n'
 import { useChipSelect } from './chipselect'
+import Group, { DepPanel, needsOnNote } from './setgroup'
+import Toggle from './Toggle'
+import Select from './Select'
+import { Hint, opt, whenOn, whenOff } from './hints'
+import { srcErrText } from './reasons'
 
 export const EXCLUDE_COLS = ['name', 'type', 'host', 'transport', 'security'] as const
 export type ExCol = (typeof EXCLUDE_COLS)[number]
@@ -104,7 +109,7 @@ export function SubInfoSection({ subs, lang }: { subs: any[] | null | undefined;
     if (sub.error) {
       rows.push(
         <div key="e" className="si-row si-warn">
-          {tt('Failed to load')}: {tt(sub.error)}
+          {tt('Failed to load')}: {srcErrText(sub.error, tt)}
         </div>,
       )
     } else {
@@ -124,7 +129,9 @@ export function SubInfoSection({ subs, lang }: { subs: any[] | null | undefined;
         const dl = subDaysLeft(sub.expire)
         rows.push(
           <div key="x" className={'si-row' + (dl <= 7 ? ' si-warn' : '')}>
-            {tt('Expires')}: {fmtDateDM(sub.expire)} ({dl} {tt('days')})
+            {dl > 0
+              ? tt('Expires') + ': ' + fmtDateDM(sub.expire) + ' (' + dl + ' ' + tt('days') + ')'
+              : tt('Expired') + ': ' + fmtDateDM(sub.expire)}
           </div>,
         )
       }
@@ -160,29 +167,186 @@ export function SubInfoSection({ subs, lang }: { subs: any[] | null | undefined;
     )
   }
   return (
-    <div className="settings-section">
-      <div className="section-header">
-        {tt('Subscription info')}
-        {withInfo.length > 1 ? ' (' + withInfo.length + ')' : ''}
-      </div>
+    <Group title={tt('Subscription info') + (withInfo.length > 1 ? ' (' + withInfo.length + ')' : '')}>
       {withInfo.map((s, i) => block(s, i))}
-    </div>
+    </Group>
+  )
+}
+
+// The interval auto-refresh starts at when it is turned on with none set.
+const REFRESH_DEFAULT_MIN = 60
+
+// RefreshGroup — auto-refresh of a tab: a switch, and while it is on, how
+// often and what to test afterwards. The switch used to sit beside a number
+// that also turned it off at 0, so there were two ways to say "off" and a
+// switch that could be on with nothing scheduled. The minutes are kept while
+// it is off, and come back when it is turned on again.
+export function RefreshGroup({
+  lang,
+  min,
+  off,
+  test,
+  setMin,
+  setOff,
+  setTest,
+  onChanged,
+}: {
+  lang: string
+  min: number
+  off: boolean
+  test: string
+  setMin: (v: number) => void
+  setOff: (v: boolean) => void
+  setTest: (v: string) => void
+  onChanged: () => void
+}) {
+  const tt = (en: string) => t10(lang, en)
+  const on = !off && min > 0
+  // What is typed, apart from the number: an emptied field is not an interval
+  // of zero, which would read as "off" and fold the field away mid-edit.
+  const [txt, setTxt] = React.useState(min > 0 ? String(min) : '')
+  React.useEffect(() => setTxt(min > 0 ? String(min) : ''), [min])
+  return (
+    <Group title={tt('Auto-refresh')}>
+      <div className="modal-row">
+        <span className="modal-row-label">{tt('Refresh on a schedule')}</span>
+        <Toggle
+          on={on}
+          onChange={(v) => {
+            setOff(!v)
+            if (v && min < 1) setMin(REFRESH_DEFAULT_MIN)
+            onChanged()
+          }}
+        />
+      </div>
+      <Hint
+        en={'Refreshes the tab on a set interval.'}
+        opts={[
+          whenOn('a tab with a source or URL reloads the latest configuration list; a tab of pasted configurations only clears stale ping and speed results so they get re-tested.'),
+          whenOff('the tab changes only on RELOAD.', true),
+        ]}
+      />
+      <DepPanel off={!on} note={needsOnNote(tt, lang, tt('Refresh on a schedule'))}>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Interval (minutes)')}</span>
+            <input
+              className="modal-input num-input"
+              type="number"
+              min={1}
+              placeholder={String(REFRESH_DEFAULT_MIN)}
+              value={txt}
+              onChange={(e) => {
+                setTxt(e.target.value)
+                const n = Math.floor(+e.target.value)
+                if (n >= 1) setMin(n)
+              }}
+              onBlur={() => {
+                // Emptied or zero: the field says how often, and "never" is the
+                // switch above — so it goes back to the last interval rather
+                // than turning the refresh off from here.
+                setTxt(min > 0 ? String(min) : '')
+                onChanged()
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+              }}
+            />
+          </div>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Test after auto-refresh')}</span>
+            <Select
+              className="modal-input num-input"
+              style={{ width: 'auto', marginBottom: 0 }}
+              value={test}
+              onChange={(e) => {
+                setTest(e.target.value)
+                onChanged()
+              }}
+            >
+              <option value="">{tt('off')}</option>
+              <option value="ping">{tt('Ping only')}</option>
+              <option value="speed">{tt('Speed test')}</option>
+            </Select>
+          </div>
+          <Hint
+            en={'A background test of the tab\'s configurations after a scheduled refresh — not after a manual RELOAD.'}
+            opts={[
+              opt('off', 'no test.', true),
+              opt('Ping only', 'each configuration is pinged.'),
+              opt('Speed test', 'a full speed test of each configuration.'),
+            ]}
+          />
+      </DepPanel>
+    </Group>
+  )
+}
+
+// ExcludeGroup — the exclude filter of a tab: its switch and the five columns.
+export function ExcludeGroup({
+  lang,
+  off,
+  setOff,
+  ef,
+  efInput,
+  setEf,
+  setEfInput,
+  onChanged,
+  children,
+}: {
+  lang: string
+  off: boolean
+  setOff: (v: boolean) => void
+  ef: ExMap
+  efInput: ExInput
+  setEf: React.Dispatch<React.SetStateAction<ExMap>>
+  setEfInput: React.Dispatch<React.SetStateAction<ExInput>>
+  onChanged: () => void
+  // Rows that go above the filter in the same block (a tab's deduplication).
+  children?: React.ReactNode
+}) {
+  const tt = (en: string) => t10(lang, en)
+  return (
+    <Group title={tt('Filtering')}>
+      {children}
+      <div className="modal-row">
+        <span className="modal-row-label">{tt('Exclude filter')}</span>
+        <Toggle
+          on={!off}
+          onChange={(v) => {
+            setOff(!v)
+            onChanged()
+          }}
+        />
+      </div>
+      <Hint
+        en={'Hides configurations by the values in the columns below. Type a value and press Enter to add it. Name and Host match a part of the text; Type, Transport and Security match the whole value (vless, ws, tls). Case does not matter. A column left empty excludes nothing.'}
+        opts={[
+          whenOn('matching configurations are hidden.', true),
+          whenOff('every configuration is shown; the values are kept.'),
+        ]}
+      />
+      <DepPanel off={off} note={needsOnNote(tt, lang, tt('Exclude filter'))}>
+        <div className={'modal-row' + (off ? '' : ' row-cont')} style={{ display: 'block' }}>
+          <ExcludeFields lang={lang} ef={ef} efInput={efInput} setEf={setEf} setEfInput={setEfInput} onChanged={onChanged} />
+        </div>
+      </DepPanel>
+    </Group>
   )
 }
 
 // ExcludeFields — the five labelled per-column chip boxes (1.10
 // renderExcludeFields). Parent owns the chip lists + pending inputs.
 export function ExcludeFields({
+  lang,
   ef,
   efInput,
-  disabled,
   setEf,
   setEfInput,
   onChanged,
 }: {
+  lang: string
   ef: ExMap
   efInput: ExInput
-  disabled: boolean
   setEf: React.Dispatch<React.SetStateAction<ExMap>>
   setEfInput: React.Dispatch<React.SetStateAction<ExInput>>
   onChanged: () => void
@@ -197,10 +361,11 @@ export function ExcludeFields({
     onChanged()
   }
   return (
-    <div className="ef-fields" id="tab-filter-fields" style={{ opacity: disabled ? 0.45 : 1 }}>
+    <div className="ef-fields" id="tab-filter-fields">
       {EXCLUDE_COLS.map((col) => (
         <ExcludeChipField
           key={col}
+          lang={lang}
           col={col}
           ef={ef}
           efInput={efInput}
@@ -217,6 +382,7 @@ export function ExcludeFields({
 // ExcludeChipField is one labelled column. Split out so useChipDragSelect (a
 // hook) is called once per column rather than inside a map.
 function ExcludeChipField({
+  lang,
   col,
   ef,
   efInput,
@@ -225,6 +391,7 @@ function ExcludeChipField({
   onChanged,
   add,
 }: {
+  lang: string
   col: ExCol
   ef: ExMap
   efInput: ExInput
@@ -252,7 +419,7 @@ function ExcludeChipField({
                 onChanged()
               }}
             >
-              x
+              ×
             </span>
           </span>
         ))}
@@ -262,7 +429,7 @@ function ExcludeChipField({
         {ef[col].length > 0 && <span className="chip-fill" aria-hidden="true" />}
         <input
           className="chip-input ef-chip-input"
-          placeholder={EXCLUDE_PLACEHOLDERS[col]}
+          placeholder={t10(lang, EXCLUDE_PLACEHOLDERS[col])}
           value={efInput[col]}
           onChange={(e) => setEfInput((prev) => ({ ...prev, [col]: e.target.value }))}
           onKeyDown={(e) => {

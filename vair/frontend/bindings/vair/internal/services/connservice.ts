@@ -40,10 +40,12 @@ export function Connect(idx: number, mode: string): $CancellablePromise<boolean>
 
 /**
  * ConnectChain connects the given entries as a chain, in the order given:
- * idxs[0] is the entry hop, idxs[last] the exit. Returns "" on success or a human-readable rejection.
+ * idxs[0] is the entry hop, idxs[last] the exit; raws are the same
+ * configurations, index for index. Returns "" on success or a human-readable
+ * rejection.
  */
-export function ConnectChain(idxs: number[] | null, mode: string): $CancellablePromise<string> {
-    return $Call.ByID(2251372410, idxs, mode);
+export function ConnectChain(idxs: number[] | null, raws: string[] | null, mode: string): $CancellablePromise<string> {
+    return $Call.ByID(2251372410, idxs, raws, mode);
 }
 
 /**
@@ -51,6 +53,14 @@ export function ConnectChain(idxs: number[] | null, mode: string): $CancellableP
  */
 export function Disconnect(): $CancellablePromise<void> {
     return $Call.ByID(4031341499);
+}
+
+/**
+ * PingLive measures the round trip through the live connection, in ms (-1:
+ * no answer). The connection bar's ping.
+ */
+export function PingLive(): $CancellablePromise<number> {
+    return $Call.ByID(842394955);
 }
 
 /**

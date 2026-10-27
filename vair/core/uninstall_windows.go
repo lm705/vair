@@ -2,6 +2,8 @@
 
 package core
 
+import "vair/helper/winsys"
+
 // Undoing Vair on the way out.
 //
 // Every other uninstaller deletes files. This one has to give the machine back
@@ -27,12 +29,14 @@ package core
 func UninstallCleanup() []string {
 	var out []string
 
-	if killSwitchHeld() {
-		releaseKillSwitch()
-		if killSwitchHeld() {
+	// The filters, not only the marker: a block whose record was lost is still
+	// a machine with no network, and an uninstall that leaves it behind leaves
+	// no program to take it down.
+	if blockInstalled() {
+		if code := ReleaseBlockFromCommandLine(); code != 0 || blockInstalled() {
 			out = append(out, "kill switch: COULD NOT RELEASE — the firewall is still blocking outbound traffic; run as administrator")
 		} else {
-			out = append(out, "kill switch: released, the firewall is back to what it was")
+			out = append(out, "kill switch: released")
 		}
 	} else {
 		out = append(out, "kill switch: not engaged")
@@ -52,4 +56,11 @@ func UninstallCleanup() []string {
 	out = append(out, "TUN adapters: swept")
 
 	return out
+}
+
+// RemoveProgramFirewallRules deletes every firewall rule that names one of
+// these programs, whoever made it, and says what it did for each
+// (winsys.RemoveProgramRules).
+func RemoveProgramFirewallRules(programs ...string) []string {
+	return winsys.RemoveProgramRules(programs...)
 }

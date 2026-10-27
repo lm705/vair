@@ -26,6 +26,8 @@ import (
 //
 //   - loopback, which is the machine talking to itself;
 //   - the tunnel interface, which is the point;
+//   - loopback and tunnel ADDRESSES, for what the engine's own nftables rules
+//     send there before the route is looked up again (see killSwitchScript);
 //   - the addresses of the VPN servers themselves, or the engine could not
 //     reach the server it is building the tunnel to;
 //   - everything the helper's own service produces, matched by cgroup. That is
@@ -89,7 +91,7 @@ func helperCgroup() (string, int, bool) {
 // An empty cgroup is what the caller falls back to: `socket cgroupv2` needs a
 // recent nft and a path that exists, and a machine without either should still
 // get a block built on the server addresses rather than no block at all.
-func killSwitchScript(iface string, serverIPs []string, allowLAN bool, cgroup string, cgroupLevel int) string {
+func killSwitchScript(iface string, tunNets, serverIPs []string, allowLAN bool, cgroup string, cgroupLevel int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "table inet %s {\n", killSwitchTable)
 	b.WriteString("  chain output {\n")
@@ -97,6 +99,30 @@ func killSwitchScript(iface string, serverIPs []string, allowLAN bool, cgroup st
 	b.WriteString("    oifname \"lo\" accept\n")
 	if iface != "" {
 		fmt.Fprintf(&b, "    oifname %q accept\n", iface)
+	}
+	// Where the engine's own rules send a packet before its route is looked up
+	// again. auto_redirect DNATs every port-53 query on the machine to the
+	// tunnel's DNS address and redirects TCP to a port on loopback; at this hook
+	// such a packet still names the interface it was first routed to, so the
+	// oifname rules above do not match it yet. Traced with `nft monitor trace`:
+	// under the kill-switch every program's own DNS query (dig @8.8.8.8, a
+	// resolver inside a container) died here with the policy, and TCP got
+	// through only because in the hybrid path the "server address" in the list
+	// below happens to be 127.0.0.1. Both kinds of destination are reached
+	// through the tunnel or stay on this machine, whatever the stale interface
+	// says.
+	b.WriteString("    ip daddr 127.0.0.0/8 accept\n")
+	b.WriteString("    ip6 daddr ::1 accept\n")
+	for _, raw := range tunNets {
+		_, n, err := net.ParseCIDR(raw)
+		if err != nil {
+			continue // the caller parses these; this is the second pair of eyes
+		}
+		if n.IP.To4() != nil {
+			fmt.Fprintf(&b, "    ip daddr %s accept\n", n)
+		} else {
+			fmt.Fprintf(&b, "    ip6 daddr %s accept\n", n)
+		}
 	}
 	if cgroup != "" {
 		fmt.Fprintf(&b, "    socket cgroupv2 level %d %q accept\n", cgroupLevel, cgroup)
@@ -121,20 +147,25 @@ func killSwitchScript(iface string, serverIPs []string, allowLAN bool, cgroup st
 }
 
 // installKillSwitch puts the table up, replacing whatever was there.
-func installKillSwitch(iface string, serverIPs []string, allowLAN bool, logf func(api.LogLine)) error {
-	removeKillSwitch() // never add to an old one: replace it
+//
+// Replaced, never added to, and in one nft transaction: the script creates the
+// table if it is missing, deletes it, and defines it again, so there is no
+// instant between the old block and the new one — which there was when this
+// was a delete and then an add, and which a switch to another server passes
+// through with the block kept (see keepBlock).
+func installKillSwitch(iface string, tunNets, serverIPs []string, allowLAN bool, logf func(api.LogLine)) error {
 	cg, level, ok := helperCgroup()
 	if !ok {
 		cg, level = "", 0
 	}
-	err := applyNft(killSwitchScript(iface, serverIPs, allowLAN, cg, level))
+	err := applyNft(replaceScript(killSwitchScript(iface, tunNets, serverIPs, allowLAN, cg, level)))
 	if err != nil && cg != "" {
 		// Almost certainly the cgroup match. Fall back rather than leave the
 		// machine unprotected, and say which one is in place — the difference
 		// matters: without the cgroup rule the engine can reach the servers in
 		// the list and nothing else, so a chain that resolves its next hop
 		// later will not come up.
-		if err2 := applyNft(killSwitchScript(iface, serverIPs, allowLAN, "", 0)); err2 != nil {
+		if err2 := applyNft(replaceScript(killSwitchScript(iface, tunNets, serverIPs, allowLAN, "", 0))); err2 != nil {
 			return fmt.Errorf("kill-switch: %w", err)
 		}
 		if logf != nil {
@@ -173,6 +204,11 @@ func killSwitchPresent() bool {
 		return false
 	}
 	return strings.Contains(string(out), killSwitchTable)
+}
+
+// replaceScript wraps a table definition so nft swaps it in atomically.
+func replaceScript(def string) string {
+	return fmt.Sprintf("add table inet %s\ndelete table inet %s\n", killSwitchTable, killSwitchTable) + def
 }
 
 func applyNft(script string) error {

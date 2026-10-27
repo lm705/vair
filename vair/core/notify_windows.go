@@ -123,6 +123,9 @@ func NotificationsBlockedReason(lang string) string {
 // desktopNotify shows a system notification. Never blocks the caller and never
 // reports failure: a machine with notifications turned off is not a fault.
 func desktopNotify(title, body string) {
+	if notifyMuted.Load() {
+		return
+	}
 	go func() {
 		ensureAUMID()
 		cmd := runHidden("powershell.exe", "-NoProfile", "-NonInteractive",

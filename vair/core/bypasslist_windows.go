@@ -32,8 +32,9 @@ import (
 // Two honest limits. A process belonging to another user or to the system will
 // show its address but not its name unless Vair is running elevated — Windows
 // does not hand out the image path of a process you cannot open. And this is
-// TCP: UDP has no connection to enumerate, so a game's UDP traffic is still
-// invisible here, though the TCP it opens alongside is not.
+// TCP, over IPv4 and IPv6: UDP has no connection to enumerate, so a game's UDP
+// traffic — and QUIC, which is UDP — is still invisible here, though the TCP it
+// opens alongside is not.
 
 // BypassRow is one connection that did not go through the proxy.
 type BypassRow struct {
@@ -85,26 +86,23 @@ func BypassConnections() []BypassRow {
 		defer bypassLast.Unlock()
 		return bypassLast.rows
 	}
-	rows := tcpConnections()
 	byKey := map[string]*BypassRow{}
 	var order []string
-	for _, r := range rows {
+	for _, r := range machineTCP() {
 		if r.state == 2 { // a listening socket is not a conversation
 			continue
 		}
-		ip := net.IPv4(byte(r.remoteAddr), byte(r.remoteAddr>>8), byte(r.remoteAddr>>16), byte(r.remoteAddr>>24))
-		name := processNameCached(r.owningPID)
-		if bypassSkip(ip, name) {
+		name := processNameCached(r.pid)
+		if bypassSkip(r.remote, name) {
 			continue
 		}
-		port := int(uint16(r.remotePort<<8) | uint16(r.remotePort>>8&0xff))
-		dest := ip.String() + ":" + strconv.Itoa(port)
+		dest := net.JoinHostPort(r.remote.String(), strconv.Itoa(r.port))
 		key := name + "\x00" + dest
 		if e, ok := byKey[key]; ok {
 			e.Count++
 			continue
 		}
-		e := &BypassRow{Process: name, Dest: dest, Name: reverseName(ip.String()), State: tcpStateName(r.state), Count: 1}
+		e := &BypassRow{Process: name, Dest: dest, Name: reverseName(r.remote.String()), State: tcpStateName(r.state), Count: 1}
 		byKey[key] = e
 		order = append(order, key)
 	}
@@ -131,38 +129,93 @@ var bypassLast = struct {
 	rows []BypassRow
 }{}
 
-// tcpConnections reads the whole table once. Same call as tcpPortOwners, kept
-// separate because that one answers "who owns this local port" and throws the
-// rest away, and this one needs the rest.
-func tcpConnections() []tcpRowOwnerPID {
+// tcpConn is one row of the machine's TCP table, IPv4 or IPv6.
+type tcpConn struct {
+	remote net.IP
+	port   int
+	state  uint32
+	pid    uint32
+}
+
+// MIB_TCP6ROW_OWNER_PID, in the order the API returns it.
+type tcp6RowOwnerPID struct {
+	localAddr     [16]byte
+	localScopeID  uint32
+	localPort     uint32
+	remoteAddr    [16]byte
+	remoteScopeID uint32
+	remotePort    uint32
+	state         uint32
+	owningPID     uint32
+}
+
+// machineTCP reads both tables once. Same call as tcpPortOwners, kept separate
+// because that one answers "who owns this local port" and throws the rest away,
+// and this one needs the rest — and the IPv6 half, which a program that goes
+// around the proxy uses as readily as IPv4.
+func machineTCP() []tcpConn {
+	const afINet, afINet6 = 2, 23
+	// The port arrives with its bytes the other way round.
+	port := func(p uint32) int { return int(uint16(p<<8) | uint16(p>>8&0xff)) }
+	var out []tcpConn
+	if buf := tcpTable(afINet); buf != nil {
+		for _, r := range tableRows[tcpRowOwnerPID](buf) {
+			a := r.remoteAddr
+			out = append(out, tcpConn{
+				remote: net.IPv4(byte(a), byte(a>>8), byte(a>>16), byte(a>>24)),
+				port:   port(r.remotePort),
+				state:  r.state,
+				pid:    r.owningPID,
+			})
+		}
+	}
+	if buf := tcpTable(afINet6); buf != nil {
+		for _, r := range tableRows[tcp6RowOwnerPID](buf) {
+			ip := make(net.IP, 16)
+			copy(ip, r.remoteAddr[:])
+			out = append(out, tcpConn{remote: ip, port: port(r.remotePort), state: r.state, pid: r.owningPID})
+		}
+	}
+	return out
+}
+
+// tcpTable returns GetExtendedTcpTable's answer for one address family, or nil.
+// The table can grow between asking its size and reading it, so a buffer that
+// turns out too small is tried again at the new size.
+func tcpTable(af uintptr) []byte {
 	const (
-		afINet                = 2
 		tcpTableOwnerPIDAll   = 5
 		errInsufficientBuffer = 122
 	)
-	mod := windows.NewLazySystemDLL("iphlpapi.dll")
-	proc := mod.NewProc("GetExtendedTcpTable")
-
+	proc := windows.NewLazySystemDLL("iphlpapi.dll").NewProc("GetExtendedTcpTable")
 	var size uint32
-	r, _, _ := proc.Call(0, uintptr(unsafe.Pointer(&size)), 0, afINet, tcpTableOwnerPIDAll, 0)
-	if r != errInsufficientBuffer || size == 0 {
-		return nil
+	r, _, _ := proc.Call(0, uintptr(unsafe.Pointer(&size)), 0, af, tcpTableOwnerPIDAll, 0)
+	for try := 0; try < 3 && r == errInsufficientBuffer && size > 0; try++ {
+		size += 4 << 10
+		buf := make([]byte, size)
+		r, _, _ = proc.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, af, tcpTableOwnerPIDAll, 0)
+		if r == 0 {
+			return buf
+		}
 	}
-	buf := make([]byte, size)
-	r, _, _ = proc.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0,
-		afINet, tcpTableOwnerPIDAll, 0)
-	if r != 0 {
+	return nil
+}
+
+// tableRows reads the rows of a MIB_*TABLE_OWNER_PID: a count, then the rows.
+func tableRows[T any](buf []byte) []T {
+	if len(buf) < 4 {
 		return nil
 	}
 	n := *(*uint32)(unsafe.Pointer(&buf[0]))
-	rowSize := unsafe.Sizeof(tcpRowOwnerPID{})
-	out := make([]tcpRowOwnerPID, 0, n)
+	var zero T
+	rowSize := unsafe.Sizeof(zero)
+	out := make([]T, 0, n)
 	for i := uint32(0); i < n; i++ {
 		off := unsafe.Sizeof(uint32(0)) + uintptr(i)*rowSize
 		if off+rowSize > uintptr(len(buf)) {
 			break
 		}
-		out = append(out, *(*tcpRowOwnerPID)(unsafe.Pointer(&buf[off])))
+		out = append(out, *(*T)(unsafe.Pointer(&buf[off])))
 	}
 	return out
 }

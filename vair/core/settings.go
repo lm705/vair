@@ -3,11 +3,17 @@ package core
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net"
+	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 // trimBOM drops a leading UTF-8 byte-order mark.
@@ -94,13 +100,21 @@ type AppSettings struct {
 	// Settings → Testing lets the user pick a preset or "Custom URL".
 	PingTestURL  string `json:"ping_test_url,omitempty"`
 	SpeedTestURL string `json:"speed_test_url,omitempty"`
-	// Fallback speed URL — used ONLY when the primary speed URL returns HTTP
-	// 429 (rate-limit). "" / unset → the CacheFly default (on by default);
+	// Fallback speed URL — used ONLY when the primary speed URL answers with
+	// one of the SpeedFallbackOn statuses (429 by default). "" / unset → the
+	// CacheFly default (on by default);
 	// "__none" → fallback explicitly disabled; anything else → that URL. See
 	// currentSpeedFallbackURL. Each attempt has its own bounded
 	// http.Client.Timeout, so an unreachable fallback cannot extend the test
 	// indefinitely or leak goroutines.
 	SpeedTestURLFallback string `json:"speed_test_url_fallback,omitempty"`
+	// SpeedFallbackOn is which HTTP statuses from the primary speed URL send the
+	// test to the fallback: codes, ranges and classes, comma-separated —
+	// "429, 403, 500-599" or "429, 5xx". "" means 429, the rate limit the
+	// fallback was made for. Only answers from the test file's server count: a
+	// connection that fails says something about the configuration, and a
+	// second URL would not change it. See speedFallbackOn.
+	SpeedFallbackOn string `json:"speed_fallback_on,omitempty"`
 	// CheckIPURL is what the "check IP" button asks. Empty → the built-in
 	// default. Any service that answers JSON will do: the reply is read by field
 	// name, not by a shape (see CheckExit).
@@ -109,6 +123,11 @@ type AppSettings struct {
 	// badge in the table. Persisted so the badge survives restarts; only
 	// one config carries it at a time.
 	LastConnectedRaw string `json:"last_connected_raw,omitempty"`
+	// LastConnectedChain is every hop of the last session when it was a chain,
+	// entry first; empty for a single configuration. LastConnectedRaw holds
+	// only the exit (the badge), and restoring from it alone brought the exit
+	// back connected directly — the one thing a chain is there to avoid.
+	LastConnectedChain []string `json:"last_connected_chain,omitempty"`
 	// Favorite configs, keyed by their raw URL (stable across reload/sort).
 	// Starred rows sort to the top in the default order.
 	Favorites []string `json:"favorites,omitempty"`
@@ -143,12 +162,13 @@ type AppSettings struct {
 	// is a decision to opt into rather than to inherit. Irrelevant while AUTO is
 	// on: AUTO watches the live node itself and moves to another one.
 	WatchConnection bool `json:"watch_connection,omitempty"`
-	// ConnTrackingOff stops the connections panel collecting anything: no row
-	// per connection, no peek at the first bytes to learn where it is going, no
-	// parsing of the engine's log for it. Inverted, so the zero value is the
-	// normal case — tracking on — and the switch in the panel is the only way to
-	// turn it off.
-	ConnTrackingOff bool `json:"conn_tracking_off,omitempty"`
+	// ConnTracking lets the connections panel collect: a row per connection,
+	// the bytes read to learn where it is going, the engine's log parsed for it.
+	// Off by default — what it collects is a list of the sites visited, with the
+	// program and the traffic, kept for the whole run and readable through the
+	// web interface — so it starts only when the switch in the panel ("record")
+	// is turned on. Replaces conn_tracking_off, which had it on by default.
+	ConnTracking bool `json:"conn_tracking,omitempty"`
 	// RuleStats, when on, counts how often each line of the user's rule lists
 	// actually fires, so the settings screen can say "never matched" about a rule
 	// that has a typo in it. It costs a debug-level sing-box log — that is where
@@ -219,10 +239,16 @@ type AppSettings struct {
 	AppFontSize   int    `json:"app_font_size,omitempty"`
 	Language      string `json:"language,omitempty"`
 	// HideHints removes the explanatory paragraph under each setting in the
-	// Settings, Tab-settings and auto-connect dialogs. Stored as the negative so
-	// the zero value keeps them — a new user should read what a switch does; it
-	// is the user who already knows who wants the dialogs short.
-	HideHints bool `json:"hide_hints,omitempty"`
+	// Settings, Tab-settings and auto-connect dialogs; an i mark beside each
+	// name opens it instead. On by default since 2.7.0 (the user's call: the
+	// dialogs are long, and a description is one click away). Not omitempty:
+	// with the default on, an explicit "show them" is a false that has to be
+	// written down, or the next start would read the default back.
+	HideHints bool `json:"hide_hints"`
+	// SettingsRev is the revision of the settings file, set by migrateSettings.
+	// Zero in a file written before revisions existed. Program-owned: no
+	// dialog writes it.
+	SettingsRev int `json:"settings_rev,omitempty"`
 	// Theme is the UI colour scheme: "" / "dark" (default) or "light". Applied
 	// client-side by toggling body.theme-light; the server only stores it.
 	Theme string `json:"theme,omitempty"`
@@ -275,22 +301,20 @@ type AppSettings struct {
 	// All zero-valued → 1.4.0 behaviour. Opt-in for now; once we have
 	// field reports we'll consider flipping defaults in 1.6.0.
 	//
-	// DNSLeakProtection is the master switch. When ON we install a real
-	// DNS routing block in sing-box, hijack port 53, and turn on
-	// strict_route so the WFP filter (Windows) prevents anything from
-	// escaping. When OFF the program behaves like 1.4.0.
+	// DNSLeakProtection is the master switch. When ON the names of the sites
+	// behind the tunnel are resolved through it, and strict_route's WFP filter
+	// (Windows) stops every other program asking a resolver outside it — the
+	// lookups Windows otherwise sends to the physical adapter's resolver in
+	// parallel. When OFF those names go to the system resolver.
 	// On by default (see appSettings initialiser). No omitempty: an explicit
 	// "off" must round-trip to disk, otherwise it would silently revert to the
 	// default on next launch.
 	DNSLeakProtection bool `json:"dns_leak_protection"`
-	// KillSwitch (TUN, only meaningful with DNSLeakProtection on) drives
-	// sing-box strict_route: on Windows a WFP filter that drops any traffic
-	// trying to leave OUTSIDE the tunnel, so nothing falls back to the physical
-	// NIC if the VPN drops (fail-closed) and DNS can't leak either. OFF = DNS is
-	// still tunnelled but traffic can fall back to direct on a tunnel drop.
-	// ON by default: before 2.1 strict_route silently followed DNSLeakProtection,
-	// so this default preserves that behaviour while making the toggle real. No
-	// omitempty — an explicit "off" must round-trip to disk.
+	// KillSwitch (TUN, only meaningful with DNSLeakProtection on): Vair's own
+	// block of everything that tries to leave OUTSIDE the tunnel, so nothing
+	// falls back to the physical NIC (tunnelblock_windows.go; the helper's
+	// nftables table on Linux). DNS is DNSLeakProtection's, not this. ON by
+	// default. No omitempty — an explicit "off" must round-trip to disk.
 	KillSwitch bool `json:"kill_switch"`
 	// BlockLAN is inverted: zero/false = LAN traffic allowed direct.
 	// When true the ip_is_private→direct rule is removed and even
@@ -332,9 +356,13 @@ type AppSettings struct {
 	IPv6Mode string `json:"ipv6_mode,omitempty"`
 	// DNS server overrides. Empty falls back to the built-in default
 	// for the slot (see dnsServerOr* helpers).
-	BootstrapDNS string `json:"bootstrap_dns,omitempty"` // plain UDP, IP-only
-	DirectDNS    string `json:"direct_dns,omitempty"`    // for bypass traffic
-	RemoteDNS    string `json:"remote_dns,omitempty"`    // through proxy
+	BootstrapDNS string `json:"bootstrap_dns,omitempty"`
+	// BootstrapStrict forbids the fallback to the system resolver when the
+	// bootstrap server does not answer: the connection fails instead, and the
+	// VPN server's name never reaches the provider's resolver.
+	BootstrapStrict bool   `json:"bootstrap_strict,omitempty"` // plain UDP, IP-only
+	DirectDNS       string `json:"direct_dns,omitempty"`       // for bypass traffic
+	RemoteDNS       string `json:"remote_dns,omitempty"`       // through proxy
 	// StaticHosts is a Windows-hosts-file-style domain→IP map.
 	// Resolved before any DNS server is asked. Useful for hard-coded
 	// VPN-server resolution, custom CNAME-like redirects, or
@@ -388,10 +416,12 @@ type AppSettings struct {
 	// The switch tolerance: how much better a candidate has to be before AUTO
 	// leaves a working connection, and how long it must stay before it may leave
 	// at all. Without them AUTO flaps between servers that differ by noise.
-	// Zero means the built-in default (20 ms / 15 % / 60 s).
-	AutoSwitchToleranceMs int `json:"auto_switch_tolerance_ms,omitempty"`
-	AutoSwitchSpeedPct    int `json:"auto_switch_speed_pct,omitempty"`
-	AutoMinDwellSec       int `json:"auto_min_dwell_sec,omitempty"`
+	// Absent means the built-in default (20 ms / 15 % / 60 s); zero is a value.
+	// They were plain numbers with omitempty, so a 0 typed into the panel was
+	// never written, and "no wait" quietly became sixty seconds.
+	AutoSwitchToleranceMs *int `json:"auto_switch_tolerance_ms,omitempty"`
+	AutoSwitchSpeedPct    *int `json:"auto_switch_speed_pct,omitempty"`
+	AutoMinDwellSec       *int `json:"auto_min_dwell_sec,omitempty"`
 	// AutoMaxLatencyMs is the live-probe round-trip budget in milliseconds.
 	// When AutoSwitch is on and the live link stays reachable but slower than
 	// this for AutoFailThreshold checks in a row, the app fails over to the
@@ -422,6 +452,14 @@ type AppSettings struct {
 	// Empty means "derive it from the old pair", which autoRankMode does. The old
 	// fields are still written, so a downgrade keeps the setting.
 	AutoRankMode string `json:"auto_rank_mode,omitempty"`
+	// AutoPreferLast makes AUTO try the last connected config first when it
+	// connects from nothing — at start, when switched on, after a disconnect —
+	// as long as that config is a candidate and passed its latest ping. Off by
+	// default since 2.7.0: the first connection goes to the top of the ranking,
+	// the row the panel's candidate list shows first. It used to be the only
+	// behaviour, and a server the ranking had long since left behind kept being
+	// chosen just for having been used. Failover always follows the ranking.
+	AutoPreferLast bool `json:"auto_prefer_last,omitempty"`
 	// LastConnectedMode records the mode ("proxy"/"tun") of the most
 	// recent connection, so AutoMode="" (remember last) can reuse it.
 	LastConnectedMode string `json:"last_connected_mode,omitempty"`
@@ -476,8 +514,11 @@ type AppSettings struct {
 const (
 	defaultPingConcurrency  = 10
 	defaultSpeedConcurrency = 5
-	maxPingConcurrency      = 200
-	maxSpeedConcurrency     = 100
+	// Each test runs an engine process of its own (about 18 MB): a high value
+	// costs processor and memory, and the description says so. The ceilings
+	// are the user's to choose within these bounds.
+	maxPingConcurrency  = 200
+	maxSpeedConcurrency = 100
 )
 
 // currentPingConcurrency returns the user's chosen ping concurrency, clamped
@@ -491,7 +532,13 @@ func currentProxyPorts() (httpPort, socksPort int) {
 	settingsMu.RLock()
 	hp, sp := appSettings.HttpPort, appSettings.SocksPort
 	settingsMu.RUnlock()
-	valid := func(p int) bool { return p >= 1 && p <= 65535 && p != webPort }
+	// Not the remote-access port either: that listener is up from the start,
+	// and a proxy on the same port could not bind.
+	remote := RemotePortSetting()
+	valid := func(p int) bool { return p >= 1 && p <= 65535 && p != webPort && p != remote }
+	if (hp != 0 && !valid(hp)) || (sp != 0 && !valid(sp)) || (hp != 0 && hp == sp) {
+		vlog("warning", "proxy ports %d/%d cannot be used (out of range, equal, or taken by remote access) — using %d/%d", hp, sp, connHTTPPort, connSOCKSPort)
+	}
 	if !valid(hp) {
 		hp = connHTTPPort
 	}
@@ -567,6 +614,44 @@ func currentPingURL() string {
 	return u
 }
 
+// validTestURL accepts what the tests can request: an http or https address
+// with a host. Anything else failed every configuration it was used for — a
+// missing scheme marked a whole tab "failed", where "Delete failed" would have
+// removed working configurations — or, when it did not parse at all, stopped
+// the program in the middle of PING ALL.
+func validTestURL(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || strings.ContainsAny(s, " \t\r\n") {
+		return false
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || u.Hostname() == "" {
+		return false
+	}
+	return u.Scheme == "http" || u.Scheme == "https"
+}
+
+// sanitizeTestURLs keeps a settings save from storing a test address that
+// cannot be requested: such a value is not saved and the one before it stays.
+// Blank means the default; the fallback also takes its "__none" switch.
+func sanitizeTestURLs(s *AppSettings, cur AppSettings) {
+	fix := func(v *string, old string) {
+		t := strings.TrimSpace(*v)
+		switch {
+		case t == "", t == "__none" && v == &s.SpeedTestURLFallback:
+			*v = t
+		case validTestURL(t):
+			*v = t
+		default:
+			*v = old
+		}
+	}
+	fix(&s.PingTestURL, cur.PingTestURL)
+	fix(&s.SpeedTestURL, cur.SpeedTestURL)
+	fix(&s.SpeedTestURLFallback, cur.SpeedTestURLFallback)
+	fix(&s.CheckIPURL, cur.CheckIPURL)
+}
+
 // currentSpeedURL returns the URL used by the speed test.
 func currentSpeedURL() string {
 	settingsMu.RLock()
@@ -598,6 +683,63 @@ func currentSpeedFallbackURL() string {
 		return speedFallbackDefaultURL
 	}
 	return u
+}
+
+// speedFallbackOn reports whether an HTTP status from the primary speed URL
+// sends the test to the fallback, by the SpeedFallbackOn list.
+func speedFallbackOn(status int) bool {
+	if status <= 0 {
+		return false
+	}
+	settingsMu.RLock()
+	spec := appSettings.SpeedFallbackOn
+	settingsMu.RUnlock()
+	match, ok := parseStatusSet(spec)
+	if !ok {
+		return status == 429
+	}
+	return match(status)
+}
+
+// parseStatusSet reads a list of HTTP statuses: codes ("429"), ranges
+// ("500-599") and classes ("5xx"), separated by commas, semicolons or spaces.
+// Tokens that are none of these are skipped; ok is false when nothing usable
+// is left, and the caller falls back to its default.
+func parseStatusSet(spec string) (match func(int) bool, ok bool) {
+	type span struct{ lo, hi int }
+	var spans []span
+	for _, tok := range strings.FieldsFunc(spec, func(r rune) bool {
+		return r == ',' || r == ';' || unicode.IsSpace(r)
+	}) {
+		tok = strings.ToLower(strings.TrimSpace(tok))
+		switch {
+		case len(tok) == 3 && tok[1:] == "xx" && tok[0] >= '1' && tok[0] <= '5':
+			base := int(tok[0]-'0') * 100
+			spans = append(spans, span{base, base + 99})
+		case strings.Contains(tok, "-"):
+			a, b, _ := strings.Cut(tok, "-")
+			lo, e1 := strconv.Atoi(a)
+			hi, e2 := strconv.Atoi(b)
+			if e1 == nil && e2 == nil && lo >= 100 && hi <= 599 && lo <= hi {
+				spans = append(spans, span{lo, hi})
+			}
+		default:
+			if n, err := strconv.Atoi(tok); err == nil && n >= 100 && n <= 599 {
+				spans = append(spans, span{n, n})
+			}
+		}
+	}
+	if len(spans) == 0 {
+		return nil, false
+	}
+	return func(code int) bool {
+		for _, s := range spans {
+			if code >= s.lo && code <= s.hi {
+				return true
+			}
+		}
+		return false
+	}, true
 }
 
 // xrayLogLevel / singboxLogLevel return the log verbosity for generated
@@ -646,12 +788,16 @@ func xrayLogConfig() map[string]interface{} {
 // config so the UI can tag exactly one row with a "last" badge. Persisted
 // (saveSettings) so the badge survives a restart; a no-op when the raw is
 // already current to avoid needless disk writes on reconnect.
-func recordLastConnected(raw string, mode ConnMode) {
+func recordLastConnected(raw string, chain []string, mode ConnMode) {
 	if raw == "" {
 		return
 	}
 	settingsMu.Lock()
 	appSettings.LastConnectedRaw = raw
+	appSettings.LastConnectedChain = nil
+	if len(chain) > 1 {
+		appSettings.LastConnectedChain = append([]string(nil), chain...)
+	}
 	if mode != "" {
 		appSettings.LastConnectedMode = string(mode)
 	}
@@ -727,8 +873,21 @@ func currentMTU() int {
 	settingsMu.RLock()
 	m := appSettings.TUNMTU
 	settingsMu.RUnlock()
+	return effectiveMTU(m, ipv6Mode())
+}
+
+// effectiveMTU is the MTU the tunnel is given for a setting and an IPv6 mode.
+//
+// IPv6 needs 1280 on the link. With an IPv6 address on the tunnel — the
+// default, "blocked" included — Windows refuses a smaller MTU and the tunnel
+// does not start at all ("set ipv6 options: The parameter is incorrect"),
+// which read like a broken engine rather than a setting.
+func effectiveMTU(m int, v6mode string) int {
 	if m < 576 || m > 9000 {
 		return 9000
+	}
+	if m < 1280 && v6mode != ipv6Direct {
+		return 1280
 	}
 	return m
 }
@@ -755,9 +914,6 @@ func RemoteConfig() (enabled bool, token string) {
 	return appSettings.RemoteEnabled, appSettings.RemoteToken
 }
 
-// EnsureRemoteToken returns the remote-access token, generating and persisting a
-// fresh random one the first time (so enabling remote access always has a
-// secret to gate on). Idempotent.
 // broadcastSettings tells every window that the settings changed.
 //
 // There is more than one window: the detached AUTO panel is a second copy of
@@ -768,6 +924,9 @@ func broadcastSettings(s AppSettings) {
 	state.broadcast(SSEEvent{Type: "settings_update", Payload: s})
 }
 
+// EnsureRemoteToken returns the remote-access token, generating and persisting a
+// fresh random one the first time (so enabling remote access always has a
+// secret to gate on). Idempotent.
 func EnsureRemoteToken() string {
 	settingsMu.Lock()
 	if appSettings.RemoteToken == "" {
@@ -871,8 +1030,8 @@ func persistentKillSwitchEnabled() bool {
 func autoSwitchToleranceMs() int64 {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
-	if v := appSettings.AutoSwitchToleranceMs; v > 0 {
-		return int64(v)
+	if v := appSettings.AutoSwitchToleranceMs; v != nil && *v >= 0 {
+		return int64(*v)
 	}
 	return 20
 }
@@ -880,8 +1039,8 @@ func autoSwitchToleranceMs() int64 {
 func autoSwitchSpeedFactor() float64 {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
-	if v := appSettings.AutoSwitchSpeedPct; v > 0 {
-		return 1 + float64(v)/100
+	if v := appSettings.AutoSwitchSpeedPct; v != nil && *v >= 0 {
+		return 1 + float64(*v)/100
 	}
 	return 1.15
 }
@@ -889,18 +1048,49 @@ func autoSwitchSpeedFactor() float64 {
 func autoMinDwell() time.Duration {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
-	if v := appSettings.AutoMinDwellSec; v > 0 {
-		return time.Duration(v) * time.Second
+	if v := appSettings.AutoMinDwellSec; v != nil && *v >= 0 {
+		return time.Duration(*v) * time.Second
 	}
 	return 60 * time.Second
+}
+
+// sanitizeAutoSettings keeps the AUTO numbers inside the ranges the panel
+// shows. The panel's own limits were only on the arrows: a typed 1000 was saved
+// as a 1000-second health check against a stated maximum of 600.
+func sanitizeAutoSettings(s *AppSettings) {
+	clamp := func(v, lo, hi int) int {
+		if v < lo {
+			return lo
+		}
+		if v > hi {
+			return hi
+		}
+		return v
+	}
+	if s.AutoHealthSec != 0 {
+		s.AutoHealthSec = clamp(s.AutoHealthSec, 5, 600)
+	}
+	if s.AutoFailThreshold != 0 {
+		s.AutoFailThreshold = clamp(s.AutoFailThreshold, 1, 10)
+	}
+	s.AutoMaxLatencyMs = clamp(s.AutoMaxLatencyMs, 0, 10000)
+	for _, p := range []struct {
+		v      **int
+		lo, hi int
+	}{{&s.AutoSwitchToleranceMs, 0, 5000}, {&s.AutoSwitchSpeedPct, 0, 500}, {&s.AutoMinDwellSec, 0, 3600}} {
+		if *p.v != nil {
+			n := clamp(**p.v, p.lo, p.hi)
+			*p.v = &n
+		}
+	}
 }
 
 func killSwitchEnabled() bool {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
-	// Kill-switch only makes sense with strict_route, which is only
-	// turned on when DNSLeakProtection is on. The UI greys this out
-	// in that case but we also defend in code.
+	// A block of all traffic that lets DNS leak is not a kill-switch: it
+	// needs DNSLeakProtection. The UI greys this out in that case but we
+	// also defend in code.
 	return appSettings.DNSLeakProtection && appSettings.KillSwitch
 }
 
@@ -1001,41 +1191,134 @@ func tlsFragmentEnabled() bool {
 	return appSettings.TLSFragment
 }
 
-// validFragmentSpec accepts xray fragment ranges: a single number ("100") or a
-// "min-max" range ("100-200"), digits only.
-func validFragmentSpec(s string) bool {
+// The bounds of the two fragment settings.
+//
+// A length of 0 stops xray before it starts ("failed to build outbound config
+// with tag fragment"), and a length past the size of a ClientHello (about
+// 1.7 KB) cuts nothing: the handshake goes out whole, exactly as with the
+// switch off, and nothing says so. 1000 still leaves two pieces. An interval is
+// paid once per piece on every handshake — a dozen pieces at a second each
+// would be twelve seconds per connection — so it stops at one second.
+const (
+	fragLengthMin, fragLengthMax     = 1, 1000
+	fragIntervalMin, fragIntervalMax = 0, 1000
+)
+
+// normalizeFragmentSpec checks one of the fragment settings — a number, or a
+// range "a-b" — against its bounds, and returns it the way the engine takes it:
+// the low end first, a range of one number as that number. ok is false for
+// anything else.
+func normalizeFragmentSpec(s string, lo, hi int) (string, bool) {
 	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
+	parts := strings.Split(s, "-")
+	if len(parts) > 2 {
+		return "", false
 	}
-	parts := strings.SplitN(s, "-", 2)
+	var nums []int
 	for _, p := range parts {
-		if p == "" {
-			return false
+		p = strings.TrimSpace(p)
+		if p == "" || len(p) > 6 {
+			return "", false
 		}
+		v := 0
 		for _, c := range p {
 			if c < '0' || c > '9' {
-				return false
+				return "", false
 			}
+			v = v*10 + int(c-'0')
+		}
+		if v < lo || v > hi {
+			return "", false
+		}
+		nums = append(nums, v)
+	}
+	if len(nums) == 2 && nums[0] > nums[1] {
+		nums[0], nums[1] = nums[1], nums[0]
+	}
+	if len(nums) == 1 || nums[0] == nums[1] {
+		return strconv.Itoa(nums[0]), true
+	}
+	return strconv.Itoa(nums[0]) + "-" + strconv.Itoa(nums[1]), true
+}
+
+// fragmentUpper is the high end of a normalized spec.
+func fragmentUpper(spec string) int {
+	if i := strings.IndexByte(spec, '-'); i >= 0 {
+		spec = spec[i+1:]
+	}
+	v, _ := strconv.Atoi(spec)
+	return v
+}
+
+// sanitizeFragmentSettings keeps a settings save from storing a fragment value
+// the engine would refuse or ignore: such a value is not saved, the one before
+// it stays, and the window says so under the field. Blank means the default.
+func sanitizeFragmentSettings(s *AppSettings, cur AppSettings) {
+	fix := func(v *string, old string, lo, hi int) {
+		if strings.TrimSpace(*v) == "" {
+			*v = ""
+			return
+		}
+		if n, ok := normalizeFragmentSpec(*v, lo, hi); ok {
+			*v = n
+		} else {
+			*v = old
 		}
 	}
-	return true
+	fix(&s.TLSFragmentLength, cur.TLSFragmentLength, fragLengthMin, fragLengthMax)
+	fix(&s.TLSFragmentInterval, cur.TLSFragmentInterval, fragIntervalMin, fragIntervalMax)
 }
 
 // currentTLSFragmentParams returns the validated length/interval ranges, falling
 // back to the defaults when unset or malformed.
 func currentTLSFragmentParams() (length, interval string) {
 	settingsMu.RLock()
-	l := strings.TrimSpace(appSettings.TLSFragmentLength)
-	iv := strings.TrimSpace(appSettings.TLSFragmentInterval)
+	l := appSettings.TLSFragmentLength
+	iv := appSettings.TLSFragmentInterval
 	settingsMu.RUnlock()
-	if !validFragmentSpec(l) {
+	var ok bool
+	if l, ok = normalizeFragmentSpec(l, fragLengthMin, fragLengthMax); !ok {
 		l = defaultTLSFragmentLength
 	}
-	if !validFragmentSpec(iv) {
+	if iv, ok = normalizeFragmentSpec(iv, fragIntervalMin, fragIntervalMax); !ok {
 		iv = defaultTLSFragmentInterval
 	}
 	return l, iv
+}
+
+// applySingboxFragment is applyXrayFragment for an outbound that runs on
+// sing-box. sing-box has no length or interval: it cuts the ClientHello inside
+// the server name, into separate TLS records sent as separate packets, and
+// waits between them. The wait is the high end of the interval setting —
+// without one it waits 500 ms per handshake on Windows, where it cannot read
+// the moment the first piece is acknowledged.
+//
+// Only an outbound that dials its server itself: a hop reached through
+// another one (detour) is inside the tunnel, where nobody inspects it.
+func applySingboxFragment(out map[string]interface{}) {
+	if out == nil || !tlsFragmentEnabled() {
+		return
+	}
+	switch out["type"] {
+	case "vless", "trojan", "vmess", "http":
+	default:
+		return // QUIC (Hysteria2, TUIC) has no TCP handshake to cut
+	}
+	if _, chained := out["detour"]; chained {
+		return
+	}
+	tls, _ := out["tls"].(map[string]interface{})
+	if tls == nil || tls["enabled"] != true {
+		return
+	}
+	_, interval := currentTLSFragmentParams()
+	delay := fragmentUpper(interval)
+	if delay < 1 {
+		delay = 1 // 0 would read as "unset", i.e. 500 ms
+	}
+	tls["fragment"] = true
+	tls["record_fragment"] = true
+	tls["fragment_fallback_delay"] = strconv.Itoa(delay) + "ms"
 }
 
 // validTLSFingerprints are the uTLS fingerprints xray accepts. Kept as a set so
@@ -1168,20 +1451,45 @@ func staticHostsSnapshot() map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(appSettings.StaticHosts))
+	var bad []string
 	for k, v := range appSettings.StaticHosts {
 		k = strings.TrimSpace(strings.ToLower(k))
 		v = strings.TrimSpace(v)
-		if k != "" && v != "" {
-			out[k] = v
+		if k == "" || v == "" {
+			continue
 		}
+		// An address that is not one is left out. It used to go into the
+		// engine's DNS module as it was, and one such line stopped every TUN
+		// connection with an error about dns.servers[5].predefined.
+		if net.ParseIP(v) == nil {
+			bad = append(bad, k+" "+v)
+			continue
+		}
+		out[k] = v
+	}
+	if len(bad) > 0 {
+		sort.Strings(bad)
+		warnBadStaticHosts(strings.Join(bad, ", "))
 	}
 	return out
+}
+
+// warnBadStaticHosts names the lines left out, once for each set of them —
+// the snapshot is taken several times for one connection.
+var lastBadStaticHosts atomic.Value
+
+func warnBadStaticHosts(lines string) {
+	if prev, _ := lastBadStaticHosts.Load().(string); prev == lines {
+		return
+	}
+	lastBadStaticHosts.Store(lines)
+	vlog("warning", "static hosts left out — the address is not an IP address: %s", lines)
 }
 
 // Defaults: DNS leak protection ON, FakeIP OFF (FakeIPDisabled=true) — picked
 // for safer out-of-the-box TUN behaviour (DNS through the tunnel, real DoH
 // rather than FakeIP for app compatibility).
-var appSettings = AppSettings{SourcesEnabled: true, DNSLeakProtection: true, KillSwitch: true, FakeIPDisabled: true, AutoHealthSec: 15, AutoFailThreshold: 2, AutoSwitch: true, AutoPingRefresh: true, AutoMaxLatencyMs: 300, DeepLinkEnabled: true}
+var appSettings = AppSettings{SourcesEnabled: true, DNSLeakProtection: true, KillSwitch: true, FakeIPDisabled: true, AutoHealthSec: 15, AutoFailThreshold: 2, AutoSwitch: true, AutoPingRefresh: true, AutoMaxLatencyMs: 300, DeepLinkEnabled: true, HideHints: true}
 
 var settingsMu sync.RWMutex
 
@@ -1189,33 +1497,154 @@ func settingsFilePath() string {
 	return dataPath("settings.json")
 }
 
+// settingsRev is the current revision of the settings file. A new default
+// reaches only the files that do not mention the setting; a change that has to
+// reach the files that do is made once by migrateSettings, for a file below
+// the revision the change belongs to, and the file is stamped so it is never
+// made again.
+const settingsRev = 1
+
+// migrateSettings brings settings written by an older version up to the
+// current revision, and reports whether it changed anything.
+//
+// Revision 1 (2.7.0): setting descriptions hidden for everyone. Hidden is the
+// default since 2.7.0, but a file that already said "shown" — every one written
+// by a 2.7.0 test build, where the switch is stored either way — kept them
+// shown. Once only: someone who turns them back on afterwards keeps them on.
+func migrateSettings(s *AppSettings) bool {
+	if s.SettingsRev >= settingsRev {
+		return false
+	}
+	if s.SettingsRev < 1 {
+		s.HideHints = true
+	}
+	s.SettingsRev = settingsRev
+	return true
+}
+
 func loadSettings() {
-	data, err := os.ReadFile(settingsFilePath())
-	if err != nil {
+	path := settingsFilePath()
+	// A few tries before giving up on the file. The one reader that can meet
+	// it half-replaced is a start that overlaps the previous copy still
+	// shutting down and saving on its way out; a moment later it is whole.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			// First start: the defaults are the settings, and already the
+			// current revision — there is nothing older to bring up to date.
+			settingsMu.Lock()
+			appSettings.SettingsRev = settingsRev
+			settingsMu.Unlock()
+			return
+		}
+		if err == nil {
+			s, derr := decodeSettings(data)
+			if derr == nil {
+				migrated := migrateSettings(&s)
+				settingsMu.Lock()
+				appSettings = s
+				settingsMu.Unlock()
+				// The backup is the file as it was read; the migrated
+				// settings are written over the file itself.
+				keepSettingsBackup(data)
+				if migrated {
+					saveSettings()
+				}
+				return
+			}
+			lastErr = derr
+		} else {
+			lastErr = err
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	// The file is there and cannot be read. Said out loud, because the failure
+	// is otherwise invisible: every setting at its default, the dialog showing
+	// those defaults as if they were the user's, and the next save writing them
+	// over the file. The copy taken at the last start that read cleanly is the
+	// way back; the unreadable file is set aside rather than overwritten, so
+	// nothing is lost even when there is no copy.
+	if bak, err := os.ReadFile(path + ".bak"); err == nil {
+		if s, derr := decodeSettings(bak); derr == nil {
+			setAsideBrokenSettings(path)
+			migrateSettings(&s)
+			settingsMu.Lock()
+			appSettings = s
+			settingsMu.Unlock()
+			saveSettings()
+			vlog("warning", "settings.json could not be read (%v) — restored from settings.json.bak, the copy taken at the last start that read it; the unreadable file is kept as settings.json.broken", lastErr)
+			return
+		}
+	}
+	setAsideBrokenSettings(path)
+	vlog("error", "settings.json could not be read (%v) and there is no usable backup — running on defaults; the unreadable file is kept as settings.json.broken", lastErr)
+}
+
+// decodeSettings reads a settings file over a COPY of the current settings and
+// hands it back only when the whole file decoded. encoding/json fills fields
+// as it goes, so decoding straight into appSettings left a file that failed
+// halfway applied halfway: some of the user's values, some defaults.
+func decodeSettings(data []byte) (AppSettings, error) {
+	data = trimBOM(data)
+	if len(bytes.TrimSpace(data)) == 0 {
+		return AppSettings{}, errEmptySettings
+	}
+	settingsMu.RLock()
+	s := appSettings
+	settingsMu.RUnlock()
+	if err := json.Unmarshal(data, &s); err != nil {
+		return AppSettings{}, err
+	}
+	return s, nil
+}
+
+var errEmptySettings = errors.New("the file is empty")
+
+// keepSettingsBackup keeps settings.json.bak equal to the last file that was
+// read cleanly at a start. Written only when it differs, so an ordinary start
+// costs one read and no write.
+func keepSettingsBackup(data []byte) {
+	bak := settingsFilePath() + ".bak"
+	if old, err := os.ReadFile(bak); err == nil && bytes.Equal(old, data) {
 		return
 	}
-	data = trimBOM(data)
-	settingsMu.Lock()
-	defer settingsMu.Unlock()
-	// Said out loud, because the failure is otherwise invisible: an unreadable
-	// file leaves every setting at its default, the dialog then shows those
-	// defaults as if they were the user's, and the next save writes them over
-	// the file that still had the real ones.
-	if err := json.Unmarshal(data, &appSettings); err != nil {
-		vlog("error", "settings.json could not be read (%v) — running on defaults; the next change will overwrite the file", err)
+	if err := writeFileDurable(bak, data, 0o600); err != nil {
+		vlog("warning", "settings.json.bak could not be written: %v", err)
 	}
 }
 
+// setAsideBrokenSettings moves an unreadable settings.json out of the way so
+// the next save cannot overwrite it. One copy is kept; a later failure
+// replaces it.
+func setAsideBrokenSettings(path string) {
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	os.Remove(path + ".broken")     //nolint:errcheck
+	os.Rename(path, path+".broken") //nolint:errcheck
+}
+
+// settingsSaveMu puts saves in a line. Each one takes a snapshot and writes
+// it; two at once could finish in the other order and leave the OLDER
+// snapshot on disk. In line, the last save writes the latest state.
+var settingsSaveMu sync.Mutex
+
 func saveSettings() {
+	settingsSaveMu.Lock()
+	defer settingsSaveMu.Unlock()
 	settingsMu.RLock()
 	data, _ := json.MarshalIndent(appSettings, "", "  ")
 	settingsMu.RUnlock()
-	os.MkdirAll(tabsDir(), 0o755)
+	os.MkdirAll(tabsDir(), 0o755) //nolint:errcheck
 	// 0600: this file carries the web-interface token and the local proxy
 	// passwords. The Chmod is for the copy an older version already wrote —
-	// WriteFile leaves the mode of an existing file alone.
-	os.WriteFile(settingsFilePath(), data, 0o600) //nolint:errcheck
-	os.Chmod(settingsFilePath(), 0o600)           //nolint:errcheck
+	// the rename keeps the new file's mode, but a failed save leaves the old.
+	if err := writeFileDurable(settingsFilePath(), data, 0o600); err != nil {
+		vlog("error", "settings.json could not be saved: %v", err)
+	}
+	os.Chmod(settingsFilePath(), 0o600) //nolint:errcheck
 }
 
 // currentCheckIPURL is the address the "check IP" button asks, and

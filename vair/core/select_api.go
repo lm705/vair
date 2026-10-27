@@ -55,38 +55,76 @@ func RawsForIndices(tabID string, idxs []int) []string {
 	return raw
 }
 
+// testFailed reports whether a row's last ping or speed test failed — what
+// "Delete failed" removes.
+func testFailed(e *ConfigEntry) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.PingStatus == StatusFailed || e.SpeedStatus == StatusFailed
+}
+
+// failedCount is how many rows DeleteFailed would remove: the whole tab, not
+// only the filtered view, because that is what it works on.
+func failedCount(tabID string) int {
+	if tabID == "" || tabID == "main" {
+		return 0
+	}
+	n := 0
+	for _, e := range loadTabEntries(tabID) {
+		if testFailed(e) {
+			n++
+		}
+	}
+	return n
+}
+
 // DeleteFailed removes every config whose ping OR speed test failed. Done
 // server-side (over the whole tab) so it works regardless of which rows the
 // windowed client currently holds. No-op on main (its entries are re-fetched).
-// Returns the number of remaining configs.
+// Returns how many were removed; the delete can be undone (UndoDelete).
 func DeleteFailed(tabID string) int {
 	if tabID == "" || tabID == "main" {
 		return 0
 	}
+	all := loadTabEntries(tabID)
+	allIdx := entryIndices(all)
 	var kept []*ConfigEntry
-	for _, e := range loadTabEntries(tabID) {
-		if e.PingStatus != StatusFailed && e.SpeedStatus != StatusFailed {
+	for _, e := range all {
+		if !testFailed(e) {
 			kept = append(kept, e)
 		}
+	}
+	if len(kept) == len(all) {
+		return 0
 	}
 	for i, e := range kept {
 		e.Index = i
 	}
 	storeReplace(tabID, kept) // re-indexed; SQLite is the source of truth
+	rememberDelete(tabID, all, kept, allIdx, entryIndices(kept))
 	loadedSignal(tabID)
 	saveTabs()
-	return len(kept)
+	return len(all) - len(kept)
 }
 
 // ConnectChain connects the given entries of the ACTIVE tab as a chain, in the
 // order given: idxs[0] is the entry hop, idxs[last] is the exit. The caller
 // sends them in the order the user picked them. Returns "" on success or a human-readable
 // rejection ("a chain needs at least 2 configs", mixed-engine reason, …).
-func ConnectChain(idxs []int, mode string) string {
+//
+// raws are the same configurations, index for index: a refresh of the tab's
+// source numbers the rows again, and a chain built from the numbers alone was
+// built from whatever rows had taken the selected ones' places. One that is
+// gone altogether refuses the chain rather than shortening it.
+func ConnectChain(idxs []int, raws []string, mode string) string {
 	var entries []*ConfigEntry
 	var nodes []*Node
 	tab := activeTabID()
-	for _, i := range idxs {
+	rows := resolveRows(tab, idxs, raws)
+	if len(rows) != len(idxs) {
+		return "chain: a selected config is no longer in the tab"
+	}
+	for _, i := range rows {
 		e, ok := memEntry(tab, i)
 		if !ok {
 			return "bad idx"
@@ -108,6 +146,7 @@ func ConnectChain(idxs []int, mode string) string {
 	}
 	// User explicitly connected → arm auto-keepalive but mark user-owned so the
 	// supervisor's pool-honor switch won't move it.
+	noteUserConnAction()
 	autoWant.Store(true)
 	autoManaged.Store(false)
 	autoLiveRtt.Store(0)

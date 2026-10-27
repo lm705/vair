@@ -1,14 +1,20 @@
 package core
 
+import "net"
+
 // AppVersion is the running build version (Settings → Updates row).
 func AppVersion() string { return appVersion }
 
 // DataDir is the app data directory (Settings → Data → Open folder).
 func DataDir() string { return dataDirPath() }
 
-// TunShareProxyEnabled reports whether the "share proxy over LAN in TUN mode"
-// toggle is on (the shell uses it to reconcile the inbound firewall rule).
-func TunShareProxyEnabled() bool { return tunShareProxyEnabled() }
+// ProxyOpenToLAN reports whether the proxy ports listen beyond this machine —
+// "Allow LAN access" or a custom address — and so need an inbound firewall
+// rule for other devices to reach them.
+func ProxyOpenToLAN() bool {
+	ip := net.ParseIP(proxyBindHost())
+	return ip != nil && !ip.IsLoopback()
+}
 
 // ProxyPorts returns the user-facing HTTP and SOCKS proxy ports (for the shell's
 // firewall rule covering the LAN-shared proxy).
@@ -30,6 +36,32 @@ func GetSettings() AppSettings {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
 	return appSettings
+}
+
+// keepProgramOwned copies into a settings save the fields the program keeps
+// itself, which no settings screen edits.
+//
+// A save carries the whole object, built from the copy a window loaded — and
+// nothing tells a window when the program changes one of these: a star, the
+// last connection, "a session was active", the mode picked on the main window,
+// a new remote-access key, the service-check list. So a window opened before
+// such a change sent the old value back with whatever setting was actually
+// changed, and the program's own record went back in time: a star vanished,
+// "restore the connection on start" restored nothing or the wrong server, AUTO
+// came up in the mode the pill no longer showed, a freshly issued remote key
+// was replaced by the one it had just revoked.
+func keepProgramOwned(s *AppSettings, cur AppSettings) {
+	s.StatsTotalUp, s.StatsTotalDown = cur.StatsTotalUp, cur.StatsTotalDown
+	s.AutoConnect, s.AutoSwitch, s.AutoConnectOnStart = cur.AutoConnect, cur.AutoSwitch, cur.AutoConnectOnStart
+	s.Favorites = cur.Favorites
+	s.LastConnectedRaw, s.LastConnectedMode, s.LastSessionActive = cur.LastConnectedRaw, cur.LastConnectedMode, cur.LastSessionActive
+	s.LastConnectedChain = cur.LastConnectedChain
+	s.SelectedMode = cur.SelectedMode
+	s.RemoteToken = cur.RemoteToken
+	s.UnlockServices = cur.UnlockServices
+	s.UpdateDismissedVersion = cur.UpdateDismissedVersion
+	s.ConnTracking = cur.ConnTracking
+	s.SettingsRev = cur.SettingsRev
 }
 
 // SetSettings applies a generic settings save and persists it. It never flips the
@@ -61,9 +93,10 @@ func SetSelectedMode(mode string) {
 
 func SetSettings(s AppSettings) AppSettings {
 	settingsMu.Lock()
-	s.StatsTotalUp = appSettings.StatsTotalUp
-	s.StatsTotalDown = appSettings.StatsTotalDown
-	s.AutoConnect = appSettings.AutoConnect
+	keepProgramOwned(&s, appSettings)
+	sanitizeFragmentSettings(&s, appSettings)
+	sanitizeTestURLs(&s, appSettings)
+	sanitizeAutoSettings(&s)
 	// The ranking mode is the setting; the two old booleans are kept in step so a
 	// downgrade lands on the nearest equivalent instead of the default.
 	syncAutoRankLegacy(&s)

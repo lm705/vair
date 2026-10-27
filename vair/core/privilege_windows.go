@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // EnsurePrivilege acquires whatever TUN mode needs on this platform, or returns
@@ -25,6 +26,12 @@ import (
 // then Start-Process -Verb RunAs, which is what shows the UAC prompt (1.10
 // restartAsAdmin, behind the "requires admin ↗" chip).
 func EnsurePrivilege() string {
+	// With the helper service — or in a copy the setup program installed,
+	// which comes with one — the answer is the service, never relaunching the
+	// app as administrator.
+	if serviceMode() || installedBySetupHere() {
+		return ensureService()
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err.Error()
@@ -52,5 +59,41 @@ func EnsurePrivilege() string {
 	// Clear the tunnel/system proxy before handing over to the elevated copy.
 	stopConnection()
 	os.Exit(0)
+	return ""
+}
+
+// ensureService brings the helper service back: started when it is only
+// stopped (an interactive user may do that, without a prompt), repaired with
+// one administrator prompt when it is missing or will not start — the setup
+// program's own "vair-helper -repair", from the installation.
+func ensureService() string {
+	if ok, _ := helperReachable(); ok {
+		return ""
+	}
+	dir := ServiceInstallDir()
+	if dir == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			return err.Error()
+		}
+		dir = filepath.Dir(exe)
+	}
+	helper := filepath.Join(dir, "vair-helper.exe")
+	if _, err := os.Stat(helper); err != nil {
+		return "the Vair helper service is missing from " + dir + " — reinstall Vair"
+	}
+	esc := func(s string) string { return strings.ReplaceAll(s, "'", "''") }
+	script := "$p = Start-Process -FilePath '" + esc(helper) + "' -ArgumentList '-repair' -Verb RunAs -WindowStyle Hidden -Wait -PassThru; exit $p.ExitCode"
+	if _, err := psOutputFor(script, 5*time.Minute); err != nil {
+		return "the Vair helper service could not be repaired: " + err.Error()
+	}
+	serviceState.Lock()
+	serviceState.at = time.Time{} // ask the service manager again
+	serviceState.Unlock()
+	if ok, _ := helperReachable(); !ok {
+		_, msg := helperProblem()
+		return msg
+	}
+	vlog("info", "the Vair helper service is running again")
 	return ""
 }

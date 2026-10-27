@@ -2,7 +2,12 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -10,23 +15,24 @@ import (
 
 // Putting a name to an address.
 //
-// The connections panel shows the destination the client ASKED for, and that is
-// usually a hostname because that is what a client sends: "CONNECT
-// example.com:443". But a program that resolves names itself and then connects
-// to the result asks for an address instead, and the row reads "104.18.7.1:443"
-// — which is a true answer to the wrong question, because nobody recognises
-// their own game or their own bank in it. That is the difference between a panel
-// that explains a problem and one that merely proves something happened.
+// The "Not through Vair" table of the connections panel lists the machine's own
+// connections that go around the proxy, and those are bare addresses —
+// "104.18.7.1:443" — which nobody recognises as their game or their bank. So an
+// address gets a name where one can be had, shown BESIDE the address, never
+// instead of it: a shared CDN address answers with whatever its owner put in
+// DNS, and plenty answer with nothing.
 //
-// So an address gets a name where one can be had. Two sources, cheapest first:
-// the names we have already seen asked for on this machine, and failing that a
-// reverse lookup. Neither is authoritative — a shared CDN address answers with
-// whatever its owner put in DNS, and plenty of addresses answer with nothing —
-// so the name is shown BESIDE the address, never instead of it.
+// The name comes from a reverse lookup, and the lookup is asked THROUGH the
+// tunnel, as DNS over HTTPS through the session's own proxy port, or not at
+// all. It used to go to the system resolver — the provider's, as a rule — and
+// alongside it every hostname a proxied connection asked for was looked up
+// there too, to fill this cache: in proxy mode every site the user visited
+// through the VPN was also sent to the provider in a plain DNS query, with the
+// panel's recording on by default. Without a proxy session up there is no
+// lookup, and the table shows addresses.
 
-// revCache holds both directions of what we know, with an expiry: an address
-// reassigned to somebody else must not keep an old name for the rest of a
-// session.
+// revCache holds the answers, with an expiry: an address reassigned to somebody
+// else must not keep an old name for the rest of a session.
 var revCache = struct {
 	sync.Mutex
 	m map[string]revEntry
@@ -47,34 +53,13 @@ const (
 	revMax = 4096
 )
 
-// noteResolvedHost records a name the machine has been seen asking for, so an
-// address that later turns up bare can be recognised. Called with whatever the
-// proxy path already learned — it costs nothing, because the name was there.
-func noteResolvedHost(host string) {
-	host = strings.TrimSpace(host)
-	if host == "" || net.ParseIP(host) != nil {
-		return
-	}
-	// The lookup is what fills the reverse direction; this only remembers that
-	// somebody cared about this name, which the resolver below uses to prefer a
-	// name the user would recognise over a machine-generated PTR.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		addrs, err := net.DefaultResolver.LookupHost(ctx, host)
-		if err != nil {
-			return
-		}
-		revCache.Lock()
-		defer revCache.Unlock()
-		for _, a := range addrs {
-			if e, ok := revCache.m[a]; ok && e.name != "" && !e.pending {
-				continue // an asked-for name already; do not overwrite it
-			}
-			revCache.m[a] = revEntry{name: host, when: time.Now()}
-		}
-	}()
-}
+// revDoHURL is the DNS-over-HTTPS endpoint the reverse lookups go to, by
+// address so that no name has to be resolved first. A var only for tests.
+var revDoHURL = "https://1.1.1.1/dns-query"
+
+// revLookup asks for the PTR name of ip through the live proxy session, or
+// reports that it cannot. A var only for tests.
+var revLookup = reverseThroughTunnel
 
 // reverseName returns a name for an address, or "" when there is none yet.
 //
@@ -103,16 +88,84 @@ func reverseName(ip string) string {
 	revCache.Unlock()
 
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 		defer cancel()
-		names, err := net.DefaultResolver.LookupAddr(ctx, ip)
-		name := ""
-		if err == nil && len(names) > 0 {
-			name = strings.TrimSuffix(names[0], ".")
-		}
+		name, asked := revLookup(ctx, ip)
 		revCache.Lock()
+		defer revCache.Unlock()
+		if !asked {
+			// No session to ask through: nothing is remembered, so the address
+			// gets its name once there is one.
+			delete(revCache.m, ip)
+			return
+		}
 		revCache.m[ip] = revEntry{name: name, when: time.Now()}
-		revCache.Unlock()
 	}()
 	return ""
+}
+
+// reverseThroughTunnel looks the PTR record up with DNS over HTTPS, through the
+// pinned source-fetch port of a live proxy session (which always rides the
+// tunnel, whatever the routing mode) — never directly. asked is false when there
+// is no such session, in which case nothing was sent anywhere.
+func reverseThroughTunnel(ctx context.Context, ip string) (name string, asked bool) {
+	cs := state.conn.snap()
+	if cs.Status != ConnConnected || cs.Mode != ModeProxy {
+		return "", false
+	}
+	proxyURL := ownProxyURL(cs)
+	if proxyURL == nil {
+		return "", false
+	}
+	arpa, err := reverseArpa(ip)
+	if err != nil {
+		return "", true
+	}
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), DisableKeepAlives: true}}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, revDoHURL+"?name="+url.QueryEscape(arpa)+"&type=PTR", nil)
+	if err != nil {
+		return "", true
+	}
+	req.Header.Set("Accept", "application/dns-json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", true
+	}
+	defer resp.Body.Close()
+	var ans struct {
+		Answer []struct {
+			Type int    `json:"type"`
+			Data string `json:"data"`
+		} `json:"Answer"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&ans) != nil {
+		return "", true
+	}
+	for _, a := range ans.Answer {
+		if a.Type == 12 && a.Data != "" {
+			return strings.TrimSuffix(a.Data, "."), true
+		}
+	}
+	return "", true
+}
+
+// reverseArpa is the reverse-lookup name of an address.
+func reverseArpa(s string) (string, error) {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return "", fmt.Errorf("not an address: %q", s)
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.%d.%d.in-addr.arpa", v4[3], v4[2], v4[1], v4[0]), nil
+	}
+	const hex = "0123456789abcdef"
+	var b strings.Builder
+	for i := len(ip) - 1; i >= 0; i-- {
+		b.WriteByte(hex[ip[i]&0x0f])
+		b.WriteByte('.')
+		b.WriteByte(hex[ip[i]>>4])
+		b.WriteByte('.')
+	}
+	b.WriteString("ip6.arpa")
+	return b.String(), nil
 }

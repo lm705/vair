@@ -1,6 +1,7 @@
 package core
 
 import (
+	"fmt"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -40,6 +41,33 @@ type sessionFacts struct {
 	DNSRemote   string
 	DirectApps  int
 	RuleCounts  [3]int // without VPN, through VPN, blocked
+	// RulesSig and AppsSig are the lists themselves, not their length: a site
+	// swapped for another is an edit the session has not seen either.
+	RulesSig string
+	AppsSig  string
+	// DPI bypass: the ClientHello as the session sends it.
+	Fragment     bool
+	FragLength   string
+	FragInterval string
+	Fingerprint  string
+	// AllTunnelled: everything through the VPN, nothing kept out by own rules
+	// or by the programs list. What the bar's "all traffic routed" claims.
+	AllTunnelled bool
+	// ProxyKS is the proxy-mode kill-switch, shown for a proxy session.
+	ProxyKS bool
+}
+
+// listOnlyMode reports whether a routing mode sends only listed sites through
+// the tunnel. Those build their own DNS module, leak protection or not.
+func listOnlyMode(mode string) bool {
+	return mode == "only_blocked" || mode == "only_blocked_cn" || mode == "only_selected"
+}
+
+// fakeIPUsed is whether the session's DNS answered with placeholder addresses:
+// the switch, and leak protection, and a mode that resolves the tunnelled names
+// itself rather than one of the list-only modes.
+func fakeIPUsed(f *sessionFacts) bool {
+	return f.FakeIP && f.LeakProtect && !listOnlyMode(f.RoutingMode)
 }
 
 // captureSessionFacts reads the settings that decide how a tunnel behaves. Call
@@ -74,13 +102,92 @@ func captureSessionFacts(engine string) *sessionFacts {
 	if f.IPv6 == "" {
 		f.IPv6 = "blocked"
 	}
-	if f.MTU == 0 {
-		f.MTU = 9000
-	}
+	f.MTU = effectiveMTU(f.MTU, f.IPv6) // what the tunnel gets, not what was typed
 	f.RuleCounts = [3]int{
 		len(appSettings.DirectDomains), len(appSettings.ProxyDomains), len(appSettings.BlockDomains),
 	}
+	f.RulesSig = fmt.Sprintf("%q %v %q %v %q %v %q %q %v", appSettings.DirectDomains, appSettings.DirectDomainsDisabled,
+		appSettings.ProxyDomains, appSettings.ProxyDomainsDisabled, appSettings.BlockDomains, appSettings.BlockDomainsDisabled,
+		appSettings.BypassCountries, appSettings.BlocklistURLs, appSettings.BlocklistURLsDisabled)
+	f.AppsSig = fmt.Sprintf("%q %v", appSettings.DirectApps, appSettings.DirectAppsDisabled)
+	// The values the engines get, not the text in the fields (see
+	// currentTLSFragmentParams and currentTLSFingerprint, which take the lock
+	// this already holds).
+	f.Fragment = appSettings.TLSFragment
+	var ok bool
+	if f.FragLength, ok = normalizeFragmentSpec(appSettings.TLSFragmentLength, fragLengthMin, fragLengthMax); !ok {
+		f.FragLength = defaultTLSFragmentLength
+	}
+	if f.FragInterval, ok = normalizeFragmentSpec(appSettings.TLSFragmentInterval, fragIntervalMin, fragIntervalMax); !ok {
+		f.FragInterval = defaultTLSFragmentInterval
+	}
+	f.Fingerprint = strings.TrimSpace(appSettings.TLSFingerprint)
+	if !validTLSFingerprints[f.Fingerprint] {
+		f.Fingerprint = "chrome"
+	}
+	f.AllTunnelled = f.RoutingMode == "proxy_all" &&
+		(appSettings.DirectDomainsDisabled || len(appSettings.DirectDomains) == 0) &&
+		(appSettings.DirectAppsDisabled || len(appSettings.DirectApps) == 0)
+	f.ProxyKS = appSettings.ProxyKillSwitch
 	return f
+}
+
+// certRow is how the session's server certificate is checked. For a chain, the
+// weakest of its hops, with a note that they differ.
+func certRow(cs ConnState) (SessionFactRow, bool) {
+	raws := cs.ChainRaws
+	if len(raws) == 0 {
+		raws = []string{cs.ConnRaw}
+	}
+	rank := map[string]int{"not checked (allowInsecure)": 0, "checked against the name in the link": 1, "checked": 2, "pinned (SHA-256)": 3, "REALITY key": 3}
+	worst, seen := "", map[string]bool{}
+	for _, r := range raws {
+		n, err := parseNode(r)
+		if err != nil {
+			continue
+		}
+		v := certCheckLabel(n)
+		if v == "" {
+			continue
+		}
+		seen[v] = true
+		if worst == "" || rank[v] < rank[worst] {
+			worst = v
+		}
+	}
+	if worst == "" {
+		return SessionFactRow{}, false
+	}
+	row := SessionFactRow{Label: "Server certificate", Value: worst}
+	if len(seen) > 1 {
+		row.Note = "The hops of the chain differ; this is the weakest of them."
+	}
+	return row, true
+}
+
+// ksNeedsLeakProtection is the note under a TUN kill-switch that is switched on
+// and cannot work: it needs TUN DNS leak protection.
+const ksNeedsLeakProtection = "On in the settings, but it works only together with TUN DNS leak protection."
+
+// listsEdited is the note under a rule row whose lists changed after the
+// session started.
+const listsEdited = "Edited after this connection started; the change applies on the next connection."
+
+// listRow is a rule row: the counts the session started with and, when the
+// lists have been edited since — added to, removed from, or one entry swapped
+// for another — the counts now and why the row is marked.
+func listRow(label, then, now, thenSig, nowSig string) SessionFactRow {
+	r := SessionFactRow{Label: label, Value: then}
+	if thenSig != nowSig {
+		r.Now = now
+		r.Note = listsEdited
+	}
+	return r
+}
+
+// ruleCounts is the rule row's value: how many lines each list has.
+func ruleCounts(f *sessionFacts) string {
+	return itoa(f.RuleCounts[0]) + " / " + itoa(f.RuleCounts[1]) + " / " + itoa(f.RuleCounts[2])
 }
 
 // SessionFactRow is one line of the session panel: what it is, what this session
@@ -91,6 +198,9 @@ type SessionFactRow struct {
 	// Now is the current setting when it no longer matches Value, empty
 	// otherwise. The panel draws it as "…, settings say X".
 	Now string `json:"now,omitempty"`
+	// Note is a sentence under the row saying why the value is what it is —
+	// a fixed English phrase the panel translates. Empty for most rows.
+	Note string `json:"note,omitempty"`
 }
 
 // SessionInfoDTO is the whole panel.
@@ -136,6 +246,22 @@ func SessionInfo() SessionInfoDTO {
 		return v
 	}
 
+	// What answered, not what the fields hold: the system resolver where that
+	// is what the session used — for the tunnelled names with leak protection
+	// off outside the list-only modes, for the direct ones when chosen.
+	direct := func(f *sessionFacts) string {
+		if strings.EqualFold(strings.TrimSpace(f.DNSDirect), directDNSSystem) {
+			return "system resolver"
+		}
+		return dns(f.DNSDirect, defaultDirectDNS)
+	}
+	tunnelled := func(f *sessionFacts) string {
+		if !f.LeakProtect && !listOnlyMode(f.RoutingMode) {
+			return "system resolver, outside the tunnel"
+		}
+		return dns(f.DNSRemote, defaultRemoteDNS)
+	}
+
 	out := SessionInfoDTO{Connected: live}
 	add := func(name string, rows ...SessionFactRow) {
 		out.Groups = append(out.Groups, name)
@@ -162,6 +288,9 @@ func SessionInfo() SessionInfoDTO {
 		if cs.HTTPPort > 0 {
 			conn = append(conn, SessionFactRow{Label: "Local ports", Value: itoa(cs.HTTPPort) + " HTTP, " + itoa(cs.SOCKSPort) + " SOCKS"})
 		}
+		if r, ok := certRow(cs); ok {
+			conn = append(conn, r)
+		}
 		if cs.Mode == ModeProxy {
 			// Only in proxy mode: TUN neither sets the system proxy nor is
 			// asked to, so holding it against the setting reported a change
@@ -176,39 +305,83 @@ func SessionInfo() SessionInfoDTO {
 
 	add("Routing",
 		SessionFactRow{Label: "Mode", Value: f.RoutingMode, Now: cmp(f.RoutingMode, now.RoutingMode)},
-		SessionFactRow{Label: "Own rules (without VPN / through / blocked)",
-			Value: itoa(f.RuleCounts[0]) + " / " + itoa(f.RuleCounts[1]) + " / " + itoa(f.RuleCounts[2]),
-			Now:   cmp(itoa(f.RuleCounts[0]), itoa(now.RuleCounts[0]))},
-		SessionFactRow{Label: "Apps without VPN", Value: itoa(f.DirectApps), Now: cmp(itoa(f.DirectApps), itoa(now.DirectApps))},
+		// The whole lists are compared, not the first count: the row used to
+		// notice only the without-VPN list growing or shrinking.
+		listRow("Own rules (without VPN / through / blocked)", ruleCounts(f), ruleCounts(now), f.RulesSig, now.RulesSig),
+		listRow("Apps without VPN", itoa(f.DirectApps), itoa(now.DirectApps), f.AppsSig, now.AppsSig),
 		SessionFactRow{Label: "IPv6", Value: f.IPv6, Now: cmp(f.IPv6, now.IPv6)},
 	)
 
-	add("Tunnel",
-		SessionFactRow{Label: "Kill-switch", Value: yes(f.KillSwitch), Now: cmp(yes(f.KillSwitch), yes(now.KillSwitch))},
-		SessionFactRow{Label: "Keep blocking after the tunnel is gone", Value: yes(f.Persistent), Now: cmp(yes(f.Persistent), yes(now.Persistent))},
-		// What that block is actually doing, which is a different question from
-		// what was asked for: Windows applies an outbound default only on
-		// profiles whose firewall is switched on, so a machine can accept every
-		// command and filter nothing. The row is the fact; the note is why.
-		blockRow(),
-		SessionFactRow{Label: "TCP/IP stack", Value: f.Stack, Now: cmp(f.Stack, now.Stack)},
-		SessionFactRow{Label: "MTU", Value: itoa(f.MTU), Now: cmp(itoa(f.MTU), itoa(now.MTU))},
-		SessionFactRow{Label: "LAN through the tunnel", Value: yes(f.BlockLAN), Now: cmp(yes(f.BlockLAN), yes(now.BlockLAN))},
-		SessionFactRow{Label: "Proxy shared over LAN", Value: yes(f.ShareLAN), Now: cmp(yes(f.ShareLAN), yes(now.ShareLAN))},
-	)
+	// Which mode the rows describe: the session's, or — with nothing connected —
+	// the one the main window has selected. A proxy session was shown the TUN
+	// kill-switch, stack, MTU and DNS protection, none of which applies to it.
+	tunView := live && cs.Mode == ModeTUN
+	if !live {
+		settingsMu.RLock()
+		tunView = appSettings.SelectedMode == string(ModeTUN)
+		settingsMu.RUnlock()
+	}
+	// The kill-switches take effect the moment they are switched, so their rows
+	// are what holds now, not what the session started with; and a TUN switch
+	// that cannot work without DNS leak protection says so instead of "on".
+	bootstrap := SessionFactRow{Label: "Bootstrap", Value: dns(f.DNSBoot, defaultBootstrapDNS),
+		Now: cmp(dns(f.DNSBoot, defaultBootstrapDNS), dns(now.DNSBoot, defaultBootstrapDNS))}
+	if tunView {
+		ks := SessionFactRow{Label: "Kill-switch", Value: yes(now.KillSwitch && now.LeakProtect)}
+		if now.KillSwitch && !now.LeakProtect {
+			ks.Note = ksNeedsLeakProtection
+		}
+		add("Tunnel",
+			ks,
+			SessionFactRow{Label: "Persistent kill-switch", Value: yes(now.Persistent && now.KillSwitch && now.LeakProtect)},
+			// What that block is actually doing, which is a different question
+			// from what was asked for: Windows applies an outbound default only on
+			// profiles whose firewall is switched on, so a machine can accept every
+			// command and filter nothing. The row is the fact; the note is why.
+			blockRow(),
+			leakRowIfLive(live),
+			SessionFactRow{Label: "TCP/IP stack", Value: f.Stack, Now: cmp(f.Stack, now.Stack)},
+			SessionFactRow{Label: "MTU", Value: itoa(f.MTU), Now: cmp(itoa(f.MTU), itoa(now.MTU))},
+			SessionFactRow{Label: "LAN through the tunnel", Value: yes(f.BlockLAN), Now: cmp(yes(f.BlockLAN), yes(now.BlockLAN))},
+			SessionFactRow{Label: "Proxy shared over LAN", Value: yes(f.ShareLAN), Now: cmp(yes(f.ShareLAN), yes(now.ShareLAN))},
+		)
+		add("DNS",
+			SessionFactRow{Label: "Leak protection", Value: yes(f.LeakProtect), Now: cmp(yes(f.LeakProtect), yes(now.LeakProtect))},
+			SessionFactRow{Label: "FakeIP", Value: yes(fakeIPUsed(f)), Now: cmp(yes(fakeIPUsed(f)), yes(fakeIPUsed(now)))},
+			// The address itself, never the operator's name: a resolver is only
+			// identifiable by where the queries actually went.
+			bootstrap,
+			SessionFactRow{Label: "Direct", Value: direct(f), Now: cmp(direct(f), direct(now))},
+			SessionFactRow{Label: "Through the tunnel", Value: tunnelled(f), Now: cmp(tunnelled(f), tunnelled(now))},
+		)
+	} else {
+		add("Protection",
+			SessionFactRow{Label: "Kill-switch (proxy)", Value: yes(now.ProxyKS)},
+			blockRow(),
+			leakRowIfLive(live),
+		)
+		// In proxy mode a site's name goes to the proxy with the request and the
+		// VPN server looks it up; the engine resolves only what its rules send
+		// directly, with the system resolver — its configuration has no DNS of
+		// its own. The rows used to name the TUN resolvers.
+		add("DNS",
+			bootstrap,
+			SessionFactRow{Label: "Sites through the proxy", Value: "the VPN server"},
+			SessionFactRow{Label: "Sites outside the proxy", Value: "system resolver"},
+		)
+	}
 
-	add("DNS",
-		SessionFactRow{Label: "Leak protection", Value: yes(f.LeakProtect), Now: cmp(yes(f.LeakProtect), yes(now.LeakProtect))},
-		SessionFactRow{Label: "FakeIP", Value: yes(f.FakeIP), Now: cmp(yes(f.FakeIP), yes(now.FakeIP))},
-		// The address itself, never the operator's name: a resolver is only
-		// identifiable by where the queries actually went.
-		SessionFactRow{Label: "Bootstrap", Value: dns(f.DNSBoot, defaultBootstrapDNS),
-			Now: cmp(dns(f.DNSBoot, defaultBootstrapDNS), dns(now.DNSBoot, defaultBootstrapDNS))},
-		SessionFactRow{Label: "Direct", Value: dns(f.DNSDirect, defaultDirectDNS),
-			Now: cmp(dns(f.DNSDirect, defaultDirectDNS), dns(now.DNSDirect, defaultDirectDNS))},
-		SessionFactRow{Label: "Through the tunnel", Value: dns(f.DNSRemote, defaultRemoteDNS),
-			Now: cmp(dns(f.DNSRemote, defaultRemoteDNS), dns(now.DNSRemote, defaultRemoteDNS))},
-	)
+	dpi := []SessionFactRow{
+		{Label: "TLS fragmentation (DPI bypass)", Value: yes(f.Fragment), Now: cmp(yes(f.Fragment), yes(now.Fragment))},
+	}
+	if f.Fragment || now.Fragment {
+		dpi = append(dpi,
+			SessionFactRow{Label: "Fragment length", Value: f.FragLength, Now: cmp(f.FragLength, now.FragLength)},
+			SessionFactRow{Label: "Fragment interval (ms)", Value: f.FragInterval, Now: cmp(f.FragInterval, now.FragInterval)},
+		)
+	}
+	dpi = append(dpi, SessionFactRow{Label: "TLS fingerprint (uTLS)", Value: f.Fingerprint, Now: cmp(f.Fingerprint, now.Fingerprint)})
+	add("DPI bypass", dpi...)
 
 	xray, singbox := engineBins()
 	engines := []SessionFactRow{}
@@ -216,9 +389,15 @@ func SessionInfo() SessionInfoDTO {
 		engines = append(engines, SessionFactRow{Label: "sing-box", Value: v})
 	} else if singbox != "" {
 		engines = append(engines, SessionFactRow{Label: "sing-box", Value: "present"})
+		// Not answered yet (or every attempt at startup failed): ask again, so the
+		// next look at the panel has the number.
+		go detectSingboxVersion()
 	}
-	if xray != "" {
+	if v := xrayVersionString(); v != "" {
+		engines = append(engines, SessionFactRow{Label: "xray", Value: v})
+	} else if xray != "" {
 		engines = append(engines, SessionFactRow{Label: "xray", Value: "present"})
+		go detectXrayVersion()
 	}
 	if len(engines) > 0 {
 		add("Engines", engines...)
@@ -283,6 +462,17 @@ func engineName(cmd *exec.Cmd) string {
 func blockRow() SessionFactRow {
 	const label = "Firewall block right now"
 	if !blockStanding() {
+		// The tunnel's own block, when it is the only one: everything is
+		// stopped except what goes through the tunnel.
+		if tunnelBlockHeld() {
+			state.conn.mu.Lock()
+			mode := state.conn.state.Mode
+			state.conn.mu.Unlock()
+			if mode == ModeProxy {
+				return SessionFactRow{Label: label, Value: "everything outside the proxy"}
+			}
+			return SessionFactRow{Label: label, Value: "everything outside the tunnel"}
+		}
 		return SessionFactRow{Label: label, Value: "not blocking"}
 	}
 	if gap := BlockGapReason(); gap != "" {

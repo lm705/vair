@@ -13,6 +13,9 @@ import { useEffect, useState } from 'react'
 import { ConfigService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
 import { copyText } from './clipboard'
+import CloseX from './closex'
+import BinIcon from './binicon'
+import ConfirmDiscard from './confirm'
 
 type Fav = {
   body: string
@@ -31,6 +34,10 @@ export default function FavoritesModal({ onClose, lang }: { onClose: () => void;
   // point of the list is to look at configurations there is no row for any
   // more — the only way to get one back out of it is to copy it.
   const [copied, setCopied] = useState('')
+  // The last removal, for "Undo": a star is set by hand, and this list is the
+  // only place one with no row can be found again.
+  const [undo, setUndo] = useState<string[]>([])
+  const [askMissing, setAskMissing] = useState(false)
 
   const load = () => ConfigService.Favorites().then((r: any) => setList(r || []))
   useEffect(() => {
@@ -39,7 +46,15 @@ export default function FavoritesModal({ onClose, lang }: { onClose: () => void;
 
   const remove = (bodies: string[]) => {
     if (bodies.length === 0) return
-    ConfigService.RemoveFavorites(bodies).then(load)
+    ConfigService.RemoveFavorites(bodies).then(() => {
+      setUndo(bodies)
+      load()
+    })
+  }
+  const restore = () => {
+    const bodies = undo
+    setUndo([])
+    ConfigService.RestoreFavorites(bodies).then(load)
   }
 
   const copy = (f: Fav) => {
@@ -61,9 +76,12 @@ export default function FavoritesModal({ onClose, lang }: { onClose: () => void;
   return (
     <div className="modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal-box fav-box">
-        <div className="modal-title">{tt('Favorites')}</div>
+        <div className="modal-head">
+          <div className="modal-title">{tt('Favorites')}</div>
+          <CloseX onClick={onClose} title={tt('Close')} />
+        </div>
         <div className="hist-hint hist-para">
-          {tt('A star is kept against the server itself, so it survives a rename and a list refresh — and it outlives the configuration too. What no tab holds right now is marked below; a source that failed to load looks the same, so nothing is removed on its own.')}
+          {tt('A star is attached to the server itself, so it is kept after renaming, after a list refresh and even after the configuration is removed. Starred servers that no tab currently contains are marked below. A source that failed to load looks the same, so nothing is removed automatically.')}
         </div>
 
         {!list ? (
@@ -87,11 +105,11 @@ export default function FavoritesModal({ onClose, lang }: { onClose: () => void;
                   {copied === f.body ? tt('copied') : tt('copy')}
                 </button>
                 <button
-                  className="btn ghost sm"
+                  className="url-rm"
                   title={tt('Remove from favorites')}
                   onClick={() => remove([f.body])}
                 >
-                  ✕
+                  <BinIcon />
                 </button>
               </div>
             ))}
@@ -104,16 +122,36 @@ export default function FavoritesModal({ onClose, lang }: { onClose: () => void;
               {copied === '*' ? tt('copied') : tt('Copy all')}
             </button>
           ) : null}
-          {missing.length > 0 ? (
-            <button className="btn ghost" onClick={() => remove(missing.map((f) => f.body))}>
-              {tt('Remove the')} {missing.length} {tt('not found')}
+          {undo.length > 0 ? (
+            <button className="btn ghost" onClick={restore}>
+              {tt('Undo')} ({undo.length})
             </button>
           ) : null}
-          <button className="btn ghost" onClick={onClose}>
-            {tt('Close')}
-          </button>
+          {missing.length > 0 ? (
+            <button className="btn ghost" onClick={() => setAskMissing(true)}>
+              {tt('Remove the ones not found')} ({missing.length})
+            </button>
+          ) : null}
         </div>
       </div>
+      {askMissing && (
+        <ConfirmDiscard
+          text={
+            tt('Remove the stars of the configurations no tab contains?') +
+            ' (' +
+            missing.length +
+            ') ' +
+            tt('A source that failed to load looks the same.')
+          }
+          discardLabel={tt('Remove stars')}
+          keepLabel={tt('Keep')}
+          onDiscard={() => {
+            setAskMissing(false)
+            remove(missing.map((f) => f.body))
+          }}
+          onKeep={() => setAskMissing(false)}
+        />
+      )}
     </div>
   )
 }

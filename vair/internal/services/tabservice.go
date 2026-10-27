@@ -28,6 +28,10 @@ func (t *TabService) Create() core.TabDTO { return core.CreateTab() }
 // Delete removes a user tab (and its configs).
 func (t *TabService) Delete(id string) { core.DeleteTab(id) }
 
+// UndoDelete puts the last deleted tab back (the Undo on the notification that
+// follows a delete); returns its name, or why it cannot.
+func (t *TabService) UndoDelete() core.TabUndoResult { return core.UndoDeleteTab() }
+
 // Rename renames a tab.
 func (t *TabService) Rename(id string, name string) { core.RenameTab(id, name) }
 

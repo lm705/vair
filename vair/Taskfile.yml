@@ -6,7 +6,7 @@ vars:
   # core/bridge.go (and build/config.yml): the update check compares what the
   # binary reports against what the release publishes, so a package claiming a
   # version its binary denies makes every upgrade prompt wrong.
-  VERSION: "2.6.0"
+  VERSION: "2.7.0"
   BIN_DIR: "bin"
   PACKAGE_MANAGER: '{{.PACKAGE_MANAGER | default "npm"}}'
   VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'

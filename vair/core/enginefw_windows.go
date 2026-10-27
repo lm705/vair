@@ -2,7 +2,7 @@
 
 package core
 
-import "fmt"
+import "vair/helper/winsys"
 
 // The inbound door for the engine when the tunnel is not carrying its own TCP.
 //
@@ -25,47 +25,39 @@ import "fmt"
 // name is created and swept away in the same breath — which is what happened
 // the first time this was written.
 //
-// sing-box registers a rule for itself as well — "sing-tun (…\sing-box.exe)"
-// is visible in the firewall on any machine that has run a tunnel — and it is
-// the broader of the two: the whole program, every address. This one stays
-// anyway, and is not merely a duplicate of it. It is ours to remove when the
-// tunnel goes (the engine's outlives every session, on a machine that may never
-// run one again), it is scoped to the tunnel interface, and it does not depend
-// on the engine having managed to register anything: the case this exists for
-// is a tunnel that comes up and carries nothing, which is exactly the shape of
-// a machine where that registration silently failed.
-const (
-	engineFirewallRule  = "Vair TUN engine"
-	engineFirewallGroup = "Vair tunnel engine"
-)
-
-// ensureEngineFirewallRule opens it for iface. Best-effort, like every other
-// firewall call here: without elevation netsh and PowerShell simply refuse, and
-// TUN mode does not run without elevation anyway.
+// sing-box registers a rule for itself as well — "sing-tun (…\sing-box.exe)",
+// on the system and mixed stacks — and it is the broader of the two: the whole
+// program, any port, any address, every profile, Public included, and it stays
+// after the session and after Vair. With the proxy shared over the LAN that
+// opened sing-box's listeners to any network the machine joined, past the
+// local-subnet, private-network rule that sharing is meant to have. So that
+// one is removed as soon as ours is in place, and again when the session ends;
+// ours covers the tunnel by itself. Only the rule for Vair's own sing-box: one
+// another program's copy registered is not ours to touch.
+// ensureEngineFirewallRule opens it for iface (winsys.EnsureEngineRule).
+// Best-effort, like every other firewall call here: without elevation netsh
+// and PowerShell simply refuse, and TUN mode does not run without elevation
+// anyway.
 func ensureEngineFirewallRule(iface string) {
-	singbox := func() string {
-		state.mu.RLock()
-		defer state.mu.RUnlock()
-		return state.singboxBin
-	}()
+	if serviceMode() {
+		return // the service opens it with the tunnel it runs
+	}
+	singbox := SingboxPath()
 	if singbox == "" || iface == "" {
 		return
 	}
-	removeEngineFirewallRule()
-	script := fmt.Sprintf(
-		"New-NetFirewallRule -DisplayName '%s' -Group '%s' -Direction Inbound -Action Allow "+
-			"-Program '%s' -InterfaceAlias '%s' -Profile Any | Out-Null",
-		engineFirewallRule, engineFirewallGroup, psQuote(singbox), psQuote(iface))
-	if _, err := psOutput(script); err != nil {
+	if err := winsys.EnsureEngineRule(singbox, iface); err != nil {
 		vlog("warning", "firewall: could not open the inbound rule for the engine: %v", err)
 	}
 }
 
-// removeEngineFirewallRule closes it again. Idempotent — a rule that is not
-// there is not an error.
+// removeEngineFirewallRule closes it again, with the rule sing-box registered
+// for Vair's binary. Idempotent.
 func removeEngineFirewallRule() {
-	psOutput(fmt.Sprintf( //nolint:errcheck
-		"Remove-NetFirewallRule -DisplayName '%s' -ErrorAction SilentlyContinue", engineFirewallRule))
+	if serviceMode() {
+		return
+	}
+	winsys.RemoveEngineRule(SingboxPath())
 }
 
 // engineNeedsFirewallRule reports whether the stack about to run terminates

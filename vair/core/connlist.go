@@ -2,8 +2,8 @@ package core
 
 import (
 	"net"
+	"net/netip"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +50,21 @@ type connEntry struct {
 	// watchers see the same connection — see adoptEngineRow.
 	taken  atomic.Bool
 	closed atomic.Bool
+	// What it had carried when the history was last cleared, for a connection
+	// that was open at that moment: "since start" counts only what came after.
+	cleared          atomic.Bool
+	baseUp, baseDown atomic.Int64
+}
+
+// sinceClear is what the connection has carried since the history was last
+// cleared, and whether it belongs in the history at all: one that was open at
+// the clear and has carried nothing since does not. It used to be folded back
+// in whole, so the button emptied the table and the next second put every open
+// connection back — in TUN, where the engine's rows end only when it says so,
+// that was most of the table.
+func (e *connEntry) sinceClear() (up, down int64, counts bool) {
+	up, down = e.Up.Load()-e.baseUp.Load(), e.Down.Load()-e.baseDown.Load()
+	return up, down, !e.cleared.Load() || up > 0 || down > 0
 }
 
 // ConnRow is one row of the live list, for the frontend.
@@ -73,24 +88,24 @@ var conns = struct {
 
 // connectionsWatched reports whether to record anything at all.
 //
-// It used to answer "is the panel open", and tracking began the first time it
-// was. That made the totals useless for the question they exist for: opening the
-// panel to find out what had been using the connection showed an empty table and
-// started counting from that moment.
+// Off until the user turns it on with the switch in the panel. What it collects
+// is a list of the sites visited, with the program that visited each and the
+// traffic, kept for the whole run and readable through the web interface; that
+// is not something to keep for someone who never asked for it.
 //
-// So it runs for the whole session — unless it is switched off, which is now a
-// deliberate choice with a switch of its own in the panel rather than a side
-// effect of closing a window. Off means off: no map entry per connection, no
-// peek at the first bytes to learn the destination, no parsing of the engine's
-// log. What has already been collected stays until it is cleared.
+// Once on, it runs for the whole session, not only while the panel is open: it
+// used to start the first time the panel opened, which made the totals useless
+// for the question they exist for. Off means off: no map entry per connection,
+// no reading of the client's request, no parsing of the engine's log. What has
+// already been collected stays until it is cleared.
 //
-// On costs, per connection: one map entry (512 live at most), one read of the
-// first kilobyte, and a process lookup with a two-second cache. Everything is in
-// memory and nothing is written to disk.
+// On costs, per connection: one map entry (512 live at most), a parse of the
+// first bytes as they pass, and a process lookup with a two-second cache.
+// Everything is in memory and nothing is written to disk.
 func connectionsWatched() bool {
 	settingsMu.RLock()
 	defer settingsMu.RUnlock()
-	return !appSettings.ConnTrackingOff
+	return appSettings.ConnTracking
 }
 
 // connBegin registers a connection and returns its handle, or nil when tracking
@@ -99,11 +114,9 @@ func connBegin(dest, process, via, rule string, exact bool) *connEntry {
 	if !connectionsWatched() {
 		return nil
 	}
-	// A name asked for here is a name that can be put to an address seen bare
-	// somewhere else — see revname.go.
-	if h, _, err := net.SplitHostPort(dest); err == nil {
-		noteResolvedHost(h)
-	}
+	// No lookup of the destination here: the name is what the client asked
+	// for, and resolving it again — once, through the system's resolver —
+	// sent every site visited through the proxy to the provider (see revname.go).
 	conns.Lock()
 	defer conns.Unlock()
 	if len(conns.m) >= connMax {
@@ -138,10 +151,17 @@ func connEnd(e *connEntry) {
 	if e == nil || e.closed.Swap(true) {
 		return
 	}
-	addConnTotal(e)
+	// Read under the list's lock: the relay points a row at its own counters
+	// when it adopts one (openRelayRow), and the engine can end that row from
+	// its log at the same moment.
 	conns.Lock()
+	snap := connEntry{ID: e.ID, Process: e.Process, Dest: e.Dest, Via: e.Via}
+	up, down, counts := e.sinceClear()
 	delete(conns.m, e.ID)
 	conns.Unlock()
+	if counts {
+		addConnTotal(&snap, up, down)
+	}
 }
 
 // adoptEngineRow hands the counting relay the row the engine has just opened
@@ -186,6 +206,63 @@ func adoptEngineRow(dest string) *connEntry {
 	return best
 }
 
+// isFakeIPDest reports whether a destination is one of FakeIP's stand-ins
+// (engine.go: inet4_range, ipv6FakeRange).
+func isFakeIPDest(dest string) bool {
+	host, _, err := net.SplitHostPort(dest)
+	if err != nil {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return fakeIPv4.Contains(ip) || fakeIPv6.Contains(ip)
+}
+
+var (
+	fakeIPv4 = netip.MustParsePrefix("198.18.0.0/15")
+	fakeIPv6 = netip.MustParsePrefix(ipv6FakeRange)
+)
+
+// mergeIntoRelayRow joins an engine row whose real destination has just become
+// known to the relay's row for the same connection, if the relay got there
+// first: it looked for an engine row by the real name while the engine row
+// still carried the stand-in, found none and opened its own. The relay's row
+// keeps the bytes, takes the program and the verdict, and the engine's goes —
+// without being counted, since it is the same connection. Nil when there is
+// nothing to join.
+func mergeIntoRelayRow(e *connEntry) *connEntry {
+	conns.Lock()
+	defer conns.Unlock()
+	var best *connEntry
+	for _, r := range conns.m {
+		if r == e || r.Dest != e.Dest || !r.Exact || r.Process != "" || r.taken.Load() {
+			continue
+		}
+		if d := r.Started.Sub(e.Started); d < -2*time.Second || d > 5*time.Second {
+			continue
+		}
+		if best == nil || r.Started.Before(best.Started) {
+			best = r
+		}
+	}
+	if best == nil || e.taken.Load() {
+		return nil
+	}
+	best.taken.Store(true)
+	best.Process = e.Process
+	if e.Rule != "" {
+		best.Rule = e.Rule
+	}
+	if e.Via != "" {
+		best.Via = e.Via
+	}
+	e.closed.Store(true)
+	delete(conns.m, e.ID)
+	return best
+}
+
 // LiveConnections returns the current list, busiest first.
 func LiveConnections() []ConnRow {
 	// Rows whose ending was never logged would otherwise pile up: a line can be
@@ -217,94 +294,6 @@ func LiveConnections() []ConnRow {
 	return out
 }
 
-// ─────────────────── where the proxy path reads the destination ─────────────
-
-// peekDestination reads the first bytes a client sends and returns the address
-// it asked for, without consuming them: the returned prefix is replayed to the
-// engine.
-//
-// Two protocols, both trivial at this depth. HTTP: either "CONNECT host:port"
-// or a request line with an absolute URL. SOCKS5: the address sits at a fixed
-// offset of the connect request, after the greeting. Anything unrecognised
-// gives an empty destination and the bytes are passed through untouched — this
-// must never be able to break a connection it merely wanted to describe.
-func peekDestination(prefix []byte) string {
-	if len(prefix) < 5 {
-		return ""
-	}
-	// SOCKS5 greeting: 05 NMETHODS ...
-	if prefix[0] == 0x05 {
-		return socks5Dest(prefix)
-	}
-	line := string(prefix)
-	if i := strings.IndexAny(line, "\r\n"); i > 0 {
-		line = line[:i]
-	}
-	parts := strings.Fields(line)
-	if len(parts) < 2 {
-		return ""
-	}
-	if strings.EqualFold(parts[0], "CONNECT") {
-		return parts[1]
-	}
-	// GET http://host/path HTTP/1.1
-	u := parts[1]
-	if i := strings.Index(u, "://"); i >= 0 {
-		u = u[i+3:]
-	} else {
-		return ""
-	}
-	if i := strings.IndexAny(u, "/?"); i >= 0 {
-		u = u[:i]
-	}
-	if u == "" {
-		return ""
-	}
-	if !strings.Contains(u, ":") {
-		u += ":80"
-	}
-	return u
-}
-
-// socks5Dest pulls the address out of a SOCKS5 connect request that follows the
-// greeting in the same read. When it does not (the client waits for the
-// method reply first, which most do), the destination stays unknown and the row
-// shows the address the engine reports instead.
-func socks5Dest(b []byte) string {
-	n := int(b[1])
-	off := 2 + n // greeting
-	if len(b) < off+7 || b[off] != 0x05 || b[off+1] != 0x01 {
-		return ""
-	}
-	atyp := b[off+3]
-	p := off + 4
-	var host string
-	switch atyp {
-	case 0x01: // IPv4
-		if len(b) < p+6 {
-			return ""
-		}
-		host = strconv.Itoa(int(b[p])) + "." + strconv.Itoa(int(b[p+1])) + "." +
-			strconv.Itoa(int(b[p+2])) + "." + strconv.Itoa(int(b[p+3]))
-		p += 4
-	case 0x03: // hostname
-		if len(b) < p+1 {
-			return ""
-		}
-		l := int(b[p])
-		p++
-		if len(b) < p+l+2 {
-			return ""
-		}
-		host = string(b[p : p+l])
-		p += l
-	default:
-		return "" // IPv6 arrives rarely here and adds nothing but formatting
-	}
-	port := int(b[p])<<8 | int(b[p+1])
-	return host + ":" + strconv.Itoa(port)
-}
-
 // ─────────────────── where the TUN path reads its connections ───────────────
 
 // The engine's own log, at info or debug, is the only view we have of a tunnel
@@ -315,7 +304,15 @@ func socks5Dest(b []byte) string {
 var tunConns = struct {
 	sync.Mutex
 	m map[string]*connEntry // engine connection id → row
-}{m: map[string]*connEntry{}}
+	// procs holds the program the engine named for a connection whose row is
+	// not open yet: sing-box logs "found process path" before "inbound
+	// connection to" for the same id. Bounded like the rows are.
+	procs map[string]string
+}{m: map[string]*connEntry{}, procs: map[string]string{}}
+
+// tunProcsMax caps the programs waiting for their row; past it the map is
+// emptied — a few rows without a name beat a map that only grows.
+const tunProcsMax = 512
 
 // noteEngineConnLine turns one line of engine output into a row, or updates one.
 func noteEngineConnLine(src, line string) {
@@ -337,18 +334,74 @@ func noteEngineConnLine(src, line string) {
 		return
 	}
 	switch {
+	case strings.Contains(line, "found process path:"):
+		// The only line where the engine names the program. It comes before
+		// the row exists, so it waits for it; if the row is already open, it
+		// is filled in directly.
+		m := singboxProcRe.FindStringSubmatch(line)
+		if m == nil {
+			return
+		}
+		proc := baseName(m[1])
+		tunConns.Lock()
+		e := tunConns.m[id]
+		if e == nil {
+			if len(tunConns.procs) >= tunProcsMax {
+				tunConns.procs = map[string]string{}
+			}
+			tunConns.procs[id] = proc
+		}
+		tunConns.Unlock()
+		if e != nil {
+			conns.Lock()
+			e.Process = proc
+			conns.Unlock()
+		}
 	case strings.Contains(line, "inbound connection to "):
 		m := singboxDestRe.FindStringSubmatch(line)
 		if m == nil {
 			return
 		}
-		e := connBegin(m[1], "", "", "", false)
+		tunConns.Lock()
+		proc := tunConns.procs[id]
+		delete(tunConns.procs, id)
+		tunConns.Unlock()
+		e := connBegin(m[1], proc, "", "", false)
 		if e == nil {
 			return
 		}
 		tunConns.Lock()
 		tunConns.m[id] = e
 		tunConns.Unlock()
+	case strings.Contains(line, "outbound connection to "):
+		// With FakeIP the program connected to a stand-in address (198.18.x.x)
+		// and the inbound line names that; the outbound line, a moment later,
+		// names what it stands for. The panel showed the stand-ins.
+		m := singboxOutDestRe.FindStringSubmatch(line)
+		if m == nil {
+			return
+		}
+		tunConns.Lock()
+		e := tunConns.m[id]
+		tunConns.Unlock()
+		if e == nil {
+			return
+		}
+		conns.Lock()
+		fake := isFakeIPDest(e.Dest)
+		if fake {
+			e.Dest = m[1]
+		}
+		conns.Unlock()
+		if fake {
+			if r := mergeIntoRelayRow(e); r != nil {
+				tunConns.Lock()
+				if tunConns.m[id] == e {
+					tunConns.m[id] = r
+				}
+				tunConns.Unlock()
+			}
+		}
 	case strings.Contains(line, "router: match["):
 		m := singboxMatchRe.FindStringSubmatch(line)
 		if m == nil {
@@ -442,8 +495,9 @@ var connTotals = struct {
 
 func totalsKey(process, dest string) string { return process + "\x00" + dest }
 
-// addConnTotal folds a finished connection into the totals.
-func addConnTotal(e *connEntry) {
+// addConnTotal folds a finished connection into the totals: up and down are
+// what it carried since the history was last cleared.
+func addConnTotal(e *connEntry, up, down int64) {
 	if e == nil || e.Dest == "" {
 		return
 	}
@@ -453,7 +507,6 @@ func addConnTotal(e *connEntry) {
 	if !connectionsWatched() {
 		return
 	}
-	up, down := e.Up.Load(), e.Down.Load()
 	connTotals.Lock()
 	defer connTotals.Unlock()
 	if len(connTotals.m) >= connTotalsMax {
@@ -500,6 +553,10 @@ func ConnectionTotals() []ConnTotalRow {
 		if e.Dest == "" {
 			continue
 		}
+		up, down, counts := e.sinceClear()
+		if !counts {
+			continue
+		}
 		k := totalsKey(e.Process, e.Dest)
 		t := merged[k]
 		if t == nil {
@@ -507,8 +564,8 @@ func ConnectionTotals() []ConnTotalRow {
 			merged[k] = t
 		}
 		t.Count++
-		t.Up += e.Up.Load()
-		t.Down += e.Down.Load()
+		t.Up += up
+		t.Down += down
 		if e.Via != "" {
 			t.Via = e.Via
 		}
@@ -552,8 +609,36 @@ func ClearConnectionTotals() {
 		conns.Lock()
 		conns.m = map[int64]*connEntry{}
 		conns.Unlock()
+	} else {
+		// The open ones stay in "right now", and "since start" counts only what
+		// they carry from here on (sinceClear).
+		conns.Lock()
+		for _, e := range conns.m {
+			e.baseUp.Store(e.Up.Load())
+			e.baseDown.Store(e.Down.Load())
+			e.cleared.Store(true)
+		}
+		conns.Unlock()
 	}
 	clearBypassSnapshot()
+}
+
+// endTunConns closes every row the engine opened: the session is over, and the
+// engine that would have reported each connection's end is gone. The rows used
+// to stay "open" for up to five minutes after a disconnect — in "right now",
+// and in "since start" as just seen — and a clear could not remove them.
+func endTunConns() {
+	tunConns.Lock()
+	rows := make([]*connEntry, 0, len(tunConns.m))
+	for id, e := range tunConns.m {
+		rows = append(rows, e)
+		delete(tunConns.m, id)
+	}
+	tunConns.procs = map[string]string{}
+	tunConns.Unlock()
+	for _, e := range rows {
+		connEnd(e)
+	}
 }
 
 // setConnVia records the engine's routing decision on the rows that are waiting
@@ -585,11 +670,34 @@ func setConnVia(host, via string) {
 // ConnectionTracking / SetConnectionTracking are the panel's switch.
 func ConnectionTracking() bool { return connectionsWatched() }
 
+// recordingOnSince is when recording was last turned on in this run, in unix
+// nanoseconds; zero when it was already on when the program started.
+var recordingOnSince atomic.Int64
+
+// ConnectionsMissedEarlier reports whether the running session has connections
+// the panel cannot show: recording was turned on after the session started, and
+// a connection is recorded when it opens — its request is read then, and only
+// then. A browser keeps its connections open for minutes, so the sites it was
+// already talking to stay missing until they are reopened; reconnecting closes
+// them all.
+func ConnectionsMissedEarlier() bool {
+	since := recordingOnSince.Load()
+	if since == 0 || !connectionsWatched() {
+		return false
+	}
+	s := ConnSnapshot()
+	return s.Status == ConnConnected && !s.StartedAt.IsZero() && s.StartedAt.UnixNano() < since
+}
+
 func SetConnectionTracking(on bool) {
 	settingsMu.Lock()
-	appSettings.ConnTrackingOff = !on
+	was := appSettings.ConnTracking
+	appSettings.ConnTracking = on
 	settingsMu.Unlock()
 	saveSettings()
+	if on && !was {
+		recordingOnSince.Store(time.Now().UnixNano())
+	}
 	// Nothing is cleared here. Switching recording off answers "stop collecting",
 	// not "throw away what you collected" — and a panel that emptied itself when
 	// the switch was flipped destroyed the very thing the user had been reading.

@@ -27,8 +27,13 @@ func (a *AutoService) Enabled() bool { return core.AutoEnabled() }
 // SetEnabled turns auto-connect on/off.
 func (a *AutoService) SetEnabled(on bool) { core.SetAuto(on) }
 
-// SwitchNow forces an immediate failover/connect (no-op if auto is off).
-func (a *AutoService) SwitchNow() bool { return core.AutoSwitch() }
+// SwitchNow forces an immediate failover/connect. Returns why it cannot (AUTO
+// off, nothing in the candidate tabs), or "".
+func (a *AutoService) SwitchNow() string { return core.AutoSwitch() }
+
+// Sweep reports how far the test of the candidate pool has got — for a panel
+// opened mid-sweep; later changes arrive as "auto_sweep" events.
+func (a *AutoService) Sweep() core.AutoSweepProgress { return core.AutoSweep() }
 
 // Candidates returns the ranked candidate pool for the AUTO panel list.
 func (a *AutoService) Candidates() []core.AutoCandDTO { return core.AutoCandidates() }

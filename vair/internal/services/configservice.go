@@ -53,10 +53,11 @@ func (c *ConfigService) AddConfig(tabId string, form core.ConfigForm) string {
 	return core.AddManualConfig(tabId, form)
 }
 
-// UpdateConfig replaces config idx in a user tab from the edited form. Returns ""
-// on success or an error string.
-func (c *ConfigService) UpdateConfig(tabId string, idx int, form core.ConfigForm) string {
-	return core.UpdateConfig(tabId, idx, form)
+// UpdateConfig replaces config idx in a user tab from the edited form; raw is
+// the configuration the form was opened on. Returns "" on success or an error
+// string.
+func (c *ConfigService) UpdateConfig(tabId string, idx int, raw string, form core.ConfigForm) string {
+	return core.UpdateConfig(tabId, idx, raw, form)
 }
 
 // Indices returns the FULL ordered index list of tabId's current view (every
@@ -78,7 +79,7 @@ func (c *ConfigService) RawsFor(tabId string, idxs []int) []string {
 }
 
 // DeleteFailed removes every config in tabId whose ping OR speed test failed
-// (whole tab, server-side). Returns the number of remaining configs.
+// (whole tab, server-side). Returns how many were removed.
 func (c *ConfigService) DeleteFailed(tabId string) int {
 	return core.DeleteFailed(tabId)
 }
@@ -94,16 +95,40 @@ func (c *ConfigService) ToggleFavorite(idx int) bool {
 func (c *ConfigService) Favorites() []core.FavoriteDTO { return core.Favorites() }
 
 // RemoveFavorites unstars the given node bodies; returns how many went.
+func (c *ConfigService) RestoreFavorites(bodies []string) int { return core.RestoreFavorites(bodies) }
+
 func (c *ConfigService) RemoveFavorites(bodies []string) int { return core.RemoveFavorites(bodies) }
 
 // RenameEntry renames config idx in the active tab; returns false if not allowed.
-func (c *ConfigService) RenameEntry(idx int, name string) bool {
-	return core.RenameEntry(idx, name)
+// raw is the configuration the table showed at idx.
+func (c *ConfigService) RenameEntry(idx int, raw, name string) bool {
+	return core.RenameEntry(idx, raw, name)
 }
 
-// DeleteEntries removes the given config indices from the active tab.
-func (c *ConfigService) DeleteEntries(indices []int) {
-	core.DeleteEntries(indices)
+// MoveEntries moves configs of a tab to just before the config at target (or
+// after it, with after set) — target -1 is the end, -2 the start — and returns
+// their new indices (nil when nothing moved). The table's drag-and-drop.
+func (c *ConfigService) MoveEntries(tabId string, indices []int, target int, after bool) []int {
+	return core.MoveEntries(tabId, indices, target, after)
+}
+
+// DeleteEntries removes the given config indices from the active tab; raws are
+// the configurations the table showed at them. Returns how many were removed.
+func (c *ConfigService) DeleteEntries(indices []int, raws []string) int {
+	return core.DeleteEntries(indices, raws)
+}
+
+// UndoDelete puts the last delete back; returns how many came back, or why
+// none did.
+func (c *ConfigService) UndoDelete() core.UndoResult {
+	n, why := core.UndoDelete()
+	return core.UndoResult{Restored: n, Reason: why}
+}
+
+// IndicesOf is where each configuration sits in the tab now (-1 when gone):
+// the table's selection follows its rows through a refresh.
+func (c *ConfigService) IndicesOf(tabId string, raws []string) []int {
+	return core.IndicesOf(tabId, raws)
 }
 
 // BeginPaste resolves the paste target ONCE (configs can't go into the main
@@ -125,25 +150,11 @@ func (c *ConfigService) BeginPaste() string {
 func (c *ConfigService) PasteChunk(tabId, raw string) int { return core.PasteChunk(tabId, raw) }
 func (c *ConfigService) EndPaste(tabId string)            { core.EndPaste(tabId) }
 
-// AddWARP enrols a free Cloudflare WARP account and adds it to the tab as a
-// WireGuard configuration. Slow (a network round trip), so the frontend shows
-// it working; returns the error text for the toast rather than swallowing it.
-func (c *ConfigService) AddWARP(tabId string) string {
-	// Same target rule as a paste: a config cannot live in the main "Sources"
-	// tab, so an empty or main target becomes a user tab.
-	if tabId == "" || tabId == "main" {
-		tabId = core.EnsureUserTab()
-		core.SwitchTab(tabId)
-	}
-	if _, err := core.AddWARPConfig(tabId); err != nil {
-		return err.Error()
-	}
-	return ""
-}
-
 // DeleteDuplicatesOf removes the other copies of one configuration, keeping it.
 // Returns how many were removed.
-func (c *ConfigService) DeleteDuplicatesOf(idx int) int { return core.DeleteDuplicatesOf(idx) }
+func (c *ConfigService) DeleteDuplicatesOf(idx int, raw string) int {
+	return core.DeleteDuplicatesOf(idx, raw)
+}
 
 // History is everything measured about config idx of the displayed tab — the
 // record behind the Stability column. Nil when the row is gone.

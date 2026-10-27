@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -210,16 +212,23 @@ func UnlockServices() []UnlockService {
 	return out
 }
 
-// SetUnlockServices saves the edited list. An entry with no id or no URL is
-// dropped; an empty list means "back to what shipped".
+// SetUnlockServices saves the edited list. An entry with no id or an address
+// that is not a web address is dropped; an empty list means "back to what
+// shipped". Ids are made unique: two services sharing one overwrote each
+// other's answers and were picked together.
 func SetUnlockServices(list []UnlockService) {
 	defs := make([]UnlockServiceDef, 0, len(list))
+	seen := map[string]bool{}
 	for _, s := range list {
 		id := strings.TrimSpace(s.ID)
 		url := strings.TrimSpace(s.URL)
-		if id == "" || url == "" {
+		if id == "" || !isWebAddress(url) {
 			continue
 		}
+		for base, n := id, 2; seen[id]; n++ {
+			id = base + "-" + strconv.Itoa(n)
+		}
+		seen[id] = true
 		name := strings.TrimSpace(s.Name)
 		if name == "" {
 			name = id
@@ -233,6 +242,12 @@ func SetUnlockServices(list []UnlockService) {
 	appSettings.UnlockServices = defs
 	settingsMu.Unlock()
 	saveSettings()
+}
+
+// isWebAddress is an http(s) address with a host in it.
+func isWebAddress(s string) bool {
+	u, err := neturl.Parse(s)
+	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && strings.Contains(u.Host, ".")
 }
 
 // UnlockResult is one config's answers.
@@ -420,13 +435,7 @@ func checkOneConfig(entry *ConfigEntry, services []unlockService, cancel chan st
 	}
 	ttl := startupTimeout + time.Duration(len(services)+1)*8*time.Second
 	_ = withEngine(n, ttl, func(_ int, tr *http.Transport) error {
-		client := &http.Client{
-			Transport: tr,
-			Timeout:   8 * time.Second,
-			// A redirect to a "not available" page is an answer; following it
-			// would turn it into a 200 for the wrong page.
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+		client := unlockClient(tr)
 		for _, s := range services {
 			select {
 			case <-cancel:
@@ -437,6 +446,23 @@ func checkOneConfig(entry *ConfigEntry, services []unlockService, cancel chan st
 		}
 		return nil
 	})
+}
+
+// unlockClient asks through one engine. Redirects are followed, and the page
+// they end on is what is judged — its status, its body and its address
+// (probeService). Stopping at the first redirect read every 3xx as "opens",
+// including the one that leads to a "not available in your country" page.
+func unlockClient(tr *http.Transport) *http.Client {
+	return &http.Client{
+		Transport: tr,
+		Timeout:   8 * time.Second,
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}
 }
 
 // probeService asks one service and reads enough of the answer to judge it.
@@ -456,7 +482,14 @@ func probeService(client *http.Client, s unlockService) unlockState {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, unlockBodyLimit))
-	return s.verdict(resp.StatusCode, string(body))
+	// The address the redirects ended on is part of the answer: a refusal is
+	// often a page whose path says so (/unavailable, /blocked, ?country=…), and
+	// a marker can name it.
+	where := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		where = resp.Request.URL.String() + "\n"
+	}
+	return s.verdict(resp.StatusCode, where+string(body))
 }
 
 // unlockSummary is used by the log line at the end of a run.

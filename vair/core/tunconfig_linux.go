@@ -1,13 +1,5 @@
 package core
 
-import (
-	"os"
-	"path/filepath"
-	"strings"
-
-	"vair/helper/api"
-)
-
 // Adapting a TUN configuration for the privileged helper.
 //
 // The rest of the engine code builds a configuration shaped by what Windows
@@ -47,10 +39,12 @@ func adaptTUNConfig(cfg map[string]interface{}) {
 		}
 		in["interface_name"] = tunIfaceName()
 
-		// gvisor is a userspace network stack: portable, and slower. On Linux
-		// "mixed" uses the kernel for TCP and gvisor for UDP, which is what
-		// sing-box recommends here.
-		in["stack"] = "mixed"
+		// The stack stays the one the user chose (TUN TCP/IP stack), as on
+		// Windows. It was forced to "mixed" here, so on Linux the setting did
+		// nothing while the Session panel reported it as the one in use. The
+		// choice also matters less here than there: with auto_redirect, TCP is
+		// redirected to the engine by nftables and never reaches the stack,
+		// which is left with UDP.
 
 		// strict_route is a Windows WFP filter. On Linux the same field means
 		// something different, and sing-box's own documentation warns against
@@ -67,56 +61,12 @@ func adaptTUNConfig(cfg map[string]interface{}) {
 	// connection and this function has none.
 }
 
-// resolveRuleSets rewrites every rule_set path to one the helper will accept.
-//
-// For each set, in order of preference: hand the app's own (refreshed) file to
-// the helper via stage and point at where the helper put it; fall back to the
-// packaged copy; drop the set. Dropping matters — sing-box treats a rule_set
-// path that does not resolve as FATAL, so a missing file would turn a stale
-// country list into a tunnel that refuses to start. A dropped country simply
-// takes the default route, which is what already happens when a refresh fails.
-func resolveRuleSets(cfg map[string]interface{}, stage func(name string, data []byte) error) {
-	route, _ := cfg["route"].(map[string]interface{})
-	if route == nil {
-		return
+// packagedRuleSet is the copy of a set that shipped with the package, in a
+// directory the helper trusts, or "" when there is none.
+func packagedRuleSet(name string) string {
+	p := tunHelperRuleSetDir + "/" + name
+	if !fileExists(p) {
+		return ""
 	}
-	sets, _ := route["rule_set"].([]interface{})
-	kept := make([]interface{}, 0, len(sets))
-	for _, raw := range sets {
-		set, ok := raw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		p, _ := set["path"].(string)
-		if p == "" {
-			kept = append(kept, set) // a remote set: no file of ours involved
-			continue
-		}
-		name := filepath.Base(strings.ReplaceAll(p, "\\", "/"))
-
-		if data, err := os.ReadFile(p); err == nil && len(data) > 0 && len(data) <= api.MaxRuleSetBytes {
-			if err := stage(name, data); err == nil {
-				set["path"] = api.RuleSetPath(name)
-				kept = append(kept, set)
-				continue
-			} else {
-				// Worth a line: the tunnel will still come up on the packaged
-				// rules, so this would otherwise be a silent downgrade to
-				// whatever shipped with the release.
-				vlog("warn", "rule-set %s could not be staged (%v) — using the packaged copy", name, err)
-			}
-		}
-
-		packaged := tunHelperRuleSetDir + "/" + name
-		if !fileExists(packaged) {
-			continue
-		}
-		set["path"] = packaged
-		kept = append(kept, set)
-	}
-	if len(kept) == 0 {
-		delete(route, "rule_set")
-	} else {
-		route["rule_set"] = kept
-	}
+	return p
 }

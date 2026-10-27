@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -55,6 +57,7 @@ type Node struct {
 	TUIC      *TuicParams
 	WireGuard *WireGuardParams
 	Proxy     *ProxyParams
+	JSON      *JSONParams // a raw outbound — see jsonconfig.go
 }
 
 // nodeSchemes lists the URL schemes Vair recognises as proxy node URLs. The
@@ -63,6 +66,7 @@ type Node struct {
 // "earliest match in a line" scan it doesn't either — we pick whichever
 // scheme appears earliest.
 var nodeSchemes = []string{
+	jsonScheme,
 	"vless://",
 	"vmess://",
 	"trojan://",
@@ -277,6 +281,8 @@ func schemeProtocol(raw string) string {
 		return string(KindTUIC)
 	case strings.HasPrefix(raw, "wireguard://"), strings.HasPrefix(raw, "wg://"):
 		return string(KindWireGuard)
+	case strings.HasPrefix(raw, jsonScheme):
+		return string(KindJSON)
 	}
 	return ""
 }
@@ -288,6 +294,8 @@ func schemeProtocol(raw string) string {
 func parseNode(raw string) (*Node, error) {
 	raw = strings.TrimSpace(raw)
 	switch {
+	case strings.HasPrefix(raw, jsonScheme):
+		return parseJSONNode(raw)
 	case strings.HasPrefix(raw, "wireguard://"), strings.HasPrefix(raw, "wg://"):
 		p, err := parseWireGuard(raw)
 		if err != nil {
@@ -438,10 +446,17 @@ type VlessParams struct {
 	ALPN          string
 	Fingerprint   string
 	AllowInsecure bool
-	Flow          string
-	PublicKey     string
-	ShortID       string
-	SpiderX       string
+	// PinnedCertSHA256 (pcs=) is the SHA-256 of the server's certificate: the
+	// connection is accepted from a server with exactly that certificate,
+	// signed by anyone or by nobody. The replacement xray offers for
+	// allowInsecure. VerifyCertName (vcn=) is the name the certificate is
+	// checked against when it is not the SNI.
+	PinnedCertSHA256 string
+	VerifyCertName   string
+	Flow             string
+	PublicKey        string
+	ShortID          string
+	SpiderX          string
 	// Per-transport settings: gRPC/xhttp mode, and mKCP's disguise and seed.
 	Mode       string
 	HeaderType string
@@ -486,6 +501,7 @@ func parseVless(raw string) (*VlessParams, error) {
 	p.Path, p.Host2, p.ServiceName = get("path"), get("host"), get("serviceName")
 	p.SNI, p.ALPN, p.Fingerprint = get("sni"), get("alpn"), get("fp")
 	p.AllowInsecure = get("allowInsecure") == "1"
+	p.PinnedCertSHA256, p.VerifyCertName = strings.TrimSpace(get("pcs")), strings.TrimSpace(get("vcn"))
 	p.Flow = get("flow")
 	p.PublicKey, p.ShortID, p.SpiderX = get("pbk"), get("sid"), get("spx")
 	p.Mode, p.HeaderType, p.Seed = get("mode"), get("headerType"), get("seed")
@@ -519,9 +535,12 @@ type TrojanParams struct {
 	ALPN          string
 	Fingerprint   string
 	AllowInsecure bool
-	PublicKey     string
-	ShortID       string
-	SpiderX       string
+	// The certificate pin and the name to check, as on VlessParams.
+	PinnedCertSHA256 string
+	VerifyCertName   string
+	PublicKey        string
+	ShortID          string
+	SpiderX          string
 	// Per-transport settings, as on VlessParams.
 	Mode       string
 	HeaderType string
@@ -640,6 +659,7 @@ func parseTrojan(raw string) (*TrojanParams, error) {
 	p.Path, p.Host2, p.ServiceName = get("path"), get("host"), get("serviceName")
 	p.SNI, p.ALPN, p.Fingerprint = get("sni"), get("alpn"), get("fp")
 	p.AllowInsecure = get("allowInsecure") == "1"
+	p.PinnedCertSHA256, p.VerifyCertName = strings.TrimSpace(get("pcs")), strings.TrimSpace(get("vcn"))
 	p.PublicKey, p.ShortID, p.SpiderX = get("pbk"), get("sid"), get("spx")
 	p.Mode, p.HeaderType, p.Seed = get("mode"), get("headerType"), get("seed")
 	return p, nil
@@ -1387,6 +1407,14 @@ func preResolveHost(n *Node) error {
 			return err
 		}
 		n.Host = n.TUIC.Host
+	case KindJSON:
+		if n.JSON == nil {
+			return nil
+		}
+		if err := preResolveJSON(n.JSON); err != nil {
+			return err
+		}
+		n.Host = n.JSON.Host
 	}
 	return nil
 }
@@ -1395,6 +1423,109 @@ func preResolveHost(n *Node) error {
 // pointers to a host and an SNI field, replaces the host in-place with an
 // IPv4 literal, and preserves the original hostname in SNI (only if SNI was
 // previously empty) so TLS still validates against the right cert.
+// serverResolver is the pure-Go resolver: see resolveHostIntoSNI.
+var serverResolver = &net.Resolver{PreferGo: true}
+
+// lookupServerIP resolves a VPN server's name, the one lookup that has to
+// happen before there is a tunnel.
+//
+// With DNS leak protection on, through the resolver the Bootstrap DNS setting
+// names (Quad9 unless changed) — which is what that setting says it is for.
+// This lookup used to go to the system's resolvers, the provider's as a rule,
+// whatever the setting said. If that resolver does not answer, the system's
+// are asked, the log says so, and for a minute the next connection goes
+// straight to them rather than waiting on it again — an AUTO sweep would
+// otherwise pay the timeout at every candidate.
+func lookupServerIP(ctx context.Context, host string) ([]net.IP, error) {
+	key := strings.ToLower(host)
+	serverIPCache.Lock()
+	c, ok := serverIPCache.m[key]
+	serverIPCache.Unlock()
+	if ok && time.Now().Before(c.until) {
+		return c.ips, nil
+	}
+	ips, err := lookupServerIPUncached(ctx, host)
+	if err == nil && len(ips) > 0 {
+		serverIPCache.Lock()
+		if len(serverIPCache.m) >= serverIPCacheMax {
+			serverIPCache.m = map[string]serverIPs{}
+		}
+		serverIPCache.m[key] = serverIPs{ips: ips, until: time.Now().Add(serverIPCacheTTL)}
+		serverIPCache.Unlock()
+	}
+	return ips, err
+}
+
+// serverIPCache keeps a server's addresses for a minute. Tests resolve the
+// name the way a connection does, so a PING ALL of a subscription asks for
+// every server in it and AUTO asks again at each sweep — the same names, over
+// and over, each a DNS-over-HTTPS exchange of its own.
+var serverIPCache = struct {
+	sync.Mutex
+	m map[string]serverIPs
+}{m: map[string]serverIPs{}}
+
+type serverIPs struct {
+	ips   []net.IP
+	until time.Time
+}
+
+const (
+	serverIPCacheTTL = time.Minute
+	serverIPCacheMax = 4096
+)
+
+func lookupServerIPUncached(ctx context.Context, host string) ([]net.IP, error) {
+	// With or without leak protection. It was only with, so turning protection
+	// off also sent the VPN server's own name to the provider's resolver,
+	// which is not what the switch is about: it decides how the names of the
+	// sites behind the tunnel are resolved, not this one.
+	settingsMu.RLock()
+	strict := appSettings.BootstrapStrict
+	settingsMu.RUnlock()
+	if !strict && !time.Now().After(bootstrapUnreachableUntil.Load().(time.Time)) {
+		return serverResolver.LookupIP(ctx, "ip4", host)
+	}
+	server := bootstrapDNSIP()
+	bctx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	ips, err := lookupBootstrap(bctx, server, host)
+	cancel()
+	if err == nil && len(ips) > 0 {
+		return ips, nil
+	}
+	if dnsNotFound(err) {
+		// The bootstrap server answered: there is no such name. Not a reason
+		// to ask the system's resolver — the provider's — the same question.
+		return nil, err
+	}
+	if strict {
+		// "Bootstrap DNS only": the name is not handed to the system's
+		// resolvers, and the connection says why it did not come up.
+		return nil, fmt.Errorf("the bootstrap DNS %s did not answer (%v) and the fallback to the system resolver is turned off", server, err)
+	}
+	bootstrapUnreachableUntil.Store(time.Now().Add(time.Minute))
+	vlog("warning", "resolve %s: the bootstrap DNS %s did not answer (%v) — asking the system resolver", host, server, err)
+	return serverResolver.LookupIP(ctx, "ip4", host)
+}
+
+var bootstrapUnreachableUntil atomic.Value // time.Time
+
+// bootstrapDNSPort is 53; a variable only so a test can stand in a server.
+var bootstrapDNSPort = "53"
+
+func init() { bootstrapUnreachableUntil.Store(time.Time{}) }
+
+// bootstrapResolver asks one DNS server, over plain DNS on port 53, from this
+// process — the one the kill-switch lets through. Only for a server that does
+// not answer DNS over HTTPS (see lookupBootstrap).
+func bootstrapResolver(server string) *net.Resolver {
+	addr := net.JoinHostPort(server, bootstrapDNSPort)
+	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}}
+}
+
 func resolveHostIntoSNI(host, sni *string) error {
 	if host == nil || *host == "" {
 		return nil
@@ -1417,12 +1548,17 @@ func resolveHostIntoSNI(host, sni *string) error {
 		}
 	}
 
-	// DNS resolve via Go's default resolver. This uses the OS resolver
-	// (and thus the OS DNS settings) and runs before sing-box brings
-	// up TUN, so it's always reachable.
+	// Looked up by this program itself, not handed to the system's DNS
+	// client. Same servers — the Go resolver reads the ones the system is
+	// configured with — but the query leaves from Vair's own process, and that
+	// is what the kill-switch lets through. The system's DNS client is a
+	// service of its own, and while the block stands and no tunnel is up it is
+	// refused, on purpose: every name it looked up used to leave the machine
+	// in the clear. A reconnect under a standing block depends on this lookup
+	// getting through.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", orig)
+	ips, err := lookupServerIP(ctx, orig)
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", orig, err)
 	}
@@ -1562,6 +1698,10 @@ type transportOpts struct {
 	XHTTPMode  string // auto | packet-up | stream-up | stream-one
 	HeaderType string // mKCP disguise: none | srtp | utp | wechat-video | dtls | wireguard
 	Seed       string // mKCP shared secret
+	// How the server's certificate is checked besides the usual chain: a
+	// pinned SHA-256 (pcs=) and the name to check it against (vcn=).
+	PinnedCertSHA256 string
+	VerifyCertName   string
 }
 
 // xray TCP-family outbound. All transport-level (network, ws path, grpc
@@ -1569,7 +1709,7 @@ type transportOpts struct {
 // pbk/sid/spx) knobs go here. Parameters are explicit rather than a single
 // params-struct so this remains scheme-agnostic — Trojan and VMess will
 // pass values from their own param structs.
-func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, fingerprint string, allowInsecure bool, publicKey, shortID, spiderX string, opts transportOpts) map[string]interface{} {
+func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, fingerprint string, publicKey, shortID, spiderX string, opts transportOpts) map[string]interface{} {
 	if network == "" {
 		network = "tcp"
 	}
@@ -1640,9 +1780,18 @@ func xrayStreamSettings(network, security, path, host2, serviceName, sni, alpn, 
 	}
 	switch security {
 	case "tls":
-		tls := map[string]interface{}{"serverName": sni, "allowInsecure": allowInsecure, "fingerprint": fingerprint}
+		// No "allowInsecure": xray 26 refuses to start with it set, and a
+		// configuration that asks for it runs on sing-box instead (see
+		// skipsCertCheck). What xray offers in its place is the pin.
+		tls := map[string]interface{}{"serverName": sni, "fingerprint": fingerprint}
 		if alpn != "" {
 			tls["alpn"] = strings.Split(alpn, ",")
+		}
+		if opts.PinnedCertSHA256 != "" {
+			tls["pinnedPeerCertSha256"] = opts.PinnedCertSHA256
+		}
+		if opts.VerifyCertName != "" {
+			tls["verifyPeerCertByName"] = opts.VerifyCertName
 		}
 		stream["tlsSettings"] = tls
 	case "reality":
@@ -1668,18 +1817,22 @@ var countryGeositeXray = map[string]string{
 func xrayRoutingForProxy() map[string]interface{} {
 	mode := routingMode()
 
-	rules := []interface{}{
-		map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
-	}
 	// User rules first, at a fixed priority: block → direct → proxy. Applied in
 	// EVERY mode (a proxy rule forces a site through the VPN even in a bypass
 	// mode; a direct rule keeps one out even in proxy_all). Entries may be
 	// domains, IP/CIDR or geosite:/geoip:/full:/regexp: (see classifyRules).
+	//
+	// Block goes ahead of everything, the local network included: the setting
+	// says it wins over every other rule, and an address on the LAN that the
+	// user listed there is one they meant to block.
 	blockRules, directRules, proxyRules := effectiveBlockRules(), effectiveDirectDomains(), effectiveProxyDomains()
 	// nil apps: xray has no process matching, so an app rule is not in effect
 	// here even when the list is full.
-	armRuleStats(blockRules, directRules, proxyRules, nil)
-	rules = append(rules, xrayRules(classifyRules(blockRules), "block")...)
+	armRuleStatsProxy(blockRules, directRules, proxyRules)
+	rules := xrayRules(classifyRules(blockRules), "block")
+	rules = append(rules,
+		map[string]interface{}{"type": "field", "ip": []string{"geoip:private"}, "outboundTag": "direct"},
+	)
 	rules = append(rules, xrayRules(classifyRules(directRules), "direct")...)
 	rules = append(rules, xrayRules(classifyRules(proxyRules), "proxy")...)
 
@@ -1718,6 +1871,11 @@ func xrayRoutingForProxy() map[string]interface{} {
 			map[string]interface{}{"type": "field", "network": "tcp,udp", "outboundTag": "direct"},
 		)
 	case "bypass_countries":
+		// The "through VPN (URL)" lists first, like the typed through-VPN list
+		// above them: a site on one stays in the tunnel even in a bypassed
+		// country's zone. They used to be shown in this mode and not applied.
+		refreshCustomBlocklists(blocklistURLs())
+		rules = append(rules, xrayRules(classifyRules(customBlocklistDomains()), "proxy")...)
 		// Everything through the VPN except the selected countries' sites. Three
 		// matchers per country: its TLD zone (domain:<cc> — the same trick
 		// category-ru itself uses via tld-ru; for KZ, which has no geosite
@@ -1779,9 +1937,10 @@ func xrayOutboundVless(p *VlessParams) map[string]interface{} {
 	stream := xrayStreamSettings(
 		p.Network, p.Security,
 		p.Path, p.Host2, p.ServiceName,
-		p.SNI, p.ALPN, p.Fingerprint, p.AllowInsecure,
+		p.SNI, p.ALPN, p.Fingerprint,
 		p.PublicKey, p.ShortID, p.SpiderX,
-		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed},
+		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed,
+			PinnedCertSHA256: p.PinnedCertSHA256, VerifyCertName: p.VerifyCertName},
 	)
 	return map[string]interface{}{
 		"tag":            "proxy",
@@ -1807,9 +1966,10 @@ func xrayOutboundTrojan(p *TrojanParams) map[string]interface{} {
 	stream := xrayStreamSettings(
 		p.Network, p.Security,
 		p.Path, p.Host2, p.ServiceName,
-		p.SNI, p.ALPN, p.Fingerprint, p.AllowInsecure,
+		p.SNI, p.ALPN, p.Fingerprint,
 		p.PublicKey, p.ShortID, p.SpiderX,
-		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed},
+		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed,
+			PinnedCertSHA256: p.PinnedCertSHA256, VerifyCertName: p.VerifyCertName},
 	)
 	return map[string]interface{}{
 		"tag":            "proxy",
@@ -1842,7 +2002,7 @@ func xrayOutboundVmess(p *VmessParams) map[string]interface{} {
 	stream := xrayStreamSettings(
 		p.Network, p.Security,
 		p.Path, p.Host2, p.ServiceName,
-		p.SNI, p.ALPN, p.Fingerprint, false,
+		p.SNI, p.ALPN, p.Fingerprint,
 		"", "", "",
 		transportOpts{GRPCMode: p.Mode, XHTTPMode: p.Mode, HeaderType: p.HeaderType, Seed: p.Seed},
 	)
@@ -2023,6 +2183,8 @@ func xrayOutboundForNode(n *Node) map[string]interface{} {
 		return xrayOutboundShadowsocks(n.SS)
 	case KindSOCKS, KindHTTP:
 		return xrayOutboundProxy(n.Proxy)
+	case KindJSON:
+		return jsonOutboundFor(n.JSON, "xray")
 	}
 	return nil
 }
@@ -2141,6 +2303,8 @@ func singboxChainEgress(nodes []*Node) ([]interface{}, []interface{}) {
 		egress["tag"] = tagFor(i)
 		if i > 0 {
 			egress["detour"] = tagFor(i - 1)
+		} else {
+			applySingboxFragment(egress) // only the entry is seen by the network
 		}
 		if out != nil {
 			outs = append(outs, out)
@@ -2214,7 +2378,10 @@ func chainEngine(nodes []*Node) (string, string) {
 		if n == nil {
 			return "", "unparseable config in selection"
 		}
-		if engineFor(n.Kind) != "xray" {
+		// The node's own engine, not its kind's: a JSON outbound written for
+		// sing-box, or a shadowsocks node with a plugin only sing-box runs,
+		// is of a kind xray owns and cannot be dialled by an xray chain.
+		if engineForNode(n) != "xray" || xrayOutboundForNode(n) == nil {
 			allXray = false
 		}
 		if singboxOutboundForNode(n) == nil && singboxEndpointForNode(n) == nil {
@@ -2255,6 +2422,11 @@ func nodeUnsupportedReason(n *Node) string {
 			return "ss plugin not supported: " + n.SS.PluginName
 		}
 		return "ss plugin not supported"
+	}
+	// A pin xray cannot read stops xray with a line about its own config
+	// parser. Said here instead, in the words of the link.
+	if pin := certPinOf(n); pin != "" && !validCertPins(pin) {
+		return "pcs= is not a certificate's SHA-256: expected 64 hexadecimal characters"
 	}
 	return ""
 }
@@ -2461,6 +2633,15 @@ func singboxRoutingRules(tun bool) []interface{} {
 	// (that is the routing loop) and not a test's (that is a measurement of the
 	// tunnel rather than of the server it is testing).
 	rules = append(rules, engineCarveOut())
+	// The block list goes ahead of every other user choice — the local network
+	// and the apps without VPN included. It used to come after them, so a
+	// program on the apps list reached a blocked site anyway, while the setting
+	// said block wins over everything.
+	blockRules, directRules, proxyRules := effectiveBlockRules(), effectiveDirectDomains(), effectiveProxyDomains()
+	// Remember what went in, so "never matched" can be told apart from "edited
+	// since this connection started, not loaded yet".
+	armRuleStats(blockRules, directRules, proxyRules, directApps)
+	rules = append(rules, singboxRules(classifyRules(blockRules), "", true)...)
 	// LAN handling: when allowed (default), private IPs bypass the tunnel so
 	// printers / NAS / router admin pages still work. With kill-switch +
 	// BlockLAN, even those go through proxy — usually breaks them, but it's
@@ -2499,14 +2680,10 @@ func singboxRoutingRules(tun bool) []interface{} {
 			rules = append(rules, map[string]interface{}{"domain_suffix": suffixes, "outbound": outbound})
 		}
 	}
-	// User rules first, at a fixed priority: block → direct → proxy. Applied in
-	// every mode; entries may be domains, IP/CIDR or full:/regexp:/domain:
-	// prefixes (geosite:/geoip: categories are xray-only and skipped here).
-	blockRules, directRules, proxyRules := effectiveBlockRules(), effectiveDirectDomains(), effectiveProxyDomains()
-	// Remember what went in, so "never matched" can be told apart from "edited
-	// since this connection started, not loaded yet".
-	armRuleStats(blockRules, directRules, proxyRules, directApps)
-	rules = append(rules, singboxRules(classifyRules(blockRules), "", true)...)
+	// The rest of the user rules, at a fixed priority after block: direct →
+	// proxy. Applied in every mode; entries may be domains, IP/CIDR or
+	// full:/regexp:/domain: prefixes (geosite:/geoip: categories are xray-only
+	// and skipped here).
 	rules = append(rules, singboxRules(classifyRules(directRules), "direct", false)...)
 	rules = append(rules, singboxRules(classifyRules(proxyRules), "proxy", false)...)
 
@@ -2516,7 +2693,8 @@ func singboxRoutingRules(tun bool) []interface{} {
 		// already emitted above), then blocked-in-RU sets → proxy. Everything else
 		// falls through to route.final = "direct" (set by applySingboxRouteMode).
 		// checkIPHost() forces "check IP" through the tunnel exit.
-		addSuffix(append(customBlocklistDomains(), checkIPHost()), "proxy")
+		rules = append(rules, singboxRules(classifyRules(customBlocklistDomains()), "proxy", false)...)
+		addSuffix([]string{checkIPHost()}, "proxy")
 		// One rule per set that is actually attached — see singboxBlockedRuleSet.
 		for _, tag := range []string{"geosite-ru-blocked", "geoip-ru-blocked"} {
 			if fileExists(ruRuleSetLocalPath(tag + ".srs")) {
@@ -2528,15 +2706,19 @@ func singboxRoutingRules(tun bool) []interface{} {
 		// come from the plain-text list — no rule-sets.
 		refreshCnBlockedList()
 		refreshCustomBlocklists(blocklistURLs())
-		extra := append(gfwDomains(), customBlocklistDomains()...)
-		extra = append(extra, checkIPHost())
-		addSuffix(extra, "proxy")
+		rules = append(rules, singboxRules(classifyRules(customBlocklistDomains()), "proxy", false)...)
+		addSuffix(append(gfwDomains(), checkIPHost()), "proxy")
 	case "only_selected":
 		// Whitelist mode: only the user's own lists → proxy (already emitted
 		// above); everything else falls through to route.final = "direct".
 		refreshCustomBlocklists(blocklistURLs())
-		addSuffix(append(customBlocklistDomains(), checkIPHost()), "proxy")
+		rules = append(rules, singboxRules(classifyRules(customBlocklistDomains()), "proxy", false)...)
+		addSuffix([]string{checkIPHost()}, "proxy")
 	case "bypass_countries":
+		// The "through VPN (URL)" lists first, as in xray: a site on one stays
+		// in the tunnel even in a bypassed country's zone.
+		refreshCustomBlocklists(blocklistURLs())
+		rules = append(rules, singboxRules(classifyRules(customBlocklistDomains()), "proxy", false)...)
 		// Each selected country's TLD zone goes direct (the same trick
 		// category-ru uses via tld-ru; for KZ, which has no geosite set, this IS
 		// the domain-level coverage)…
@@ -2886,6 +3068,10 @@ func singboxTLS(security, sni, host, alpn, fingerprint, publicKey, shortID strin
 	}
 	// A fingerprint means uTLS: the ClientHello is shaped like a browser's. That
 	// is the whole point of these configurations, so it is not optional here.
+	// Without an fp= of its own, the one in Settings — as on xray.
+	if fingerprint == "" {
+		fingerprint = currentTLSFingerprint()
+	}
 	if fingerprint != "" {
 		tls["utls"] = map[string]interface{}{"enabled": true, "fingerprint": fingerprint}
 	}
@@ -3056,6 +3242,8 @@ func singboxOutboundForNode(n *Node) map[string]interface{} {
 		return singboxOutboundVmess(n.Vmess)
 	case KindSOCKS, KindHTTP:
 		return singboxOutboundProxy(n.Proxy, "proxy")
+	case KindJSON:
+		return jsonOutboundFor(n.JSON, "singbox")
 	}
 	return nil
 }
@@ -3068,9 +3256,19 @@ func engineForNode(n *Node) string {
 	if n == nil {
 		return "xray"
 	}
+	// A configuration that turns the certificate check off runs on sing-box,
+	// which still allows it: xray 26 refuses to start with allowInsecure, so on
+	// xray it could not connect at all. When sing-box cannot carry it (an
+	// xray-only transport), it stays on xray with the certificate checked.
+	if skipsCertCheck(n) && singboxOutboundForNode(n) != nil {
+		return "singbox"
+	}
 	if n.Kind == KindSS && n.SS != nil && n.SS.PluginName != "" &&
 		ssPluginSupportedBySingbox(n.SS.PluginName) {
 		return "singbox"
+	}
+	if n.Kind == KindJSON && n.JSON != nil {
+		return n.JSON.Engine // the engine the outbound was written for
 	}
 	return engineFor(n.Kind)
 }
@@ -3112,6 +3310,7 @@ func buildSingboxTestConfig(n *Node, httpPort int) map[string]interface{} {
 	if out == nil && ep == nil {
 		return nil
 	}
+	applySingboxFragment(out)
 	return map[string]interface{}{
 		"log": map[string]interface{}{"level": singboxLogLevel(), "timestamp": true},
 		"inbounds": []interface{}{
@@ -3159,6 +3358,7 @@ func buildSingboxProxyConfig(n *Node, httpPort, socksPort int) map[string]interf
 	if out == nil && ep == nil {
 		return nil
 	}
+	applySingboxFragment(out)
 
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
@@ -3203,6 +3403,7 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 	if out == nil && ep == nil {
 		return nil
 	}
+	applySingboxFragment(out)
 	leakProtect := dnsLeakProtectionEnabled()
 	useFakeIP := fakeIPEnabled()
 
@@ -3217,13 +3418,15 @@ func buildSingboxTUNConfig(n *Node, ifaceName string) map[string]interface{} {
 		"address":        tunAddrs,
 		"mtu":            currentMTU(),
 		"auto_route":     true,
-		"strict_route":   killSwitchEnabled(), // kill-switch = fail-closed (see buildHybridTUNConfig)
+		"strict_route":   leakProtect, // leak protection's DNS filter (see buildHybridTUNConfig)
 		"stack":          tunStack(),
 	}
 
+	// See buildHybridTUNConfig: what the engine dials itself is resolved by
+	// Direct DNS.
 	defaultResolver := "dns-local"
 	if leakProtect {
-		defaultResolver = "dns-bootstrap"
+		defaultResolver = "dns-direct"
 	}
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,

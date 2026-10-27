@@ -48,8 +48,10 @@ func displayProtocol(kind, security string) string {
 // shouldSkip reports whether a config row should be hidden because it
 // matches any of the per-tab exclude rules. Each rule is "column:value"
 // (or bare "value" for legacy name-only rules — see parseExcludeRule).
-// A row is skipped if ANY rule's value is a (case-insensitive) substring
-// of the corresponding column's value on the row.
+// A row is skipped if ANY rule matches, case-insensitively: Name and Host by a
+// part of the text, Type, Transport and Security by the whole value. Those three
+// are short codes that contain one another — "ss" is in "vless" and "vmess",
+// "http" in "httpupgrade" — and hiding Shadowsocks hid VLESS and VMess with it.
 //
 // The `kind` parameter is the backend protocol id ("vless", "ss", …); the
 // type-column match uses displayProtocol so a "ss2022" filter actually
@@ -61,7 +63,7 @@ func shouldSkip(name, kind, host, network, security string, rules []string) bool
 	lowName := strings.ToLower(name)
 	lowType := strings.ToLower(displayProtocol(kind, security))
 	lowHost := strings.ToLower(host)
-	lowNet := strings.ToLower(network)
+	lowNet := shownNetwork(network)
 	lowSec := strings.ToLower(security)
 	for _, r := range rules {
 		col, val := parseExcludeRule(r)
@@ -69,21 +71,27 @@ func shouldSkip(name, kind, host, network, security string, rules []string) bool
 		if val == "" {
 			continue
 		}
-		var hay string
 		switch col {
 		case "type":
-			hay = lowType
-		case "host":
-			hay = lowHost
+			if lowType == val {
+				return true
+			}
 		case "transport":
-			hay = lowNet
+			if lowNet == val {
+				return true
+			}
 		case "security":
-			hay = lowSec
+			if lowSec == val {
+				return true
+			}
+		case "host":
+			if strings.Contains(lowHost, val) {
+				return true
+			}
 		default: // "name" + legacy
-			hay = lowName
-		}
-		if strings.Contains(hay, val) {
-			return true
+			if strings.Contains(lowName, val) {
+				return true
+			}
 		}
 	}
 	return false

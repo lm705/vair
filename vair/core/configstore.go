@@ -130,35 +130,43 @@ func openConfigStore() (*configStore, error) {
 	// 260k-row paste. Without it there's no ptr map to corrupt; freed pages are
 	// reused by later inserts instead of returned to the OS (fine for a config
 	// store — disk is cheap, and a shrink is rare). No per-write vacuum anymore.
+	//
+	// secure_delete(fast): a deleted row is overwritten where that costs no
+	// extra writes, rather than left readable in the file. The connection log is
+	// cleared with the full setting (clearSessions).
 	dsn := "file:" + filepath.ToSlash(configDBPath()) +
 		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)&_pragma=synchronous(FULL)" +
-		"&_pragma=auto_vacuum(none)"
+		"&_pragma=auto_vacuum(none)&_pragma=secure_delete(fast)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	// Crash-recovery: if the on-disk DB is corrupt ("database disk image is
 	// malformed" — e.g. the process was killed mid-write), every read fails and
-	// the app shows 0 configs forever. Detect it up front, quarantine the bad
-	// file, and start fresh so the app is usable again (SOURCES re-fetches;
-	// pasted tabs are lost but the corrupt file is kept as .corrupt-<ts> for
-	// manual recovery).
+	// the app shows 0 configs forever. Detect it up front, move the damaged file
+	// aside, read what can still be read from it, and start a new one with that
+	// (dbrecover.go). It used to be deleted, and the user's own tabs with it.
+	var salvage *dbSalvage
+	recovered := false
 	if dbLooksCorrupt(db) {
 		db.Close()
 		bad := configDBPath()
-		// A malformed image is unrecoverable (quick_check failed hard), so don't
-		// keep 185 MB corpses accumulating — drop the file and its sidecars and
-		// start clean. SOURCES re-fetches; pasted tabs are lost.
-		for _, sfx := range []string{"", "-journal", "-wal", "-shm"} {
-			os.Remove(bad + sfx)
-		}
-		// Sweep any leftover *.corrupt-* from earlier crashes too.
-		if matches, _ := filepath.Glob(bad + ".corrupt-*"); matches != nil {
-			for _, m := range matches {
-				os.Remove(m)
+		copyPath := quarantineCorruptDB(bad)
+		if copyPath != "" {
+			salvage = salvageDB(copyPath)
+		} else {
+			// It could not even be renamed: removing it is the only way left to
+			// a usable program.
+			for _, sfx := range []string{"", "-journal", "-wal", "-shm"} {
+				os.Remove(bad + sfx)
 			}
 		}
-		fmt.Fprintf(os.Stderr, "⚠ config DB was corrupt — recreated fresh (old data dropped)\n")
+		recovered = true
+		dbRecovery = &struct {
+			copy     string
+			salvaged int
+		}{copy: copyPath}
+		fmt.Fprintf(os.Stderr, "⚠ config DB was damaged — kept as %q, starting a new one\n", copyPath)
 		if db, err = sql.Open("sqlite", dsn); err != nil {
 			return nil, err
 		}
@@ -175,6 +183,11 @@ func openConfigStore() (*configStore, error) {
 	if _, err := db.Exec(configIndexes); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("indexes: %w", err)
+	}
+	if recovered {
+		dbRecovery.salvaged = restoreSalvage(db, salvage)
+	} else {
+		compactIfMostlyFree(db)
 	}
 	// No VACUUM / auto_vacuum conversion here anymore: converting auto_vacuum
 	// requires a full-file VACUUM (rewrites everything — minutes on a big DB and
@@ -425,13 +438,39 @@ func memReplace(tabID string, entries []*ConfigEntry) {
 }
 
 // dbPersist writes the tab to SQLite (the durable copy).
+//
+// A tab of the user's own configurations is written in one transaction: they
+// exist nowhere else, and the chunked write — the old rows deleted, the new
+// ones committed thirty thousand at a time — left such a tab empty or half
+// written when the program was killed in between. A tab with a source keeps
+// the chunked write; it is fetched again, and a huge list writes faster so.
 func dbPersist(tabID string, entries []*ConfigEntry) {
 	if store == nil {
 		return
 	}
-	if err := store.replaceTabConfigs(tabID, entries); err != nil {
+	write := store.replaceTabConfigs
+	if !tabHasSource(tabID) {
+		write = store.rewriteTabAtomic
+	}
+	if err := write(tabID, entries); err != nil {
 		vlog("warning", "config store replace %s: %v", tabID, err)
 	}
+}
+
+// tabHasSource says whether a tab's configurations can be loaded again from
+// somewhere: SOURCES, or a tab with links, files or a GitHub import.
+func tabHasSource(tabID string) bool {
+	if tabID == "main" {
+		return true
+	}
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, t := range state.tabs {
+		if t.ID == tabID {
+			return len(t.SourceURLs) > 0 || len(t.SourceFiles) > 0 || t.gitHubReady()
+		}
+	}
+	return false
 }
 
 // storeReplace keeps memory + disk in sync in one call (memory first).
@@ -445,6 +484,20 @@ func storeReplace(tabID string, entries []*ConfigEntry) {
 // replaceTabConfigs replaces every row of a tab with the given entries. Used by
 // the fetch paths instead of `state.tabEntries[id] = entries`.
 func (s *configStore) replaceTabConfigs(tabID string, entries []*ConfigEntry) error {
+	return s.rewriteTab(tabID, entries, false, nil)
+}
+
+// rewriteTabAtomic is replaceTabConfigs as one transaction: the old rows go
+// and the new ones arrive together or not at all. For a reorder of a tab whose
+// configurations exist nowhere else — a manual tab cannot be fetched again, so
+// a program closed between the delete and the insert must not lose it.
+func (s *configStore) rewriteTabAtomic(tabID string, entries []*ConfigEntry) error {
+	return s.rewriteTab(tabID, entries, true, nil)
+}
+
+// rewriteTab does both. progress, when given, is told how many rows are in
+// after every batch — the import's count of configurations saved.
+func (s *configStore) rewriteTab(tabID string, entries []*ConfigEntry, atomicTx bool, progress func(n int)) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	// Pin ONE connection so the temporary synchronous=OFF below applies to this
@@ -463,9 +516,12 @@ func (s *configStore) replaceTabConfigs(tabID string, entries []*ConfigEntry) er
 	// already fast for a 200k-row refresh and crash-safe.
 
 	// Delete the whole tab in one statement (index-driven, fast — the chunked
-	// subquery delete was O(n²)-ish and dominated big refreshes).
-	if _, err := conn.ExecContext(ctx, `DELETE FROM configs WHERE tab_id = ?`, tabID); err != nil {
-		return err
+	// subquery delete was O(n²)-ish and dominated big refreshes). Atomic: inside
+	// the transaction below instead.
+	if !atomicTx {
+		if _, err := conn.ExecContext(ctx, `DELETE FROM configs WHERE tab_id = ?`, tabID); err != nil {
+			return err
+		}
 	}
 	// Insert in BATCHED multi-row statements (one Exec of `VALUES (…),(…),…` per
 	// 500 rows is dramatically faster than 500 single Execs in the pure-Go
@@ -486,6 +542,12 @@ func (s *configStore) replaceTabConfigs(tabID string, entries []*ConfigEntry) er
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
+	}
+	if atomicTx {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM configs WHERE tab_id = ?`, tabID); err != nil {
+			tx.Rollback()
+			return err
+		}
 	}
 	sinceCommit := 0
 	flush := func(chunk []*ConfigEntry) error {
@@ -513,8 +575,11 @@ func (s *configStore) replaceTabConfigs(tabID string, entries []*ConfigEntry) er
 			tx.Rollback()
 			return err
 		}
+		if progress != nil {
+			progress(end)
+		}
 		sinceCommit += end - i
-		if sinceCommit >= commitEvery {
+		if !atomicTx && sinceCommit >= commitEvery {
 			if err := tx.Commit(); err != nil {
 				return err
 			}

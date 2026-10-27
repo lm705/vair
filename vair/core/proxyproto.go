@@ -208,7 +208,10 @@ func xrayOutboundProxy(p *ProxyParams) map[string]interface{} {
 		"tag":      "proxy",
 	}
 	if p.TLS {
-		tls := map[string]interface{}{"allowInsecure": p.AllowInsecure}
+		// No allowInsecure: xray 26 refuses it, and a proxy that asks for it
+		// runs on sing-box (engineForNode). The handshake has the browser shape
+		// from Settings, as every other TLS configuration does.
+		tls := map[string]interface{}{"fingerprint": currentTLSFingerprint()}
 		if sni := p.SNI; sni != "" {
 			tls["serverName"] = sni
 		} else {
@@ -242,7 +245,8 @@ func singboxOutboundProxy(p *ProxyParams, tag string) map[string]interface{} {
 		out["password"] = p.Password
 	}
 	if p.TLS {
-		tls := map[string]interface{}{"enabled": true, "insecure": p.AllowInsecure}
+		tls := map[string]interface{}{"enabled": true, "insecure": p.AllowInsecure,
+			"utls": map[string]interface{}{"enabled": true, "fingerprint": currentTLSFingerprint()}}
 		if p.SNI != "" {
 			tls["server_name"] = p.SNI
 		} else {

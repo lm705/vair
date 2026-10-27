@@ -16,6 +16,9 @@ import "github.com/godbus/dbus/v5"
 // desktopNotify shows a system notification. Never blocks the caller and never
 // reports failure.
 func desktopNotify(title, body string) {
+	if notifyMuted.Load() {
+		return
+	}
 	go func() {
 		conn, err := dbus.SessionBus()
 		if err != nil {

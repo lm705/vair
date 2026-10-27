@@ -26,9 +26,9 @@ import (
 // gets identical routing (RU-direct, blocked-through-VPN, custom domains…).
 //
 // Both listeners honour the USER-FACING proxy credentials (proxyHttpCreds /
-// proxySocksCreds), so what the user enters in Settings → Security is exactly
-// what a phone enters in Telegram: no auth when the toggle is off, the chosen
-// login/password when it's on. Previously SOCKS was hard-wired to the internal
+// proxySocksCreds), so what the user enters in Settings → Local proxy →
+// Authentication is exactly what a phone enters in Telegram: no auth when the
+// toggle is off, the chosen login/password when it's on. Previously SOCKS was hard-wired to the internal
 // per-launch random password (unusable, since it's shown nowhere) and HTTP had
 // no auth at all. Bind + ports come from settings.
 func lanProxyInbounds() []interface{} {
@@ -68,21 +68,22 @@ func singboxInboundUsers(user, pass string) []interface{} {
 func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPort int, blockQUIC bool) map[string]interface{} {
 	// Hybrid TUN: sing-box routes traffic, xray handles VLESS protocol.
 	//
-	// Two independent protections (see settings docs):
+	// Two protections, each complete on its own (see settings docs):
 	//
-	//   - DNSLeakProtection (leakProtect): installs the real DNS routing block
-	//     (three servers: bootstrap/direct/remote) + a hijack-dns rule, so DNS
-	//     goes through the tunnel instead of the OS resolver. Legacy mode (off)
-	//     defers to the OS resolver — leak-prone, matches 1.4.0.
-	//   - KillSwitch (killSwitch, only meaningful with leakProtect on): turns on
-	//     strict_route — on Windows a WFP filter that drops any traffic (incl.
-	//     port 53) trying to leave OUTSIDE the tunnel. That's the fail-closed
-	//     "no fallback to the physical NIC if the VPN drops" behaviour AND the
-	//     belt on DNS leaks. Off = DNS still tunnelled, but traffic can fall back
-	//     to direct if the tunnel dies. On by default (preserves the pre-2.1
-	//     behaviour, where strict_route followed leakProtect).
+	//   - DNSLeakProtection (leakProtect): the names of the sites behind the
+	//     tunnel are resolved through it (see buildDNSBlock), AND nothing else
+	//     on the machine can ask a resolver outside it. The second half is
+	//     strict_route, which on Windows is exactly that and nothing more: WFP
+	//     filters that let the engine and the TUN adapter through and stop
+	//     port 53 everywhere else. Without it Windows sends every lookup to the
+	//     physical adapter's resolver as well, in parallel — a trace of the
+	//     adapter showed the tunnelled names reaching the provider's resolver
+	//     with protection on — so the switch promised what it did not keep
+	//     unless the kill-switch happened to be on too. strict_route used to
+	//     follow the kill-switch for that reason alone.
+	//   - KillSwitch: everything else. Vair's own block, put up with the
+	//     session (tunnelblock_windows.go); it needs leakProtect on.
 	leakProtect := dnsLeakProtectionEnabled()
-	killSwitch := killSwitchEnabled()
 	useFakeIP := fakeIPEnabled()
 
 	dns := buildDNSBlock(leakProtect, useFakeIP)
@@ -103,7 +104,7 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 		"address":        tunAddrs,
 		"mtu":            currentMTU(),
 		"auto_route":     true,
-		"strict_route":   killSwitch, // WFP-filter on Windows when true (kill-switch)
+		"strict_route":   leakProtect, // on Windows: DNS filters only — leak protection's; the kill-switch is tunnelblock_windows.go
 		"stack":          tunStack(),
 	}
 
@@ -157,15 +158,18 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 		})
 	}
 
-	// default_domain_resolver picks the DNS server used when sing-box
-	// itself needs to resolve a name in a routing rule (e.g. the IP
-	// for a CIDR-matching geosite). In legacy mode → OS resolver. In
-	// protected mode → our bootstrap server (plain UDP, no detour),
-	// so name resolution for sing-box's own internal needs can never
-	// loop through the proxy.
+	// default_domain_resolver resolves the names sing-box dials itself on the
+	// direct outbound: a program on "Apps without VPN" under FakeIP (its
+	// lookup got a placeholder, and the engine connects by name), a direct
+	// request through the LAN-shared proxy. Those leave around the tunnel, so
+	// they are asked of Direct DNS — the resolver the user chose for exactly
+	// that. It used to be the bootstrap server: those names went in plain UDP
+	// to Quad9 instead of the chosen one, and the setting said it resolves the
+	// VPN server's name and nothing else. Never through the proxy, so this
+	// cannot loop. Without leak protection, the system resolver, as before.
 	defaultResolver := "dns-local"
 	if leakProtect {
-		defaultResolver = "dns-bootstrap"
+		defaultResolver = "dns-direct"
 	}
 	route := map[string]interface{}{
 		"auto_detect_interface":   true,
@@ -214,26 +218,23 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 
 // buildDNSBlock returns the sing-box "dns" configuration block.
 //
-// legacy mode (leakProtect=false):
-//
-//	One server, "dns-local" of type "local". sing-box defers to the
-//	OS resolver. DNS leaks are possible because port 53 packets the
-//	OS resolver sends out are not forced into TUN (strict_route is
-//	false in this mode). This is what 1.4.0 shipped with — kept for
-//	compatibility.
+// without leak protection (leakProtect=false): the names of the sites that go
+// through the tunnel are answered by "dns-local", the system resolver, outside
+// the tunnel; everything else is as below — static hosts, local names, Direct
+// DNS for the names that go direct, the address strategy. No strict_route
+// either, so Windows may also ask the other adapters' resolvers itself.
 //
 // protected mode (leakProtect=true): three real DNS servers plus an
 // optional FakeIP server used via rule (never as `final`).
 //
-//   - dns-bootstrap (plain UDP, no detour) — sing-box's internal
-//     fallback for routing-time resolutions. No `detour: direct`
-//     here: in sing-box 1.13+ that errors out as
-//     "detour to an empty direct outbound makes no sense". Without
-//     a detour, sing-box dials the IP through OS routing, with
-//     its own internal carve-out from the strict_route WFP filter
-//     that blocks UDP/53 for other processes.
 //   - dns-direct (plain UDP, no detour) — for bypass traffic
-//     (geosite-ru, custom direct domains). Same shape as bootstrap.
+//     (geosite-ru, custom direct domains), and the engine's default
+//     domain resolver for what it dials directly. No `detour: direct`
+//     here: in sing-box 1.13+ that errors out as "detour to an empty
+//     direct outbound makes no sense". Without a detour, sing-box dials
+//     the IP through OS routing, with its own internal carve-out from
+//     the strict_route WFP filter that blocks UDP/53 for other
+//     processes.
 //   - dns-remote (DoH over proxy) — for tunnelled traffic when
 //     FakeIP is disabled, AND always as the `final` server so any
 //     non-A/AAAA query (PTR, MX, SRV…) gets a real answer through
@@ -244,44 +245,65 @@ func buildHybridTUNConfig(ifaceName, serverIP string, xrayHTTPPort, xraySocksPor
 //     addresses immediately; real resolution happens once the
 //     connection is dialled through the proxy.
 //
-// Rule ordering (matters):
+// Rule ordering (matters) — the order routing applies the same lists in:
 //  1. Static hosts (predefined map) — highest priority.
-//  2. RU bypass + user-direct-domains → dns-direct.
-//  3. If FakeIP enabled: A/AAAA → dns-fakeip.
-//  4. Everything else falls through to `final = dns-remote`.
+//     1a. Names only the local network knows → dns-local.
+//  2. The without-VPN list → dns-direct.
+//  3. In bypass_countries: the through-VPN list → dns-remote, then the
+//     bypassed countries → dns-direct.
+//  4. If FakeIP enabled: A/AAAA → dns-fakeip.
+//  5. Everything else falls through to `final = dns-remote`.
 func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 	// only_blocked has the INVERSE policy: resolve everything directly by default,
 	// and only blocked-in-RU domains through the tunnel (so they get a clean,
 	// un-poisoned IP). Independent of the leak-protection toggle.
-	if routingMode() == "only_blocked" {
-		return buildDNSBlockOnlyBlocked()
+	// The modes whose traffic goes direct unless a list says otherwise resolve
+	// that way too: the provider-side resolver by default, the tunnel only for
+	// the names on the lists. Resolving everything through the tunnel — what the
+	// China and selected-sites modes did — gave sites that are then reached
+	// directly the addresses a resolver abroad hands out.
+	switch routingMode() {
+	case "only_blocked":
+		return buildDNSBlockDirectDefault(nil, []string{"geosite-ru-blocked"})
+	case "only_blocked_cn":
+		return buildDNSBlockDirectDefault(gfwDomains(), nil)
+	case "only_selected":
+		return buildDNSBlockDirectDefault(nil, nil)
 	}
+	// Leak protection decides one thing: whether the names of sites that go
+	// through the tunnel are resolved through it (dns-remote, or FakeIP) or by
+	// the system resolver, outside it. It used to decide everything — off meant
+	// a module with the system resolver alone — so with it off Direct DNS and
+	// the static hosts did nothing in these two modes, although neither has
+	// anything to do with a leak: the names Direct DNS answers go around the
+	// tunnel anyway. Nor did the IPv6 strategy apply, and with IPv6 blocked the
+	// machine was handed AAAA answers for addresses the tunnel then refused
+	// mid-handshake (curl: SSL connect error on every dual-stack site).
 	if !leakProtect {
-		m := map[string]interface{}{
-			"servers": []interface{}{
-				map[string]interface{}{"tag": "dns-local", "type": "local"},
-			},
-			"final": "dns-local",
+		servers := []interface{}{
+			map[string]interface{}{"tag": "dns-local", "type": "local"},
+			directDNSServer(),
 		}
+		m := map[string]interface{}{
+			"servers":  servers,
+			"rules":    dnsDirectRules(&servers, "dns-local"),
+			"final":    "dns-local",
+			"strategy": dnsAddressStrategy(),
+		}
+		m["servers"] = servers
 		withIndependentCache(m)
 		return m
 	}
 
 	servers := []interface{}{
-		// Bootstrap: plain UDP, no detour. sing-box uses its own
-		// kernel-level carve-out to escape strict_route's WFP filter
-		// for these internal queries.
-		map[string]interface{}{
-			"tag":    "dns-bootstrap",
-			"type":   "udp",
-			"server": bootstrapDNSIP(),
-		},
-		// Direct: same shape, used for bypass traffic queries.
-		map[string]interface{}{
-			"tag":    "dns-direct",
-			"type":   "udp",
-			"server": directDNSIP(),
-		},
+		// The system resolver, for the names only the local network knows
+		// (dnsLocalNames) and for nothing else.
+		map[string]interface{}{"tag": "dns-local", "type": "local"},
+		// No bootstrap server: the VPN server's name is resolved by Vair
+		// before the engine starts (lookupBootstrap, over DoH), and the
+		// engine's own direct lookups go to Direct DNS.
+		// Direct: for the names that go around the tunnel.
+		directDNSServer(),
 		// Remote: DoH through the proxy outbound. Always present
 		// (acts as `final`) regardless of FakeIP setting.
 		parseRemoteDNSServer(),
@@ -301,59 +323,9 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 		servers = append(servers, fake)
 	}
 
-	rules := []interface{}{}
-
-	// 1. Static hosts: hard-coded answers, checked before everything via
-	// sing-box's "hosts" DNS server type. One server with a predefined
-	// map is more efficient than one server per host.
-	if hosts := staticHostsSnapshot(); len(hosts) > 0 {
-		predefined := make(map[string]interface{}, len(hosts))
-		var domainList []string
-		for domain, ip := range hosts {
-			predefined[domain] = []string{ip}
-			domainList = append(domainList, domain)
-		}
-		servers = append(servers, map[string]interface{}{
-			"tag":        "dns-hosts",
-			"type":       "hosts",
-			"predefined": predefined,
-		})
-		rules = append(rules, map[string]interface{}{
-			"domain": domainList,
-			"server": "dns-hosts",
-		})
-	}
-
-	// 2. Direct bypass: RU geosite + user-defined direct domains.
-	settingsMu.RLock()
-	ruSitesDirect := appSettings.RuSitesDirect
-	var directDomains []string
-	if !appSettings.DirectDomainsDisabled {
-		directDomains = make([]string, len(appSettings.DirectDomains))
-		copy(directDomains, appSettings.DirectDomains)
-	}
-	settingsMu.RUnlock()
-	if ruSitesDirect {
-		rules = append(rules, map[string]interface{}{
-			"rule_set": "geosite-ru",
-			"server":   "dns-direct",
-		})
-	}
-	if len(directDomains) > 0 {
-		var suffixes []string
-		for _, d := range directDomains {
-			d = strings.TrimSpace(d)
-			if d != "" {
-				suffixes = append(suffixes, d)
-			}
-		}
-		if len(suffixes) > 0 {
-			rules = append(rules, map[string]interface{}{
-				"domain_suffix": suffixes,
-				"server":        "dns-direct",
-			})
-		}
-	}
+	// 1. Static hosts, 2. the names that go direct — the same in both
+	// branches, see dnsDirectRules.
+	rules := dnsDirectRules(&servers, "dns-remote")
 
 	// 3. FakeIP for the common case: A/AAAA queries for tunnelled
 	// hostnames. Must be a rule, not final — sing-box rejects fakeip
@@ -372,9 +344,8 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 	// Not the probe URL AUTO uses (www.gstatic.com): that one is supposed to
 	// go through the tunnel — measuring it anywhere else measures nothing.
 	//
-	// The honest limit: dns-direct is a public resolver, so this stops the
-	// poisoning but does not make "printer.lan" resolvable. That would need a
-	// local-type server, which this branch does not have.
+	// Local names are not among them: dnsLocalRule has already sent those to
+	// the system resolver.
 	if useFakeIP {
 		rules = append(rules,
 			map[string]interface{}{
@@ -382,8 +353,9 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 				"server":        "dns-direct",
 			},
 			map[string]interface{}{
-				"query_type": []string{"A", "AAAA"},
-				"server":     "dns-fakeip",
+				"query_type":  []string{"A", "AAAA"},
+				"server":      "dns-fakeip",
+				"rewrite_ttl": fakeIPTTL,
 			},
 		)
 	}
@@ -401,6 +373,122 @@ func buildDNSBlock(leakProtect, useFakeIP bool) map[string]interface{} {
 	return m
 }
 
+// dnsDirectRules is what Vair answers itself whether or not leak protection is
+// on: the static hosts (a server of their own, added to servers), and the names
+// that go around the tunnel anyway — the countries a bypass mode leaves direct
+// and the without-VPN list — through Direct DNS. Neither is a leak: the first
+// never leaves the machine, the second is traffic that does not use the tunnel.
+//
+// In the order routing applies the same lists (singboxRoutingRules): without
+// VPN, then through VPN, then the countries. A site on both user lists goes
+// direct, so its name does too; a through-VPN site in a bypassed country's zone
+// goes through the tunnel, so its name goes to tunnelled — the server the
+// module answers the tunnelled names with — instead of Direct DNS, which would
+// hand it to the provider.
+func dnsDirectRules(servers *[]interface{}, tunnelled string) []interface{} {
+	rules := []interface{}{}
+
+	// 1. Static hosts: hard-coded answers, checked before everything via
+	// sing-box's "hosts" DNS server type. One server with a predefined
+	// map is more efficient than one server per host.
+	if hosts := staticHostsSnapshot(); len(hosts) > 0 {
+		predefined := make(map[string]interface{}, len(hosts))
+		var domainList []string
+		for domain, ip := range hosts {
+			predefined[domain] = []string{ip}
+			domainList = append(domainList, domain)
+		}
+		*servers = append(*servers, map[string]interface{}{
+			"tag":        "dns-hosts",
+			"type":       "hosts",
+			"predefined": predefined,
+		})
+		rules = append(rules, map[string]interface{}{
+			"domain": domainList,
+			"server": "dns-hosts",
+		})
+	}
+
+	// 1a. The names only the local network knows.
+	rules = append(rules, dnsLocalRule())
+
+	// 2. The without-VPN list.
+	rules = append(rules, dnsListRules(effectiveDirectDomains(), "dns-direct")...)
+
+	// 3. The countries a bypass mode leaves direct — the country's zone and its
+	// site list, matched the way routing matches them — so a site reached
+	// directly is looked up by a resolver where the user is. The through-VPN
+	// list goes first, as it does in the route.
+	if routingMode() == "bypass_countries" {
+		if ccs := bypassCountries(); len(ccs) > 0 {
+			rules = append(rules, dnsListRules(effectiveProxyDomains(), tunnelled)...)
+			rules = append(rules, dnsListRules(customBlocklistDomains(), tunnelled)...)
+			rules = append(rules, map[string]interface{}{"domain_suffix": ccs, "server": "dns-direct"})
+			var sets []string
+			for _, cc := range ccs {
+				if fileExists(ruRuleSetLocalPath("geosite-" + cc + ".srs")) {
+					sets = append(sets, "geosite-"+cc)
+				}
+			}
+			if len(sets) > 0 {
+				rules = append(rules, map[string]interface{}{"rule_set": sets, "server": "dns-direct"})
+			}
+		}
+	}
+
+	return rules
+}
+
+// dnsLocalNames are the names only the local network can answer: the suffixes
+// home routers and company networks use, and the reverse zones of the private
+// and link-local ranges. They go to the system resolver — the router, or the
+// company's — and to nothing else. They used to go wherever the module's other
+// names went, which with leak protection on was the Remote DNS: a public
+// resolver that cannot answer "printer.lan" and was told the names and the
+// addresses of the network the user sits in, one lookup at a time (Windows
+// asks for the names of the private addresses it sees on its own).
+//
+// Only the private reverse zones, not all of in-addr.arpa: the reverse lookup of
+// a public address says which address one is talking to, and that belongs in
+// the tunnel like the forward one.
+var dnsLocalNames = func() []string {
+	names := []string{
+		"lan", "local", "home", "internal", "localdomain", "home.arpa",
+		"10.in-addr.arpa", "168.192.in-addr.arpa", "254.169.in-addr.arpa",
+		// fc00::/7 and fe80::/10
+		"c.f.ip6.arpa", "d.f.ip6.arpa", "8.e.f.ip6.arpa", "9.e.f.ip6.arpa", "a.e.f.ip6.arpa", "b.e.f.ip6.arpa",
+	}
+	for i := 16; i <= 31; i++ { // 172.16.0.0/12
+		names = append(names, fmt.Sprintf("%d.172.in-addr.arpa", i))
+	}
+	return names
+}()
+
+// dnsLocalRule sends the local names to the system resolver ("dns-local", which
+// every module has).
+func dnsLocalRule() map[string]interface{} {
+	return map[string]interface{}{"domain_suffix": dnsLocalNames, "server": "dns-local"}
+}
+
+// dnsListRules turns one of the user's rule lists into DNS rules that send its
+// names to server, matched the way routing matches the same list (classifyRules
+// and singboxRules): a plain entry by suffix, full: exactly, regexp: by the
+// expression. The raw entries used to go in as suffixes, so "full:" and
+// "regexp:" entries matched nothing and their names were resolved by whatever
+// came next. IP entries are left out — a query has no address to match — and
+// so are geosite: categories, which the route leaves out too.
+func dnsListRules(entries []string, server string) []interface{} {
+	b := classifyRules(entries)
+	b.sIPs = nil
+	rules := singboxRules(b, "", false)
+	for _, r := range rules {
+		m := r.(map[string]interface{})
+		delete(m, "outbound")
+		m["server"] = server
+	}
+	return rules
+}
+
 // withIndependentCache adds the per-server DNS cache key to a DNS block, on the
 // engines that need to be told. See dnsIndependentCache for which those are and
 // why it is not simply always written.
@@ -410,17 +498,18 @@ func withIndependentCache(m map[string]interface{}) {
 	}
 }
 
-// buildDNSBlockOnlyBlocked is the DNS module for only_blocked mode. Blocked-in-RU
-// domains resolve through the proxy (dns-remote) so they get a clean, un-poisoned
-// IP; everything else resolves directly (dns-direct, the final). No global FakeIP:
-// non-blocked names must resolve to their real direct IPs, and blocked traffic is
-// still steered to the proxy by domain (sniff + the geosite-ru-blocked rule_set,
-// which is also attached to the route by applySingboxRouteMode).
-func buildDNSBlockOnlyBlocked() map[string]interface{} {
+// buildDNSBlockDirectDefault is the DNS module for the direct-by-default modes
+// (only_blocked, only_blocked_cn, only_selected). The names the mode tunnels —
+// the user's "through VPN" lists plus tunnelled and the tunnelledSets rule sets
+// (e.g. the blocked-in-RU list) — resolve through the proxy (dns-remote) so they
+// get a clean, un-poisoned IP; everything else resolves directly (dns-direct,
+// the final). No global FakeIP: the other names must resolve to their real
+// direct IPs, and tunnelled traffic is still steered to the proxy by domain
+// (sniff + the same lists, attached to the route by applySingboxRouteMode).
+func buildDNSBlockDirectDefault(tunnelled, tunnelledSets []string) map[string]interface{} {
 	servers := []interface{}{
 		map[string]interface{}{"tag": "dns-local", "type": "local"},
-		map[string]interface{}{"tag": "dns-bootstrap", "type": "udp", "server": bootstrapDNSIP()},
-		map[string]interface{}{"tag": "dns-direct", "type": "udp", "server": directDNSIP()},
+		directDNSServer(),
 		parseRemoteDNSServer(), // dns-remote (DoH through the proxy outbound)
 	}
 	rules := []interface{}{}
@@ -437,12 +526,28 @@ func buildDNSBlockOnlyBlocked() map[string]interface{} {
 		})
 		rules = append(rules, map[string]interface{}{"domain": domainList, "server": "dns-hosts"})
 	}
-	// Manual + custom-URL "through VPN" domains → resolve through the tunnel.
-	if proxyDomains := append(effectiveProxyDomains(), customBlocklistDomains()...); len(proxyDomains) > 0 {
+	// The names only the local network knows: to the system resolver, not to
+	// the public one that is this module's default.
+	rules = append(rules, dnsLocalRule())
+	// The without-VPN list wins over every list below, as it does in the
+	// route: a site on it and on the blocked list is reached directly, so its
+	// name is looked up directly too, not abroad through the tunnel.
+	rules = append(rules, dnsListRules(effectiveDirectDomains(), "dns-direct")...)
+	// What the mode sends through the tunnel is resolved through it too: the
+	// manual and URL "through VPN" lists, the mode's own list, and the check-IP
+	// service, which every one of these modes routes through the tunnel.
+	rules = append(rules, dnsListRules(effectiveProxyDomains(), "dns-remote")...)
+	rules = append(rules, dnsListRules(customBlocklistDomains(), "dns-remote")...)
+	proxyDomains := append([]string(nil), tunnelled...)
+	if h := checkIPHost(); h != "" {
+		proxyDomains = append(proxyDomains, h)
+	}
+	if len(proxyDomains) > 0 {
 		rules = append(rules, map[string]interface{}{"domain_suffix": proxyDomains, "server": "dns-remote"})
 	}
-	// Blocked-in-RU domains → resolve through the tunnel (clean IP).
-	rules = append(rules, map[string]interface{}{"rule_set": "geosite-ru-blocked", "server": "dns-remote"})
+	for _, set := range tunnelledSets {
+		rules = append(rules, map[string]interface{}{"rule_set": set, "server": "dns-remote"})
+	}
 	m := map[string]interface{}{
 		"servers":  servers,
 		"rules":    rules,
@@ -513,8 +618,11 @@ func reconcileDNSRuleSets(route, dns map[string]interface{}) {
 // fakeIPExcluded are the domain suffixes that must resolve to a real address
 // even when FakeIP is on. See the rule that uses it in buildDNSBlock.
 var fakeIPExcluded = []string{
-	// Local names: nothing in the tunnel answers to them.
-	"lan", "local", "arpa", "home", "internal",
+	// Local names are not here: dnsLocalRule sends them to the system resolver
+	// ahead of this list. "arpa" was, and sent every reverse lookup — of the
+	// public addresses the tunnel carries too — to the Direct DNS, around the
+	// tunnel; a PTR query never gets a fake answer anyway (A/AAAA only).
+	//
 	// Proxy auto-discovery: a fake answer sends Windows to fetch a PAC file
 	// from the fake range.
 	"wpad",
@@ -525,23 +633,61 @@ var fakeIPExcluded = []string{
 	"time.nist.gov", "time.cloudflare.com", "time.google.com",
 }
 
+// fakeIPTTL is how long a placeholder answer may be kept, in seconds.
+//
+// The placeholders are handed out afresh by every engine — every connection,
+// every switch AUTO makes — and the same address soon stands for another name.
+// With the default ten minutes, a name a program had cached went on pointing at
+// the address it had in the last session: harmless for the web, where the
+// engine reads the real name from TLS or the Host header, but a connection
+// that carries no name — SSH, RDP, a game over UDP — went to whatever the
+// address now stands for. A few seconds make that window as short. The
+// lookups it costs are answered by the engine itself, on this machine.
+//
+// Not by keeping the table on disk across sessions, which sing-box can do:
+// that file would be a list of the sites visited.
+const fakeIPTTL = 5
+
 // bootstrapDNSIP returns just the IP component of the bootstrap DNS
 // setting. If the user wrote a full URL like "https://9.9.9.9/...",
 // strip it back to the host so sing-box's "udp" server type can use
 // it directly.
 func bootstrapDNSIP() string {
-	v := currentBootstrapDNS()
-	if ip := stripURLToHost(v); ip != "" {
-		return ip
-	}
-	return defaultBootstrapDNS
+	return plainDNSAddress("bootstrap", currentBootstrapDNS(), defaultBootstrapDNS)
 }
-func directDNSIP() string {
-	v := currentDirectDNS()
-	if ip := stripURLToHost(v); ip != "" {
-		return ip
+func directDNSIP() string { return plainDNSAddress("direct", currentDirectDNS(), defaultDirectDNS) }
+
+// directDNSSystem is the Direct DNS value that means "the system resolver" —
+// the provider's or the router's, whatever this machine is set to use. The one
+// choice that resolves names only the local network knows (printer.lan, a
+// company's internal domains) and that gives a CDN's answer for where the user
+// actually is; a public resolver can do neither.
+const directDNSSystem = "system"
+
+// directDNSServer is the dns-direct server: plain UDP to the address set, or
+// the system resolver when that is what was chosen.
+func directDNSServer() map[string]interface{} {
+	if strings.EqualFold(currentDirectDNS(), directDNSSystem) {
+		return map[string]interface{}{"tag": "dns-direct", "type": "local"}
 	}
-	return defaultDirectDNS
+	return map[string]interface{}{"tag": "dns-direct", "type": "udp", "server": directDNSIP()}
+}
+
+// plainDNSAddress is the address a plain-UDP DNS slot can use: an IP address,
+// taken out of a URL if one was written. A name is not usable there — resolving
+// it would need a resolver of its own, and sing-box refuses to start on it — so
+// a value that is not an address falls back to the default, and the log says
+// which setting was ignored, rather than the tunnel failing to come up.
+func plainDNSAddress(slot, v, def string) string {
+	host := stripURLToHost(v)
+	if host == "" {
+		return def
+	}
+	if net.ParseIP(host) == nil {
+		vlog("warning", "DNS: the %s server %q is not an IP address — using %s", slot, v, def)
+		return def
+	}
+	return host
 }
 
 // stripURLToHost extracts the host part of a URL or returns the input

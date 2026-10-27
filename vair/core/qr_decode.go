@@ -24,6 +24,10 @@ import (
 //     what rescues the dotted Chrome/GitHub style), AND it keeps a 4K screen
 //     grab fast;
 //   - then the original;
+//   - and on an image larger than 2000px a side, which is not tried whole,
+//     the original in overlapping tiles: the downscales alone missed codes
+//     whose modules a whole-number factor blurs — a 207px code on a 4K screen,
+//     a 138px one at 2560x1440 — while 1920x1080 found every size;
 //   - each with both binarizers (hybrid + global histogram) and the inverted
 //     luminance (light-on-dark codes);
 //   - all with TRY_HARDER.
@@ -48,6 +52,8 @@ func decodeQRImage(img image.Image) (string, error) {
 	b := img.Bounds()
 	if b.Dx() <= 2000 && b.Dy() <= 2000 {
 		variants = append(variants, img)
+	} else {
+		variants = append(variants, fullResTiles(img)...)
 	}
 
 	for _, v := range variants {
@@ -77,6 +83,46 @@ func decodeQRImage(img image.Image) (string, error) {
 // blends a module's dot + surrounding gap into a single mid-tone the binarizer
 // then thresholds to a clean cell — the trick that makes dotted QRs decodable.
 // Returns nil when the factor is trivial or the result would be too small.
+// fullResTiles cuts a large image into overlapping tiles at full resolution.
+// A tile is at most qrTile pixels a side and the next one starts qrTileStep
+// further on, so any code up to qrTile-qrTileStep pixels across lies whole in
+// at least one of them; a larger code survives the downscales anyway.
+func fullResTiles(img image.Image) []image.Image {
+	sub, ok := img.(interface {
+		SubImage(image.Rectangle) image.Image
+	})
+	if !ok {
+		return nil
+	}
+	b := img.Bounds()
+	starts := func(lo, hi int) []int {
+		if hi-lo <= qrTile {
+			return []int{lo}
+		}
+		var out []int
+		for p := lo; ; p += qrTileStep {
+			if p+qrTile >= hi {
+				out = append(out, hi-qrTile)
+				return out
+			}
+			out = append(out, p)
+		}
+	}
+	var tiles []image.Image
+	for _, y := range starts(b.Min.Y, b.Max.Y) {
+		for _, x := range starts(b.Min.X, b.Max.X) {
+			r := image.Rect(x, y, x+qrTile, y+qrTile).Intersect(b)
+			tiles = append(tiles, sub.SubImage(r))
+		}
+	}
+	return tiles
+}
+
+const (
+	qrTile     = 1600
+	qrTileStep = 1200
+)
+
 func boxDownscale(img image.Image, factor int) image.Image {
 	if factor < 2 {
 		return nil

@@ -126,11 +126,18 @@ func refreshRuleSets(defs []ruRuleSetDef) {
 	ruRefreshMu.Lock()
 	defer ruRefreshMu.Unlock()
 
-	client := &http.Client{Timeout: ruDownloadTimeout}
+	client := ownHTTPClient(ruDownloadTimeout)
 	for _, rs := range defs {
 		path := ruRuleSetLocalPath(rs.file)
-		if info, err := os.Stat(path); err == nil && time.Since(info.ModTime()) <= ruRuleSetMaxAge {
+		info, err := os.Stat(path)
+		if err == nil && time.Since(info.ModTime()) <= ruRuleSetMaxAge {
 			continue // fresh enough
+		}
+		if err == nil && !ownTrafficTunnelled() {
+			// A copy is here: this connection uses it, and the refresh waits
+			// for the tunnel rather than going out from the real address.
+			deferRuleSet(rs)
+			continue
 		}
 		if last, ok := ruLastTry[rs.file]; ok && time.Since(last) < ruRefreshThrottle {
 			continue // attempted recently — don't re-stall on a blocked host
@@ -154,14 +161,19 @@ func refreshRuleSets(defs []ruRuleSetDef) {
 func refreshCustomBlocklists(urls []string) {
 	ruRefreshMu.Lock()
 	defer ruRefreshMu.Unlock()
-	client := &http.Client{Timeout: ruDownloadTimeout}
+	client := ownHTTPClient(ruDownloadTimeout)
 	for _, url := range urls {
 		url = strings.TrimSpace(url)
 		if url == "" {
 			continue
 		}
 		path := customBlocklistPathFor(url)
-		if info, err := os.Stat(path); err == nil && time.Since(info.ModTime()) <= ruRuleSetMaxAge {
+		info, err := os.Stat(path)
+		if err == nil && time.Since(info.ModTime()) <= ruRuleSetMaxAge {
+			continue
+		}
+		if err == nil && !ownTrafficTunnelled() {
+			deferBlocklist(url) // see refreshRuleSets
 			continue
 		}
 		key := "custom:" + url

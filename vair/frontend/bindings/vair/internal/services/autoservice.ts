@@ -111,8 +111,17 @@ export function SetEnabled(on: boolean): $CancellablePromise<void> {
 }
 
 /**
- * SwitchNow forces an immediate failover/connect (no-op if auto is off).
+ * Sweep reports how far the test of the candidate pool has got — for a panel
+ * opened mid-sweep; later changes arrive as "auto_sweep" events.
  */
-export function SwitchNow(): $CancellablePromise<boolean> {
+export function Sweep(): $CancellablePromise<core$0.AutoSweepProgress> {
+    return $Call.ByID(2501661512);
+}
+
+/**
+ * SwitchNow forces an immediate failover/connect. Returns why it cannot (AUTO
+ * off, nothing in the candidate tabs), or "".
+ */
+export function SwitchNow(): $CancellablePromise<string> {
     return $Call.ByID(537568580);
 }

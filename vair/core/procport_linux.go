@@ -1,13 +1,10 @@
 package core
 
 import (
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 )
 
 // Which program opened a connection, on Linux.
@@ -15,35 +12,7 @@ import (
 // /proc holds the same answer Windows keeps in a table: the socket's inode is
 // in /proc/net/tcp, and the process that owns that inode has it as a symlink in
 // its fd directory. Walking every process for every connection would be absurd,
-// so the map is built once and cached for a couple of seconds, exactly as on
-// the other platform.
-
-var procPortCache = struct {
-	sync.Mutex
-	m    map[uint16]string
-	when time.Time
-}{m: map[uint16]string{}}
-
-const procPortTTL = 2 * time.Second
-
-func processForLocalPort(localAddr string) string {
-	_, portStr, err := net.SplitHostPort(localAddr)
-	if err != nil {
-		return ""
-	}
-	p, err := strconv.Atoi(portStr)
-	if err != nil || p <= 0 || p > 65535 {
-		return ""
-	}
-	procPortCache.Lock()
-	if time.Since(procPortCache.when) > procPortTTL {
-		procPortCache.m = tcpPortOwners()
-		procPortCache.when = time.Now()
-	}
-	name := procPortCache.m[uint16(p)]
-	procPortCache.Unlock()
-	return name
-}
+// so the map is cached (procport.go), exactly as on the other platform.
 
 // tcpPortOwners maps a local port to the program holding it.
 func tcpPortOwners() map[uint16]string {

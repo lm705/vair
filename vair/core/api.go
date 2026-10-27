@@ -79,6 +79,13 @@ func Init() {
 // in the DB but is missing from state.tabs (its tabs.json entry was lost). The
 // configs are preserved; the tab reappears as a user tab with a recovered name.
 func recoverOrphanTabs() {
+	// First the tabs deleted last time whose rows were not yet removed when the
+	// program closed: removed now, not brought back.
+	for _, id := range tabsBeingDeleted() {
+		if store.deleteTabRows(id) == nil {
+			markTabDeleting(id, false)
+		}
+	}
 	dbIDs, err := store.distinctTabIDs()
 	if err != nil {
 		return
@@ -200,7 +207,7 @@ func Window(tabID, sort, filter string, proto []string, offset, limit int) ([]Ro
 		_, fav := favSet[nodeBody(e.Raw)]
 		rows[i] = Row{
 			Index: e.Index, Raw: e.Raw, Name: e.Name, Host: e.Host, Port: e.Port,
-			Net: e.Network, Sec: e.Security, Proto: e.Protocol,
+			Net: shownNetwork(e.Network), Sec: e.Security, Proto: e.Protocol,
 			Ping: int(e.Delay), Speed: e.SpeedMBps, SpeedLive: e.SpeedLive,
 			PingSt: string(e.PingStatus), SpeedSt: string(e.SpeedStatus),
 			PingErr: e.PingErr, SpeedErr: e.SpeedErr, Fav: fav,
@@ -224,9 +231,13 @@ func WindowCount(tabID, filter string, proto []string) int {
 // StatsDTO feeds the header (configs / ping ok / failed / best ping / best speed
 // / traffic).
 type StatsDTO struct {
-	Configs   int     `json:"configs"`
-	PingOK    int     `json:"ping_ok"`
-	Failed    int     `json:"failed"`
+	Configs int `json:"configs"`
+	PingOK  int `json:"ping_ok"`
+	Failed  int `json:"failed"`
+	// Removable is how many rows "Delete failed" removes. Failed counts failed
+	// pings in the filtered view; this counts failed pings and failed speed
+	// tests across the whole tab, because that is what the action removes.
+	Removable int     `json:"removable"`
 	BestPing  int64   `json:"best_ping"`  // ms; 0 = none
 	BestSpeed float64 `json:"best_speed"` // MB/s; 0 = none
 	TotalUp   int64   `json:"total_up"`
@@ -243,7 +254,7 @@ func Stats(tabID, filter string, proto []string) StatsDTO {
 	q := windowQuery{sort: "idx", filter: filter, proto: proto, dedupHide: tabDedupHide(tabID), exclude: tabExcludeFilter(tabID), offset: 0, limit: 0, favorites: favs}
 	_, _, st := memWindow(tabID, q, favs, true) // withStats
 	return StatsDTO{
-		Configs: st.total, PingOK: st.ok, Failed: st.fail,
+		Configs: st.total, PingOK: st.ok, Failed: st.fail, Removable: failedCount(tabID),
 		BestPing: st.minPing, BestSpeed: st.maxSpeed,
 		TotalUp: tup, TotalDown: tdown,
 	}
@@ -385,5 +396,7 @@ type entryEvent struct {
 // through it, so anything else computed rather than stored has one place to be
 // added.
 func entryPayload(e ConfigEntry) entryEvent {
+	// The row a result updates shows its transport the way the table does.
+	e.Network = shownNetwork(e.Network)
 	return entryEvent{ConfigEntry: e, Stab: stabilityFor(hashBody(e.Raw))}
 }

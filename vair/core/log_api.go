@@ -21,3 +21,7 @@ func GetLogs() []LogLine {
 
 // ClearLogs empties the log buffer.
 func ClearLogs() { logs.clear() }
+
+// LogEvent writes a line to the program's log from outside core — the place
+// the user reads, which stderr is not.
+func LogEvent(level, format string, args ...interface{}) { vlog(level, format, args...) }

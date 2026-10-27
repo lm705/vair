@@ -75,7 +75,7 @@ export default function Select({
   // to 18px dropped a 13px list. Taken from the trigger itself, so it is right
   // for the settings dialog and for the small selects in the log bar alike.
   const [pos, setPos] = useState<
-    { left: number; top: number; width: number; drop: 'down' | 'up'; fs: string } | null
+    { left: number; right: number; top: number; width: number; drop: 'down' | 'up'; fs: string } | null
   >(null)
 
   const current = opts.find((o) => o.value === value)
@@ -94,12 +94,29 @@ export default function Select({
     const drop = below < wanted && r.top > below ? 'up' : 'down'
     setPos({
       left: r.left,
+      right: r.right,
       top: drop === 'down' ? r.bottom + 2 : Math.max(4, r.top - wanted - 2),
       width: r.width,
       drop,
       fs,
     })
   }, [open, opts.length])
+
+  // A list wider than its trigger, hung from the trigger's left edge, ran off
+  // the right of the window when the trigger sat at the right of a row — the
+  // usual place for a short list — and its longest entries were cut. It is
+  // measured once it is drawn and, when it does not fit, lines up with the
+  // trigger's right edge instead, as far left as it has to go. Before paint,
+  // so it is never seen in the wrong place.
+  useLayoutEffect(() => {
+    const el = listRef.current
+    if (!open || !pos || !el) return
+    const w = el.offsetWidth
+    const maxLeft = window.innerWidth - w - 4
+    if (pos.left <= maxLeft) return
+    const left = Math.max(4, Math.min(pos.right - w, maxLeft))
+    if (left !== pos.left) setPos({ ...pos, left })
+  }, [open, pos])
 
   useEffect(() => {
     if (!open) return

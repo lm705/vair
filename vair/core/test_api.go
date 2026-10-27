@@ -48,8 +48,23 @@ func viewIndices(sort, filter string, proto []string) []int {
 
 // PingSelected / SpeedSelected test a chosen set (the row context menu) via the
 // bulk runner. A re-call cancels a run in progress.
-func PingSelected(idxs []int)  { setTableActive(); go runPingAll(idxs) }
-func SpeedSelected(idxs []int) { setTableActive(); go runSpeedAll(idxs) }
+//
+// The configurations travel with the indices, as for a delete: a refresh of the
+// tab's source numbers the rows again, and the test went to whatever rows had
+// taken the selected ones' places (resolveRows).
+func PingSelected(idxs []int, raws []string) {
+	setTableActive()
+	if rows := resolveRows(activeTabID(), idxs, raws); len(rows) > 0 {
+		go runPingAll(rows)
+	}
+}
+
+func SpeedSelected(idxs []int, raws []string) {
+	setTableActive()
+	if rows := resolveRows(activeTabID(), idxs, raws); len(rows) > 0 {
+		go runSpeedAll(rows)
+	}
+}
 
 // PingOne tests a SINGLE config on its own manual-test channel (1.10
 // handlePingOne) — NOT the bulk runner. So it emits only entry_update (no
@@ -77,7 +92,7 @@ func PingOne(idx int) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(20 * time.Second):
+		case <-time.After(pingTestBudget() + 5*time.Second):
 		}
 		entry.mu.Lock()
 		if entry.PingStatus == StatusTestingPing && !isTestCancelled(cancelCh) {
@@ -118,7 +133,7 @@ func SpeedOne(idx int) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(25 * time.Second):
+		case <-time.After(speedTestBudget() + 5*time.Second):
 		}
 		cancelled := isTestCancelled(cancelCh)
 		entry.mu.Lock()

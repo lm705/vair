@@ -1,15 +1,20 @@
 // Tab settings modal — an exact port of the 1.10 openTabSettings() DOM
 // (same classes/sections, live apply debounced 250ms, no Save button).
 import { useEffect, useRef, useState } from 'react'
+import { Events } from '@wailsio/runtime'
 import Check from './Check'
 import { TabService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import LangSelect from './langselect'
 import { IS_REMOTE } from './remote'
-import { Hint } from './hints'
+import { Hint, opt, whenOn, whenOff } from './hints'
 import type { HintOpt } from './hints'
-import Select from './Select'
+import Toggle from './Toggle'
+import Group, { DepPanel, needsOnNote } from './setgroup'
+import BinIcon from './binicon'
 import {
-  ExcludeFields,
+  ExcludeGroup,
+  RefreshGroup,
   SubInfoSection,
   emptyExInput,
   emptyExMap,
@@ -19,9 +24,11 @@ import {
   type ExInput,
   type ExMap,
 } from './tabshared'
+import CloseX from './closex'
+import { srcErrText } from './reasons'
 
 type UrlRow = { url: string; disabled: boolean }
-type FileRow = { name: string; path: string; size: number; mtime: number; disabled: boolean; isNew: boolean }
+type FileRow = { name: string; path: string; size: number; mtime: number; disabled: boolean; isNew: boolean; error?: string }
 
 export default function TabModal({
   tabId,
@@ -46,7 +53,11 @@ export default function TabModal({
   const [ghOwner, setGhOwner] = useState('')
   const [ghRepo, setGhRepo] = useState('')
   const [ghFile, setGhFile] = useState('')
+  // The stored token never comes here (core Tab.MarshalJSON): the field holds
+  // only a new one being typed, and ghPatSet says one is stored.
   const [ghPat, setGhPat] = useState('')
+  const [ghPatSet, setGhPatSet] = useState(false)
+  const [ghPatClear, setGhPatClear] = useState(false)
   const [ghPatVisible, setGhPatVisible] = useState(false)
   const [refreshMin, setRefreshMin] = useState(0)
   const [refreshDisabled, setRefreshDisabled] = useState(false)
@@ -79,13 +90,14 @@ export default function TabModal({
           mtime: typeof f.mtime === 'number' ? f.mtime : 0,
           disabled: !!f.disabled,
           isNew: false,
+          error: f.error || '',
         })),
       )
       setGhEnabled(!!t.github_enabled)
       setGhOwner(t.github_owner || '')
       setGhRepo(t.github_repo || '')
       setGhFile(t.github_file || '')
-      setGhPat(t.github_pat || '')
+      setGhPatSet(!!t.github_pat_set)
       setRefreshMin(t.refresh_min || 0)
       setRefreshDisabled(!!t.refresh_disabled)
       setRefreshTest(t.auto_refresh_test || '')
@@ -100,6 +112,25 @@ export default function TabModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabId])
 
+  // What the fetches started from here found — a source that did not load,
+  // and why — arrives with the tab list; the dialog shows it while open.
+  useEffect(() => {
+    const off = Events.On('tabs_update', (e: any) => {
+      const t = ((e?.data?.payload || []) as any[]).find((x) => x?.id === tabId)
+      if (!t) return
+      setTab((prev: any) => (prev ? { ...prev, subs: t.subs, github_error: t.github_error } : prev))
+      setFiles((prev) =>
+        prev.map((f) => {
+          const m = (t.source_files || []).find((x: any) => x.path === f.path)
+          return m ? { ...f, error: m.error || '' } : f
+        }),
+      )
+    })
+    return () => {
+      off?.()
+    }
+  }, [tabId])
+
   // Live apply (debounced 250ms, as in 1.10 scheduleTabApply). Reads the
   // CURRENT state on fire — the effect below reschedules on every edit.
   const stateRef = useRef<any>(null)
@@ -112,6 +143,7 @@ export default function TabModal({
     ghRepo,
     ghFile,
     ghPat,
+    ghPatClear,
     refreshMin,
     refreshDisabled,
     refreshTest,
@@ -155,6 +187,7 @@ export default function TabModal({
       github_repo: s.ghRepo,
       github_file: s.ghFile,
       github_pat: s.ghPat,
+      github_pat_clear: s.ghPatClear,
     } as any)
   }
   const scheduleApply = () => {
@@ -194,6 +227,17 @@ export default function TabModal({
     })
   }
 
+  // urlNote is what is wrong with URL row i, if anything: a line that is not a
+  // link (it used to fail as "unsupported protocol scheme"), or one already in
+  // the list above (it was loaded twice).
+  const urlNote = (i: number): string => {
+    const v = urls[i].url.trim()
+    if (!v) return ''
+    if (!/^https?:\/\//i.test(v)) return tt('Not a link — a source address starts with https://')
+    if (urls.slice(0, i).some((r) => r.url.trim() === v)) return tt('This link is already in the list above')
+    return ''
+  }
+
   if (!tab) return null
 
   return (
@@ -204,163 +248,173 @@ export default function TabModal({
         if (e.target === e.currentTarget) closeModal()
       }}
     >
-      <div className="modal-box" id="tab-modal-box">
-        <div className="modal-title">{tt('Tab Settings')}</div>
-
-        <div className="settings-section">
-          <div className="modal-label">{tt('Name')}</div>
-          <input
-            className="modal-input"
-            id="ms-name"
-            maxLength={40}
-            style={{ marginBottom: 0 }}
-            value={name}
-            autoFocus
-            onFocus={(e) => e.target.select()}
-            onChange={(e) => setName(e.target.value)}
-            onBlur={scheduleApply}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') scheduleApply()
-            }}
-          />
+      <div className="modal-box cardset" id="tab-modal-box">
+        <div className="modal-title set-title">
+          <span>{tt('Tab Settings')}</span>
+          <div className="set-title-controls">
+            <LangSelect lang={lang} />
+            <CloseX onClick={closeModal} title={tt('Close')} />
+          </div>
         </div>
+
+        <Group>
+          <div className="modal-row" style={{ display: 'block' }}>
+            <span className="modal-row-label stack">{tt('Name')}</span>
+            <input
+              className="modal-input"
+              id="ms-name"
+              maxLength={40}
+              style={{ marginBottom: 0 }}
+              value={name}
+              autoFocus
+              onFocus={(e) => e.target.select()}
+              onChange={(e) => setName(e.target.value)}
+              onBlur={scheduleApply}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') scheduleApply()
+              }}
+            />
+          </div>
+        </Group>
 
         <SubInfoSection subs={tab.subs} lang={lang} />
 
-        {/* ── Sources: URLs + files ── */}
-        <div className="settings-section">
-          <div className="modal-label">{tt('Source URLs (raw links, base64 subscriptions)')}</div>
-          {urls.some((r) => /^http:\/\//i.test(r.url.trim())) && (
-            <div className="modal-hint" style={{ display: 'block', color: 'var(--warn, #d9a441)' }}>
-              {tt(
-                'A source over plain http:// can be changed by anyone between you and the server, and what it returns becomes the servers your traffic goes through. Use https:// where the provider offers it.',
-              )}
-            </div>
-          )}
-          <div id="ms-urls">
-            {urls.map((r, i) => (
-              <div key={i} className={'url-row' + (r.disabled ? ' src-off' : '')}>
-                <Check
-                  className="ms-url-on"
-                  checked={!r.disabled}
-                  title={tt('Enable / disable this source')}
-                  onChange={(v) => {
-                    setUrls((prev) => prev.map((x, j) => (j === i ? { ...x, disabled: !v } : x)))
-                    scheduleApply()
-                  }}
-                />
-                <input
-                  className="modal-input ms-url"
-                  placeholder="https://raw.githubusercontent.com/..."
-                  value={r.url}
-                  spellCheck={false}
-                  onChange={(e) =>
-                    setUrls((prev) => prev.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))
-                  }
-                  onBlur={scheduleApply}
-                />
-                <button
-                  className="url-qr"
-                  title={tt('QR')}
-                  onClick={() => {
-                    const u = r.url.trim()
-                    if (u) onShowQR(u)
-                  }}
-                >
-                  QR
-                </button>
-                <button
-                  className="url-rm"
-                  title="Remove"
-                  onClick={() => {
-                    setUrls((prev) => prev.filter((_, j) => j !== i))
-                    scheduleApply()
-                  }}
-                >
-                  x
-                </button>
+        {/* ── Sources: URLs, files, GitHub ── */}
+        <Group title={tt('Config sources')}>
+          <div className="modal-row" style={{ display: 'block' }}>
+            <span className="modal-row-label stack">{tt('Source URLs (raw links, base64 subscriptions)')}</span>
+            {urls.some((r) => /^http:\/\//i.test(r.url.trim())) && (
+              <div className="set-note" style={{ margin: '0 0 6px', color: 'var(--warn, #d9a441)' }}>
+                {tt(
+                  'A source over plain http:// can be changed by anyone between you and the server, and what it returns becomes the servers your traffic goes through. Use https:// where the provider offers it.',
+                )}
               </div>
-            ))}
-          </div>
-          <button
-            className="btn ghost"
-            style={{ fontSize: 'calc(var(--modal-fs-base) - 2px)', margin: '4px 0 12px' }}
-            onClick={() => setUrls((prev) => [...prev, { url: '', disabled: false }])}
-          >
-            {tt('+ add URL')}
-          </button>
-          <div className="modal-label">{tt('Files (loaded in addition order, after URLs)')}</div>
-          <div id="ms-files">
-            {files.length === 0 ? (
-              <div className="modal-hint" style={{ margin: '0 0 6px' }}>
-                {tt('No files added. Use the + add file button below.')}
-              </div>
-            ) : (
-              files.map((f, i) => (
-                <div key={i} className={'file-line' + (f.disabled ? ' src-off' : '')}>
+            )}
+            <div id="ms-urls">
+              {urls.map((r, i) => (
+                <div key={i} className={'url-row' + (r.disabled ? ' src-off' : '')}>
                   <Check
                     className="ms-url-on"
-                    checked={!f.disabled}
+                    checked={!r.disabled}
                     title={tt('Enable / disable this source')}
                     onChange={(v) => {
-                      setFiles((prev) =>
-                        prev.map((x, j) => (j === i ? { ...x, disabled: !v } : x)),
-                      )
+                      setUrls((prev) => prev.map((x, j) => (j === i ? { ...x, disabled: !v } : x)))
                       scheduleApply()
                     }}
                   />
-                  <div className={'file-row' + (f.isNew ? ' new' : '')} title={f.path || f.name}>
-                    <span className="file-ico">📄</span>
-                    <span className="file-name">{f.name}</span>
-                    <span className="file-size">{fmtBytes(f.size)}</span>
-                  </div>
+                  <input
+                    className="modal-input ms-url"
+                    placeholder="https://raw.githubusercontent.com/..."
+                    value={r.url}
+                    spellCheck={false}
+                    onChange={(e) =>
+                      setUrls((prev) => prev.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))
+                    }
+                    onBlur={scheduleApply}
+                  />
+                  <button
+                    className="url-qr"
+                    title={tt('QR code')}
+                    onClick={() => {
+                      const u = r.url.trim()
+                      if (u) onShowQR(u)
+                    }}
+                  >
+                    QR
+                  </button>
                   <button
                     className="url-rm"
-                    title="Remove"
+                    title={tt('Remove')}
                     onClick={() => {
-                      setFiles((prev) => prev.filter((_, j) => j !== i))
+                      setUrls((prev) => prev.filter((_, j) => j !== i))
                       scheduleApply()
                     }}
                   >
-                    x
+                    <BinIcon />
                   </button>
+                  {urlNote(i) && <div className="src-err">{urlNote(i)}</div>}
                 </div>
-              ))
+              ))}
+            </div>
+            <button
+              className="btn ghost"
+              style={{ marginTop: 4 }}
+              onClick={() => setUrls((prev) => [...prev, { url: '', disabled: false }])}
+            >
+              {tt('+ add URL')}
+            </button>
+          </div>
+          <div className="modal-row" style={{ display: 'block' }}>
+            <span className="modal-row-label stack">{tt('Files (loaded in addition order, after URLs)')}</span>
+            <div id="ms-files">
+              {files.length === 0 ? (
+                <div className="set-note" style={{ margin: '0 0 6px' }}>
+                  {IS_REMOTE
+                    ? tt('No files added. Files are added on the computer Vair runs on.')
+                    : tt('No files added. Use the + add file button below.')}
+                </div>
+              ) : (
+                files.map((f, i) => (
+                  <div key={i} className={'file-line' + (f.disabled ? ' src-off' : '')}>
+                    <Check
+                      className="ms-url-on"
+                      checked={!f.disabled}
+                      title={tt('Enable / disable this source')}
+                      onChange={(v) => {
+                        setFiles((prev) => prev.map((x, j) => (j === i ? { ...x, disabled: !v } : x)))
+                        scheduleApply()
+                      }}
+                    />
+                    <div className={'file-row' + (f.isNew ? ' new' : '')} title={f.path || f.name}>
+                      <span className="file-ico">📄</span>
+                      <span className="file-name">{f.name}</span>
+                      <span className="file-size">{fmtBytes(f.size)}</span>
+                    </div>
+                    <button
+                      className="url-rm"
+                      title={tt('Remove')}
+                      onClick={() => {
+                        setFiles((prev) => prev.filter((_, j) => j !== i))
+                        scheduleApply()
+                      }}
+                    >
+                      <BinIcon />
+                    </button>
+                    {f.error && !f.disabled && (
+                      <div className="src-err">
+                        {tt('Failed to load')}: {srcErrText(f.error, tt)}
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+            {/* The picker opens on the computer, and the paths it returns are
+                the computer's — from a phone the button appears to do nothing.
+                The files already added stay listed above, and still load. */}
+            {!IS_REMOTE && (
+              <button className="btn ghost" style={{ marginTop: 4 }} onClick={pickFiles}>
+                {tt('+ add file')}
+              </button>
             )}
           </div>
-          {/* The picker opens on the computer, and the paths it returns are
-              the computer's — from a phone the button appears to do nothing.
-              The files already added stay listed above, and still load. */}
-          {!IS_REMOTE && (
-            <button className="btn ghost" style={{ fontSize: 'calc(var(--modal-fs-base) - 2px)', margin: '4px 0 12px' }} onClick={pickFiles}>
-              {tt('+ add file')}
-            </button>
-          )}
           {hint('Files are read from disk on every RELOAD, so edits propagate without re-adding. No size limit — only the path is stored.')}
-        </div>
-
-        {/* ── GitHub import ── */}
-        <div className="settings-section">
-          <div className="modal-row" style={{ marginBottom: 6 }}>
-            <span className="modal-label" style={{ margin: 0 }}>
-              {tt('Import from GitHub (private repo)')}
-            </span>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={ghEnabled}
-                onChange={(e) => {
-                  setGhEnabled(e.target.checked)
-                  scheduleApply()
-                }}
-              />
-              <span className="toggle-track" />
-              <span className="toggle-thumb" />
-            </label>
+          <div className="modal-row">
+            <span className="modal-row-label">{tt('Import from GitHub (private repo)')}</span>
+            <Toggle
+              on={ghEnabled}
+              onChange={(v) => {
+                setGhEnabled(v)
+                scheduleApply()
+              }}
+            />
           </div>
-          {hint('Pulls a config file from a private GitHub repository on every reload via a personal access token. Loaded after URLs and files.')}
-          {ghEnabled && (
-            <div id="ms-gh-fields">
+          {hint('A configuration file from a private GitHub repository, pulled through a personal access token. Loaded after URLs and files. The token is kept in the program and is not shown again; type a new one to replace it.', [
+            whenOn('the file is pulled on every reload.'),
+            whenOff('the repository is not used.', true),
+          ])}
+          <DepPanel off={!ghEnabled} note={needsOnNote(tt, lang, tt('Import from GitHub (private repo)'))}>
+            <div className={'modal-row' + (ghEnabled ? ' row-cont' : '')} id="ms-gh-fields" style={{ display: 'block' }}>
               <input
                 className="modal-input"
                 placeholder={tt('owner (user or organization)')}
@@ -392,78 +446,74 @@ export default function TabModal({
                 <input
                   className="modal-input"
                   type={ghPatVisible ? 'text' : 'password'}
-                  placeholder={tt('personal access token (PAT)')}
+                  placeholder={
+                    ghPatSet ? tt('a token is saved — type a new one to replace it') : tt('personal access token (PAT)')
+                  }
                   value={ghPat}
                   autoComplete="off"
                   spellCheck={false}
                   onChange={(e) => setGhPat(e.target.value)}
                   onBlur={scheduleApply}
                 />
-                <button type="button" className="btn ghost gh-view-btn" onClick={() => setGhPatVisible((v) => !v)}>
-                  {ghPatVisible ? tt('hide') : tt('view')}
-                </button>
+                {/* Only for a token being typed: the stored one never comes to
+                    this dialog, and over an empty field the button did nothing. */}
+                {ghPat && (
+                  <button type="button" className="btn ghost gh-view-btn" onClick={() => setGhPatVisible((v) => !v)}>
+                    {ghPatVisible ? tt('hide') : tt('view')}
+                  </button>
+                )}
+                {ghPatSet && !ghPat && (
+                  <button
+                    type="button"
+                    className="url-rm"
+                    title={tt('Remove the saved token')}
+                    onClick={() => {
+                      setGhPatSet(false)
+                      setGhPatClear(true)
+                      scheduleApply()
+                    }}
+                  >
+                    <BinIcon />
+                  </button>
+                )}
               </div>
+              {tab.github_error && ghEnabled && (
+                <div className="src-err">
+                  {tt('Failed to load')}: {srcErrText(tab.github_error, tt)}
+                </div>
+              )}
             </div>
-          )}
-        </div>
+          </DepPanel>
+        </Group>
 
-        {/* ── Auto-refresh ── */}
-        <div className="settings-section">
-          <div className="modal-row" style={{ marginBottom: 6 }}>
-            <span className="modal-label" style={{ margin: 0 }}>
-              {tt('Auto-refresh interval (minutes, 0 = off)')}
-            </span>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={!refreshDisabled}
-                onChange={(e) => {
-                  setRefreshDisabled(!e.target.checked)
-                  scheduleApply()
-                }}
-              />
-              <span className="toggle-track" />
-              <span className="toggle-thumb" />
-            </label>
-          </div>
-          <input
-            className="modal-input"
-            type="number"
-            min={0}
-            value={refreshMin}
-            style={{ width: 80, opacity: refreshDisabled ? 0.45 : 1 }}
-            onChange={(e) => setRefreshMin(+e.target.value || 0)}
-            onBlur={scheduleApply}
-          />
-          {hint('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')}
-          <div className="modal-row" style={{ marginTop: 8 }}>
-            <span className="modal-row-label">{tt('Test after auto-refresh')}</span>
-            <Select
-              className="modal-input num-input"
-              style={{ width: 'auto', marginBottom: 0 }}
-              value={refreshTest}
-              onChange={(e) => {
-                setRefreshTest(e.target.value)
-                scheduleApply()
-              }}
-            >
-              <option value="">{tt('off')}</option>
-              <option value="ping">{tt('Ping only')}</option>
-              <option value="speed">{tt('Speed test')}</option>
-            </Select>
-          </div>
-          {hint("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}
-        </div>
+        <RefreshGroup
+          lang={lang}
+          min={refreshMin}
+          off={refreshDisabled}
+          test={refreshTest}
+          setMin={setRefreshMin}
+          setOff={setRefreshDisabled}
+          setTest={setRefreshTest}
+          onChanged={scheduleApply}
+        />
 
-        {/* ── Dedup ── */}
-        <div className="settings-section">
-          <div className="modal-row" style={{ alignItems: 'flex-end' }}>
+        <ExcludeGroup
+          lang={lang}
+          off={excludeDisabled}
+          setOff={setExcludeDisabled}
+          ef={ef}
+          efInput={efInput}
+          setEf={setEf}
+          setEfInput={setEfInput}
+          onChanged={scheduleApply}
+        >
+          <div className="modal-row">
             <span className="modal-row-label">{tt('Deduplicate duplicate configs')}</span>
             <div className="seg-group" id="ms-dedup-seg" role="radiogroup">
               {[
                 { v: '', l: tt('Off'), title: tt('No deduplication') },
                 { v: 'hide', l: tt('Hide'), title: tt('Hide duplicates from view (reversible)') },
-                { v: 'delete', l: tt('Delete'), title: tt('Permanently delete duplicates') },
+                { v: 'delete', l: tt('Delete'), title: tt('Delete duplicates from the tab') },
               ].map((m) => (
                 <button
                   key={m.v}
@@ -480,49 +530,15 @@ export default function TabModal({
               ))}
             </div>
           </div>
-          {hint('Off shows everything, Hide filters duplicates out of the view (reversible), Delete removes them for good. Two configurations count as duplicates when they point at the same server with the same settings; the name is not compared.')}
-        </div>
+          {hint('What happens to duplicate configurations. Two configurations count as duplicates when they point at the same server with the same settings; the name is not compared.', [
+            opt('Off', 'everything is shown.', true),
+            opt('Hide', 'duplicates are filtered out of the view; this can be undone.'),
+            opt('Delete', 'duplicates are removed from the tab — the notification that follows can undo it, and later loads of the sources arrive without duplicates.'),
+          ])}
+        </ExcludeGroup>
 
-        {/* ── Exclude filter ── */}
-        <div className="settings-section">
-          <div className="modal-row" style={{ marginBottom: 6 }}>
-            <span className="modal-label" style={{ margin: 0 }}>
-              {tt('Exclude filter')}
-            </span>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={!excludeDisabled}
-                onChange={(e) => {
-                  setExcludeDisabled(!e.target.checked)
-                  scheduleApply()
-                }}
-              />
-              <span className="toggle-track" />
-              <span className="toggle-thumb" />
-            </label>
-          </div>
-          <Hint
-            className="ef-hint"
-            en="Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it."
-          />
-          <ExcludeFields
-            ef={ef}
-            efInput={efInput}
-            disabled={excludeDisabled}
-            setEf={setEf}
-            setEfInput={setEfInput}
-            onChanged={scheduleApply}
-          />
-        </div>
-
-        <div className="modal-hint" style={{ marginBottom: 8 }}>
+        <div className="set-note" style={{ margin: '14px 0 0' }}>
           {tt('Changes apply automatically.')}
-        </div>
-        <div className="modal-btns">
-          <button className="btn ghost" onClick={closeModal}>
-            {tt('Close')}
-          </button>
         </div>
       </div>
     </div>

@@ -63,6 +63,7 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 	if err = cmd.Start(); err != nil {
 		return fmt.Errorf("xray start: %w", err)
 	}
+	tieToVair(cmd)
 	trackPID(cmd.Process.Pid)
 	defer func() {
 		cmd.Process.Kill() //nolint:errcheck
@@ -88,7 +89,7 @@ func withXray(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transpo
 		if len(errMsg) > 160 {
 			errMsg = "..." + errMsg[len(errMsg)-160:]
 		}
-		return fmt.Errorf("xray: %s", errMsg)
+		return fmt.Errorf("%s", engineErrorText("xray", errMsg))
 	case ready := <-portResult:
 		if !ready {
 			return fmt.Errorf("xray: port not ready after %s", xrayStartupTimeout)
@@ -145,6 +146,7 @@ func withSingbox(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Tran
 	if err = cmd.Start(); err != nil {
 		return fmt.Errorf("sing-box start: %w", err)
 	}
+	tieToVair(cmd)
 	trackPID(cmd.Process.Pid)
 	defer func() {
 		cmd.Process.Kill() //nolint:errcheck
@@ -184,6 +186,15 @@ func withSingbox(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Tran
 // Ping/speed runners call this instead of withXray directly so a mixed list
 // (VLESS + Hysteria2 + …) just works without per-call-site branching.
 func withEngine(n *Node, ttl time.Duration, fn func(httpPort int, tr *http.Transport) error) error {
+	// The server's name is asked the way a connection asks it — the bootstrap
+	// server, over DNS over HTTPS (lookupServerIP) — and not left to the engine,
+	// which hands it to the system's DNS client: with no connection, or in
+	// proxy mode, that is the provider's resolver, in the clear, once for every
+	// server a PING ALL or an AUTO sweep touches. The test itself still goes
+	// straight to the server; that is what it measures.
+	if err := preResolveHost(n); err != nil {
+		return err
+	}
 	if engineForNode(n) == "singbox" {
 		return withSingbox(n, ttl, fn)
 	}
@@ -316,6 +327,7 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 		nodes[i] = n
 		labels[i] = n.Name
 		raws[i] = e.Raw
+		noteCertCheckOnXray(n)
 		e.mu.Lock()
 		e.Protocol = string(n.Kind)
 		e.mu.Unlock()
@@ -397,6 +409,7 @@ func startChainOnTab(entries []*ConfigEntry, connTab string, mode ConnMode) {
 // build the config and hand off to runXrayProxyConfig for the shared spawn/
 // wait/finalize sequence (also used by the chain path).
 func startProxyConnectionXray(cm *connManager, entry *ConfigEntry, n *Node, connTab string) {
+	noteCertCheckOnXray(n)
 	runXrayProxyConfig(cm, entry, n.Name, connTab, nil, nil, func(intHTTPPort, intSOCKSPort int) map[string]interface{} {
 		// Proxy mode = user-facing HTTP+SOCKS → use the configured auth credentials
 		// (empty when the respective setting is off).
@@ -418,11 +431,15 @@ func startProxyConnectionXray(cm *connManager, entry *ConfigEntry, n *Node, conn
 // XRAY proxy config and pins its traffic to the proxy outbound with a rule
 // prepended ahead of the routing-mode rules (first match wins in xray).
 func injectSourceFetchInbound(cfg map[string]interface{}, port int) {
+	// With a login of its own, made for this session (see srcfetch.go).
+	user, pass := newSrcFetchCreds()
 	inb, _ := cfg["inbounds"].([]interface{})
 	cfg["inbounds"] = append(inb, map[string]interface{}{
 		"tag": "src-fetch", "listen": "127.0.0.1", "port": port,
 		"protocol": "http",
-		"settings": map[string]interface{}{"auth": "noauth"},
+		"settings": map[string]interface{}{
+			"accounts": []interface{}{map[string]interface{}{"user": user, "pass": pass}},
+		},
 	})
 	if routing, ok := cfg["routing"].(map[string]interface{}); ok {
 		if rules, ok := routing["rules"].([]interface{}); ok {
@@ -436,10 +453,12 @@ func injectSourceFetchInbound(cfg map[string]interface{}, port int) {
 // injectSourceFetchInboundSingbox is the sing-box flavour of the same pin
 // (proxy-mode Hysteria2/TUIC sessions).
 func injectSourceFetchInboundSingbox(cfg map[string]interface{}, port int) {
+	user, pass := newSrcFetchCreds()
 	inb, _ := cfg["inbounds"].([]interface{})
 	cfg["inbounds"] = append(inb, map[string]interface{}{
 		"type": "http", "tag": "src-fetch",
 		"listen": "127.0.0.1", "listen_port": port,
+		"users": singboxInboundUsers(user, pass),
 	})
 	if route, ok := cfg["route"].(map[string]interface{}); ok {
 		if rules, ok := route["rules"].([]interface{}); ok {
@@ -451,16 +470,10 @@ func injectSourceFetchInboundSingbox(cfg map[string]interface{}, port int) {
 }
 
 func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab string, chain, chainRaws []string, build func(intHTTPPort, intSOCKSPort int) map[string]interface{}) {
-	httpPort, socksPort := currentProxyPorts()
-	if !portFree(httpPort) {
-		if pf, e := findFreePort(); e == nil {
-			httpPort = pf
-		}
-	}
-	if !portFree(socksPort) {
-		if pf, e := findFreePort(); e == nil {
-			socksPort = pf
-		}
+	httpPort, socksPort, perr := claimProxyPorts()
+	if perr != nil {
+		setConnError(cm, entry, perr.Error())
+		return
 	}
 
 	// The user-visible ports above are what apps connect to (system proxy
@@ -531,6 +544,7 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 		setConnError(cm, entry, "xray start: "+err.Error())
 		return
 	}
+	tieToVair(cmd)
 
 	go pumpProcLog("xray", stdoutPipe, sink)
 	go pumpProcLog("xray", stderrPipe, sink)
@@ -569,7 +583,7 @@ func runXrayProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab strin
 		if len(errMsg) > 200 {
 			errMsg = "..." + errMsg[len(errMsg)-200:]
 		}
-		setConnError(cm, entry, "xray: "+errMsg)
+		setConnError(cm, entry, engineErrorText("xray", errMsg))
 		return
 	case ready := <-portResult:
 		if !ready {
@@ -603,20 +617,23 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 	// next time". Taken before anything can change underneath it.
 	facts := captureSessionFacts(engineName(mainCmd))
 	fwdCtx, fwdCancel := context.WithCancel(context.Background())
-	bindHost := proxyBindHost() // 127.0.0.1, or 0.0.0.0 when "allow LAN" is on
-	if _, err := startCountingForwarder(fwdCtx, bindHost, httpPort, intHTTPPort, counter, "proxy-http"); err != nil {
-		fwdCancel()
-		mainCancel()
-		os.Remove(tmpPath)
-		setConnError(cm, entry, "proxy http counter: "+err.Error())
-		return
-	}
-	if _, err := startCountingForwarder(fwdCtx, bindHost, socksPort, intSOCKSPort, counter, "proxy-socks"); err != nil {
-		fwdCancel()
-		mainCancel()
-		os.Remove(tmpPath)
-		setConnError(cm, entry, "proxy socks counter: "+err.Error())
-		return
+	// 127.0.0.1, 0.0.0.0 when "allow LAN" is on, or a custom address together
+	// with 127.0.0.1 (see proxyListenHosts).
+	for _, host := range proxyListenHosts() {
+		if _, err := startCountingForwarder(fwdCtx, host, httpPort, intHTTPPort, counter, "proxy-http"); err != nil {
+			fwdCancel()
+			mainCancel()
+			os.Remove(tmpPath)
+			setConnError(cm, entry, "proxy http counter: "+err.Error())
+			return
+		}
+		if _, err := startCountingForwarder(fwdCtx, host, socksPort, intSOCKSPort, counter, "proxy-socks"); err != nil {
+			fwdCancel()
+			mainCancel()
+			os.Remove(tmpPath)
+			setConnError(cm, entry, "proxy socks counter: "+err.Error())
+			return
+		}
 	}
 
 	// Non-system-proxy mode: leave the Windows proxy settings alone — only apps
@@ -635,7 +652,7 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 	cm.fwdCancel = fwdCancel
 	cm.startedWith = facts
 	cm.state = ConnState{
-		Status: ConnConnected, Mode: ModeProxy, ConnTab: connTab, ConnRaw: entry.Raw,
+		Status: ConnConnected, Checking: true, Mode: ModeProxy, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: name,
 		HTTPPort: httpPort, SOCKSPort: socksPort, SrcFetchPort: intSrcPort,
 		StartedAt: time.Now(),
@@ -643,24 +660,36 @@ func finalizeProxyConnection(cm *connManager, entry *ConfigEntry, name, connTab 
 		ChainRaws: chainRaws,
 	}
 	cm.mu.Unlock()
-	// "last connected" badge: for a single node it's that node; for a chain it's
-	// the EXIT hop (the egress config — what the user thinks of as "where I came
-	// out"), i.e. the last raw in chainRaws.
-	if len(chainRaws) > 0 {
-		recordLastConnected(chainRaws[len(chainRaws)-1], ModeProxy)
-	} else {
-		recordLastConnected(entry.Raw, ModeProxy)
+	// A proxy session is not a tunnel: a block the last TUN session left for
+	// its successor has no successor, and holding everyone but the proxy's
+	// users offline is the proxy kill-switch — which has a setting of its own.
+	// When that switch is on its block is the session's own too, and the
+	// engage below replaces the one standing in a single step: releasing it
+	// here first left a moment with neither.
+	if !proxyKillSwitchEnabled() || persistentKillSwitchEnabled() || !proxyBlockIsSessions {
+		releaseTunnelBlock()
 	}
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	// Before the question, not after — see the TUN path. A failed check tears the
 	// session down and takes the system proxy with it; without the block already
 	// on, the machine would be handed straight back to its ordinary connection.
 	engageProxyKillSwitch()
+	dropBlockNobodyWants(ModeProxy)
 	// Same question TUN asks before it believes itself: does anything actually
 	// go through? A listener that answers the browser and nothing else is the
 	// proxy-mode shape of "connected with no traffic".
 	if !verifyProxyCarriesTraffic(cm, mainCmd, entry, connTab) {
 		return
+	}
+	// "last connected" badge: for a single node it's that node; for a chain it's
+	// the EXIT hop (the egress config — what the user thinks of as "where I came
+	// out"), i.e. the last raw in chainRaws. After the check, as the TUN paths
+	// do: recorded before it, a session that never carried anything became the
+	// one a restore on the next start would bring back.
+	if len(chainRaws) > 0 {
+		recordLastConnected(chainRaws[len(chainRaws)-1], chainRaws, ModeProxy)
+	} else {
+		recordLastConnected(entry.Raw, nil, ModeProxy)
 	}
 	// No interface to watch in proxy mode; the engine dying is the whole of it,
 	// and it left "connected" on screen with a listener nobody was serving.
@@ -693,16 +722,10 @@ func startProxyConnectionSingbox(cm *connManager, entry *ConfigEntry, n *Node, c
 // connect and by a chain whose hops sing-box carries.
 func runSingboxProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab string,
 	chain, chainRaws []string, build func(intHTTPPort, intSOCKSPort int) map[string]interface{}) {
-	httpPort, socksPort := currentProxyPorts()
-	if !portFree(httpPort) {
-		if pf, e := findFreePort(); e == nil {
-			httpPort = pf
-		}
-	}
-	if !portFree(socksPort) {
-		if pf, e := findFreePort(); e == nil {
-			socksPort = pf
-		}
+	httpPort, socksPort, perr := claimProxyPorts()
+	if perr != nil {
+		setConnError(cm, entry, perr.Error())
+		return
 	}
 	intHTTPPort, e1 := findFreePort()
 	if e1 != nil {
@@ -750,6 +773,7 @@ func runSingboxProxyConfig(cm *connManager, entry *ConfigEntry, name, connTab st
 		setConnError(cm, entry, "sing-box start: "+err.Error())
 		return
 	}
+	tieToVair(cmd)
 
 	go pumpProcLog("singbox", stderrPipe, func(line string) {
 		tailMu.Lock()
@@ -919,6 +943,9 @@ func startTUNConnectionOnTab(entry *ConfigEntry, connTab string) {
 func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, connTab, tunIface string, chainNodes []*Node, chainLabels, chainRaws []string) {
 
 	isChain := len(chainNodes) > 1
+	if !isChain {
+		noteCertCheckOnXray(n) // a chain's hops are noted where it is assembled
+	}
 	// 1. Start xray as local HTTP+SOCKS proxy
 	xrayHTTPPort, e1 := findFreePort()
 	if e1 != nil {
@@ -934,13 +961,15 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	// TUN hybrid: this xray SOCKS is the INTERNAL handoff sing-box dials (with the
 	// matching credentials) — never user-facing — so it always keeps auth on with
 	// the per-launch random credentials, independent of the user's SOCKS-auth
-	// setting. The xray HTTP inbound here is unused (sing-box dials the SOCKS one),
-	// so its auth is left empty. The user-facing LAN share is a separate sing-box
-	// inbound (lanProxyInbounds), which applies the configured credentials.
+	// setting. The xray HTTP inbound here is unused (sing-box dials the SOCKS one)
+	// takes the same per-launch login: unused is not the same as closed, and a
+	// listener without one carried anything any program sent it into the VPN.
+	// The user-facing LAN share is a separate sing-box inbound
+	// (lanProxyInbounds), which applies the configured credentials.
 	if isChain {
-		xrayCfg = buildXrayChainConfig(chainNodes, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass, "", "")
+		xrayCfg = buildXrayChainConfig(chainNodes, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass, proxyAuthUser, proxyAuthPass)
 	} else {
-		xrayCfg = buildXrayConfigForNode(n, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass, "", "")
+		xrayCfg = buildXrayConfigForNode(n, xrayHTTPPort, xraySocksPort, proxyAuthUser, proxyAuthPass, proxyAuthUser, proxyAuthPass)
 		// In hybrid TUN the proxy-vs-direct split is made by sing-box; the xray
 		// child must send everything it receives straight to the proxy. Otherwise
 		// the child's own routing (e.g. only_blocked default→direct) could push a
@@ -990,6 +1019,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		setConnError(cm, entry, "xray hybrid start: "+err.Error())
 		return
 	}
+	tieToVair(xrayCmd)
 	go pumpProcLog("xray", xrayStdoutPipe, nil)
 	go pumpProcLog("xray", xrayStderrPipe, nil)
 	// Wait for xray port
@@ -1071,6 +1101,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		setConnError(cm, entry, "sing-box start: "+err.Error())
 		return
 	}
+	tieToVair(cmd)
 
 	exitCh := make(chan error, 1)
 	go func() { exitCh <- cmd.Wait() }()
@@ -1157,7 +1188,7 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 		connName = strings.Join(chainLabels, " → ")
 	}
 	cm.state = ConnState{
-		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
+		Status: ConnConnected, Checking: true, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: connName,
 		TUNIface: tunIface, StartedAt: time.Now(),
 		Chain: chainLabels, ChainRaws: chainRaws,
@@ -1171,25 +1202,27 @@ func startTUNConnectionHybrid(cm *connManager, entry *ConfigEntry, n *Node, conn
 	// tunnel that turns out to carry nothing leaves the traffic stopped, and the
 	// error says so.
 	//
-	// TUN's other kill-switch is sing-box's own strict_route (see
-	// buildHybridTUNConfig); this is the firewall-level one, which outlives the
-	// engine.
+	// Two blocks: the tunnel's, which stops everything outside the tunnel for
+	// as long as it is up (strict_route alone stops only DNS — see
+	// tunnelblock_windows.go), and the persistent one, which outlives it.
 	// The engine's inbound door, for the stacks that terminate connections in
 	// the operating system. Here rather than at start-up: the rule names the
 	// adapter, and the adapter does not exist until the engine has made it.
 	if engineNeedsFirewallRule() {
 		ensureEngineFirewallRule(tunIface)
 	}
+	engageTunnelBlock(tunIface)
 	engagePersistentKillSwitch(tunIface)
+	dropBlockNobodyWants(ModeTUN)
 	if !verifyTUNCarriesTraffic(cm, cmd, entry, connTab) {
 		return
 	}
 	watchSession(cm, cmd, exitCh, tunIface, ModeTUN)
 	// last-connected badge → exit hop for a chain, else the single node.
 	if isChain {
-		recordLastConnected(chainRaws[len(chainRaws)-1], ModeTUN)
+		recordLastConnected(chainRaws[len(chainRaws)-1], chainRaws, ModeTUN)
 	} else {
-		recordLastConnected(entry.Raw, ModeTUN)
+		recordLastConnected(entry.Raw, nil, ModeTUN)
 	}
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
@@ -1255,6 +1288,7 @@ func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]inte
 		setConnError(cm, entry, "sing-box start: "+err.Error())
 		return
 	}
+	tieToVair(cmd)
 
 	exitCh := make(chan error, 1)
 	go func() { exitCh <- cmd.Wait() }()
@@ -1333,7 +1367,7 @@ func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]inte
 	cm.fwdCancel = nil
 	cm.startedWith = facts
 	cm.state = ConnState{
-		Status: ConnConnected, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
+		Status: ConnConnected, Checking: true, Mode: ModeTUN, ConnTab: connTab, ConnRaw: entry.Raw,
 		EntryIndex: entry.Index, EntryName: name,
 		TUNIface: tunIface, StartedAt: time.Now(),
 		StatsUnavailable: true,
@@ -1348,21 +1382,23 @@ func startTUNSingboxCfg(cm *connManager, entry *ConfigEntry, cfg map[string]inte
 	// tunnel that turns out to carry nothing leaves the traffic stopped, and the
 	// error says so.
 	//
-	// TUN's other kill-switch is sing-box's own strict_route (see
-	// buildHybridTUNConfig); this is the firewall-level one, which outlives the
-	// engine.
+	// Two blocks: the tunnel's, which stops everything outside the tunnel for
+	// as long as it is up (strict_route alone stops only DNS — see
+	// tunnelblock_windows.go), and the persistent one, which outlives it.
 	// The engine's inbound door, for the stacks that terminate connections in
 	// the operating system. Here rather than at start-up: the rule names the
 	// adapter, and the adapter does not exist until the engine has made it.
 	if engineNeedsFirewallRule() {
 		ensureEngineFirewallRule(tunIface)
 	}
+	engageTunnelBlock(tunIface)
 	engagePersistentKillSwitch(tunIface)
+	dropBlockNobodyWants(ModeTUN)
 	if !verifyTUNCarriesTraffic(cm, cmd, entry, connTab) {
 		return
 	}
 	watchSession(cm, cmd, exitCh, tunIface, ModeTUN)
-	recordLastConnected(entry.Raw, ModeTUN)
+	recordLastConnected(entry.Raw, nil, ModeTUN)
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 	startUptimeTicker(cm)
 	// startStatsTicker self-terminates immediately on a nil counter — no
@@ -1375,6 +1411,8 @@ func stopConnection() {
 	state.conn.actionMu.Lock()
 	defer state.conn.actionMu.Unlock()
 	stopConnectionLocked(state.conn, false, true)
+	// The user said disconnect: nothing is coming next to hand the block to.
+	releaseTunnelBlock()
 	state.broadcast(SSEEvent{Type: "conn_update", Payload: state.conn.snap()})
 	// A verbose connection can churn a lot of transient heap (log lines, JSON
 	// batches). Go won't hand that back to the OS for ~5 min on its own, which
@@ -1464,7 +1502,14 @@ func stopConnectionLocked(cm *connManager, keepProxy, sweepGhosts bool) {
 	// helper treats a dropped owner as a teardown — but asking lets it report
 	// a problem instead of leaving us to guess.
 	if tunRemote != nil {
-		if err := tunRemote.Stop(); err != nil {
+		// With its block kept for the next tunnel, as the Windows block is
+		// (handOverTunnelBlock below): most teardowns are a switch. A
+		// disconnect takes it down right after — stopConnection.
+		stop := tunRemote.Stop
+		if h, ok := tunRemote.(interface{ StopForHandover() error }); ok {
+			stop = h.StopForHandover
+		}
+		if err := stop(); err != nil {
 			vlog("warn", "helper stop: %v", err)
 		}
 		tunRemote.Close()
@@ -1494,6 +1539,16 @@ func stopConnectionLocked(cm *connManager, keepProxy, sweepGhosts bool) {
 	<-mainDone
 	<-xrayDone
 
+	// The tunnel's block is handed to whatever comes next rather than taken
+	// down: most teardowns are a switch — the user picking another server, AUTO
+	// moving on, a failed candidate making room for the next — and between the
+	// old engine dying and the new one up, the machine had no tunnel and no
+	// block, so for those seconds everything went out with its own address. A
+	// new TUN session takes the block over; nothing coming back within the
+	// grace period takes it down (see handOverTunnelBlock). The user's own
+	// disconnect takes it down at once — stopConnection.
+	handOverTunnelBlock()
+
 	// Cleanup temp files
 	if mainTmpCfg != "" {
 		os.Remove(mainTmpCfg)
@@ -1522,8 +1577,16 @@ func stopConnectionLocked(cm *connManager, keepProxy, sweepGhosts bool) {
 		}
 	}
 	if wasTUN {
+		// The engine is gone, and with it the log that would have ended each
+		// of its connections' rows.
+		endTunConns()
+	}
+	if wasTUN && !sessionEnding.Load() {
 		// The inbound door for the engine closes with the session. It names the
 		// adapter this session had, and the next one gets a rule of its own.
+		// Not while Windows is ending the session: it is a PowerShell run, and a
+		// new process then can hang — and the restart with it. The next start
+		// removes the rule anyway (core.Init).
 		removeEngineFirewallRule()
 	}
 	if wasTUN && sweepGhosts {
@@ -1551,6 +1614,9 @@ func stopConnectionLocked(cm *connManager, keepProxy, sweepGhosts bool) {
 }
 
 func setConnError(cm *connManager, entry *ConfigEntry, msg string, tab ...string) {
+	// Engine output arrives with its terminal colours: "ESC[31mFATAL ESC[0m…"
+	// is what the connection bar showed.
+	msg = stripANSI(msg)
 	name := entry.Name
 	if name == "" {
 		name = fmt.Sprintf("#%d", entry.Index)
@@ -1633,16 +1699,18 @@ func statsSnapshot(counter *trafficCounter) map[string]interface{} {
 	settingsMu.RUnlock()
 	var sessUp, sessDown int64
 	if counter != nil {
-		sessUp = counter.Up.Load()
-		sessDown = counter.Down.Load()
+		// The session as statistics saw it: what crossed while they were off
+		// is not part of it.
+		sessUp = counter.Up.Load() - counter.SkippedUp.Load()
+		sessDown = counter.Down.Load() - counter.SkippedDown.Load()
 		// Fold in the not-yet-persisted portion of this session so the
 		// displayed total grows in lockstep with session bytes. The
 		// next persist run will move these bytes into appSettings and
 		// bump LastPersisted — at which point the same display value
 		// comes from the disk side and the delta drops to zero, so the
 		// total never jumps.
-		totalUp += sessUp - counter.LastPersistedUp.Load()
-		totalDown += sessDown - counter.LastPersistedDown.Load()
+		totalUp += counter.Up.Load() - counter.LastPersistedUp.Load()
+		totalDown += counter.Down.Load() - counter.LastPersistedDown.Load()
 	}
 	return map[string]interface{}{
 		"session_up":   sessUp,
@@ -1662,6 +1730,7 @@ func startStatsTicker(cm *connManager) {
 		t := time.NewTicker(1 * time.Second)
 		defer t.Stop()
 		var ticksSincePersist int
+		wasOn := statsEnabled()
 		for range t.C {
 			cm.mu.Lock()
 			ok := cm.state.Status == ConnConnected
@@ -1670,7 +1739,7 @@ func startStatsTicker(cm *connManager) {
 			if !ok || counter == nil {
 				return
 			}
-			if !statsEnabled() {
+			if !statsTick(counter, statsEnabled(), &wasOn, &ticksSincePersist) {
 				continue
 			}
 			// Lossy — stats_update fires every second (or faster) and the
@@ -1678,11 +1747,6 @@ func startStatsTicker(cm *connManager) {
 			// case under buffer pressure the on-screen counter pauses for
 			// one tick; never matters because the next tick replaces it.
 			state.broadcast(SSEEvent{Type: "stats_update", Payload: statsSnapshot(counter), Lossy: true})
-			ticksSincePersist++
-			if ticksSincePersist >= 30 {
-				ticksSincePersist = 0
-				persistCounterDelta(counter)
-			}
 		}
 	}()
 }
@@ -1821,9 +1885,23 @@ func failureWasOurs() bool { return failedOnOurOwnBlock.Load() }
 // through it" would leave them looking for a network fault that is the
 // program's own doing.
 func noTrafficMessage(mode ConnMode, blocked bool) string {
+	return noTrafficMessageFor(mode, blocked, false)
+}
+
+// noTrafficMessageFor is noTrafficMessage for a session that may be a chain. A
+// chain that carries nothing has a hop that does not answer, and the check
+// cannot tell which; the message says where to look instead of naming the
+// mode.
+func noTrafficMessageFor(mode ConnMode, blocked, chain bool) string {
 	what := "the tunnel started but no traffic goes through it"
 	if mode == ModeProxy {
 		what = "the proxy started but no traffic goes through it"
+	}
+	if chain {
+		what = "the chain started but no traffic goes through it — test its configs one by one to find the one that does not answer"
+	}
+	if blocked && blockWillLapse() {
+		return what + " — traffic stays blocked for 20 s (kill-switch), then the normal connection returns"
 	}
 	if blocked {
 		return what + " — traffic stays blocked (kill-switch); disconnect to release it"
@@ -1847,6 +1925,11 @@ func verifyProxyCarriesTraffic(cm *connManager, cmd *exec.Cmd, entry *ConfigEntr
 }
 
 func verifyCarriesTraffic(cm *connManager, cmd *exec.Cmd, entry *ConfigEntry, connTab string, mode ConnMode) bool {
+	// A new session has no verdict yet. Without this the panel went on showing
+	// the last session's — "does not apply" from a proxy session over a TUN one —
+	// until this session's check came in. A new run, so that a check of the
+	// last session still probing cannot write over it either.
+	setLeakResultOf(newLeakRun(), leakCheckResult{verdict: leakNotRun})
 	// Twice, with a pause first — the same shape auto-connect uses. Routes are
 	// installed a moment after the engine says it is up, and a single failed
 	// request is a thin reason to throw a session away.
@@ -1863,9 +1946,18 @@ func verifyCarriesTraffic(cm *connManager, cmd *exec.Cmd, entry *ConfigEntry, co
 			return true // torn down or replaced while we were probing
 		}
 		if alive, _ := probeLiveTunnel(cm); alive {
+			cm.mu.Lock()
+			if cm.state.Status == ConnConnected && cm.cmd == cmd {
+				cm.state.Checking = false
+			}
+			cm.mu.Unlock()
+			state.broadcast(SSEEvent{Type: "conn_update", Payload: cm.snap()})
 			if mode == ModeTUN {
 				go noteIPv6Reachability(cm, cmd)
 			}
+			go runLeakCheckAfterConnect(cm, cmd, mode)
+			// What the program put off until there was a tunnel to carry it.
+			afterSessionUp()
 			return true
 		}
 	}
@@ -1885,7 +1977,12 @@ func verifyCarriesTraffic(cm *connManager, cmd *exec.Cmd, entry *ConfigEntry, co
 		// the ranking over a fault on this side of the wire.
 		noteFailureWasOurs()
 	}
-	msg := noTrafficMessage(mode, blocked)
+	// The message counts the session's own block too (trafficHeldNow); the
+	// charge above stays with the persistent set, which can stop the probe.
+	cm.mu.Lock()
+	isChain := len(cm.state.Chain) > 1
+	cm.mu.Unlock()
+	msg := noTrafficMessageFor(mode, trafficHeldNow(), isChain)
 	vlog("warning", "%s", warn)
 	noteSessionEndReason("came up but carried no traffic")
 	// The system proxy stays pointed at the local port while AUTO still has

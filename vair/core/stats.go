@@ -40,6 +40,61 @@ type trafficCounter struct {
 
 	LastPersistedUp   atomic.Int64
 	LastPersistedDown atomic.Int64
+
+	// SkippedUp/SkippedDown are the bytes that crossed while statistics were
+	// switched off. Statistics leave them out of what they show and keep; Up
+	// and Down stay whole, because the liveness checks read the raw traffic.
+	SkippedUp   atomic.Int64
+	SkippedDown atomic.Int64
+
+	// ServerDown is the part of Down that can only have come from the server:
+	// a connection's bytes back count here once it has received more than
+	// serverReplyMin. Below that it may be nothing but the engine's own reply
+	// to the proxy handshake — "200 Connection established", a SOCKS reply —
+	// which it sends whether or not the server is there, and which made a dead
+	// server look alive to the liveness checks for as long as anything tried
+	// to connect.
+	ServerDown atomic.Int64
+}
+
+// serverReplyMin is more than any proxy handshake reply and less than what a
+// server sends back on any real exchange (a TLS handshake alone carries a
+// certificate).
+const serverReplyMin = 512
+
+// skipUncounted sets aside what crossed since the last fold-in without adding
+// it to the lifetime total. Called every tick while statistics are off, so
+// switching them back on does not bring the off period into the total.
+func skipUncounted(c *trafficCounter) {
+	up, down := c.Up.Load(), c.Down.Load()
+	c.SkippedUp.Add(up - c.LastPersistedUp.Load())
+	c.SkippedDown.Add(down - c.LastPersistedDown.Load())
+	c.LastPersistedUp.Store(up)
+	c.LastPersistedDown.Store(down)
+}
+
+// statsTick is one second of the stats ticker, apart from the broadcast: it
+// reports whether statistics are counting now. wasOn and ticks are the
+// ticker's own state.
+func statsTick(c *trafficCounter, enabled bool, wasOn *bool, ticks *int) bool {
+	if !enabled {
+		// The part of the session seen while statistics were on is kept first
+		// — up to 30 s of it may not have been folded in yet — and from then
+		// on nothing is.
+		if *wasOn {
+			persistCounterDelta(c)
+			*wasOn = false
+		}
+		skipUncounted(c)
+		return false
+	}
+	*wasOn = true
+	*ticks++
+	if *ticks >= 30 {
+		*ticks = 0
+		persistCounterDelta(c)
+	}
+	return true
 }
 
 // countingReader wraps an io.Reader and tallies the bytes it produces
@@ -47,9 +102,18 @@ type trafficCounter struct {
 type countingReader struct {
 	r io.Reader
 	n *atomic.Int64
-	// also is the live list's per-connection counter, when the panel is open.
-	// Nil the rest of the time, which is the ordinary case.
+	// also is this connection's own counter, which becomes its row's.
 	also *atomic.Int64
+	// spy, on the client's side, reads what the connection is for (relayspy.go).
+	spy *destSpy
+	// watch, on the client's side of a SOCKS port, reads the command of the
+	// request (socksudp.go).
+	watch *socksCmdWatch
+	// server, on the direction back to the client, is trafficCounter.ServerDown;
+	// seen is this connection's bytes so far, to know when it has passed
+	// serverReplyMin.
+	server *atomic.Int64
+	seen   int64
 }
 
 func (cr *countingReader) Read(p []byte) (int, error) {
@@ -59,23 +123,20 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 		if cr.also != nil {
 			cr.also.Add(int64(n))
 		}
+		if cr.spy != nil {
+			cr.spy.feed(p[:n])
+		}
+		if cr.watch != nil {
+			cr.watch.feed(p[:n])
+		}
+		if cr.server != nil {
+			cr.seen += int64(n)
+			if cr.seen > serverReplyMin {
+				cr.server.Add(int64(n))
+			}
+		}
 	}
 	return n, err
-}
-
-// liveUp / liveDown give the row's counters, or nil when nothing is tracked.
-func liveUp(e *connEntry) *atomic.Int64 {
-	if e == nil {
-		return nil
-	}
-	return e.Up
-}
-
-func liveDown(e *connEntry) *atomic.Int64 {
-	if e == nil {
-		return nil
-	}
-	return e.Down
 }
 
 // relayLabelTUN marks the forwarder that sits between the two engines in hybrid
@@ -121,6 +182,12 @@ func startCountingForwarder(ctx context.Context, bindHost string, listenPort, ta
 // relayCountedConn shuttles bytes between a client and xray, counting
 // uplink (client→xray) and downlink (xray→client) into the shared
 // counter. Closes both connections when either direction ends.
+//
+// Everything is forwarded from the first byte. Which connection it is — the
+// row in the connections panel — is read off the client's bytes on the way
+// through (relayspy.go) and opened the moment the request has been seen; the
+// connection's own counters become the row's, so the bytes before that moment
+// are on it too.
 func relayCountedConn(client net.Conn, targetPort int, counter *trafficCounter, label string) {
 	defer client.Close()
 	target, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", targetPort), 5*time.Second)
@@ -129,68 +196,39 @@ func relayCountedConn(client net.Conn, targetPort int, counter *trafficCounter, 
 	}
 	defer target.Close()
 
-	// The live list, when someone is looking at it. The first bytes of the
-	// conversation name the destination the client asked for; they are read into
-	// a buffer and handed on unchanged, so a client whose greeting we do not
-	// recognise is not affected in any way.
-	var live *connEntry
-	var prefix []byte
-	if connectionsWatched() {
-		buf := make([]byte, 1024)
-		client.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
-		n, rerr := client.Read(buf)
-		client.SetReadDeadline(time.Time{}) //nolint:errcheck
-		if n > 0 {
-			prefix = buf[:n]
-			dest := peekDestination(prefix)
-			if dest != "" {
-				// Who asked for it — but only where the answer means anything.
-				// In proxy mode the client of this relay is the user's own
-				// program; in TUN it is sing-box, one step further along the
-				// same chain, and naming it would put "sing-box" in the program
-				// column of every row on the machine. Unknown is the truth
-				// there, and the panel already has a way to say it.
-				//
-				// The verdict is left empty for the opposite reason in proxy
-				// mode: which way a connection goes is the engine's decision and
-				// it says so in its own log a moment later, so claiming "proxy"
-				// here would label a direct-routed connection as tunnelled. In
-				// TUN this relay only ever carries what the engine has already
-				// decided to tunnel, so it can say so itself.
-				process, via := processForLocalPort(client.RemoteAddr().String()), ""
-				if label == relayLabelTUN {
-					// The engine is one step ahead of us on the same
-					// connection: take the row it has already opened rather
-					// than list the connection a second time.
-					live = adoptEngineRow(dest)
-					// And when there is none — the engine's log can be quiet,
-					// or a line can be lost to the rate gate — open one that
-					// does not claim to know who asked. The client of this
-					// relay is sing-box, one step along the same chain, and
-					// naming it would put the engine in the program column of
-					// every row on the machine. Where it went we do know:
-					// everything this relay carries is already bound for the
-					// tunnel.
-					process, via = "", "proxy"
-				}
-				if live == nil {
-					live = connBegin(dest, process, via, "", true)
-				}
-				defer connEnd(live)
-			}
+	opened := time.Now()
+	var up, down atomic.Int64 // this connection's counts — the row's, once there is one
+	var row atomic.Pointer[connEntry]
+	defer func() {
+		if e := row.Load(); e != nil {
+			connEnd(e)
 		}
-		// A read that timed out or failed with nothing to show for it is left
-		// alone: the relay below behaves exactly as it did before this feature
-		// existed. Describing a connection must never be able to end one.
-		_ = rerr
-		if len(prefix) > 0 {
-			if _, werr := target.Write(prefix); werr != nil {
-				return
-			}
-			if live != nil {
-				live.Up.Add(int64(len(prefix)))
-			}
-			counter.Up.Add(int64(len(prefix)))
+	}()
+	var spy *destSpy
+	if connectionsWatched() {
+		spy = newDestSpy(
+			func(dest string) {
+				if e := openRelayRow(dest, client, opened, label, &up, &down); e != nil {
+					row.Store(e)
+				}
+			},
+			func(name string) {
+				if e := row.Load(); e != nil {
+					nameRelayRow(e, name)
+				}
+			})
+	}
+
+	// A SOCKS client asking for UDP — a device on the network, a program here,
+	// sing-box in TUN mode — gets Vair's relay, which it can reach and which
+	// counts (socksudp.go); everything else passes as it is.
+	var watch *socksCmdWatch
+	var fromEngine io.Reader = target
+	if label == "proxy-socks" || label == relayLabelTUN {
+		w, wrap, cleanup := socksUDPRelay(client, counter)
+		defer cleanup()
+		if w != nil {
+			watch, fromEngine = w, wrap(target)
 		}
 	}
 
@@ -201,7 +239,7 @@ func relayCountedConn(client net.Conn, targetPort int, counter *trafficCounter, 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(target, &countingReader{r: client, n: &counter.Up, also: liveUp(live)}) //nolint:errcheck
+		io.Copy(target, &countingReader{r: client, n: &counter.Up, also: &up, spy: spy, watch: watch}) //nolint:errcheck
 		// Signal write half-close so xray sees the end of the upstream;
 		// it can finish flushing its response before we tear everything
 		// down. Errors here are benign.
@@ -211,10 +249,56 @@ func relayCountedConn(client net.Conn, targetPort int, counter *trafficCounter, 
 	}()
 	go func() {
 		defer wg.Done()
-		io.Copy(client, &countingReader{r: target, n: &counter.Down, also: liveDown(live)}) //nolint:errcheck
+		io.Copy(client, &countingReader{r: fromEngine, n: &counter.Down, also: &down, server: &counter.ServerDown}) //nolint:errcheck
 		if c, ok := client.(*net.TCPConn); ok {
 			c.CloseWrite() //nolint:errcheck
 		}
 	}()
 	wg.Wait()
+}
+
+// openRelayRow opens the row for a relayed connection whose destination has just
+// been read, and points it at the relay's counters.
+//
+// Who asked for it — but only where the answer means anything. In proxy mode
+// the client of this relay is the user's own program; in TUN it is sing-box,
+// one step further along the same chain, and naming it would put "sing-box" in
+// the program column of every row on the machine. Unknown is the truth there.
+//
+// The verdict is left empty in proxy mode: which way a connection goes is the
+// engine's decision and it says so in its own log a moment later, so claiming
+// "proxy" here would label a direct-routed connection as tunnelled. In TUN this
+// relay only ever carries what the engine has already decided to tunnel.
+func openRelayRow(dest string, client net.Conn, opened time.Time, label string, up, down *atomic.Int64) *connEntry {
+	var live *connEntry
+	process, via := "", ""
+	if label == relayLabelTUN {
+		// The engine is one step ahead of us on the same connection: take the
+		// row it has already opened rather than list the connection twice.
+		live = adoptEngineRow(dest)
+		via = "proxy"
+	} else {
+		process = processForLocalPort(client.RemoteAddr().String(), opened)
+	}
+	if live == nil {
+		live = connBegin(dest, process, via, "", true)
+	}
+	if live == nil {
+		return nil
+	}
+	conns.Lock()
+	live.Up, live.Down = up, down
+	conns.Unlock()
+	return live
+}
+
+// nameRelayRow shows the name the client meant in place of a bare address.
+func nameRelayRow(e *connEntry, name string) {
+	conns.Lock()
+	defer conns.Unlock()
+	host, port, err := net.SplitHostPort(e.Dest)
+	if err != nil || net.ParseIP(host) == nil {
+		return
+	}
+	e.Dest = net.JoinHostPort(name, port)
 }

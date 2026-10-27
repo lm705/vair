@@ -50,6 +50,10 @@ func autostartPath() string {
 	return filepath.Join(c, "autostart", desktopFileName)
 }
 
+// ReconcileAutostart makes the autostart entry agree with the setting, at every
+// start: the entry is this program's own file, so it simply follows the switch.
+func ReconcileAutostart(enable bool) error { return ApplyAutostart(enable) }
+
 // ApplyAutostart writes or removes the autostart entry.
 //
 // The Exec line points at THIS binary rather than at /usr/bin/vair, so a build
@@ -275,7 +279,12 @@ func OpenPath(path string) {
 }
 
 func OpenURL(url string) {
-	_ = exec.Command("xdg-open", url).Start()
+	// Web addresses only (see webLink): xdg-open opens files and programs too.
+	link, ok := webLink(url)
+	if !ok {
+		return
+	}
+	_ = exec.Command("xdg-open", link).Start()
 }
 
 // removeUserDesktopEntry deletes the fallback entry we may have written when no

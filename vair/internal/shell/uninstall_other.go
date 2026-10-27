@@ -16,5 +16,11 @@ func HasUninstallCleanupFlag([]string) bool { return false }
 // installer's, and there is no Windows installer here.
 func HasEnableAutostartFlag([]string) bool { return false }
 
+// HasReleaseBlockFlag is Windows only: the Linux block belongs to the helper.
+func HasReleaseBlockFlag([]string) bool { return false }
+
+// IsQuitForUninstall is the Windows uninstaller's request; nothing sends it here.
+func IsQuitForUninstall([]string) bool { return false }
+
 // RunEnableAutostart is never reached outside Windows.
 func RunEnableAutostart() {}

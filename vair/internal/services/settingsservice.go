@@ -1,8 +1,6 @@
 package services
 
 import (
-	"os"
-
 	"vair/core"
 	"vair/internal/remote"
 	"vair/internal/shell"
@@ -25,6 +23,16 @@ func (s *SettingsService) SetSelectedMode(mode string) { core.SetSelectedMode(mo
 func (s *SettingsService) Set(ns core.AppSettings) core.AppSettings {
 	old := core.GetSettings()
 	applied := core.SetSettings(ns)
+	afterSettingsChange(old, applied)
+	return applied
+}
+
+// afterSettingsChange carries out what a changed setting does outside the
+// settings file: the registry, the firewall, the remote-access listener, the
+// tray, a live connection. A save and an import both end here — an import
+// used to apply only the two registry toggles, so an imported theme, language,
+// remote-access port or LAN sharing waited for the next unrelated change.
+func afterSettingsChange(old, applied core.AppSettings) {
 	if applied.AutostartEnabled != old.AutostartEnabled {
 		_ = shell.ApplyAutostart(applied.AutostartEnabled)
 	}
@@ -36,12 +44,9 @@ func (s *SettingsService) Set(ns core.AppSettings) core.AppSettings {
 	if applied.WatchConnection && !old.WatchConnection {
 		core.NotifyWatchTurnedOn()
 	}
-	// Turning the firewall block off means off now, not at the next disconnect —
-	// otherwise the switch says one thing and the machine does another.
-	if (old.KillSwitchPersistent && !applied.KillSwitchPersistent) ||
-		(old.ProxyKillSwitch && !applied.ProxyKillSwitch) {
-		core.ReleasePersistentKillSwitch()
-	}
+	// Turning a block's switch off means off now, not at the next disconnect —
+	// unless the other switch still wants the same block (see core).
+	core.AfterBlockSettingsChange(old, applied)
 	// Theme changed → re-sync the native window/webview background, else a live
 	// resize flashes the previous theme's colour at the lagging edges.
 	if applied.Theme != old.Theme {
@@ -60,15 +65,25 @@ func (s *SettingsService) Set(ns core.AppSettings) core.AppSettings {
 	if applied.NoSystemProxy != old.NoSystemProxy {
 		core.ReapplySystemProxy()
 	}
-	// TUN-mode LAN proxy sharing: reconcile the inbound firewall rule when the
-	// toggle, the ports, or the bind address change (so another device can reach
-	// the shared proxy). The config-side inbound applies on the next connection.
+	// Proxy access from the LAN: reconcile the inbound firewall rule when the
+	// ports or the bind address change (so another device can reach the
+	// proxy). The listeners themselves change on the next connection.
 	if applied.TunShareProxy != old.TunShareProxy || applied.HttpPort != old.HttpPort ||
-		applied.SocksPort != old.SocksPort || applied.ProxyBind != old.ProxyBind {
-		shell.ApplyTunProxyFirewall()
+		applied.SocksPort != old.SocksPort || applied.ProxyBind != old.ProxyBind ||
+		applied.ProxyAllowLAN != old.ProxyAllowLAN {
+		shell.ApplyProxyFirewall()
 	}
-	return applied
 }
+
+// CheckProxyPort says whether a proxy port, as typed, can be used, and what
+// holds it if not. other is the other proxy port, as typed.
+func (s *SettingsService) CheckProxyPort(port, other int) core.PortCheck {
+	return core.CheckProxyPort(port, other)
+}
+
+// CheckProxyBind says whether a custom proxy address is an address of this
+// machine: "ok", "invalid" or "absent".
+func (s *SettingsService) CheckProxyBind(addr string) string { return core.CheckProxyBind(addr) }
 
 // RemoteInfo tells the Settings UI whether remote control is on, its token, the
 // port, and the machine's LAN IPs (to build the phone URL + QR).
@@ -77,6 +92,10 @@ type RemoteInfo struct {
 	Token   string   `json:"token"`
 	Port    int      `json:"port"`
 	IPs     []string `json:"ips"`
+	// Listening is whether the server is accepting connections; Problem is
+	// why it is not although it is switched on (a fixed English phrase).
+	Listening bool   `json:"listening"`
+	Problem   string `json:"problem,omitempty"`
 }
 
 // Remote returns the current remote-access info (ensuring a token exists so the
@@ -86,7 +105,9 @@ func (s *SettingsService) Remote() RemoteInfo {
 	if token == "" {
 		token = core.EnsureRemoteToken()
 	}
-	return RemoteInfo{Enabled: enabled, Token: token, Port: remote.Port(), IPs: remote.LocalIPv4s()}
+	listening, problem := remote.Status()
+	return RemoteInfo{Enabled: enabled, Token: token, Port: remote.Port(), IPs: remote.LocalIPv4s(),
+		Listening: listening, Problem: problem}
 }
 
 // RegenerateRemoteToken replaces the access key (old links/QRs/cookies stop
@@ -122,6 +143,12 @@ func (s *SettingsService) BlockNotInForce() string { return core.BlockGapReason(
 // (a walk of four short lists) and never needed when it is closed.
 func (s *SettingsService) RuleStats() core.RuleStatsDTO { return core.RuleStats() }
 
+// CheckRules reads typed rule lines the way the configuration will: each comes
+// back in the form to keep, or with what is wrong with it.
+func (s *SettingsService) CheckRules(entries []string) []core.RuleCheck {
+	return core.CheckRules(entries)
+}
+
 // OpenDataFolder shows the app's data directory in the file manager.
 func (s *SettingsService) OpenDataFolder() {
 	shell.OpenPath(core.DataDir())
@@ -129,24 +156,28 @@ func (s *SettingsService) OpenDataFolder() {
 
 // Export saves tabs + tab settings + app settings to a JSON file picked in the
 // native Save dialog. Returns "" on success, "cancelled", or an error text.
+//
+// The dialog comes first and the work after it: building the document before
+// asking where to put it left the button doing nothing visible for as long as
+// that took. Progress is reported as export_progress (see core).
 func (s *SettingsService) Export() string {
-	data, filename, err := core.ExportSettingsJSON()
-	if err != nil {
-		return err.Error()
-	}
 	path, err := shell.App().Dialog.SaveFile().
 		SetMessage("Vair — export settings").
-		SetFilename(filename).
+		SetFilename(core.ExportSettingsFilename()).
 		AddFilter("JSON (*.json)", "*.json").
 		PromptForSingleSelection()
 	if err != nil || path == "" {
 		return "cancelled"
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := core.ExportSettingsToFile(path); err != nil {
 		return err.Error()
 	}
 	return ""
 }
+
+// BackupProgress is how far a running export or import has got, for a
+// settings window opened in the middle of one.
+func (s *SettingsService) BackupProgress() core.BackupProgress { return core.BackupProgressNow() }
 
 // Import replaces the current state from an exported JSON file picked in the
 // native Open dialog. includeTabs=false imports only the app settings.
@@ -160,16 +191,10 @@ func (s *SettingsService) Import(includeTabs bool) string {
 	if err != nil || len(paths) == 0 {
 		return "cancelled"
 	}
-	body, err := os.ReadFile(paths[0])
-	if err != nil {
-		return err.Error()
-	}
-	res := core.ImportSettings(body, includeTabs)
+	old := core.GetSettings()
+	res := core.ImportSettingsFromFile(paths[0], includeTabs)
 	if res == "" {
-		// Registry-backed toggles may have changed with the imported settings.
-		applied := core.GetSettings()
-		_ = shell.ApplyAutostart(applied.AutostartEnabled)
-		_ = shell.RegisterDeepLink(applied.DeepLinkEnabled)
+		afterSettingsChange(old, core.GetSettings())
 	}
 	return res
 }

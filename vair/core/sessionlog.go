@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"sync"
 	"time"
 )
@@ -160,14 +161,25 @@ func (s *configStore) loadSessions() []SessionRow {
 	return out
 }
 
-// clearSessions empties the table.
+// clearSessions empties the table — and the file: with secure_delete on, the
+// pages the rows were on are overwritten as they are freed. Otherwise a cleared
+// record of when you were connected, and to what, stayed readable in the
+// database file until something happened to reuse the space.
 func (s *configStore) clearSessions() {
 	if s == nil {
 		return
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	s.db.Exec(`DELETE FROM sessions`) //nolint:errcheck
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	conn.ExecContext(ctx, `PRAGMA secure_delete = ON`)   //nolint:errcheck
+	conn.ExecContext(ctx, `DELETE FROM sessions`)        //nolint:errcheck
+	conn.ExecContext(ctx, `PRAGMA secure_delete = FAST`) //nolint:errcheck
 }
 
 // sessions is the log in memory, oldest first. Loaded from the store at

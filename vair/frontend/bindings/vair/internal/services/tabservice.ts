@@ -105,3 +105,11 @@ export function SourcesInfo(): $CancellablePromise<string[] | null> {
 export function Switch(id: string): $CancellablePromise<boolean> {
     return $Call.ByID(332268492, id);
 }
+
+/**
+ * UndoDelete puts the last deleted tab back (the Undo on the notification that
+ * follows a delete); returns its name, or why it cannot.
+ */
+export function UndoDelete(): $CancellablePromise<core$0.TabUndoResult> {
+    return $Call.ByID(1177809273);
+}

@@ -26,6 +26,10 @@ func (c *ConnectionsService) ClearTotals() { core.ClearConnectionTotals() }
 func (c *ConnectionsService) Tracking() bool      { return core.ConnectionTracking() }
 func (c *ConnectionsService) SetTracking(on bool) { core.SetConnectionTracking(on) }
 
+// MissedEarlier reports that recording was turned on during the running
+// session, so the connections it already had open are not listed.
+func (c *ConnectionsService) MissedEarlier() bool { return core.ConnectionsMissedEarlier() }
+
 // Bypass lists the machine's TCP connections that did NOT go through Vair —
 // what a program using raw sockets is talking to, which the live list cannot
 // show because it never passes through us.

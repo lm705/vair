@@ -1,4 +1,30 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+/* The interface font ships with the program. It used to be fetched from Google
+   Fonts at every start, which cost three things: the font was whatever the
+   network allowed at that moment — no connection yet, the kill-switch block
+   standing, a tunnel mid-switch, Google slow or blocked, and the text came up
+   in another face until the next start; every start of a VPN client asked
+   Google for a stylesheet, from outside the tunnel; and on machines without
+   JetBrains Mono installed, which is most of them, it was never the intended
+   face offline. Now it is one file among the app's own assets, the same on
+   every machine. JetBrains Mono 2.211, variable weight 100-800, SIL Open Font
+   License 1.1 — the copyright and licence travel inside the font files'
+   metadata, as the licence allows. Declaring the family here also means a
+   locally installed copy is never used in its place. */
+@font-face{
+  font-family:'JetBrains Mono';
+  src:url('/JetBrainsMono.ttf') format('truetype');
+  font-weight:100 800;font-style:normal;
+  /* block: the file comes from the program itself, so the wait is a few
+     milliseconds — and a moment of no text is better than a moment of the
+     wrong font, which is the very thing this replaces. */
+  font-display:block;
+}
+@font-face{
+  font-family:'JetBrains Mono';
+  src:url('/JetBrainsMono-Italic.ttf') format('truetype');
+  font-weight:100 800;font-style:italic;
+  font-display:block;
+}
 /* Country-flag emoji. Windows/Segoe UI Emoji renders regional-indicator pairs as
    plain letters (US, RU, …) instead of flags — a Windows platform choice. This
    small self-hosted subset of Twemoji Mozilla (flag glyphs only) makes them draw
@@ -21,7 +47,10 @@
   color-scheme:dark;
   --bg:#0c0c0c;--bg2:#111;--bg3:#181818;--bg4:#1e1e1e;
   --border:#222;--border2:#2a2a2a;
-  --text:#c8c8c8;--dim:#4a4a4a;--dim2:#303030;
+  /* --dim is secondary TEXT — column values, hints, labels — and is held to
+     4.5:1 against every surface it sits on (WCAG AA for small text). It was
+     #4a4a4a, about 2:1, which read as decoration rather than as words. */
+  --text:#c8c8c8;--dim:#808080;--dim2:#303030;
   --accent:#e8c547;--green:#4ade80;--red:#f87171;
   --blue:#60a5fa;--orange:#fb923c;--purple:#c084fc;--teal:#2dd4bf;
   --font:'Twemoji Country Flags','JetBrains Mono',Consolas,monospace;
@@ -43,7 +72,10 @@ body.theme-light{
   color-scheme:light;
   --bg:#f4f4f5;--bg2:#ffffff;--bg3:#ececef;--bg4:#e2e2e6;
   --border:#d4d4d8;--border2:#c4c4c8;
-  --text:#1d1d20;--dim:#8a8a90;--dim2:#c8c8cc;
+  /* --dim is 4.5:1 or better on the light surfaces. The accent is one
+     goldenrod for fills, marks and text alike, as it was in 2.6: the darker
+     shades tried for text (#86620a, then #866400) read as brown. */
+  --text:#1d1d20;--dim:#65656b;--dim2:#c8c8cc;
   --accent:#b8860b;--green:#15803d;--red:#dc2626;
   --blue:#2563eb;--orange:#ea580c;--purple:#9333ea;--teal:#0d9488;
   --cbar-cp:#dcf5e2;--cbar-cp-bd:#a8d8b4;
@@ -78,7 +110,7 @@ input,textarea{user-select:text;-webkit-user-select:text}
 #conn-bar.ce{background:var(--cbar-ce);border-top-color:var(--cbar-ce-bd)}
 /* Ping chip in the connection bar — shows the connected config's latest
    delay; click to re-ping it. Colour mirrors the table ping pills. */
-.cping{flex-shrink:0;cursor:pointer;font-size:calc(var(--app-fs-base) - 2px);font-weight:700;padding:2px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
+.cping{flex-shrink:0;cursor:pointer;font-size:calc(var(--app-fs-base) - 2px);font-weight:700;padding:2px 9px;border-radius:5px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
 .cping:hover{border-color:var(--accent);color:var(--accent)}
 .cping.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
 .cping.failed{color:var(--red);border-color:rgba(220,80,80,.4)}
@@ -86,7 +118,7 @@ input,textarea{user-select:text;-webkit-user-select:text}
 /* Copy-the-connected-config chip (same pill shape as the ping chip). */
 .ccopy{letter-spacing:.04em}
 .ccopy.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
-.cexit{flex-shrink:0;cursor:pointer;font-size:calc(var(--app-fs-base) - 2px);font-weight:700;padding:2px 9px;border-radius:99px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
+.cexit{flex-shrink:0;cursor:pointer;font-size:calc(var(--app-fs-base) - 2px);font-weight:700;padding:2px 9px;border-radius:5px;border:1px solid var(--border2);color:var(--dim);user-select:none;white-space:nowrap;transition:color .15s,border-color .15s}
 .cexit:hover{border-color:var(--accent);color:var(--accent)}
 .cexit.ok{color:var(--green);border-color:rgba(80,200,120,.4)}
 .cexit.failed{color:var(--red);border-color:rgba(220,80,80,.4)}
@@ -109,7 +141,7 @@ input,textarea{user-select:text;-webkit-user-select:text}
 #cports{display:none;gap:6px;align-items:center;flex-shrink:0}
 #cports.on{display:flex} /* shown while connected; hidden again below 720px */
 .pchip{
-  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:5px;
   padding:2px 7px;font-size:calc(var(--app-fs-base) - 3px);cursor:pointer;transition:border-color .15s;white-space:nowrap;
 }
 .pchip:hover{border-color:var(--accent)}.pchip b{color:var(--accent)}
@@ -118,22 +150,32 @@ input,textarea{user-select:text;-webkit-user-select:text}
    control someone is meant to browse past. */
 .blocked-chip{color:var(--red);border-color:rgba(248,113,113,.5)}
 .blocked-chip:hover{border-color:var(--red);background:rgba(248,113,113,.1)}
+/* A live connection whose server has stopped answering: a warning, not a
+   control — nothing to click, the hover says what to do. */
+.silent-chip{color:var(--orange);border-color:rgba(251,146,60,.5);cursor:default}
+.silent-chip:hover{border-color:rgba(251,146,60,.5)}
 
 
 /* mode pills */
-.mode-wrap{display:flex;gap:4px;align-items:center;flex-shrink:0;white-space:nowrap}
+.mode-wrap{display:flex;gap:6px;align-items:center;flex-shrink:0;white-space:nowrap}
+/* Two halves of one switch (a .bgroup): the chosen mode takes its colour —
+   the text, a light tint and a line along its foot, as every switched-on
+   control is marked — and the other one is a plain segment. */
 .mpill{
   all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);font-weight:700;
-  padding:3px 10px;border-radius:3px;text-transform:uppercase;letter-spacing:.07em;
-  border:1px solid var(--border2);color:var(--dim);transition:all .15s;white-space:nowrap;
+  padding:4px 11px;text-transform:uppercase;letter-spacing:.07em;
+  color:var(--dim);transition:background .15s,color .15s,box-shadow .15s;white-space:nowrap;
 }
-.mpill:hover{color:var(--text);border-color:var(--dim)}
-.mpill.sel-proxy{color:var(--green);border-color:var(--green);background:rgba(74,222,128,.08)}
-.mpill.sel-tun  {color:var(--blue); border-color:var(--blue); background:rgba(96,165,250,.08)}
-.mpill.off{opacity:1;cursor:pointer;color:var(--dim);border-color:var(--border2)}
-.mpill.off:hover{color:var(--text);border-color:var(--dim)}
+.mpill:hover{color:var(--text);background:var(--bg4)}
+.mpill:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.mpill.sel-proxy{color:var(--green);background:color-mix(in srgb,var(--green) 10%,transparent);box-shadow:inset 0 -2px 0 var(--green)}
+.mpill.sel-proxy:hover{background:color-mix(in srgb,var(--green) 16%,transparent)}
+.mpill.sel-tun{color:var(--blue);background:color-mix(in srgb,var(--blue) 10%,transparent);box-shadow:inset 0 -2px 0 var(--blue)}
+.mpill.sel-tun:hover{background:color-mix(in srgb,var(--blue) 16%,transparent)}
+.mpill.off{opacity:1;cursor:pointer;color:var(--dim)}
+.mpill.off:hover{color:var(--text)}
 .mode-wrap .mtip{
-  font-size:calc(var(--app-fs-base) - 3px);color:var(--accent);border:1px solid rgba(232,197,71,.3);border-radius:3px;
+  font-size:calc(var(--app-fs-base) - 3px);color:var(--accent);border:1px solid rgba(232,197,71,.3);border-radius:5px;
   padding:2px 7px;background:rgba(232,197,71,.06);white-space:nowrap;cursor:pointer;
   transition:all .15s;
 }
@@ -169,24 +211,82 @@ header{
 @media (prefers-reduced-motion:no-preference){
   header,.stats,.toolbar,#conn-bar{transition:gap .16s ease,padding .16s ease}
   .stat,.stat .sv{transition:font-size .16s ease,margin .16s ease,padding .16s ease}
-  .btn{transition:padding .16s ease,opacity .15s}
+  .btn{transition:padding .16s ease,background .15s,color .15s,border-color .15s,box-shadow .15s}
 }
 .spacer{flex:1}
 /* nowrap + no shrink: the control buttons stay on the header's single row. */
-.ctrls{display:flex;gap:5px;align-items:center;flex-wrap:nowrap;flex-shrink:0}
+.ctrls{display:flex;gap:8px;align-items:center;flex-wrap:nowrap;flex-shrink:0}
+/* Buttons (2.7.0, the "segments" style). A frame; on hover the face fills, on
+   a press it sinks; a button that stands for something switched on — AUTO,
+   a test that is running, an open panel — takes the accent with a line along
+   its foot. Buttons that belong together share one frame (.bgroup below),
+   split by hairlines. It used to be a frame that only faded on hover, which
+   said little about what the pointer was on. Colours come from the theme
+   tokens, so the light theme follows without rules of its own. */
 .btn{
   all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--app-fs-base) - 2px);font-weight:700;
-  padding:5px 11px;border-radius:3px;letter-spacing:.07em;text-transform:uppercase;
-  display:inline-flex;align-items:center;gap:5px;transition:opacity .15s;white-space:nowrap;
+  padding:5px 11px;border-radius:5px;letter-spacing:.07em;text-transform:uppercase;
+  display:inline-flex;align-items:center;gap:5px;white-space:nowrap;
   border:1px solid transparent;
+  transition:background .15s,color .15s,border-color .15s,box-shadow .15s;
 }
-.btn:hover{opacity:.8}.btn:active{opacity:.55}
-.btn.ghost  {background:transparent;         color:var(--text);  border-color:var(--border2)}
-.btn.red    {background:rgba(248,113,113,.12);color:var(--red);  border-color:rgba(248,113,113,.35)}
+.btn:hover{background:var(--bg4)}
+.btn:active{background:var(--bg3);box-shadow:inset 0 2px 4px var(--shadow)}
+.btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+/* Every control a keyboard can reach shows where the keyboard is. One class
+   beats this, so a control with a ring of its own keeps it; the many buttons
+   reset with all:unset do not, which is the point. */
+button:focus-visible,a[href]:focus-visible,[role=button]:focus-visible,[role=tab]:focus-visible,:where([tabindex]:not([tabindex="-1"])):focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.tab-btn:focus-visible,.tab-dd-trigger:focus-visible,.proto-dd-trigger:focus-visible,.proto-btn:focus-visible,.sort-btn:focus-visible,.cpb:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+/* A menu takes the focus itself when it opens; the ring belongs on its items. */
+.ctx-menu:focus,.tab-dd-menu:focus{outline:none}
+/* Likewise a dialog: its box takes the focus when it opens (dialogkeys.ts) so
+   the next Tab lands inside it; a ring round the whole box says nothing. */
+.modal-overlay > :focus{outline:none}
+.ctx-menu-item:focus-visible,.tab-dd-item:focus-visible{background:var(--bg4);outline:1px solid var(--accent);outline-offset:-1px}
+/* The table is one stop for the keyboard; the row it is on is outlined while
+   the table has the focus. */
+.gtable:focus{outline:none}
+.gtable:focus-visible{box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--accent) 45%,transparent)}
+.gtable:focus .grow.kbd-cur{outline:1px solid var(--accent);outline-offset:-1px}
+.btn.ghost  {background:transparent;color:var(--text);border-color:var(--border2)}
+.btn.ghost:hover{background:var(--bg4)}
+.btn.ghost:active{background:var(--bg3)}
+.btn.on{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
+.btn.on:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
+/* Lit at once, not faded in: the panel it opens appears in the same frame, and
+   a button still catching up with it read as a delay. Going out still fades. */
+.btn.on{transition:none}
+/* The action a dialog exists for — Save, Add, Check: framed in the accent,
+   so it is found without reading the others. */
+.btn.primary{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 60%,transparent);background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.btn.primary:hover{background:color-mix(in srgb,var(--accent) 17%,transparent)}
+.btn.red    {background:color-mix(in srgb,var(--red) 12%,transparent);color:var(--red);border-color:color-mix(in srgb,var(--red) 40%,transparent)}
+.btn.red:hover{background:color-mix(in srgb,var(--red) 20%,transparent)}
 .btn.sm     {padding:3px 8px;font-size:calc(var(--app-fs-base) - 3px);letter-spacing:.05em}
-.btn.sm-disc{padding:3px 9px;font-size:calc(var(--app-fs-base) - 3px);background:rgba(248,113,113,.1);color:var(--red);border-color:rgba(248,113,113,.3)}
+.btn.sm-disc{padding:3px 9px;font-size:calc(var(--app-fs-base) - 3px);background:color-mix(in srgb,var(--red) 10%,transparent);color:var(--red);border-color:color-mix(in srgb,var(--red) 35%,transparent)}
+.btn.sm-disc:hover{background:color-mix(in srgb,var(--red) 18%,transparent)}
+/* A group: one frame, hairlines between. The buttons inside give up their own
+   frame and corners, so a group is exactly as tall as a button on its own. */
+.bgroup{display:inline-flex;align-items:stretch;flex-shrink:0;border:1px solid var(--border2);border-radius:5px;overflow:hidden}
+.bgroup > .btn,.bgroup > .mpill,.bgroup > .hint-lang{border:0;border-radius:0}
+.bgroup > .btn + .btn,.bgroup > .mpill + .mpill,.bgroup > .hint-lang + .hint-lang{border-left:1px solid var(--border2)}
+.bgroup > .btn:focus-visible{outline-offset:-2px}
+/* The three panel buttons keep the size they had as separate buttons: the
+   pixel of frame each gave up comes back as padding. */
+.bgroup > .btn.icon{padding-left:12px;padding-right:12px}
 .chain-hop-tag{display:inline-flex;align-items:center;justify-content:center;min-width:24px;font-size:calc(var(--app-fs-base) - 1px);color:var(--green);opacity:.85;cursor:default}
-.btn:disabled{opacity:.22;pointer-events:none}
+.btn:disabled{opacity:.3;pointer-events:none}
+/* The close control of every panel and dialog (src/closex.tsx) and the new-tab
+   button share one square: the height of the controls beside them, with the
+   glyph drawn larger than the labels, which it is not one of. Three classes,
+   so the toolbars' own .btn padding cannot reach it. */
+.btn.ghost.xbtn{box-sizing:border-box;width:var(--ctl-h);height:var(--ctl-h);padding:0;justify-content:center;
+  font-size:calc(var(--app-fs-base) + 1px);font-weight:400;line-height:1;letter-spacing:0;flex:none}
+.modal-box .btn.ghost.xbtn{width:var(--mctl-h);height:var(--mctl-h);font-size:calc(var(--modal-fs-base) + 2px)}
+/* A dialog's title row: the title, and the ✕ at its right-hand end. */
+.modal-head{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.modal-head .modal-title{flex:1;min-width:0;margin-bottom:0}
 /* Narrow-window compaction. Below ~1080 CSS px the header (stats + 6 control
    buttons) starts to crowd; tighten gaps, shrink the stat numbers, and drop the
    tiny uppercase stat labels (the numbers + colour still convey everything) so
@@ -195,9 +295,15 @@ header{
 @media (max-width:1080px){
   header{gap:8px;padding:8px 12px}
   .stats{gap:9px}
-  .ctrls{gap:4px}
+  .ctrls{gap:6px}
   .btn{padding:5px 8px;letter-spacing:.04em}
+  .bgroup > .btn.icon{padding-left:9px;padding-right:9px}
   #conn-bar{gap:7px;padding:0 12px}
+  /* The three bars share their side margins at every width, so what ends on
+     the right — SETTINGS, TYPE, the mode switch, a row's copy icon — ends on
+     one line. By id: the toolbar's own rule comes later in this file and beat
+     every .toolbar written in these blocks, so it kept 16px at all widths. */
+  #toolbar{padding-left:12px;padding-right:12px}
 }
 /* Second step, for genuinely narrow windows (down to the 720px floor): drop the
    two "best ping / best speed" summaries and the traffic counters — the table
@@ -230,6 +336,7 @@ header{
   header{gap:6px;padding:7px 10px}
   .stats{gap:7px}
   .toolbar{padding:5px 10px;gap:8px}
+  #toolbar{padding-left:10px;padding-right:10px}
   .toolbar-right{gap:7px}
   .finput{width:auto;flex:1 1 90px;min-width:70px}
   #conn-bar{gap:6px;padding:0 10px}
@@ -240,7 +347,9 @@ header{
    reach its collapse thresholds. */
 @media (max-width:720px){
   #cports,#cports.on{display:none}
+  header{padding-left:8px;padding-right:8px}
   .toolbar{padding:5px 8px}
+  #toolbar{padding-left:8px;padding-right:8px}
   #conn-bar{gap:5px;padding:0 8px}
 }
 .btn.dim-btn{opacity:.4;color:var(--dim)}
@@ -265,21 +374,22 @@ header{
 .tab-bar{display:flex;gap:2px;align-items:center;flex-wrap:wrap;row-gap:3px;flex:0 1 auto;min-width:0}
 .tab-btn{
   all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);font-weight:700;
-  box-sizing:border-box;height:22px;padding:0 7px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
-  transition:all .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em;
+  box-sizing:border-box;height:var(--ctl-h);padding:0 7px;border-radius:5px;color:var(--dim);border:1px solid var(--border2);
+  transition:background .15s,color .15s,border-color .15s,box-shadow .15s;white-space:nowrap;text-transform:uppercase;letter-spacing:.05em;
   display:inline-flex;align-items:center;gap:3px;
 }
 /* A long press on these opens their context menu (the touch stand-in for
    right-click), so iOS must not answer the same gesture with its own callout. */
 .tab-btn,.tab-dd-trigger,#tb tr{-webkit-touch-callout:none}
-.tab-btn:hover{color:var(--text);border-color:var(--dim)}
-.tab-btn.active{color:var(--accent);border-color:var(--accent)}
+.tab-btn:hover{color:var(--text);background:var(--bg4)}
+.tab-btn.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
 .tab-add{
   all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);font-weight:700;
-  box-sizing:border-box;height:22px;padding:0;min-width:20px;display:flex;align-items:center;justify-content:center;
-  border-radius:3px;color:var(--dim);border:1px solid var(--border2);transition:all .15s;flex-shrink:0;
+  box-sizing:border-box;height:var(--ctl-h);width:var(--ctl-h);padding:0;display:flex;align-items:center;justify-content:center;
+  border-radius:5px;color:var(--dim);border:1px solid var(--border2);transition:background .15s,color .15s;flex-shrink:0;
+  font-size:calc(var(--app-fs-base) + 2px);font-weight:400;line-height:1;
 }
-.tab-add:hover{color:var(--accent);border-color:var(--accent)}
+.tab-add:hover{color:var(--text);background:var(--bg4)}
 .tab-btn.dragging{opacity:.4}
 .tab-btn.drag-over{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
 
@@ -290,12 +400,13 @@ header{
    narrow widths / many tabs. */
 .tab-dd-trigger{
   all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);font-weight:700;
-  box-sizing:border-box;height:22px;padding:0 6px 0 8px;border-radius:3px;
-  color:var(--accent);border:1px solid var(--accent);transition:all .15s;
+  box-sizing:border-box;height:var(--ctl-h);padding:0 6px 0 8px;border-radius:5px;
+  color:var(--accent);border:1px solid var(--border2);transition:background .15s;
+  background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 0 -2px 0 var(--accent);
   display:none;align-items:center;gap:5px;max-width:200px;flex-shrink:1;min-width:0;
   text-transform:uppercase;letter-spacing:.05em;
 }
-.tab-dd-trigger:hover{background:rgba(232,197,71,.08)}
+.tab-dd-trigger:hover{background:color-mix(in srgb,var(--accent) 14%,transparent)}
 .tab-dd-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .tab-dd-caret{font-size:calc(var(--app-fs-base) - 5px);opacity:.8;flex-shrink:0}
 /* In compact mode: show the trigger, hide the per-tab buttons. */
@@ -308,7 +419,7 @@ header{
 /* Tab dropdown list (compact-mode tab switcher). Reuses ctx-menu look. */
 .tab-dd-menu{
   position:fixed;z-index:9999;background:var(--bg3);border:1px solid var(--border2);
-  border-radius:5px;padding:4px 0;min-width:160px;max-height:60vh;overflow-y:auto;
+  border-radius:6px;padding:4px 0;min-width:160px;max-height:60vh;overflow-y:auto;
   box-shadow:0 6px 20px rgba(0,0,0,.5);font-family:var(--font);font-size:calc(var(--app-fs-base) - 2px);
 }
 .tab-dd-item{
@@ -324,13 +435,13 @@ header{
    (proto-btn), lit like the tab trigger when a filter is active. */
 .proto-dd-trigger{
   all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);font-weight:700;
-  box-sizing:border-box;height:22px;padding:0 6px 0 8px;border-radius:3px;
-  color:var(--dim);border:1px solid var(--border2);transition:all .15s;
+  box-sizing:border-box;height:var(--ctl-h);padding:0 6px 0 8px;border-radius:5px;
+  color:var(--dim);border:1px solid var(--border2);transition:background .15s,color .15s,box-shadow .15s;
   display:inline-flex;align-items:center;gap:5px;max-width:190px;min-width:0;
   text-transform:uppercase;letter-spacing:.05em;
 }
-.proto-dd-trigger:hover{border-color:var(--accent);color:var(--accent)}
-.proto-dd-trigger.on{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+.proto-dd-trigger:hover{color:var(--text);background:var(--bg4)}
+.proto-dd-trigger.on{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
 .proto-dd-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
 .proto-dd-caret{font-size:calc(var(--app-fs-base) - 5px);opacity:.8;flex-shrink:0}
 /* Narrower than the tab menu and right-anchored by the click handler, so it
@@ -350,7 +461,7 @@ header{
    menu taller than the window cannot be moved into view, only scrolled. */
 .ctx-menu{
   position:fixed;z-index:9999;background:var(--bg3);border:1px solid var(--border2);
-  border-radius:5px;padding:4px 0;min-width:180px;max-height:80vh;overflow-y:auto;
+  border-radius:6px;padding:4px 0;min-width:180px;max-height:80vh;overflow-y:auto;
   box-shadow:0 6px 20px rgba(0,0,0,.5);font-family:var(--font);font-size:calc(var(--app-fs-base) - 2px);
 }
 .ctx-menu-item{
@@ -371,6 +482,10 @@ header{
    must stack above it — same z-index meant the QR rendered behind, and the
    settings window had to be closed to see it. */
 .modal-overlay.modal-nested{z-index:10001}
+/* "Leave without saving?" in front of a dialog (confirm.tsx). */
+.confirm-box{width:auto;max-width:min(420px,92vw)}
+.confirm-text{font-size:var(--modal-fs-base);line-height:1.5;margin-bottom:14px}
+.confirm-btns{display:flex;justify-content:flex-end;gap:8px}
 /* Modal text scale.
  * A single CSS variable on :root drives every font-size in the Settings
  * and Tab settings modals. The user can grow or shrink modal typography
@@ -381,6 +496,12 @@ header{
   /* Two text sizes: the dialogs, and the main window. Both are settings. */
   --modal-fs-base: 12px;
   --app-fs-base: 13px;
+  /* The height of a compact control — a tab, a field or dropdown in a
+     toolbar, the square close and new-tab buttons — as a share of the text
+     size it sits with: 22px at the default sizes, and larger with the text.
+     They were a fixed 22px, and a larger text setting outgrew them. */
+  --ctl-h: calc(var(--app-fs-base) * 22 / 13);
+  --mctl-h: calc(var(--modal-fs-base) * 22 / 12);
 }
 .modal-box{
   background:var(--bg2);border:1px solid var(--border2);border-radius:6px;
@@ -415,7 +536,7 @@ header{
 .modal-title{font-size:calc(var(--modal-fs-base) + 2px);font-weight:700;color:var(--accent);margin-bottom:14px;text-transform:uppercase;letter-spacing:.06em}
 .modal-label{font-size:calc(var(--modal-fs-base) - 1px);color:var(--dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
 .modal-input{
-  width:100%;box-sizing:border-box;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  width:100%;box-sizing:border-box;background:var(--bg3);border:1px solid var(--border2);border-radius:5px;
   color:var(--text);font-family:var(--font);font-size:var(--modal-fs-base);padding:6px 10px;outline:none;
   margin-bottom:12px;
 }
@@ -433,20 +554,26 @@ textarea.modal-input{resize:vertical;min-width:0}
 .modal-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .modal-row-label{font-size:var(--modal-fs-base);color:var(--text)}
 .toggle{position:relative;width:36px;height:20px;cursor:pointer;flex-shrink:0}
-.toggle input{display:none}
+/* The checkbox stays in the page, invisible and over the switch, so Tab
+   reaches it and Space flips it; with display:none no switch in the program
+   could be used from the keyboard. */
+.toggle input{position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:1}
+.toggle input:focus-visible+.toggle-track{outline:2px solid var(--accent);outline-offset:2px}
 .toggle-track{position:absolute;inset:0;background:var(--dim2);border-radius:10px;transition:.2s}
 .toggle input:checked+.toggle-track{background:var(--accent)}
 .toggle-thumb{position:absolute;top:2px;left:2px;width:16px;height:16px;background:#fff;border-radius:50%;transition:.2s}
 .toggle input:checked~.toggle-thumb{left:18px}
+.toggle-wrap{display:inline-flex}
+.toggle-wrap.off-limits{opacity:.45;pointer-events:none}
 /* chip lists allow text selection so entries can be selected + copied. The
    copy handler reconstructs the selection as a newline column (see
    chipsColumnFromSelection); the × buttons stay unselectable. */
 /* Native text selection is off here — the chip fields use a controlled
    click-selection (useChipSelect): click a chip to select it, Ctrl/⌘+click for a
    multi-selection, Ctrl+C to copy. The input keeps its own native editing. */
-.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;user-select:none;-webkit-user-select:none;cursor:text}
+.chips-wrap{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;min-height:26px;padding:4px 6px;background:var(--bg3);border:1px solid var(--border2);border-radius:5px;user-select:none;-webkit-user-select:none;cursor:text}
 .chip{display:inline-flex;align-items:center;gap:3px;font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
-  padding:2px 6px 2px 8px;border-radius:99px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3);
+  padding:2px 6px 2px 8px;border-radius:5px;background:rgba(232,197,71,.12);color:var(--accent);border:1px solid rgba(232,197,71,.3);
   user-select:none;-webkit-user-select:none;cursor:pointer;
   /* Never shrink (a squeezed chip used to collapse into a thin amber sliver with
      clipped text); keep the value on one line. */
@@ -462,22 +589,15 @@ textarea.modal-input{resize:vertical;min-width:0}
 /* Stability: how the server has behaved over time. The percentage is the share
    of checks it answered; the sparkline is the last delays, a gap for a check it
    missed. Monospace so the bars line up down the column. */
-/* The connections panel: two tables, the present above and the session below.
+/* The data tables of the connections pane and the service check (DataTable).
    Selectable — the app-wide user-select:none does not apply here, because the
    whole point is to copy a hostname into a search box. */
-.conns-box{width:min(920px,94vw)}
-.conns-head{display:flex;align-items:baseline;gap:8px;margin:8px 0 3px}
-.conns-cap{font-size:var(--modal-fs-base);font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--dim)}
-/* --dim2 is a hair from --border2, so a note in it read as another table line
-   rather than as text. The hint colour the dialogs already use instead. */
-.conns-note{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim)}
-.conns-search{display:flex;align-items:center;gap:6px;margin:8px 0 2px}
-.conns-search .modal-input{flex:1}
+.conns-search{display:flex;align-items:stretch;gap:6px;margin:8px 0 14px}
+.conns-search .modal-input{flex:1;margin:0}
 /* Vertical scrolling only. The columns are sized as percentages of this box, so
    the table is exactly as wide as the box no matter how the edges are dragged —
    there is nothing to scroll sideways for, and a horizontal scrollbar could only
-   mean a bug. Both tables get the same height: two panes of different sizes read
-   as one of them being an afterthought. */
+   mean a bug. */
 /* The column lines: the only thing that draws them, sitting OUTSIDE the
    scrolling box so they span the whole height and stay put while the rows move.
    Their width is measured in JS, because the box is narrower than this frame by
@@ -497,7 +617,7 @@ textarea.modal-input{resize:vertical;min-width:0}
 .conns-headline{position:absolute;left:1px;right:1px;height:1px;background:var(--border2);
   pointer-events:none;z-index:6}
 .conns-wrap{overflow-x:hidden;overflow-y:auto;height:27vh;border:1px solid var(--border2);
-  border-radius:3px;background:var(--bg3);
+  border-radius:6px;background:var(--bg3);
   user-select:text;-webkit-user-select:text;cursor:text;
   /* Room for the vertical scrollbar is reserved, so it cannot sit on top of the
      last column's heading when the list gets long enough to need one. */
@@ -530,9 +650,11 @@ textarea.modal-input{resize:vertical;min-width:0}
 .conns-table .via.proxy{color:var(--accent)}
 .conns-table .via.direct{color:var(--dim)}
 .conns-table .via.blocked{color:#f08a8a}
-/* Above the column-line overlay (z-index 5), which is drawn over the whole
-   frame: the line of text sat under it and had a rule through it. */
-.conns-empty{text-align:center;color:var(--dim);padding:14px 8px;position:relative;z-index:6;background:var(--bg3)}
+/* Above the column-line overlay (z-index 5), and outside the table: a cell
+   cannot rise above the overlay, because the table is a stacking context of
+   its own. It covers the body of the box, so the lines stop at the heading. */
+.conns-empty{position:absolute;left:1px;right:1px;bottom:1px;z-index:6;background:var(--bg3);
+  border-radius:0 0 5px 5px;text-align:center;color:var(--dim);font-size:var(--modal-fs-base);padding:14px 8px}
 .conns-table th{position:relative}
 /* The grip straddles the edge, centred on it: the line sits at the cell's right
    boundary, so a strip 11px wide whose right edge is 5px past that boundary has
@@ -548,7 +670,7 @@ textarea.modal-input{resize:vertical;min-width:0}
 /* The service check: configurations down, services across, one glyph each. */
 .unlock-box{width:min(880px,94vw)}
 .unlock-picks{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
-.unlock-pick{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:99px;
+.unlock-pick{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border-radius:5px;
   border:1px solid var(--border2);color:var(--dim);cursor:pointer;font-size:var(--modal-fs-base);user-select:none}
 .unlock-pick .chk-label{font-size:var(--modal-fs-base)}
 /* The editor: one grid, so the columns line up down the rows without a table.
@@ -556,7 +678,7 @@ textarea.modal-input{resize:vertical;min-width:0}
    one way, one per line. */
 /* A button that sits inside a row of controls rather than under one. */
 .btn.tiny{padding:2px 7px;font-size:calc(var(--app-fs-base) - 3px);line-height:16px}
-.unlock-editor{border:1px solid var(--border2);border-radius:3px;background:var(--bg3);padding:8px;margin:6px 0}
+.unlock-editor{border:1px solid var(--border2);border-radius:6px;background:var(--bg3);padding:8px;margin:6px 0}
 .unlock-ed-head,.unlock-ed-row{display:grid;grid-template-columns:1.1fr 2.2fr 1.4fr 1.4fr 26px;gap:6px;align-items:start}
 .unlock-ed-head{font-size:calc(var(--modal-fs-base) - 1px);text-transform:uppercase;letter-spacing:.05em;color:var(--dim2);margin-bottom:4px}
 .unlock-ed-row{margin-bottom:4px}
@@ -566,12 +688,11 @@ textarea.modal-input{resize:vertical;min-width:0}
 /* The scope radios: the browser's own, tinted to match the checkbox next to
    them. A radio is a different question from a checkbox and should stay
    visibly different, but not a different colour. */
-.unlock-scope input[type=radio]{accent-color:var(--accent)}
 .unlock-pick.on{border-color:var(--accent);color:var(--accent);background:rgba(232,197,71,.10)}
 .unlock-pick input{margin:0}
 .unlock-scope{display:flex;align-items:center;gap:14px;margin:2px 0 8px;font-size:var(--modal-fs-base);color:var(--dim)}
-.unlock-scope label{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
-.unlock-scope label.on{color:var(--text)}
+.unlock-scope .seg-group{margin-left:0;align-self:stretch}
+.unlock-scope .seg-btn{display:flex;align-items:center}
 .unlock-prog{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--accent)}
 /* The service check's matrix is the connections table (src/DataTable.tsx), so
    its rows, heading, edges and empty state are already styled. What is left is
@@ -595,7 +716,7 @@ textarea.modal-input{resize:vertical;min-width:0}
    it held, and what ended it. A list rather than a table — five short fields,
    and the reason is the one that varies in length. */
 .sess-list{display:flex;flex-direction:column;gap:2px;max-height:26vh;overflow-y:auto;
-  border:1px solid var(--border2);border-radius:3px;padding:6px 8px;background:var(--bg3)}
+  border:1px solid var(--border2);border-radius:6px;padding:6px 8px;background:var(--bg3)}
 .sess-row{display:flex;align-items:baseline;gap:8px;font-size:calc(var(--modal-fs-base) - 1px);white-space:nowrap}
 .sess-when{color:var(--dim);font-variant-numeric:tabular-nums;flex:0 0 auto}
 .sess-name{color:var(--text);font-weight:700;overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;max-width:38%}
@@ -620,7 +741,7 @@ textarea.modal-input{resize:vertical;min-width:0}
 /* One rhythm for the whole dialog rather than a margin per element: --gap
    between blocks, half of it inside one. Every distance below is a multiple of
    these two, which is the difference between "spaced" and "spaced somehow". */
-.hist-box{width:min(470px,94vw);font-size:var(--modal-fs-base);--gap:16px;--gap-h:8px}
+.hist-box{width:min(520px,94vw);font-size:var(--modal-fs-base);--gap:16px;--gap-h:8px}
 .hist-head{display:flex;align-items:baseline;gap:var(--gap-h);margin:calc(var(--gap-h) * -1) 0 var(--gap);flex-wrap:wrap}
 .hist-name{font-weight:700;color:var(--text)}
 .hist-host{font-size:calc(var(--modal-fs-base) - 1px);color:var(--dim)}
@@ -643,20 +764,41 @@ textarea.modal-input{resize:vertical;min-width:0}
 .hist-say{font-size:calc(var(--modal-fs-base) - 1px);color:var(--dim);line-height:1.45}
 .hist-foot{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);line-height:1.45;
   margin-top:var(--gap);padding-top:var(--gap-h);border-top:1px solid var(--border2)}
-/* The three questions the history answers — how fast, how reliably, how much
-   bandwidth — each as a figure with its qualification under it. The number
-   leads; the label is small above it, because the number is what is being
-   looked for. */
-.hist-tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--gap-h)}
-.hist-tile{background:var(--bg3);border-radius:6px;padding:10px;display:flex;flex-direction:column;gap:3px;min-width:0}
-.ht-label{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);text-transform:uppercase;letter-spacing:.06em}
-.ht-value{font-size:calc(var(--modal-fs-base) + 7px);line-height:1.1;color:var(--text);font-variant-numeric:tabular-nums}
-.ht-value.poor{color:#f08a8a}
-.ht-unit{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-left:3px}
-.ht-note{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);overflow:hidden;text-overflow:ellipsis}
-/* A figure the ranking will no longer use says so in the colour it is written
-   in — the number is still true, it is just too old to act on. */
-.ht-note.stale{color:#f0b37a}
+/* One panel per measurement, both built alike: a title row (with a status mark
+   when the figures are not, or no longer, fit to rank on), three figures in
+   equal columns divided by hairlines, and a row of facts. One frame, one
+   background, one rhythm — figures in boxes of different sizes read as
+   scattered. */
+.hist-sec{border:1px solid var(--border2);border-radius:6px;background:var(--bg2);overflow:hidden}
+.hist-sec-head{display:flex;align-items:center;justify-content:space-between;gap:var(--gap-h);
+  padding:7px 12px;background:var(--bg3);border-bottom:1px solid var(--border2)}
+.hist-sec-title{font-size:calc(var(--modal-fs-base) - 1px);font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--text)}
+.hist-chip{font-size:calc(var(--modal-fs-base) - 3px);font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+  padding:2px 7px;border-radius:4px;color:var(--orange);border:1px solid color-mix(in srgb,var(--orange) 45%,transparent);
+  background:color-mix(in srgb,var(--orange) 10%,transparent);white-space:nowrap;cursor:help}
+.hist-chip.muted{color:var(--dim);border-color:var(--border2);background:transparent}
+.hist-metrics{display:grid;grid-template-columns:repeat(3,1fr)}
+.hm{display:flex;flex-direction:column;gap:2px;padding:10px 12px;min-width:0}
+.hm + .hm{border-left:1px solid var(--border2)}
+.hm-label{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);text-transform:uppercase;letter-spacing:.06em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hm-value{font-size:calc(var(--modal-fs-base) + 7px);line-height:1.15;color:var(--text);font-variant-numeric:tabular-nums;white-space:nowrap}
+.hm-value.poor{color:var(--red)}
+/* Still true, no longer acted on: the figure stays, in the secondary colour. */
+.hm-value.off{color:var(--dim)}
+.hm-unit{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-left:3px}
+/* Wraps rather than clips: on a phone a third of the dialog is narrower than
+   "used for AUTO ranking". */
+.hm-cap{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);line-height:1.35;overflow-wrap:anywhere}
+.hist-facts{display:flex;flex-wrap:wrap;gap:4px 18px;padding:7px 12px;border-top:1px solid var(--border2);
+  font-size:calc(var(--modal-fs-base) - 2px)}
+.hf{display:inline-flex;gap:6px;white-space:nowrap}
+.hf-label{color:var(--dim)}
+.hf-value{color:var(--text);font-variant-numeric:tabular-nums}
+.hf-value.stale{color:var(--orange)}
+.hist-sec-empty{padding:12px;color:var(--dim);font-size:calc(var(--modal-fs-base) - 1px)}
+.hist-sec + .hist-sec{margin-top:10px}
+.hist-sec-title{display:inline-flex;align-items:center;gap:6px}
 /* The checks themselves: values separated by a middle dot rather than boxed, so
    twenty of them read as a sequence instead of twenty objects.
    A whole tab is pinged at once, so the checks arrive in bursts; each burst is
@@ -670,20 +812,25 @@ textarea.modal-input{resize:vertical;min-width:0}
 .hist-recent{display:flex;flex-wrap:wrap;gap:0;flex:1 1 auto;min-width:0;font-variant-numeric:tabular-nums;
   font-size:calc(var(--modal-fs-base) - 1px);line-height:1.6}
 .hist-seq{color:var(--text)}
-.hist-seq.bad{color:#f08a8a}
+.hist-seq.bad{color:var(--red)}
 .hist-dot{color:var(--dim);margin:0 5px}
 .hist-none{color:var(--dim)}
 /* Speed measurements are read the same way as the delay checks and use the same
    rows — the two lists answer the same question about different measurements,
    and laying them out differently made them look like different kinds of thing.
    Past the window the ranking uses: still true, no longer acted on. */
-.hist-run.stale .hist-when{color:#f0b37a}
+.hist-run.stale .hist-when{color:var(--orange)}
 .hist-run.stale .hist-seq{color:var(--dim)}
-.chip-hit{font-size:calc(var(--modal-fs-base) - 3px);font-weight:800;line-height:1;padding:1px 4px;border-radius:99px;
+.chip-hit{font-size:calc(var(--modal-fs-base) - 3px);font-weight:800;line-height:1;padding:1px 4px;border-radius:5px;
   background:rgba(232,197,71,.25);color:var(--accent);cursor:default}
 /* Never matched: the one state worth interrupting for — a rule with a typo in
    it is indistinguishable from a working one until this says otherwise. */
 .chip-hit.never{background:rgba(244,114,114,.22);color:#f08a8a}
+/* A rule line the program cannot read: kept where it is, marked, and left out
+   of the configuration until it is fixed or removed. */
+.chip.bad{background:rgba(244,114,114,.14);color:#f08a8a;border-color:rgba(244,114,114,.45);text-decoration:line-through}
+/* Why the text left in the field was not added. A row of its own in the box. */
+.chip-err{flex:1 1 100%;font-size:calc(var(--modal-fs-base) - 2px);color:#f08a8a;padding:2px 2px 0;user-select:text;-webkit-user-select:text}
 /* Nothing to say yet: not loaded, not countable, or nothing routed so far. */
 .chip-hit.muted,.chip-hit.pending{background:transparent;color:var(--text);opacity:.45;font-weight:700}
 .chip-x{cursor:pointer;opacity:.5;font-size:calc(var(--modal-fs-base) - 2px);user-select:none;-webkit-user-select:none}.chip-x:hover{opacity:1;color:var(--red)}
@@ -710,11 +857,29 @@ textarea.modal-input{resize:vertical;min-width:0}
 .ef-field-tag{font-size:var(--modal-fs-base);color:var(--text)}
 .ef-field .chips-wrap{margin-bottom:0}
 .modal-hint{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-top:-6px;margin-bottom:10px}
+/* The verdict under a port field. Looks like a hint and is not one: it stays
+   when descriptions are turned off, because it is a result, not an explanation. */
+/* A group of settings waiting on another setting (SettingsModal Dependent).
+   The note is not a description: it stays with descriptions hidden and is not
+   dimmed with the group it explains. */
+.dep-note{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;margin:2px 0 8px;padding:5px 8px;border-left:2px solid var(--accent);background:var(--bg3);color:var(--text);font-size:calc(var(--modal-fs-base) - 1px);line-height:1.45}
+.dep-note .linkish{color:var(--accent);white-space:nowrap}
+.dep-body{opacity:.45;user-select:none}
+/* The row "Show" took you to, marked for a moment. */
+.setting-flash{animation:settingFlash 1.7s ease-out}
+@keyframes settingFlash{0%,35%{background:color-mix(in srgb,var(--accent) 22%,transparent)}100%{background:transparent}}
+@media (prefers-reduced-motion:reduce){.setting-flash{animation:none;outline:1px solid var(--accent)}}
+.port-status{font-size:calc(var(--modal-fs-base) - 2px);margin-top:-4px;margin-bottom:10px}
 /* "Show setting descriptions" off. One rule instead of a condition at 35 call
    sites — and it reaches every dialog, including ones added later. The rows
    keep their own spacing, so what is left is the settings themselves.
    The history dialog writes its explanations in its own classes and so used to
    sit out the setting entirely — the one dialog that is mostly explanation. */
+/* A message is not a description: these say what just happened or why a list
+   is empty, and they were drawn as .modal-hint — so with descriptions off (the
+   default) the AUTO panel's empty list and the service check's error showed
+   nothing at all. */
+.msg-note{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim)}
 body.no-hints .modal-hint,
 body.no-hints .hist-hint,
 body.no-hints .hist-foot{display:none}
@@ -769,6 +934,10 @@ body.no-hints .hist-foot{display:none}
 .sess-box .hist-row{justify-content:space-between}
 .sess-box .hist-label{min-width:0;flex:1 1 auto;padding-right:12px}
 .sess-box .hist-value{flex:0 0 auto;text-align:right}
+/* Why a value is what it is (the leak check says what it tested, or why it
+   did not): its own line under the row, and not a hint class, so it stays
+   with descriptions hidden. */
+.sess-box .sess-note{flex:1 0 100%;font-size:calc(var(--modal-fs-base) - 1px);color:var(--dim);line-height:1.45;margin-top:2px}
 /* Not a description: it says what the panel is showing, so it stays when the
    descriptions are switched off. */
 .sess-say{font-size:calc(var(--modal-fs-base) - 1px);color:var(--dim);margin:-2px 0 10px}
@@ -799,12 +968,13 @@ body.no-hints .hist-foot{display:none}
   letter-spacing:.06em;text-transform:uppercase;color:var(--dim);
 }
 .hint-lang{
-  padding:1px 6px;border-radius:4px;border:1px solid var(--border2);
+  padding:2px 7px;border-radius:5px;border:1px solid var(--border2);
   background:transparent;color:var(--dim);font-family:var(--font);
   font-size:calc(var(--modal-fs-base) - 3px);font-weight:800;cursor:pointer;
+  transition:background .15s,color .15s;
 }
-.hint-lang:hover{color:var(--text)}
-.hint-lang.on{border-color:var(--accent);color:var(--accent)}
+.hint-lang:hover{color:var(--text);background:var(--bg4)}
+.hint-lang.on,.hint-lang.on:hover{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
 .hint-pop-x{
   border:0;background:transparent;color:var(--dim);cursor:pointer;
   font-size:calc(var(--modal-fs-base) + 4px);line-height:1;padding:0 2px;
@@ -820,6 +990,11 @@ body.no-hints .hist-foot{display:none}
 .hint-opt-k{font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;color:var(--text)}
 .hint-opt-k.mono{font-family:var(--mono,ui-monospace,Consolas,monospace);color:var(--accent)}
 .hint-opt-v{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);line-height:1.4}
+/* A setting's states under its description: one per line, the name of the
+   state set off from what it does. */
+.hint-states{display:flex;flex-direction:column;gap:3px;margin-top:4px}
+.hint-st-k{font-weight:700;color:var(--text)}
+.hint-pop-body + .hint-pop-body{margin-top:2px}
 /* The exclude-filter intro hint sits below a label, so the global -6px pull
    would clip it onto the label above. Reset it to a small positive gap. */
 .modal-hint.ef-hint{margin-top:2px;margin-bottom:12px}
@@ -889,6 +1064,17 @@ body.no-hints .hist-foot{display:none}
 /* Self-update download progress bar. */
 .upd-bar{height:6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;overflow:hidden;margin:2px 0 10px}
 .upd-fill{height:100%;width:0;background:var(--accent);transition:width .2s}
+/* A vair:// link waiting for a yes: what it holds, where it goes, the warning. */
+.link-confirm{width:min(520px,94vw)}
+.link-confirm .link-confirm-what{display:flex;flex-direction:column;gap:3px;margin:0 0 10px;color:var(--text)}
+.link-confirm .link-confirm-url{font-family:var(--mono,ui-monospace,Consolas,monospace);word-break:break-all;color:var(--dim);user-select:text}
+.link-confirm .link-confirm-where{margin-top:6px}
+.link-confirm .link-confirm-warn{margin:0 0 12px;font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim)}
+/* The settings export and import: the count above its bar, then the file. */
+.set-note.bk-prog .upd-bar{margin:4px 0 0}
+.set-note.bk-done{color:var(--green)}
+.set-note.bk-fail{color:var(--red)}
+.set-note .bk-path{font-family:var(--mono,ui-monospace,Consolas,monospace);word-break:break-all;user-select:text}
 /* Author attribution under the Updates section. */
 .upd-attrib{margin-top:12px;padding-top:8px;border-top:1px solid var(--border2);font-size:var(--modal-fs-base);color:var(--dim);text-align:center}
 .upd-attrib a{color:var(--accent);text-decoration:none;cursor:pointer}
@@ -910,24 +1096,31 @@ body.no-hints .hist-foot{display:none}
  * (text + border), mirroring the active-tab treatment in .tab-btn.active.
  * A small left margin keeps the group from crowding the row label. */
 .seg-group{
-  display:inline-flex;gap:4px;margin-left:12px;
+  display:inline-flex;gap:0;margin-left:12px;border:1px solid var(--border2);border-radius:5px;overflow:hidden;
 }
 .seg-btn{
   all:unset;cursor:pointer;font-family:var(--font);font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;
-  padding:3px 7px;border-radius:3px;
-  color:var(--dim);border:1px solid var(--border2);
+  padding:4px 9px;color:var(--dim);
   text-transform:uppercase;letter-spacing:.05em;
-  transition:color .15s, border-color .15s;
+  transition:color .15s,background .15s,box-shadow .15s;
 }
-.seg-btn:hover:not(.active){color:var(--text);border-color:var(--dim)}
-.seg-btn.active{color:var(--accent);border-color:var(--accent)}
-.url-row{display:flex;gap:4px;margin-bottom:4px;align-items:center}
+.seg-btn + .seg-btn{border-left:1px solid var(--border2)}
+.seg-btn:hover:not(.active){color:var(--text);background:var(--bg4)}
+.seg-btn.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
+.seg-btn:disabled{opacity:.4;cursor:default}
+.seg-btn:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.url-row{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px;align-items:center}
+/* Why a source row is wrong or did not load: its own line under the row. Not
+   a .set-note — the dialog's rule for those caps their width, and the note sat
+   beside the field and squeezed it to nothing. */
+.src-err{flex-basis:100%;margin:0 0 2px 18px;font-size:calc(var(--modal-fs-base) - 2px);color:var(--warn,#d9a441)}
 .url-row .ms-url-on{flex:none;width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
 .url-row.src-off .ms-url{opacity:.45;text-decoration:line-through}
 .url-row .modal-input{flex:1;margin-bottom:0}
-.url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:var(--modal-fs-base);width:18px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px}
+.url-rm{all:unset;cursor:pointer;color:var(--dim);font-size:var(--modal-fs-base);width:1.6em;height:1.6em;flex:none;display:flex;align-items:center;justify-content:center;border-radius:5px}
+.url-rm svg{width:1.05em;height:1.05em;display:block}
 .url-rm:hover{color:var(--red);background:rgba(248,113,113,.1)}
-.url-qr{all:unset;cursor:pointer;color:var(--dim);font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;padding:0 6px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:3px;text-transform:uppercase;letter-spacing:.03em}
+.url-qr{all:unset;cursor:pointer;color:var(--dim);font-size:calc(var(--modal-fs-base) - 1px);font-weight:700;padding:0 6px;height:18px;display:flex;align-items:center;justify-content:center;border-radius:5px;text-transform:uppercase;letter-spacing:.03em}
 .url-qr:hover{color:var(--accent);background:rgba(232,197,71,.1)}
 /* Read-only SOURCES URL rows (built-in, copy-only). COPY/QR use the same
    borderless .url-qr style as the user-tab QR button, vertically centered next
@@ -935,24 +1128,24 @@ body.no-hints .hist-foot{display:none}
 .src-url-row{display:flex;gap:4px;align-items:center;margin-bottom:6px}
 .src-url-row:last-child{margin-bottom:0}
 .src-url{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;padding:5px 8px;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:5px;padding:5px 8px;
   color:var(--text);font-size:var(--modal-fs-base);user-select:text}
 .btn.sm{padding:3px 9px;font-size:calc(var(--app-fs-base) - 3px)}
 /* QR modal — always white quiet-zone behind the code so it scans on any theme. */
-.qr-wrap{display:inline-block;background:#fff;padding:12px;border-radius:6px}
+.qr-wrap{display:block;width:fit-content;margin:0 auto;background:#fff;padding:12px;border-radius:6px}
 .qr-img{display:block;width:260px;height:260px;image-rendering:pixelated}
 
 /* file rows in tab settings */
 .file-row{
   display:flex;gap:6px;margin-bottom:4px;align-items:center;
-  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:5px;
   padding:5px 10px;font-size:var(--modal-fs-base);color:var(--text);
 }
 .file-row .file-ico{color:var(--dim);flex-shrink:0;font-size:var(--modal-fs-base)}
 .file-row .file-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .file-row .file-size{color:var(--dim);font-size:calc(var(--modal-fs-base) - 1px);flex-shrink:0;margin-right:2px}
 .file-row.new{border-color:rgba(74,222,128,.35);background:rgba(74,222,128,.05)}
-.file-line{display:flex;gap:4px;align-items:center;margin-bottom:4px}
+.file-line{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-bottom:4px}
 .file-line .file-row{flex:1;margin-bottom:0}
 .file-line .ms-url-on{flex:none;width:14px;height:14px;cursor:pointer;accent-color:var(--accent)}
 .file-line.src-off .file-name{opacity:.45;text-decoration:line-through}
@@ -1002,9 +1195,9 @@ body.no-hints .hist-foot{display:none}
 }
 .tl{font-size:calc(var(--app-fs-base) - 3px);color:var(--dim);text-transform:uppercase;letter-spacing:.1em;white-space:nowrap}
 .finput{
-  background:var(--bg3);border:1px solid var(--border2);border-radius:3px;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:5px;
   color:var(--text);font-family:var(--font);font-size:calc(var(--app-fs-base) - 1px);padding:0 9px;width:180px;outline:none;
-  box-sizing:border-box;height:22px;
+  box-sizing:border-box;height:var(--ctl-h);
 }
 .finput:focus{border-color:var(--accent)}
 .sort-group{display:flex;gap:4px}
@@ -1029,7 +1222,16 @@ body.no-hints .hist-foot{display:none}
    to this box on every resize, so it can never legitimately need to scroll
    sideways. What it did do was flicker a scrollbar for the one frame between
    the window changing and the columns being recomputed. */
-.tw{flex:1;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;margin-right:var(--tgap,4px)}
+/* overflow-anchor:none, because the list is virtual and places its own rows.
+   Left on, the browser picks a row on screen as an anchor and scrolls to keep
+   it there whenever its node moves — and while a test runs sorted by ping or
+   speed, rows move every 200 ms as results land. The view followed whichever
+   row it had picked: the list scrolled by itself, and only while you were
+   looking at the part being tested, because that is where the rows move. */
+/* At least three rows: when the window gets short the dock gives way, not the
+   table (and not the connection bar below it). */
+.tw{flex:1;min-height:calc(var(--app-fs-base,13px) * 7.6);overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;margin-right:var(--tgap,4px);
+  overflow-anchor:none}
 
 /* ── the table, as a grid ──────────────────────────────────────────────
    Rows are grids, not table rows, and every one of them — including the
@@ -1047,10 +1249,59 @@ body.no-hints .hist-foot{display:none}
    layout can say something different without the measuring pass in App.tsx
    holding a second opinion. */
 :root{--cn-floor:15;--ch-floor:13;--act-gap-min:10}
+/* Switching tabs (App.tsx, tabFade): the table dims at once and comes back up
+   as the incoming tab's rows arrive. */
+.tw,.thw{transition:opacity .16s ease-out}
+/* A tab seen for the first time dims a little, over a few frames, while its
+   rows are fetched — falling to a quarter in one frame read as a flash. The
+   empty numbered rows standing in for them are not shown at all. */
+.tw.tab-fade,.thw.tab-fade{opacity:.6;transition:opacity .08s ease-in}
+.tw.tab-fade .grow:not([data-idx]){visibility:hidden}
+@media (prefers-reduced-motion:reduce){.tw,.thw{transition:none}.tw.tab-fade,.thw.tab-fade{opacity:1}}
+/* The crossfade (App.tsx, tabCrossfade): for the length of a tab switch the
+   header and the rows are named, so they blend from the tab being left into
+   the one opened while the rest of the window changes at once. Named only
+   then: a name makes its element a stacking context, which the table has no
+   need to be the rest of the time. Clicks pass through the transition's
+   pictures to the live window. */
+html.vt-tab .thw{view-transition-name:vair-thead}
+html.vt-tab .tw{view-transition-name:vair-rows}
+::view-transition-old(root),::view-transition-new(root){animation:none}
+::view-transition-group(vair-rows),::view-transition-group(vair-thead),
+::view-transition-old(vair-rows),::view-transition-new(vair-rows),
+::view-transition-old(vair-thead),::view-transition-new(vair-thead){animation-duration:.18s;animation-timing-function:ease-out}
+::view-transition{pointer-events:none}
+/* A new tab's placeholder rows stay hidden while its first window loads. */
+.tw.tab-wait .grow:not([data-idx]){visibility:hidden}
 .grow{
   display:grid;grid-template-columns:var(--cols);align-items:center;
   border-bottom:1px solid var(--border);transition:background .08s;
+  position:relative;
 }
+/* Moving rows by hand. The grip is the last thing in the ACTIONS cell: six dots
+   drawn in an 8x12 content box, with padding round it so the target is bigger
+   than the mark. Drawn in close to the copy icon, since every pixel it adds to
+   the column brings the compact labels on sooner. Always shown, as dim as the
+   copy icon: it is what ends the row on the window's right-hand line, and
+   hidden until hover it left an empty strip there. Off (sorted, or a bulk test
+   on the tab) it keeps its room, fades further and only its tooltip works. The
+   landing place is a line drawn between two rows rather than a shadow: selected
+   and connected rows already use theirs. */
+.row-grip{flex:none;box-sizing:content-box;font-size:calc(var(--app-fs-base) - 1px);
+  width:.667em;height:1em;padding:.42em .17em;margin-left:-.25em;cursor:grab;
+  color:var(--dim);touch-action:none;
+  background-image:radial-gradient(circle,currentColor .083em,transparent .117em);background-size:.333em .333em;
+  background-origin:content-box;background-clip:content-box;
+  transition:opacity .12s,color .12s}
+.grow:hover .row-grip{color:var(--text)}
+.row-grip:hover{color:var(--accent)}
+.row-grip.off,.grow:hover .row-grip.off,.row-grip.off:hover{cursor:default;color:var(--dim);opacity:.4}
+body.row-dragging,body.row-dragging *{cursor:grabbing!important;user-select:none!important;-webkit-user-select:none!important}
+.grow.row-moving{opacity:.4}
+.grow.drop-before::before,.grow.drop-after::after{content:'';position:absolute;left:0;right:0;height:2px;
+  background:var(--accent);z-index:3;pointer-events:none}
+.grow.drop-before::before{top:-1px}
+.grow.drop-after::after{bottom:-1px}
 .gc,.gh{min-width:0;padding:5px 10px;font-size:calc(var(--app-fs-base) - 1px);white-space:nowrap}
 /* Only the two columns whose content has no natural width clip; the rest are
    sized to what is in them, so an ellipsis there would mean the sizing is
@@ -1063,8 +1314,10 @@ body.no-hints .hist-foot{display:none}
 .gc.cp2,.gh.cp2,.gc.cst,.gh.cst,.gc.csp,.gh.csp,.gh.ca{text-align:center}
 /* No side padding of its own: the room on the right is --act-gap, held by the
    buttons' own box, and the room on the left is what is left over — which is
-   the same number until the button wears the longer word and takes it. */
+   --act-room until the button wears the longer word and takes it. The heading
+   keeps the same two rooms, so ACTIONS stands centred over the buttons. */
 .gc.ca{text-align:right;padding-left:0;padding-right:0}
+.gh.ca{padding-left:var(--act-room,10px);padding-right:var(--act-gap,10px)}
 /* The heading row: outside the scroller, padded on the right by exactly the
    gutter the rows' scrollbar takes, so the two grids resolve to the same
    width and their tracks land on the same pixels. */
@@ -1143,21 +1396,58 @@ thead th.sortable.sorted{color:var(--accent)}
 .grow.row-new{box-shadow:inset 3px 0 0 var(--green)}
 .reload-toast{position:fixed;top:54px;left:50%;transform:translateX(-50%);background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:6px 16px;font-size:var(--app-fs-base);font-weight:800;letter-spacing:.04em;color:var(--text);z-index:9999;box-shadow:0 4px 16px rgba(0,0,0,.45);transition:opacity .45s;opacity:1;pointer-events:none}
 .reload-toast.fade{opacity:0}
+/* A toast with a button (the Undo after a delete) takes clicks; the plain one
+   lets them through to what is under it. */
+.reload-toast.has-act{pointer-events:auto;display:flex;align-items:center;gap:12px}
+.reload-toast .toast-act{font-weight:700;letter-spacing:0}
 /* Startup "new version available" banner — a centered card below the title/conn
    bar (not full-width, so it never covers the window controls). */
-.upd-banner{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:10000;display:flex;align-items:center;gap:14px;max-width:90%;padding:8px 14px;background:var(--bg2);border:1px solid var(--accent);border-radius:8px;color:var(--text);font-size:var(--app-fs-base);box-shadow:0 6px 20px rgba(0,0,0,.5)}
+.upd-banner{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:10000;display:flex;align-items:center;gap:14px;max-width:90%;padding:8px 14px;background:var(--bg2);border:1px solid var(--accent);border-radius:6px;color:var(--text);font-size:var(--app-fs-base);box-shadow:0 6px 20px rgba(0,0,0,.5)}
 .upd-banner-txt{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw}
 .upd-banner-btns{display:flex;gap:8px;align-items:center;flex-shrink:0}
-/* ── Logs dock panel ── */
-#log-panel{position:relative;flex-shrink:0;height:30vh;min-height:120px;display:flex;flex-direction:column;border-top:2px solid var(--border);background:var(--bg2)}
+/* ── The dock under the table: the log, the connections, or both ──
+   One height for the dock (dragged at its top edge); two panes side by side
+   when both are open, divided by a strip that is dragged sideways. */
+/* Its height is the one the user dragged it to, kept in pixels — so in a window
+   made shorter it has to give way: it shrinks down to a few lines before the
+   table goes below three rows or the connection bar out of the window. */
+#dock{position:relative;flex-shrink:1;height:30vh;min-height:72px;display:flex;border-top:2px solid var(--border);background:var(--bg2)}
+.dock-pane{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
+.dock-split{flex:none;width:6px;cursor:ew-resize;background:var(--bg);border-left:1px solid var(--border2);border-right:1px solid var(--border2);box-sizing:border-box}
+.dock-split:hover{background:var(--accent)}
+/* Two panes share the width. A toolbar gives way in steps as its pane
+   narrows: the search field shrinks, then the counts and the title go, and
+   only then does the toolbar take a second line — copy, clear and close
+   moving there together, at the right. */
+.dock-pane{container-type:inline-size}
+.dock-pane .log-head{flex-wrap:wrap;row-gap:5px}
+.dock-pane .log-find{flex:1 1 60px;min-width:60px;max-width:200px}
+.dock-tools{margin-left:auto;flex:none;display:flex;align-items:center;gap:8px}
+@container (max-width:700px){.dock-pane .conns-n{display:none}}
+@container (max-width:600px){.dock-pane .log-title{display:none}}
+/* A narrow window shows the two panes as tabs, the strip above the one shown. */
+.dock-tabs{flex:none;margin:6px 12px 0;align-self:flex-start}
+/* Why a table is nearly empty: a fact about the session, not a description. */
+.dock-note{flex-shrink:0;padding:4px 12px;font-size:calc(var(--app-fs-base) - 3px);color:var(--dim);border-bottom:1px solid var(--border2)}
+/* The connections pane: one table at a time, as tall as the pane allows. */
+.conns-pane .conns-body{flex:1;min-height:0;display:flex;flex-direction:column;padding:6px 12px 8px;background:var(--bg)}
+.conns-pane .conns-frame{flex:1;min-height:0;display:flex;flex-direction:column}
+.conns-pane .conns-wrap{flex:1;min-height:0;height:auto}
+.conns-pane .conns-table,.conns-pane .conns-empty{font-size:calc(var(--app-fs-base) - 2px)}
+.conns-pane .conns-table th{font-size:calc(var(--app-fs-base) - 4px)}
+.conns-pane .conns-views{margin-left:0;height:var(--ctl-h);box-sizing:border-box}
+.conns-pane .conns-views .seg-btn{display:flex;align-items:center;padding:0 8px;font-size:calc(var(--app-fs-base) - 3px)}
+.conns-n{margin-left:4px;font-weight:400;opacity:.65;font-variant-numeric:tabular-nums}
 .log-resize{position:absolute;top:-3px;left:0;right:0;height:6px;cursor:ns-resize;z-index:10}
 .log-resize:hover,.log-resize.dragging{background:var(--accent)}
 .log-head{flex-shrink:0;display:flex;align-items:center;gap:8px;padding:5px 12px;border-bottom:1px solid var(--border2)}
 .log-title{font-size:calc(var(--app-fs-base) - 2px);font-weight:800;text-transform:uppercase;letter-spacing:.08em;color:var(--accent)}
 .log-head .spacer{flex:1}
-.log-sel{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);border-radius:3px;padding:1px 4px;outline:none;cursor:pointer}
+/* Every control in the two log toolbars is 22px, the height of the main
+   toolbar's: the dropdowns were 17, the search 20 and the buttons 22. */
+.log-sel{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);border-radius:5px;padding:0 6px;outline:none;cursor:pointer;box-sizing:border-box;height:var(--ctl-h)}
 /* Free-text search over the log lines (also narrows what "copy" writes). */
-.log-find{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);border-radius:3px;padding:1px 6px;outline:none;width:130px;height:20px;box-sizing:border-box}
+.log-find{background:var(--bg3);border:1px solid var(--border2);color:var(--text);font-family:var(--font);font-size:calc(var(--app-fs-base) - 3px);border-radius:5px;padding:0 7px;outline:none;width:130px;height:var(--ctl-h);box-sizing:border-box}
 .log-find:focus{border-color:var(--accent)}
 .log-find-n{font-size:calc(var(--app-fs-base) - 3px);color:var(--dim);white-space:nowrap}
 /* The checkbox, one drawing for the whole program (see src/Check.tsx). The
@@ -1188,7 +1478,10 @@ thead th.sortable.sorted{color:var(--accent)}
 .chk-off{opacity:.45;cursor:default}
 .chk-off .chk-box{border-color:var(--border2)}
 .log-auto{display:flex;align-items:center;gap:4px;font-size:calc(var(--app-fs-base) - 3px);color:var(--dim);text-transform:uppercase;letter-spacing:.04em;cursor:pointer;user-select:none}
-.log-head .btn{padding:3px 9px;font-size:calc(var(--app-fs-base) - 3px)}
+.log-head .btn{padding:0 9px;font-size:calc(var(--app-fs-base) - 3px);box-sizing:border-box;height:var(--ctl-h)}
+.log-head .bgroup > .btn{height:calc(var(--ctl-h) - 2px)}
+.auto-log-head .bgroup > .btn{height:calc(var(--mctl-h) - 2px)}
+.modal-box .log-sel{height:var(--mctl-h)}
 .log-view{flex:1;overflow-y:auto;padding:6px 12px;font-family:var(--font);font-size:calc(var(--app-fs-base) - 2px);line-height:1.5;white-space:pre-wrap;word-break:break-word;background:var(--bg);user-select:text;-webkit-user-select:text;cursor:text}
 .log-line{display:block}
 .log-line .lt{color:var(--dim2)}
@@ -1201,18 +1494,22 @@ thead th.sortable.sorted{color:var(--accent)}
 .log-line .ls.src-singbox{color:#b387f0}
 .log-line .ls.src-vair{color:#9fd84a}
 .log-empty{color:var(--dim);font-style:italic}
-#btn-logs.on{color:var(--accent);border-color:var(--accent)}
-#btn-auto.on{color:var(--accent);border-color:var(--accent)}
-#btn-auto.switching{color:#f0b429;border-color:#f0b429}
-.auto-status{font-size:var(--modal-fs-base);line-height:1.5;padding:8px 10px;border:1px solid var(--border2);border-radius:4px;background:var(--bg2)}
+#btn-auto.on{border-color:color-mix(in srgb,var(--accent) 55%,transparent)}
+#btn-auto.switching{color:#f0b429;border-color:#f0b429;box-shadow:inset 0 -2px 0 #f0b429}
+.auto-status{font-size:var(--modal-fs-base);line-height:1.5;padding:8px 10px;border:1px solid var(--border2);border-radius:6px;background:var(--bg2)}
 .auto-status .as-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;background:var(--dim);vertical-align:middle}
 .auto-status.ok .as-dot{background:var(--accent)}
 .auto-status.ok.m-proxy .as-dot{background:var(--green)}
 .auto-status.ok.m-tun .as-dot{background:var(--blue)}
 .auto-status.warn .as-dot{background:#f0b429}
 .auto-status.down .as-dot{background:#e5484d}
+/* The pool test under the status: a count and the main window's thin bar. */
+.as-sweep{margin-top:7px}
+.as-sweep-row{display:flex;justify-content:space-between;gap:10px;font-size:.85em;color:var(--dim);margin-bottom:4px}
+.as-sweep-n{font-variant-numeric:tabular-nums;color:var(--text)}
+.auto-status .as-sweep-bar{height:3px;border-radius:2px;overflow:hidden}
 .auto-cands{margin-top:8px;display:flex;flex-direction:column;gap:2px;max-height:168px;overflow-y:auto}
-.auto-cand{display:flex;align-items:center;gap:8px;font-size:var(--modal-fs-base);padding:4px 8px;border:1px solid var(--border2);border-radius:4px;background:var(--bg2);cursor:pointer;transition:border-color .12s,background .12s}
+.auto-cand{display:flex;align-items:center;gap:8px;font-size:var(--modal-fs-base);padding:4px 8px;border:1px solid var(--border2);border-radius:5px;background:var(--bg2);cursor:pointer;transition:border-color .12s,background .12s}
 .auto-cand:hover{border-color:var(--dim);background:var(--bg3)}
 .auto-cand.current{border-color:var(--accent);background:rgba(232,197,71,.08)}
 .auto-cand.current:hover{border-color:var(--accent)}
@@ -1223,7 +1520,7 @@ thead th.sortable.sorted{color:var(--accent)}
 /* Why a row sits where it does: ranked on history, or being skipped after a
    failure. Small and quiet — they explain the order, they are not the order. */
 .auto-cand .ac-flag{flex:0 0 auto;font-size:calc(var(--modal-fs-base) - 3px);text-transform:uppercase;
-  letter-spacing:.05em;color:var(--dim);border:1px solid var(--border2);border-radius:99px;padding:0 5px}
+  letter-spacing:.05em;color:var(--dim);border:1px solid var(--border2);border-radius:5px;padding:0 5px}
 .auto-cand .ac-flag.cooling{color:#f0b37a;border-color:rgba(240,179,122,.45)}
 /* The history flag opens the record it was ranked on. It has to look clickable
    on a row that is itself a button for something else — connecting — so the
@@ -1246,17 +1543,18 @@ thead th.sortable.sorted{color:var(--accent)}
    below it. Expanded by default. */
 /* No border-top here: the STATUS section above already draws a divider
    (its border-bottom), so adding one here would show two stacked lines. */
-.auto-collapse-head{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;
-  font-size:calc(var(--modal-fs-base) - 1px);text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
-  padding:2px 0 9px}
-.auto-collapse-head:hover{color:var(--text)}
-.auto-collapse-arrow{display:inline-block;font-size:calc(var(--modal-fs-base) - 2px);transition:transform .15s}
+.auto-collapse-head{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;
+  font-size:calc(var(--modal-fs-base) + 1px);font-weight:700;color:var(--text);
+  margin:18px 0 7px}
+.auto-collapse-head .auto-collapse-arrow{color:var(--set-soft,var(--dim));font-weight:400}
+.auto-collapse-head:hover .auto-collapse-arrow{color:var(--text)}
+.auto-collapse-arrow{display:inline-block;font-size:var(--modal-fs-base);transition:transform .15s}
 .auto-collapse-head.collapsed .auto-collapse-arrow{transform:rotate(-90deg)}
 .auto-collapse-body.collapsed{display:none}
 /* AUTO panel's own Logs section (mirrors the main dock inside the modal). */
 .auto-log-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
-.auto-log-head .btn{padding:3px 9px;font-size:calc(var(--modal-fs-base) - 2px)}
-#auto-log-view{height:200px;min-height:120px;border:1px solid var(--border2);border-radius:3px;margin-bottom:4px;flex:none}
+.auto-log-head .btn{padding:0 9px;font-size:calc(var(--modal-fs-base) - 2px);box-sizing:border-box;height:var(--mctl-h)}
+#auto-log-view{height:200px;min-height:120px;border:1px solid var(--border2);border-radius:6px;margin-bottom:4px;flex:none}
 /* Header row of the AUTO panel: title on the left, Detach button on the right. */
 .auto-title-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;gap:10px}
 .auto-detach,.auto-return{flex-shrink:0}
@@ -1279,7 +1577,7 @@ body.auto-standalone .tw,
 body.auto-standalone .thw,
 body.auto-standalone #sub-bar,
 body.auto-standalone #conn-bar,
-body.auto-standalone #log-panel{display:none!important}
+body.auto-standalone #dock{display:none!important}
 /* The overlay becomes a normal flex item BENEATH the title bar (so the Vair
    title bar with minimize/maximize/close stays visible at the top), fills the
    remaining height, and centers the panel. No dim backdrop and NO outer padding
@@ -1311,11 +1609,12 @@ body.auto-standalone #auto-modal .modal-box{
 .auto-tab-pill{
   all:unset;cursor:pointer;font-family:var(--font);font-size:var(--modal-fs-base);
   box-sizing:border-box;min-height:24px;display:inline-flex;align-items:center;
-  padding:0 11px;border-radius:3px;color:var(--dim);border:1px solid var(--border2);
-  background:var(--bg2);transition:all .15s;max-width:100%;
+  padding:0 11px;border-radius:5px;color:var(--dim);border:1px solid var(--border2);
+  transition:background .15s,color .15s,box-shadow .15s;max-width:100%;
 }
-.auto-tab-pill:hover{color:var(--text);border-color:var(--dim)}
-.auto-tab-pill.active{color:var(--accent);border-color:var(--accent);background:rgba(232,197,71,.08)}
+.auto-tab-pill:hover{color:var(--text);background:var(--bg4)}
+.auto-tab-pill:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.auto-tab-pill.active{color:var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent);box-shadow:inset 0 -2px 0 var(--accent)}
 .auto-tab-pill .atp-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
 td{padding:5px 10px;vertical-align:middle;font-size:calc(var(--app-fs-base) - 1px)}
 /* Column widths live in one place now: COLSPEC in App.tsx, written to the
@@ -1375,11 +1674,11 @@ td{padding:5px 10px;vertical-align:middle;font-size:calc(var(--app-fs-base) - 1p
 .nh{display:block;max-width:100%;color:var(--dim);font-size:calc(var(--app-fs-base) - 3px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* "last connected" badge — fixed size at the end of the name column; the
    adjacent name clips before it instead of overlapping. */
-.last-badge{flex:0 0 auto;font-size:calc(var(--app-fs-base) - 5px);font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);background:rgba(232,197,71,.14);border:1px solid rgba(232,197,71,.35);border-radius:3px;padding:0 3px;line-height:13px}
+.last-badge{flex:0 0 auto;font-size:calc(var(--app-fs-base) - 5px);font-weight:800;text-transform:uppercase;letter-spacing:.04em;color:var(--accent);background:rgba(232,197,71,.14);border:1px solid rgba(232,197,71,.35);border-radius:5px;padding:0 3px;line-height:13px}
 .et{font-size:calc(var(--app-fs-base) - 3px);color:var(--red);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:205px}
 
 .vc{display:flex;align-items:center;justify-content:center;gap:5px}
-.pill{font-size:calc(var(--app-fs-base) - 3px);font-weight:700;padding:2px 7px;border-radius:99px;min-width:66px;text-align:center;letter-spacing:.02em;border:1px solid;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pill{font-size:calc(var(--app-fs-base) - 3px);font-weight:700;padding:2px 7px;border-radius:5px;min-width:66px;text-align:center;letter-spacing:.02em;border:1px solid;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 /* Both chips are one size whatever they hold: the readings — "12.34 MB/s",
    "1234ms", the word while a test runs — are never cut, and an error long
    enough to need it ends in an ellipsis instead of setting the column's width.
@@ -1397,17 +1696,23 @@ td{padding:5px 10px;vertical-align:middle;font-size:calc(var(--app-fs-base) - 1p
 .pill.skipped  {color:var(--dim);border-color:var(--dim2);background:transparent;font-style:italic}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 
-.nb{font-size:calc(var(--app-fs-base) - 3px);padding:1px 5px;border-radius:2px;border:1px solid var(--border);color:var(--dim)}
+.nb{font-size:calc(var(--app-fs-base) - 3px);padding:1px 5px;border-radius:5px;border:1px solid var(--border);color:var(--dim)}
 .nb.ws{color:#818cf8;border-color:rgba(129,140,248,.4)}
 .nb.grpc{color:var(--orange);border-color:rgba(251,146,60,.4)}
 .nb.h2{color:var(--blue);border-color:rgba(96,165,250,.4)}
 .nb.tcp{color:var(--green);border-color:rgba(74,222,128,.4)}
 .nb.httpupgrade,.nb.splithttp,.nb.xhttp{color:var(--purple);border-color:rgba(192,132,252,.4)}
-.sb{font-size:calc(var(--app-fs-base) - 3px);padding:1px 5px;border-radius:2px;color:var(--dim);
-  display:inline-block;white-space:nowrap;vertical-align:middle}
+/* Clipped to its cell: the column is measured on the rows in view and kept
+   under a sort or a scroll, so a row brought in later can hold a longer cipher
+   (chacha20-ietf-poly1305) than the column was measured for; it ran over the
+   PING cell. The full value is in the title. A ceiling in per cent does not stop
+   the next measurement from widening the column. */
+.sb{font-size:calc(var(--app-fs-base) - 3px);padding:1px 5px;border-radius:5px;color:var(--dim);
+  display:inline-block;white-space:nowrap;vertical-align:middle;
+  max-width:100%;overflow:hidden;text-overflow:ellipsis}
 .sb.tls{color:var(--blue)}.sb.reality{color:var(--purple);font-weight:700}
 
-.pb{font-size:calc(var(--app-fs-base) - 3px);padding:1px 5px;border-radius:2px;border:1px solid var(--border);color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em;display:inline-block;white-space:nowrap;vertical-align:middle}
+.pb{font-size:calc(var(--app-fs-base) - 3px);padding:1px 5px;border-radius:5px;border:1px solid var(--border);color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em;display:inline-block;white-space:nowrap;vertical-align:middle}
 .pb.vless{color:var(--accent);border-color:rgba(232,197,71,.4)}
 .pb.vmess{color:#818cf8;border-color:rgba(129,140,248,.4)}
 .pb.trojan{color:var(--red);border-color:rgba(248,113,113,.4)}
@@ -1437,17 +1742,25 @@ td{padding:5px 10px;vertical-align:middle;font-size:calc(var(--app-fs-base) - 1p
 .proto-btn#proto-hysteria2.active{color:var(--orange);border-color:rgba(251,146,60,.7);background:rgba(251,146,60,.10)}
 .proto-btn#proto-tuic.active{color:var(--purple);border-color:rgba(192,132,252,.7);background:rgba(192,132,252,.10)}
 
-/* The buttons hang from the right-hand end of their column and the column
-   keeps --act-gap free on that side. PING and SPEED therefore stand in one
-   place whatever the first button says, and connect becoming disconnect grows
-   into the room on its left. The gap is the difference between the two words,
-   so the form on screen nearly all the time sits centred in the column. */
+/* The buttons hang from the right-hand end of their column. PING and SPEED
+   therefore stand in one place whatever the first button says, and connect
+   becoming disconnect grows into the room on its left (--act-room, the
+   difference between the two words). --act-gap on the right is measured so the
+   copy icon ends on the same line as SETTINGS, TYPE and the mode switch. */
 .act-cell{display:flex;gap:3px;align-items:center;justify-content:flex-end;
   padding-right:var(--act-gap,10px)}
 /* Each row action ships two labels — the word and a compact form. The phone
    media query swaps them; on the desktop only the word is shown. */
 .lbl-short{display:none}
-.cpb{all:unset;cursor:pointer;color:var(--dim);font-size:calc(var(--app-fs-base) - 1px);padding:2px 4px;border-radius:2px;transition:color .12s;display:inline-flex}
+.cpb{all:unset;cursor:pointer;color:var(--dim);font-size:calc(var(--app-fs-base) - 1px);padding:2px 4px;border-radius:5px;transition:color .12s;display:inline-flex}
+/* The copy icon, drawn to the text size and centred in the row. */
+.cpb{align-items:center}
+#sub-bar .sb-item.sb-stale{opacity:.6}
+.cpb-ico{display:block;width:1.15em;height:1.15em;fill:none;stroke:currentColor;stroke-width:1.4;
+  stroke-linecap:round;stroke-linejoin:round}
+/* Set with --act-gap by the column sizing in App.tsx: where the row ends on
+   the window's right-hand line, the last icon's empty padding hangs past it. */
+.act-cell > :last-child{margin-right:var(--cpb-pull,0px)}
 .cpb:hover{color:var(--accent)}.cpb.done{color:var(--green)}
 
 
@@ -1566,10 +1879,6 @@ td{padding:5px 10px;vertical-align:middle;font-size:calc(var(--app-fs-base) - 1p
   100%{background:transparent}
 }
 
-/* Header ctrls: thin vertical divider between button groups (auto ⎸ reload/
-   ping/speed ⎸ logs/⚙) — same look and HEIGHT as the .stat.traf border-left
-   divider (the session/total one spans the ~26px stat column). */
-.ctrl-sep{height:26px;align-self:center;width:0;border-left:1px solid var(--border2);margin:0 5px}
 /* Icon-only ctrls buttons (logs, ⚙): the BOX must equal a regular .btn (the old
    settings button) — no padding/line-height overrides. The svg is sized to the
    text line box (11px font × 1.4 ≈ 15px) so both buttons come out equal. */
@@ -1666,7 +1975,6 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
   .stat.traf{margin-left:0;padding-left:0;border-left:0}
   .stat.traf .sl{display:none}
   .ctrls{flex-wrap:wrap;gap:4px;width:100%}
-  .ctrl-sep{display:none}
 
   /* Toolbar: tabs on their own row, filter + type below, full width. */
   .toolbar{flex-wrap:wrap;padding:5px 8px;gap:6px}
@@ -1696,7 +2004,6 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
   .btn.sm.act-ping,.btn.sm.act-speed{padding:2px 4px}
   .act-ping .lbl-short,.act-speed .lbl-short{display:inline-block;width:12px;text-align:center}
   .act-cell{gap:4px}
-  .gh.ca{padding-right:6px} /* the cell's own room is --act-gap, inside the buttons' box */
   .pb{padding:1px 5px;font-size:calc(var(--app-fs-base) - 4px)} /* the protocol badge, tightened to fit */
   /* The ping/speed values lose their pill on a phone and become plain coloured
      text. The pill's 66px floor plus padding and border needs ~82px per value
@@ -1735,12 +2042,13 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
      be the same width or the columns that share the remainder resolve to
      different pixels in each. */
   :root{--tgap:8px;
-    /* The name gets eight characters here rather than fifteen, and the
-       buttons keep four pixels rather than ten: at 375px the row does not fit
-       otherwise, and a name cut short is worth more than a column dropped.
-       The floor is read in the ROW's font, a size larger than the cells' —
-       eight characters here is about sixty pixels. */
-    --cn-floor:8;--ch-floor:8;--act-gap-min:4}
+    /* The name gets twelve characters here rather than fifteen, and the
+       buttons keep four pixels rather than ten. Twelve because the star and
+       the flag are inside the name's cell: at eight the name itself came down
+       to two letters while the stability column stayed — now that column is
+       the one that goes (App.tsx, DROP_ORDER). The floor is read in the ROW's
+       font, a size larger than the cells'. */
+    --cn-floor:12;--ch-floor:8;--act-gap-min:4}
   /* Four pixels a side, not six. Twenty pixels across the row is the
      difference between the name having room for a word and having room for
      its flag: at 375px the row is within a few pixels of the screen once the
@@ -1805,6 +2113,12 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
   /* Logs panel: the toolbar wraps instead of overflowing. */
   .log-head{flex-wrap:wrap;gap:6px}
   .log-find{width:100%}
+  /* The dock's two panes one above the other: side by side, each would be
+     half of a phone's width. */
+  #dock{flex-direction:column}
+  #dock > .dock-pane{flex:1 1 0!important;min-height:0}
+  .dock-split{display:none}
+  .dock-pane .log-find{flex:1 1 100%}
 }
 
 /* A real touch screen draws OVERLAY scrollbars, so the gutter above would be an
@@ -1814,6 +2128,10 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
 @media (max-width:700px) and (pointer:coarse){
   :root{--tgap:0px}
   .tw{scrollbar-gutter:auto}
+  /* On a phone a row is moved from its menu (Move to top / bottom): a grip
+     under a finger competes with scrolling the list, and the room it takes
+     comes out of the name. */
+  .row-grip{display:none}
 }
 
 /* ── Select (frontend/src/Select.tsx) ──────────────────────────────
@@ -1837,7 +2155,7 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
 /* Fixed, not absolute: the list is portalled to <body> so a select near the
    bottom of the scrolling settings modal is not clipped by its overflow. */
 .vsel-list{position:fixed;z-index:9999;max-height:260px;overflow-y:auto;
-  background:var(--bg3);border:1px solid var(--border2);border-radius:4px;
+  background:var(--bg3);border:1px solid var(--border2);border-radius:6px;
   box-shadow:0 6px 18px var(--shadow);padding:3px}
 .vsel-opt{padding:4px 9px;border-radius:3px;white-space:nowrap;cursor:pointer;color:var(--text)}
 .vsel-act{background:var(--bg4)}
@@ -1849,7 +2167,7 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
    <code> that inherited the same grey — read as another sentence to skip. Text
    selection is off app-wide, so the copy button is the only way to get it. */
 .cmd-note{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
-  margin:2px 0 12px;padding:7px 9px;border-radius:4px;
+  margin:2px 0 12px;padding:7px 9px;border-radius:6px;
   background:var(--bg3);border:1px solid var(--border2);border-left:3px solid var(--orange)}
 .cmd-note-text{flex:1 1 100%;font-size:calc(var(--modal-fs-base) - 2px);color:var(--text)}
 .cmd-note code{flex:1 1 auto;min-width:140px;color:var(--accent);
@@ -1864,11 +2182,24 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
 .fav-list{display:flex;flex-direction:column;gap:2px;max-height:46vh;overflow-y:auto;margin-bottom:var(--gap-h)}
 .fav-row{display:flex;align-items:baseline;gap:var(--gap-h);padding:3px 0;border-bottom:1px solid var(--border2)}
 .fav-row:last-child{border-bottom:0}
+/* On a phone the name and where it is cannot share a line: "Tab 1 · host:port"
+   took the whole row and left the name three letters. The name gets the line,
+   where it is goes under it, the buttons stay at the side. */
+@media (max-width:560px){
+  .fav-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;
+    grid-template-areas:"name copy rm" "where copy rm";align-items:center;column-gap:var(--gap-h);row-gap:1px}
+  .fav-row .fav-name{grid-area:name}
+  .fav-row .fav-where{grid-area:where;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fav-row .btn.sm{grid-area:copy}
+  .fav-row .url-rm{grid-area:rm}
+}
 .fav-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
 .fav-where{flex:0 0 auto;color:var(--dim);font-size:calc(var(--modal-fs-base) - 2px)}
 /* A configuration with no row left in the table can only be got back out of
    here, so every row carries its own copy. */
 .fav-row .btn.sm{flex:0 0 auto;padding:1px 6px}
+.fav-row .url-rm{align-self:center}
+.unlock-ed-row .url-rm{margin-top:3px}
 .fav-row.gone .fav-name{color:var(--dim)}
 .fav-row.gone .fav-where{color:#f0b37a}
 
@@ -1882,7 +2213,7 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
 /* Opaque, and from the same token every other dialog uses: the first version
    named a colour that does not exist in this stylesheet, so the box came out
    transparent and the text was read against whatever was behind it. */
-.kb-box{background:var(--bg2);border:1px solid var(--red);border-radius:10px;max-width:560px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.kb-box{background:var(--bg2);border:1px solid var(--red);border-radius:6px;max-width:560px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.5)}
 .kb-head{display:flex;align-items:center;gap:6px;padding:12px 14px;border-bottom:1px solid var(--border)}
 .kb-title{flex:1;font-weight:600;color:var(--red)}
 .kb-body{padding:12px 14px;font-size:13px;line-height:1.5;color:var(--text)}
@@ -1894,9 +2225,10 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
 .kb-foot{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--border)}
 .kb-never{flex:0 0 auto;background:none;border:none;color:var(--dim);font-size:12px;text-decoration:underline;cursor:pointer;padding:4px}
 .kb-never:hover{color:var(--text)}
-.kb-ok{margin-left:auto;background:var(--red);color:#fff;border:none;border-radius:6px;padding:7px 16px;font-size:13px;cursor:pointer;min-width:132px}
+/* A .btn.red, a size up: it is the one way out of this dialog. */
+.btn.kb-ok{margin-left:auto;min-width:132px;justify-content:center;padding:7px 16px}
 /* Disabled says "not yet", not "never": it keeps its colour and counts down. */
-.kb-ok:disabled{opacity:.55;cursor:default}
+.btn.kb-ok:disabled{opacity:.55}
 /* A button that reads as a link — used where a sentence needs one word to open
    something and a real button would break the line. */
 .linkish{background:none;border:none;padding:0;color:inherit;font:inherit;text-decoration:underline;cursor:pointer}
@@ -1906,12 +2238,160 @@ body.theme-light .tw::-webkit-scrollbar-button:single-button:vertical:increment:
    looking as though they had floated up. They are centred against the title's
    own box instead, and the box is given the controls' height so the row cannot
    grow taller than they are. */
-.set-title{display:flex;align-items:center;gap:10px;min-height:24px}
-.set-title > span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;line-height:24px}
+.set-title{display:flex;align-items:center;gap:10px;min-height:var(--mctl-h)}
+.set-title > span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;line-height:var(--mctl-h)}
 .set-title-controls{display:flex;align-items:center;gap:6px;flex:0 0 auto}
 /* Narrower than a settings field and with the dialog's own font size, so the
    title line does not grow taller than it was without them. */
 /* margin:0 matters: .modal-input carries a bottom margin for the settings
    rows, and it made the controls box twelve pixels taller than the
    controls, which pushed them above the title they sit beside. */
-.set-title-sel{width:104px;margin:0;text-align:left;padding:0 6px;height:24px;line-height:22px;font-size:calc(var(--modal-fs-base) - 1px)}
+.set-title-sel{width:104px;margin:0;text-align:left;padding:0 6px;height:var(--mctl-h);line-height:calc(var(--mctl-h) - 2px);font-size:calc(var(--modal-fs-base) - 1px)}
+
+/* ── Settings drawn as blocks (2.7.0) ─────────────────────────────────────
+   The frame: a rule under the search and one above the footer, both the full
+   width of the window, and the section list as a slightly darker column with
+   its own rule. The settings scroll between the two rules; nothing outside
+   them moves. --set-pad is the box's side padding, which the rules and the
+   column reach past to meet the window's edges. */
+#settings-modal > .modal-box{--set-pad:22px;
+  /* Secondary text in this dialog: the descriptions, block subtitles, the
+     sections not open. --dim is 2:1 against these grounds and was hard to
+     read; this sits between it and --text in either theme (about 4.5:1). */
+  --set-soft:color-mix(in srgb,var(--text) 62%,var(--bg3));
+  /* A group waiting on another setting: its ground, a shade off the card's,
+     and the rail down its left edge. */
+  --dep-bg:color-mix(in srgb,var(--bg4) 70%,var(--bg3));
+  --dep-rail:color-mix(in srgb,var(--accent) 65%,transparent)}
+/* The other dialogs that hold settings draw them in the same blocks (see
+   src/setgroup.tsx), with the same colours. */
+.cardset{
+  --set-soft:color-mix(in srgb,var(--text) 62%,var(--bg3));
+  --dep-bg:color-mix(in srgb,var(--bg4) 70%,var(--bg3));
+  --dep-rail:color-mix(in srgb,var(--accent) 65%,transparent)}
+#settings-modal #set-search{margin-bottom:12px!important}
+#settings-modal .set-split{gap:0;margin:0 calc(-1 * var(--set-pad));border-top:1px solid var(--border2);border-bottom:1px solid var(--border2)}
+#settings-modal .set-split::before{display:none}
+#settings-modal .set-side{width:calc(var(--set-side,150px) + 24px);box-sizing:border-box;padding:12px;background:var(--bg);border-right:1px solid var(--border2)}
+#settings-modal .set-pane{padding:16px 14px 18px 20px}
+/* The footer: the credit centred, the close button at the right, one line. */
+#settings-modal .set-foot{display:flex;justify-content:center;align-items:center;margin-top:12px}
+#settings-modal .set-foot .upd-attrib{margin:0;padding:0;border-top:0}
+/* The section list: the open section is a plate, not a bar at the edge. */
+#settings-modal .set-tab{border-left:0;border-radius:5px;padding:5px 10px;margin-bottom:1px}
+#settings-modal .set-tab{color:var(--set-soft)}
+#settings-modal .set-tab:hover{background:var(--bg3);color:var(--text)}
+#settings-modal .set-tab.on{background:var(--bg4);color:var(--accent);font-weight:700}
+/* The tab's own title, at the top of the pane. */
+#settings-modal .set-pane > .settings-section > .section-header{font-size:calc(var(--modal-fs-base) + 4px);text-transform:none;letter-spacing:0;color:var(--text);margin:0 0 14px}
+/* A block: its title and what it is for, then the card. */
+:is(#settings-modal,.cardset) .set-group{margin-bottom:18px}
+:is(#settings-modal,.cardset) .set-group:last-child{margin-bottom:0}
+:is(#settings-modal,.cardset) .set-group-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:2px 10px;margin:0 0 7px}
+:is(#settings-modal,.cardset) .set-group-title{font-size:calc(var(--modal-fs-base) + 1px);font-weight:700;color:var(--text)}
+:is(#settings-modal,.cardset) .set-group-sub{font-size:calc(var(--modal-fs-base) - 1px);color:var(--set-soft)}
+/* The card. Every row draws a rule above itself; the first one's is pulled
+   under the card's own border (margin-top:-1px, clipped by overflow), so the
+   rules come out BETWEEN rows whatever the first child happens to be. */
+:is(#settings-modal,.cardset) .set-card{--card-pad:14px;background:var(--bg3);border:1px solid var(--border2);border-radius:6px;padding:0 var(--card-pad);overflow:hidden}
+:is(#settings-modal,.cardset) .set-card-in{margin-top:-1px}
+:is(#settings-modal,.cardset) .set-card .modal-row{margin:0 calc(-1 * var(--card-pad))!important;padding:10px var(--card-pad);border-top:1px solid var(--border2)}
+/* A continuation — a field under its switch, the countries under the mode —
+   is part of the setting above it: no rule, and close to it. */
+:is(#settings-modal,.cardset) .set-card .modal-row.row-cont{border-top:0;padding-top:2px}
+/* The description sits under the name, across the card like the row above
+   it. It was held to 64 characters, which left a column of empty card to its
+   right on any dialog wider than that. */
+:is(#settings-modal,.cardset) .set-card .modal-hint{margin:-4px 0 10px;color:var(--set-soft)}
+:is(#settings-modal,.cardset) .set-card-in > .modal-hint:first-child{margin-top:10px}
+:is(#settings-modal,.cardset) .set-card .port-status{margin:-4px 0 10px}
+:is(#settings-modal,.cardset) .set-card .set-note{margin:-4px 0 10px;color:var(--set-soft)}
+:is(#settings-modal,.cardset) .set-card-in > .set-note:first-child{margin-top:10px}
+:is(#settings-modal,.cardset) .set-card .set-actions{margin:-2px 0 10px}
+/* Fields sit IN the card, a shade from it in either theme. */
+:is(#settings-modal,.cardset) .set-card .modal-input{background:var(--bg2)}
+:is(#settings-modal,.cardset) .set-card :is(.chips-wrap,.src-url,.file-row:not(.new)){background:var(--bg2)}
+/* A block of subscription details is a row of the card like any other. */
+:is(#settings-modal,.cardset) .set-card .si-block{margin:0 calc(-1 * var(--card-pad));padding:10px var(--card-pad) 5px;border-top:1px solid var(--border2)}
+/* A label over what it names (a list, a field with buttons): the row's name,
+   set as it is in a row where the control sits beside it. */
+:is(#settings-modal,.cardset) .set-card .modal-row-label.stack{display:block;margin-bottom:4px}
+.cardset .set-card .auto-tabs-wrap{margin:0}
+.cardset .set-card .gh-pat-row{margin-bottom:0}
+/* A group waiting on another setting is one panel: the note at its head,
+   every setting it governs under it, on its own ground and with a rail down
+   the left edge. With only the note marked, it read as being about the row
+   right under it — two rows further down looked like ordinary settings that
+   happened to be grey. Edge to edge like the rows, so the rule above it meets
+   the card's sides. The rail sits above the dimmed rows (z-index), which are a
+   stacking context of their own. */
+:is(#settings-modal,.cardset) .set-card .dep{position:relative;margin:0 calc(-1 * var(--card-pad));padding:0 var(--card-pad);border-top:1px solid var(--border2);background:var(--dep-bg)}
+:is(#settings-modal,.cardset) .set-card .dep::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--dep-rail);z-index:1}
+:is(#settings-modal,.cardset) .set-card .dep-note{margin:0 calc(-1 * var(--card-pad));padding:9px var(--card-pad) 8px;border-left:0;background:transparent}
+/* "TUN" is where a setting applies, not part of its name: a mark before it. */
+:is(#settings-modal,.cardset) .mode-tag{display:inline-block;font-size:calc(var(--modal-fs-base) - 3px);line-height:1.5;letter-spacing:.06em;font-weight:400;color:var(--set-soft);border:1px solid var(--border2);border-radius:5px;padding:0 4px;margin-right:7px;vertical-align:1px}
+@media (max-width:700px){
+  #settings-modal > .modal-box{--set-pad:12px}
+  #settings-modal .set-side{width:calc(var(--set-side,150px) + 12px);padding:10px 6px}
+  #settings-modal .set-pane{padding:12px 6px 14px 12px}
+  :is(#settings-modal,.cardset) .set-card{--card-pad:10px}
+}
+
+/* A note that is not a description — a result, a warning, where something is,
+   an instruction: it looks like one and stays when descriptions are hidden. */
+.set-note{font-size:calc(var(--modal-fs-base) - 2px);color:var(--dim);margin-top:-6px;margin-bottom:10px}
+.set-note.log-path{font-family:var(--mono,ui-monospace,Consolas,monospace);margin-top:-4px;user-select:text;word-break:break-all}
+.set-actions{display:flex;gap:6px;flex-wrap:wrap}
+/* AUTO's title bar: the language and the detach button together at the right. */
+.auto-title-tools{display:flex;align-items:center;gap:6px}
+.auto-title-tools .btn.sm{box-sizing:border-box;height:var(--mctl-h);padding-top:0;padding-bottom:0}
+
+/* ── Phones ─────────────────────────────────────────────────────────────
+   The section list of Settings becomes a strip across the top. As a column it
+   kept a third of a 390px screen and left the settings themselves 250px; on a
+   phone the list scrolls sideways instead, one line high, and the pane takes
+   the width. Not wrapped: wrapped, thirteen names made a bar three rows tall. */
+@media (max-width:480px){
+  #settings-modal .set-split{flex-direction:column;gap:0}
+  #settings-modal .set-split::before{display:none}
+  #settings-modal .set-side{width:auto;flex:none;display:flex;gap:2px;overflow-x:auto;overflow-y:hidden;
+    padding:6px;border-right:0;border-bottom:1px solid var(--border2);scrollbar-width:none}
+  #settings-modal .set-side::-webkit-scrollbar{display:none}
+  #settings-modal .set-tab{flex:none;width:auto;white-space:nowrap;border-left:0;border-bottom:2px solid transparent;border-radius:5px 5px 0 0}
+  #settings-modal .set-tab.on{border-bottom-color:var(--accent)}
+  #settings-modal .set-pane{padding:12px 6px 14px}
+  /* A row whose control is wider than what is left beside its label puts the
+     control under it, at the right, rather than past the dialog's edge — the
+     AUTO ranking list was cut off there. */
+  .cardset .modal-row{flex-wrap:wrap}
+  .cardset .modal-row-label{flex:1 1 60%;min-width:0}
+  .cardset .modal-row > *:not(.modal-row-label){margin-left:auto}
+  .cardset .modal-row .modal-input{max-width:100%;min-width:0}
+  .set-actions .btn{white-space:normal;max-width:100%;text-align:left}
+}
+
+/* ── Fingers ────────────────────────────────────────────────────────────
+   Controls sized for a pointer are 20-27px tall; a finger needs more. On a
+   touch screen the controls a phone is driven with get at least 36px to land
+   on — the platforms advise 44, and the table keeps a little less so a screen
+   still holds a useful number of rows (its height is raised in App.tsx). */
+@media (pointer:coarse){
+  .ctrls .btn,#toolbar .btn,#conn-bar .btn,.modal-box .btn,.modal-box .xbtn,#dock .btn,.tab-add{min-height:36px}
+  .modal-box .xbtn,#dock .xbtn,.tab-add{min-width:36px}
+  .seg-btn,.log-sel,.modal-input.vsel,.set-title-sel{min-height:32px}
+  .url-rm,.url-qr{min-width:32px;min-height:32px}
+  .tab-btn{min-height:32px}
+  .set-tab{min-height:34px}
+  .ctx-menu-item{padding-top:11px;padding-bottom:11px}
+  .act-cell .btn.sm{box-sizing:border-box;min-height:32px;min-width:30px;justify-content:center}
+  .proto-dd-trigger{min-height:32px}
+  /* The "i" marks grow to something a finger can hit, the drawn dot and stem
+     with them (their desktop sizes are in the .hint-i rules above). */
+  .hint-i{width:22px;height:22px}
+  .hint-i::before{top:4px;width:3px;height:3px;margin-left:-1.5px}
+  .hint-i::after{top:8px;width:3px;height:7px;margin-left:-1.5px}
+  /* A row is moved from its menu on a touch screen, at any width: a grip under
+     a finger competes with scrolling, and a phone held sideways is wider than
+     the phone layout. */
+  .row-grip{display:none}
+}

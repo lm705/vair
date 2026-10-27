@@ -175,7 +175,11 @@ func setSystemProxy(port int) error {
 		Addr:     fmt.Sprintf("127.0.0.1:%d", port),
 		Snapshot: snap,
 	}); err == nil {
-		os.WriteFile(proxyLockPath(), data, 0o600) //nolint:errcheck
+		// Durable, because this file is the way back: it holds the proxy the
+		// user had before ours, and a start after a crash reads it to put that
+		// proxy back. A torn copy would leave the machine pointing at a
+		// listener that no longer exists.
+		writeFileDurable(proxyLockPath(), data, 0o600) //nolint:errcheck
 	}
 	appliedProxyPort = port
 	return nil

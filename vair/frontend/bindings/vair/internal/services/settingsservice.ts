@@ -20,6 +20,14 @@ import * as core$0 from "../../core/models.js";
 import * as $models from "./models.js";
 
 /**
+ * BackupProgress is how far a running export or import has got, for a
+ * settings window opened in the middle of one.
+ */
+export function BackupProgress(): $CancellablePromise<core$0.BackupProgress> {
+    return $Call.ByID(375466135);
+}
+
+/**
  * BlockNotInForce returns a sentence when the firewall block that was asked for
  * is not actually blocking anything on this machine — the commands succeeded
  * and the profile in use has its firewall switched off, which is a setting that
@@ -30,8 +38,36 @@ export function BlockNotInForce(): $CancellablePromise<string> {
 }
 
 /**
+ * CheckProxyBind says whether a custom proxy address is an address of this
+ * machine: "ok", "invalid" or "absent".
+ */
+export function CheckProxyBind(addr: string): $CancellablePromise<string> {
+    return $Call.ByID(1584205621, addr);
+}
+
+/**
+ * CheckProxyPort says whether a proxy port, as typed, can be used, and what
+ * holds it if not. other is the other proxy port, as typed.
+ */
+export function CheckProxyPort(port: number, other: number): $CancellablePromise<core$0.PortCheck> {
+    return $Call.ByID(3621927841, port, other);
+}
+
+/**
+ * CheckRules reads typed rule lines the way the configuration will: each comes
+ * back in the form to keep, or with what is wrong with it.
+ */
+export function CheckRules(entries: string[] | null): $CancellablePromise<core$0.RuleCheck[] | null> {
+    return $Call.ByID(446062797, entries);
+}
+
+/**
  * Export saves tabs + tab settings + app settings to a JSON file picked in the
  * native Save dialog. Returns "" on success, "cancelled", or an error text.
+ * 
+ * The dialog comes first and the work after it: building the document before
+ * asking where to put it left the button doing nothing visible for as long as
+ * that took. Progress is reported as export_progress (see core).
  */
 export function Export(): $CancellablePromise<string> {
     return $Call.ByID(848699144);

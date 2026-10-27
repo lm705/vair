@@ -23,14 +23,26 @@ export function exitChecking(tt: TT): ExitView {
 // exitView turns the service's answer into the line shown.
 export function exitView(d: any, tt: TT): ExitView {
   if (!d || d.error) {
-    return { cls: 'failed', label: '🌍 ' + (d?.error || tt('check failed')) + ' ↻' }
+    // The reason in the user's language; the service's own words in the tooltip.
+    const reason: Record<string, string> = {
+      unreachable: tt('service unreachable'),
+      http: tt('the service answered') + ' ' + String(d?.error || '').split(':')[0],
+      unreadable: tt('unreadable answer'),
+      no_address: tt('no address in the answer'),
+      refused: tt('the service refused'),
+    }
+    return {
+      cls: 'failed',
+      label: '🌍 ' + ((d?.reason && reason[d.reason]) || d?.error || tt('check failed')) + ' ↻',
+      title: (d?.error ? d.error + ' — ' : '') + tt('The check IP service could not tell the address. Click to re-check.'),
+    }
   }
   const flag = flagEmoji(d.country_code)
   const loc = [d.city, d.country].filter(Boolean).join(', ')
   return {
     cls: 'ok',
     label: (flag ? flag + ' ' : '') + (loc || d.country_code || '?') + (d.ip ? ' · ' + d.ip : ''),
-    title: (d.isp ? d.isp + ' — ' : '') + 'Exit IP as seen through the tunnel. Click to re-check.',
+    title: (d.isp ? d.isp + ' — ' : '') + tt('Exit IP as seen through the tunnel. Click to re-check.'),
   }
 }
 

@@ -179,19 +179,6 @@ func (t *tunnel) pump(r interface{ Read([]byte) (int, error) }) {
 	}
 }
 
-// engineLevel maps sing-box's own prefix onto the app's log levels so the panel
-// filters behave the same as they do when the GUI spawns the engine itself.
-func engineLevel(line string) string {
-	switch {
-	case strings.Contains(line, "FATAL") || strings.Contains(line, "ERROR"):
-		return "error"
-	case strings.Contains(line, "WARN"):
-		return "warn"
-	default:
-		return "info"
-	}
-}
-
 // stop tears the tunnel down and waits for the engine to be gone.
 //
 // SIGTERM first so sing-box can remove its routes and interface; SIGKILL if it
@@ -250,6 +237,7 @@ func (t *tunnel) stop() {
 		removeRouteLeftovers(iface, logf)
 	}
 
+	removeGuard()         // it only ever stands with a tunnel (guard_linux.go)
 	os.Remove(pidPath)    //nolint:errcheck
 	os.Remove(configPath) //nolint:errcheck
 	os.Remove(rulesPath)  //nolint:errcheck
@@ -424,6 +412,7 @@ func cleanupLeftovers() error {
 		log.Printf("removing a kill-switch left by a previous run")
 		removeKillSwitch()
 	}
+	removeGuard()         // a guard over no tunnel guards nothing
 	os.Remove(rulesPath)  //nolint:errcheck
 	os.Remove(configPath) //nolint:errcheck
 	// Rule-sets staged by a session that no longer exists. /run is a tmpfs, so

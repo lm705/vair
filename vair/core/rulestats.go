@@ -70,6 +70,10 @@ type RuleHitDTO struct {
 	// categories are matched inside the engine's own database, and a hit on one
 	// carries no value we could tie back to the line.
 	Tracked bool `json:"tracked"`
+	// Unused marks an apps-list line while the running connection is in proxy
+	// mode, which cannot tell programs apart: it is not pending — the next
+	// proxy connection will not load it either.
+	Unused bool `json:"unused,omitempty"`
 }
 
 // RuleStatsDTO is the whole answer for the settings screen.
@@ -89,6 +93,7 @@ var ruleStats = struct {
 	inEffect map[string]map[string]bool     // list → entry text present in the running config
 	observed int
 	since    time.Time
+	noApps   bool // the running engine cannot match programs (proxy mode, xray)
 }{
 	hits:     map[string]map[string]*ruleHit{},
 	inEffect: map[string]map[string]bool{},
@@ -106,6 +111,24 @@ func ruleStatsEnabled() bool {
 // about to run. Called from the config builders — the one place that knows what
 // the engine will actually see, as opposed to what the settings say right now.
 func armRuleStats(block, direct, proxy, apps []string) {
+	armRules(block, direct, proxy, apps, false)
+}
+
+// armRuleStatsProxy is armRuleStats for xray, which has no process matching:
+// the apps list is not in its configuration and will not be in the next one.
+func armRuleStatsProxy(block, direct, proxy []string) {
+	armRules(block, direct, proxy, nil, true)
+}
+
+func armRules(block, direct, proxy, apps []string, noApps bool) {
+	for _, l := range []struct {
+		name    string
+		entries []string
+	}{{"block", block}, {"without VPN", direct}, {"through VPN", proxy}} {
+		if bad := invalidRules(l.entries); len(bad) > 0 {
+			vlog("warning", "routing: %s rules left out — not a domain, address or valid expression: %s", l.name, strings.Join(bad, ", "))
+		}
+	}
 	snap := func(entries []string) map[string]bool {
 		m := make(map[string]bool, len(entries))
 		for _, e := range entries {
@@ -117,6 +140,7 @@ func armRuleStats(block, direct, proxy, apps []string) {
 	}
 	ruleStats.mu.Lock()
 	defer ruleStats.mu.Unlock()
+	ruleStats.noApps = noApps
 	ruleStats.inEffect = map[string]map[string]bool{
 		ruleListBlock:  snap(block),
 		ruleListDirect: snap(direct),
@@ -176,6 +200,9 @@ func RuleStats() RuleStatsDTO {
 				Pending: !ruleStats.inEffect[list][e],
 				Tracked: ruleEntryTracked(e),
 			}
+			if list == ruleListApps && ruleStats.noApps {
+				d.Pending, d.Unused = false, true
+			}
 			if h := ruleStats.hits[list][e]; h != nil {
 				d.Hits = h.Hits
 				d.Last = h.Last.Unix()
@@ -225,10 +252,16 @@ var singboxMatchRe = regexp.MustCompile(`router: match\[\d+\] ([a-z_]+)=(.+) => 
 // two lines that name where that connection is going. The sniffed domain is the
 // better answer where both exist: it is what the router actually matched on.
 var (
-	singboxIDRe    = regexp.MustCompile(`\[(\d+) [^\]]*\]`)
-	singboxDestRe  = regexp.MustCompile(`inbound connection to (\S+)`)
-	singboxSniffRe = regexp.MustCompile(`router: sniffed protocol: [^,]+, domain: (\S+)`)
-	singboxProcRe  = regexp.MustCompile(`router: found process path: (.+?), user:`)
+	singboxIDRe   = regexp.MustCompile(`\[(\d+) [^\]]*\]`)
+	singboxDestRe = regexp.MustCompile(`inbound connection to (\S+)`)
+	// The outbound line, which names the real destination where the inbound
+	// one names a FakeIP stand-in.
+	singboxOutDestRe = regexp.MustCompile(`outbound connection to (\S+)`)
+	singboxSniffRe   = regexp.MustCompile(`router: sniffed protocol: [^,]+, domain: (\S+)`)
+	// The user is on Linux only: sing-box on Windows ends the line at the
+	// path ("found process path: C:\Windows\System32\curl.exe"), so a
+	// pattern that required it never matched there.
+	singboxProcRe = regexp.MustCompile(`router: found process path: (.+?)(?:, user: .*)?\s*$`)
 )
 
 // singboxDest remembers where each in-flight connection is going, so a match
@@ -349,6 +382,8 @@ var (
 	xrayMark     = []byte("accepted ")
 	singboxMarks = [][]byte{
 		[]byte("inbound connection to "),
+		// The real destination behind a FakeIP stand-in (noteEngineConnLine).
+		[]byte("outbound connection to "),
 		[]byte("router: match["),
 		[]byte("connection closed"),
 		[]byte("sniffed protocol:"),
@@ -626,21 +661,11 @@ func lineMatcher(list, entry string) (key, value string) {
 	if list == ruleListApps {
 		return "process_path_regex", processMatchRegex(e)
 	}
-	lower := strings.ToLower(e)
-	switch {
-	case strings.HasPrefix(lower, "geosite:"), strings.HasPrefix(lower, "geoip:"):
+	m, err := parseRule(e)
+	if err != nil {
 		return "", ""
-	case strings.HasPrefix(lower, "full:"):
-		return "domain", e[len("full:"):]
-	case strings.HasPrefix(lower, "regexp:"):
-		return "domain_regex", e[len("regexp:"):]
-	case strings.HasPrefix(lower, "domain:"):
-		return "domain_suffix", e[len("domain:"):]
-	case isIPOrCIDR(e):
-		return "ip_cidr", e
-	default:
-		return "domain_suffix", e
 	}
+	return m.key, m.value
 }
 
 // withPrefixLen makes a bare address into the /32 or /128 the engine prints.

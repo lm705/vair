@@ -10,6 +10,15 @@ if [ -f /etc/apparmor.d/vair ] && command -v apparmor_parser >/dev/null 2>&1; th
   apparmor_parser -R /etc/apparmor.d/vair 2>/dev/null || true
 fi
 
+# An upgrade is not a removal: the new package puts the binary straight back,
+# and its postinstall restarts the helper on it. Disabling the unit here — as
+# this script did on every upgrade, since dpkg runs it with "upgrade" and rpm
+# with 1 — switched the helper off for good at each update, and TUN mode was
+# gone until the user installed the helper again.
+case "$1" in
+  upgrade|1) exit 0 ;;
+esac
+
 # Stop the helper before its binary goes away. Left running it would keep a
 # tunnel up with no package behind it, and the next boot would fail to start a
 # unit whose ExecStart no longer exists.

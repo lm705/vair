@@ -48,10 +48,18 @@ func (c *ConnService) CheckExit() core.ExitInfo {
 	return core.CheckExit()
 }
 
+// PingLive measures the round trip through the live connection, in ms (-1:
+// no answer). The connection bar's ping.
+func (c *ConnService) PingLive() int64 {
+	return core.PingLive()
+}
+
 // ConnectChain connects the given entries as a chain, in the order given:
-// idxs[0] is the entry hop, idxs[last] the exit. Returns "" on success or a human-readable rejection.
-func (c *ConnService) ConnectChain(idxs []int, mode string) string {
-	return core.ConnectChain(idxs, mode)
+// idxs[0] is the entry hop, idxs[last] the exit; raws are the same
+// configurations, index for index. Returns "" on success or a human-readable
+// rejection.
+func (c *ConnService) ConnectChain(idxs []int, raws []string, mode string) string {
+	return core.ConnectChain(idxs, raws, mode)
 }
 
 // AppInfo reports engine availability + elevation (gates the TUN mode pill).

@@ -144,3 +144,6 @@ func nftAvailable() bool {
 	_, err := exec.LookPath("nft")
 	return err == nil
 }
+
+// helperServiceCap: Linux's helper is reported through TUNBlockReason.
+func helperServiceCap() string { return "" }

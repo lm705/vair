@@ -22,6 +22,8 @@ except AttributeError:
 #   tt('…') / t10(lang, '…')  — the direct call
 #   hint('…')                 — the settings helper, which is tt inside a <div>
 #   needs="…"                 — a label handed to Dependent, translated there
+#   tt0('…')                  — a phrase marked where it is defined and
+#                               translated where it is shown (SessionModal)
 # Only the first was matched for a long time, so a hint written through the
 # helper — which is most of the hints — was never checked at all.
 #
@@ -33,7 +35,7 @@ except AttributeError:
 # to be worth translating. Without it in the pattern the checker quietly skipped
 # exactly the strings most likely to be missing a translation.
 KEY = re.compile(
-    r"(?:\btt|\bt10|\bhint)\(\s*(?:lang(?:Ref\.current)?\s*,\s*)?"
+    r"(?:\btt0?|\bt10|\bhint)\(\s*(?:lang(?:Ref\.current)?\s*,\s*)?"
     r"(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\")\s*,?\s*\)"
 )
 NEEDS = re.compile(r"\bneeds=(?:\"([^\"]*)\"|'([^']*)')")
@@ -47,7 +49,15 @@ PROP = re.compile(r"\ben\s*[:=]\s*\{?\s*" + STR)
 # is a worked example, and only the right half is prose — the left one is what
 # the user types, and asking for a Russian translation of it would be a bug in
 # the checker rather than in the interface.
-OPT = re.compile(r"\bopt\(\s*" + STR + r"\s*,\s*" + STR + r"\s*,?\s*\)", re.S)
+#
+# A third argument marks the default choice; it is a flag, not text.
+OPT = re.compile(r"\bopt\(\s*" + STR + r"\s*,\s*" + STR + r"\s*(?:,\s*(?:true|false))?\s*,?\s*\)", re.S)
+# The two states of a switch: whenOn('…') / whenOff('…', true). One string each,
+# the same optional flag.
+STATE = re.compile(r"\bwhen(?:On|Off)\(\s*" + STR + r"\s*(?:,\s*(?:true|false))?\s*,?\s*\)", re.S)
+# hint('…', [states]) — the description followed by its states. KEY only sees a
+# hint with nothing after the string.
+HINT = re.compile(r"\bhint\(\s*" + STR + r"\s*,\s*\[", re.S)
 EX = re.compile(r"\bex\(\s*(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")\s*,\s*" + STR + r"\s*,?\s*\)", re.S)
 DICT = re.compile(r'\n    "((?:[^"\\]|\\.)*)"\s*:')
 
@@ -61,14 +71,16 @@ for f in sorted(glob.glob("frontend/src/*.tsx") + glob.glob("frontend/src/*.ts")
     if f.endswith("i18n.ts"):
         continue
     s = io.open(f, encoding="utf-8").read()
-    for pat in (KEY, NEEDS, PROP, OPT, EX):
+    for pat in (KEY, NEEDS, PROP, OPT, EX, STATE, HINT):
         for m in pat.finditer(s):
             # Each literal is one quoted group of the pair the pattern offers;
             # opt() offers two pairs, and both are keys.
             gs = m.groups()
             for a, b in zip(gs[0::2], gs[1::2]):
                 k = a if a is not None else b
-                if k is not None:
+                # A value with no words in it — a port, a range, an empty
+                # description — reads the same in every language.
+                if k is not None and re.search("[A-Za-z]", k):
                     used.setdefault(unescape(k), set()).add(f.replace("\\", "/").split("/")[-1])
 
 raw = DICT.findall(io.open("frontend/src/i18n.ts", encoding="utf-8").read())

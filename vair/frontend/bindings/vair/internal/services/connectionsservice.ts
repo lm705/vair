@@ -42,6 +42,14 @@ export function List(): $CancellablePromise<core$0.ConnRow[] | null> {
     return $Call.ByID(3003922434);
 }
 
+/**
+ * MissedEarlier reports that recording was turned on during the running
+ * session, so the connections it already had open are not listed.
+ */
+export function MissedEarlier(): $CancellablePromise<boolean> {
+    return $Call.ByID(3354333793);
+}
+
 export function SetTracking(on: boolean): $CancellablePromise<void> {
     return $Call.ByID(327161603, on);
 }

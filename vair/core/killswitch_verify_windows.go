@@ -5,6 +5,8 @@ package core
 import (
 	"fmt"
 	"strings"
+
+	"vair/helper/winsys"
 )
 
 // Whether the block that was just installed is actually blocking anything.
@@ -21,46 +23,6 @@ import (
 // program that says nothing, and no protection at all. So the block is read
 // back after it is installed, and what is found is what the interface shows.
 
-// fwProfile is one Windows firewall profile as it matters here.
-type fwProfile struct {
-	enabled  bool
-	outbound string
-}
-
-// parseFirewallState reads the shape firewallStateScript prints. Separate from
-// running it so the decision can be tested without a firewall.
-func parseFirewallState(out string) (active []string, profiles map[string]fwProfile) {
-	profiles = map[string]fwProfile{}
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "ACTIVE:"):
-			for _, c := range strings.Split(strings.TrimPrefix(line, "ACTIVE:"), ",") {
-				if c = strings.TrimSpace(c); c != "" {
-					// The connection profile calls it DomainAuthenticated; the
-					// firewall profile is called Domain.
-					if strings.EqualFold(c, "DomainAuthenticated") {
-						c = "Domain"
-					}
-					active = append(active, c)
-				}
-			}
-		case strings.HasPrefix(line, "PROFILE:"):
-			body := strings.TrimPrefix(line, "PROFILE:")
-			name, rest, ok := strings.Cut(body, "=")
-			if !ok {
-				continue
-			}
-			en, out, _ := strings.Cut(rest, "/")
-			profiles[strings.TrimSpace(name)] = fwProfile{
-				enabled:  strings.EqualFold(strings.TrimSpace(en), "true"),
-				outbound: strings.TrimSpace(out),
-			}
-		}
-	}
-	return active, profiles
-}
-
 // blockGapReason names what is wrong with a block that is supposedly standing,
 // or returns "" when it is real. Written for a person: it ends up under the
 // setting that asked for it and in the session panel.
@@ -73,27 +35,36 @@ func blockGapReason(active []string, profiles map[string]fwProfile) string {
 		if !ok {
 			continue
 		}
-		if !p.enabled {
+		if !p.Enabled {
 			return fmt.Sprintf("the Windows firewall is switched off for this network (the %s profile), so the block does not apply to it", name)
 		}
-		if !strings.EqualFold(p.outbound, "Block") {
-			return fmt.Sprintf("the %s profile did not take the block (it reports %q)", name, p.outbound)
+		if !strings.EqualFold(p.Outbound, "Block") {
+			return fmt.Sprintf("the %s profile did not take the block (it reports %q)", name, p.Outbound)
 		}
 	}
 	return ""
 }
 
-// firewallStateScript prints the two things the check needs, one per line.
-const firewallStateScript = `"ACTIVE:" + ((Get-NetConnectionProfile | ForEach-Object { $_.NetworkCategory }) -join ',')
-Get-NetFirewallProfile -All | ForEach-Object { "PROFILE:" + $_.Name + "=" + $_.Enabled + "/" + $_.DefaultOutboundAction }`
-
 // verifyBlockStanding reads the firewall back and returns what is wrong with
 // the block, or "" when there is nothing wrong. An unreadable firewall is not
 // an accusation: it answers "".
+//
+// For a block put up by this build that means asking the filtering engine
+// whether our filters are in place. Windows Firewall's profiles no longer say
+// anything about it: the filters apply whether the firewall is on or off, on
+// every network, which is exactly what the profile checks below used to catch
+// the absence of.
 func verifyBlockStanding() string {
-	out, err := psOutput(firewallStateScript)
-	if err != nil {
+	if st, had := readKillSwitchState(); had && st.legacy() {
+		active, profiles, err := winsys.FirewallState()
+		if err != nil {
+			return ""
+		}
+		return blockGapReason(active, profiles)
+	}
+	present, known := wfpBlockPresent()
+	if !known || present {
 		return ""
 	}
-	return blockGapReason(parseFirewallState(out))
+	return "the block's filters are not in place in the Windows Filtering Platform"
 }

@@ -2,10 +2,7 @@
 
 package core
 
-import (
-	"path/filepath"
-	"strings"
-)
+import "vair/helper/winsys"
 
 // removeTUNAdapter reaps leftover TUN adapters by name so they don't linger in
 // the system and cause "file already exists" on the next connect.
@@ -15,31 +12,10 @@ import (
 // interface name carries a timestamp, hence the wildcards; xc-tun-* is from the
 // 1.10 releases and is swept too, for users upgrading.
 func removeTUNAdapter() {
-	runHidden("powershell", "-NonInteractive", "-Command", reapScript(liveTUNIface())).Run() //nolint:errcheck
-}
-
-// reapScript is the sweep, with the adapter of a live session left alone.
-//
-// The sweep matches every vair-* adapter, and it runs in the background so a
-// disconnect does not wait for it — which used to mean this: switch from one
-// configuration to another, the teardown starts a sweep, the connect right
-// behind it creates vair-<now>, and the sweep (a PowerShell launch, 300-700ms
-// later) removes the adapter that was just made. sing-box carried on running
-// with no interface, the window still said connected, and every packet went out
-// the physical one. It survived further switches — each spawned another sweep —
-// and only an explicit disconnect cleared it, because there nothing was racing.
-//
-// Excluding the live name is the belt to the reordering's braces: even a sweep
-// that overlaps a connect now cannot touch the adapter that connect is using.
-func reapScript(except string) string {
-	const base = `Get-NetAdapter -Name 'vair-*','xc-tun-*' -ErrorAction SilentlyContinue`
-	tail := ` | Remove-NetAdapter -Confirm:$false`
-	if except == "" {
-		return base + tail
+	if serviceMode() {
+		return // the service sweeps after its own engine
 	}
-	// Single-quoted PowerShell string: the only character to escape is the
-	// quote itself, and the names we generate never contain one.
-	return base + ` | Where-Object { $_.Name -ne '` + psQuote(except) + `' }` + tail
+	runHidden("powershell", "-NonInteractive", "-Command", winsys.ReapScript(liveTUNIface())).Run() //nolint:errcheck
 }
 
 // sweepGhostTunnelAtStart clears what a run that never got to tear anything
@@ -62,10 +38,13 @@ func reapScript(except string) string {
 // what comes back is the ordinary route table of a machine that is not
 // connected to anything — which is the true state of it.
 func sweepGhostTunnelAtStart() {
+	if serviceMode() {
+		return // the service sweeps when it starts
+	}
 	state.mu.RLock()
 	engines := []string{state.xrayBin, state.singboxBin}
 	state.mu.RUnlock()
-	script := ghostSweepScript(engines)
+	script := winsys.GhostSweepScript(engines)
 	// The lock is taken HERE, on the startup goroutine, and released by the
 	// sweep when it finishes. That ordering is the whole point: a connect waits
 	// on this same lock before it starts an engine, so from the first moment of
@@ -86,31 +65,4 @@ func sweepGhostTunnelAtStart() {
 		runHidden("powershell", "-NonInteractive", "-Command", script).Run() //nolint:errcheck
 		tunReapDone++
 	}()
-}
-
-// ghostSweepScript builds that sweep.
-//
-// Engines are matched by their full path, never by image name. The user runs
-// the 1.10 release beside this one, and a sweep by name would reach into it and
-// kill a working tunnel; the path is what tells the two apart. For the same
-// reason the adapter pattern here is vair-* alone — the teardown sweep also
-// takes xc-tun-*, the 1.10 name, which is right when this program has just torn
-// down a tunnel and wrong at a start, where the only thing that owns an
-// xc-tun-* adapter is a copy of 1.10 that is running now.
-func ghostSweepScript(engines []string) string {
-	var b strings.Builder
-	for _, p := range engines {
-		if p == "" {
-			continue
-		}
-		name := strings.TrimSuffix(filepath.Base(p), ".exe")
-		// -Name narrows the enumeration to the two candidates; the Path test is
-		// what actually decides. A process we may not open reads back as an
-		// empty path and fails the test, which is the safe way to fail.
-		b.WriteString("Get-Process -Name '" + psQuote(name) + "' -ErrorAction SilentlyContinue | " +
-			"Where-Object { $_.Path -eq '" + psQuote(p) + "' } | " +
-			"Stop-Process -Force -ErrorAction SilentlyContinue; ")
-	}
-	b.WriteString("Get-NetAdapter -Name 'vair-*' -ErrorAction SilentlyContinue | Remove-NetAdapter -Confirm:$false")
-	return b.String()
 }

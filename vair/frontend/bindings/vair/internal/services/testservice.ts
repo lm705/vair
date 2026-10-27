@@ -43,9 +43,10 @@ export function PingOne(idx: number): $CancellablePromise<void> {
 
 /**
  * PingSelected / SpeedSelected test a chosen set (the row context menu).
+ * raws are the selected configurations, index for index (see core.PingSelected).
  */
-export function PingSelected(idxs: number[] | null): $CancellablePromise<void> {
-    return $Call.ByID(2365491842, idxs);
+export function PingSelected(idxs: number[] | null, raws: string[] | null): $CancellablePromise<void> {
+    return $Call.ByID(2365491842, idxs, raws);
 }
 
 /**
@@ -66,6 +67,6 @@ export function SpeedOne(idx: number): $CancellablePromise<void> {
     return $Call.ByID(3743802418, idx);
 }
 
-export function SpeedSelected(idxs: number[] | null): $CancellablePromise<void> {
-    return $Call.ByID(3572141571, idxs);
+export function SpeedSelected(idxs: number[] | null, raws: string[] | null): $CancellablePromise<void> {
+    return $Call.ByID(3572141571, idxs, raws);
 }

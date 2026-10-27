@@ -37,6 +37,11 @@ type Options struct {
 	// bind anything; a config that asks it to listen on 80 or 443 is not a
 	// tunnel configuration.
 	MinListenPort int
+	// Windows judges the configuration as one the Windows helper service will
+	// run: Windows paths, and the adapter names the Windows app generates.
+	// Set by the caller, never inferred from the machine — the tests of both
+	// shapes run everywhere.
+	Windows bool
 }
 
 // DefaultMinListenPort keeps inbounds out of the privileged range.
@@ -46,6 +51,11 @@ const DefaultMinListenPort = 1024
 // unmistakable: an arbitrary name lets a caller collide with an existing
 // interface and have root reconfigure it.
 var ifaceName = regexp.MustCompile(`^vair[0-9]{0,2}$`)
+
+// ifaceNameWindows is the Windows shape: "vair-" and a number. The number
+// changes every session there, so a fresh connect never collides with an
+// adapter a crash left behind; the helper sweeps vair-* adapters itself.
+var ifaceNameWindows = regexp.MustCompile(`^vair-[0-9]{1,5}$`)
 
 // topLevel is every key allowed at the root of the document.
 //
@@ -161,6 +171,12 @@ func checkInbounds(raw json.RawMessage, opt Options) error {
 		case "tun":
 			tunCount++
 			name, _ := in["interface_name"].(string)
+			if opt.Windows {
+				if !ifaceNameWindows.MatchString(name) {
+					return fmt.Errorf("inbound %d: interface_name %q is not one of ours (want vair-1234)", i, name)
+				}
+				break
+			}
 			if !ifaceName.MatchString(name) {
 				return fmt.Errorf("inbound %d: interface_name %q is not one of ours (want vair, vair0, vair12…)", i, name)
 			}
@@ -250,6 +266,9 @@ func checkPaths(node interface{}, key string, inRuleSet bool, opt Options) error
 func checkPath(key, p string, opt Options) error {
 	if p == "" {
 		return fmt.Errorf("%s is empty", key)
+	}
+	if opt.Windows {
+		return checkWindowsPath(key, p, opt)
 	}
 	if !strings.HasPrefix(p, "/") {
 		return fmt.Errorf("%s %q must be an absolute path", key, p)

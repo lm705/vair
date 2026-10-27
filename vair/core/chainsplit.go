@@ -37,7 +37,7 @@ func engineForChainHop(n *Node) string {
 	if n == nil {
 		return ""
 	}
-	if engineFor(n.Kind) == "xray" && xrayOutboundForNode(n) != nil {
+	if engineForNode(n) == "xray" && xrayOutboundForNode(n) != nil {
 		return "xray"
 	}
 	if singboxOutboundForNode(n) != nil || singboxEndpointForNode(n) != nil {
@@ -85,7 +85,7 @@ func buildChainSegmentUpstream(seg chainSegment, socksPort int) map[string]inter
 		if cfg == nil && len(seg.Nodes) == 1 {
 			cfg = buildXrayConfigForNode(seg.Nodes[0], 0, socksPort, "", "", "", "")
 		}
-		return cfg
+		return carryOnlyTheNextHop(cfg, seg.Engine)
 	case "singbox":
 		var cfg map[string]interface{}
 		if len(seg.Nodes) == 1 {
@@ -93,9 +93,53 @@ func buildChainSegmentUpstream(seg chainSegment, socksPort int) map[string]inter
 		} else {
 			cfg = buildSingboxChainProxyConfig(seg.Nodes, 0, socksPort)
 		}
-		return withoutIdleInbound(cfg, "http-in")
+		return carryOnlyTheNextHop(withoutIdleInbound(cfg, "http-in"), seg.Engine)
 	}
 	return nil
+}
+
+// carryOnlyTheNextHop replaces the upstream half's routing with one rule:
+// everything it is handed goes through its hops.
+//
+// The half is built by the same functions as a whole proxy session, and those
+// carry the user's routing — private and LAN addresses direct, the bypassed
+// countries direct, their own direct and block rules, and in the "only blocked"
+// and "only selected" modes direct for everything else. Its only client is the
+// other half, and the only thing that half sends it is the connection to the
+// next hop's server; under those rules that connection went out directly,
+// past the entry hop. A chain shown as "A → B" connected to B from the
+// user's own address, or did not connect at all. The user's routing belongs to
+// the half the programs talk to, and stays there.
+func carryOnlyTheNextHop(cfg map[string]interface{}, engine string) map[string]interface{} {
+	if cfg == nil {
+		return nil
+	}
+	switch engine {
+	case "xray":
+		cfg["routing"] = map[string]interface{}{
+			"domainStrategy": "AsIs",
+			"rules": []interface{}{
+				map[string]interface{}{"type": "field", "inboundTag": []interface{}{"socks"}, "outboundTag": "proxy"},
+			},
+		}
+	case "singbox":
+		old, _ := cfg["route"].(map[string]interface{})
+		route := map[string]interface{}{
+			"auto_detect_interface": true,
+			"final":                 "proxy",
+		}
+		if r, ok := old["default_domain_resolver"]; ok {
+			route["default_domain_resolver"] = r
+		}
+		// The half resolves nothing but its own servers' names, through the
+		// default resolver; the per-site DNS rules, and the rule-sets they name,
+		// belong to the other half too.
+		if dns, ok := cfg["dns"].(map[string]interface{}); ok {
+			delete(dns, "rules")
+		}
+		cfg["route"] = route
+	}
+	return cfg
 }
 
 // withoutIdleInbound drops an inbound this half has no use for. The upstream

@@ -2,6 +2,7 @@ import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
 import { startRemoteEvents } from './remote'
+import { installDialogKeys } from './dialogkeys'
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>
@@ -14,3 +15,6 @@ ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
 // render so the Wails runtime (which owns window._wails.dispatchWailsEvent) is
 // initialised by App's imports.
 startRemoteEvents()
+
+// Focus, Tab and Esc for every dialog (dialogkeys.ts).
+installDialogKeys()

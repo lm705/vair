@@ -4,6 +4,7 @@ package core
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/windows"
@@ -30,6 +31,29 @@ func (wininetProxy) set(host string, port int) (proxySnapshot, error) {
 	// WinINET wants one semicolon-separated string, and <local> — the token for
 	// "any name without a dot" — has no equivalent in the neutral list.
 	over := strings.Join(bypassWin(), ";") + ";<local>"
+
+	// Through the per-connection options, not only the three registry values:
+	// automatic configuration comes before a manual proxy in WinINET. A PAC
+	// script (AutoConfigURL) or "Automatically detect settings" (WPAD — on by
+	// default in Windows) that is in force overrides the address written here,
+	// and programs that follow the system setting went around Vair while it
+	// said "connected": a PAC answering DIRECT sent a request straight out in a
+	// test, and a network that serves WPAD — a company's, a public Wi-Fi, or
+	// someone on it — does the same with a proxy of its choosing. For the
+	// session both are switched off; what they were is in the snapshot, and
+	// revert puts them back.
+	if cur, err := queryPerConn(); err == nil {
+		snap["flags"] = strconv.FormatUint(uint64(cur.flags), 10)
+		snap["pac"] = cur.pac
+		snap["pcserver"] = cur.server
+		snap["pcbypass"] = cur.bypass
+		if err := setPerConn(perConnSettings{flags: proxyTypeDirect | proxyTypeProxy, server: addr, bypass: over}); err == nil {
+			notifyWininet()
+			return snap, nil
+		}
+		// The API refused: the registry values below are what is left.
+		delete(snap, "flags")
+	}
 	k, err := registry.OpenKey(registry.CURRENT_USER, wininetKey, registry.SET_VALUE)
 	if err != nil {
 		return snap, fmt.Errorf("open Internet Settings: %w", err)
@@ -56,6 +80,17 @@ func (wininetProxy) set(host string, port int) (proxySnapshot, error) {
 // they had disconnected. The snapshot comes from the lock file, so this holds
 // after a crash too, when nothing is left in memory.
 func (wininetProxy) revert(snap proxySnapshot) error {
+	// A snapshot taken through the per-connection options is put back the same
+	// way: automatic detection and the PAC script included.
+	if f, ok := snap["flags"]; ok {
+		if flags, err := strconv.ParseUint(f, 10, 32); err == nil {
+			err := setPerConn(perConnSettings{flags: uint32(flags), server: snap["pcserver"], bypass: snap["pcbypass"], pac: snap["pac"]})
+			if err == nil {
+				notifyWininet()
+				return nil
+			}
+		}
+	}
 	k, err := registry.OpenKey(registry.CURRENT_USER, wininetKey, registry.SET_VALUE)
 	if err != nil {
 		return fmt.Errorf("open Internet Settings: %w", err)
@@ -90,6 +125,14 @@ func (wininetProxy) revert(snap proxySnapshot) error {
 // and would have to be scraped.
 // pointsAt reads the two values that decide it: the switch and the address.
 func (wininetProxy) pointsAt(host string, port int) (bool, error) {
+	// The per-connection view first: it is what WinINET acts on, and it says
+	// whether a PAC script or automatic detection has been switched back on —
+	// either takes the traffic away from the address while the registry values
+	// alone still read as ours.
+	if cur, err := queryPerConn(); err == nil {
+		auto := cur.flags&(proxyTypeAutoProxyURL|proxyTypeAutoDetect) != 0
+		return cur.flags&proxyTypeProxy != 0 && !auto && strings.Contains(cur.server, fmt.Sprintf("%s:%d", host, port)), nil
+	}
 	snap := readWininet()
 	if snap["enable"] != "1" {
 		return false, nil

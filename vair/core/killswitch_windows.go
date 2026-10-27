@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"vair/helper/wfp"
+	"vair/helper/winsys"
 )
 
 // The kill-switch that outlives the tunnel.
@@ -18,51 +21,50 @@ import (
 // protection at the moment it is most wanted: the tunnel is gone and traffic
 // resumes on the physical adapter, unprotected and unannounced.
 //
-// This holds the line at the firewall instead. Windows Firewall's default
-// outbound action becomes Block for the duration, with explicit allow rules for
-// the traffic that must keep moving: the tunnel's own interface, the engines
-// (so they can reach the VPN server and reconnect), loopback, and — when the
-// user has not asked otherwise — the local network.
+// This holds the line in the Windows Filtering Platform instead — see
+// wfp_windows.go for why not Windows Firewall, and wfpblock_windows.go for
+// what is let through. The filters are persistent: they stay after this
+// program exits and after a reboot, which is the point, and they come down
+// when the user says so — a disconnect, the setting turned off, the red button
+// on the connection bar, or, without the program's window,
+// `Vair.exe --release-block` or the release-block.ps1 script written next to
+// the marker.
 //
-// Why the default action rather than block rules: in Windows Firewall an
-// explicit Block beats an explicit Allow, so "block everything, allow these"
-// cannot be written as rules. Flipping the default to Block makes it an
-// implicit block, which allow rules do override.
-//
-// The dangerous part is stated plainly, because it is the point: while this is
-// engaged the machine has no way out except through the tunnel, and that
-// survives this program exiting. Three things undo it — an explicit disconnect,
-// this program starting up and finding its own marker, and the command printed
-// in the log. The marker on disk is what makes the second one possible: it
-// records what the firewall looked like before, so the release puts back
-// exactly that.
+// Builds before 2.7.0 did this with Windows Firewall's default outbound action
+// and a group of allow rules. A block of that kind can still be standing when
+// this build starts, so the code that takes it down is kept — see
+// releaseLegacyBlockLocked — and nothing else of it.
 
 // killSwitchState is the marker written to disk while the block is engaged.
 type killSwitchState struct {
-	// Previous is the DefaultOutboundAction each profile had before, so the
-	// release restores what was there instead of assuming "Allow".
-	Previous map[string]string `json:"previous"`
+	// Engine is "wfp" for a block put up by this build. Empty means Windows
+	// Firewall, from before 2.7.0.
+	Engine string `json:"engine,omitempty"`
+	// Previous is, for a Windows Firewall block, the DefaultOutboundAction each
+	// profile had before, so its release restores what was there.
+	Previous map[string]string `json:"previous,omitempty"`
 	Iface    string            `json:"iface"`
 	Since    time.Time         `json:"since"`
 	PID      int               `json:"pid"`
-	// Gen names the allow-rule set currently standing, so the next switch can
-	// install its own beside it and take this one down afterwards. Absent in a
-	// marker written by an earlier build, which reads as 0 and simply means the
-	// next set is #1.
-	Gen int `json:"gen,omitempty"`
+	Gen      int               `json:"gen,omitempty"`
 }
 
-const killSwitchRuleGroup = "Vair kill-switch"
+// legacy says the marker describes a Windows Firewall block.
+func (st killSwitchState) legacy() bool { return st.Engine == "" }
 
-// The firewall operations, behind variables so a test can exercise the marker
-// handling without reaching for the machine's actual firewall.
+// The operations, behind variables so a test can exercise the marker handling
+// without reaching for the machine's actual firewall.
 var (
 	ksSetOutbound    = setOutboundActionFor
 	ksSetAllOutbound = setOutboundAction
 	ksRemoveRules    = removeKillSwitchRules
-	ksAddRules       = addKillSwitchAllowRules
-	ksRemoveOldRules = removeKillSwitchRulesOtherThan
+	ksBlockOptions   = currentBlockOptions
+	ksPrivileged     = blocksAvailable
 )
+
+// blocksAvailable says whether the blocks can be put up and taken down: by the
+// helper service, or by this program when it runs as administrator.
+func blocksAvailable() bool { return serviceMode() || isPrivileged() }
 
 var killSwitchMu sync.Mutex
 
@@ -77,125 +79,125 @@ func killSwitchHeld() bool {
 	return err == nil
 }
 
+// readKillSwitchState reads the marker, and says whether there was one.
+func readKillSwitchState() (killSwitchState, bool) {
+	var st killSwitchState
+	data, err := os.ReadFile(killSwitchMarker())
+	if err != nil {
+		return st, false
+	}
+	_ = json.Unmarshal(data, &st)
+	return st, true
+}
+
 // engageKillSwitch blocks everything that is not the tunnel.
 //
-// iface is the TUN interface's name; traffic on it is allowed through. Returns
-// an error without changing anything when the machine is not ours to change
-// (no elevation).
+// iface is the TUN interface's name, whose traffic is let through; "" for the
+// proxy kill-switch. Called again for every new tunnel while a block stands —
+// the name is different each time on Windows — and then it replaces the whole
+// set in one transaction, so a switch between configurations has no moment
+// without a block and no moment with the new tunnel shut out.
 func engageKillSwitch(iface string) error {
 	killSwitchMu.Lock()
 	defer killSwitchMu.Unlock()
-	// Already held: the tunnel this was engaged for is gone and a new one has
-	// taken its place, with a different name — the allow rule has to follow it,
-	// or the block stays and the new tunnel is inside it.
-	//
-	// This is also what closes the leak between two configurations. Removing a
-	// TUN adapter puts the ordinary routes back and takes the engine's own
-	// filter with it, so every switch used to have a second of open traffic in
-	// the middle of it. The firewall block does not come down for a switch — it
-	// only ever comes down for an explicit disconnect — so the gap is covered
-	// as long as the rules keep pointing at the right interface.
-	if killSwitchHeld() {
-		return refreshKillSwitchRules(iface)
-	}
-	if !isPrivileged() {
+	if !ksPrivileged() {
 		return fmt.Errorf("the persistent kill-switch needs the same privileges as TUN mode")
 	}
-
-	if !firewallEnabled() {
-		return fmt.Errorf("windows firewall is switched off on this machine, so a firewall block would hold nothing — turn the firewall on to use this")
-	}
-	prev, err := currentOutboundActions()
+	opts, err := ksBlockOptions(iface)
 	if err != nil {
 		return err
 	}
-
-	// The allow list first, then the door. In this order a mistake leaves the
-	// machine reachable; the other way round it leaves it silent. And the list
-	// goes in as a whole or not at all — the script stops at the first rule it
-	// cannot create, and what got in is swept before anything is blocked.
-	const gen = 1
-	if err := addKillSwitchAllowRules(iface, gen); err != nil {
-		removeKillSwitchRules()
-		return err
+	prev, had := readKillSwitchState()
+	if err := wfpInstallBlock(opts); err != nil {
+		return fmt.Errorf("the block could not be put in place: %w", err)
 	}
-	if err := setOutboundAction("Block"); err != nil {
-		removeKillSwitchRules()
-		return err
+	// A Windows Firewall block from an earlier build comes down only now that
+	// this one is standing: never a moment with neither.
+	if had && prev.legacy() {
+		releaseLegacyBlockLocked(prev)
 	}
-
-	st := killSwitchState{Previous: prev, Iface: iface, Since: time.Now(), PID: os.Getpid(), Gen: gen}
+	st := killSwitchState{Engine: "wfp", Iface: iface, Since: time.Now(), PID: os.Getpid()}
+	if had && !prev.legacy() && !prev.Since.IsZero() {
+		st.Since = prev.Since
+	}
+	// Durable: this file is how the block gets taken down again. Written in
+	// place and cut short by a crash or a restart, it would leave a standing
+	// block beside a record nobody can read.
 	if data, err := json.MarshalIndent(st, "", "  "); err == nil {
-		_ = os.WriteFile(killSwitchMarker(), data, 0o600)
+		_ = writeFileDurable(killSwitchMarker(), data, 0o600)
 	}
-	vlog("warning", "kill-switch: traffic outside the tunnel is blocked at the firewall, and stays blocked if Vair stops. Release: disconnect, or run  Set-NetFirewallProfile -All -DefaultOutboundAction Allow")
+	writeReleaseScript()
+	switch {
+	case had && !prev.legacy() && prev.Iface != iface:
+		vlog("info", "kill-switch: block re-pointed at %s (traffic stayed blocked through the switch)", iface)
+	case !had || prev.legacy():
+		vlog("warning", "kill-switch: traffic outside the tunnel is blocked, and stays blocked if Vair stops. Release: disconnect, or run  %s", releaseHint())
+	}
 	return nil
 }
 
-// refreshKillSwitchRules re-points an engaged block at the current tunnel.
-//
-// The whole allow list is rewritten rather than the one rule edited: it is a
-// single call either way, and it also picks up anything else that changed
-// between connections (the engines' paths, the LAN setting).
-//
-// Made before broken. The new set is installed under the next generation while
-// the old one is still standing, and the old one comes down only afterwards —
-// so at no point is the door shut over an empty allow list. If the new set
-// cannot be installed, the old one is left exactly where it was: it names the
-// tunnel that has just gone, which is of no use to the new one, but it still
-// allows the engine and the loopback, and that is the difference between a
-// machine that can rebuild the tunnel and one that cannot.
-func refreshKillSwitchRules(iface string) error {
-	data, err := os.ReadFile(killSwitchMarker())
-	if err != nil {
-		return nil // nothing engaged after all
+// heldBlockMode is the kind of session the standing block was put up for:
+// TUN when its record names a tunnel, proxy when it names none.
+func heldBlockMode() (ConnMode, bool) {
+	st, had := readKillSwitchState()
+	if !had || st.legacy() {
+		return "", false
 	}
-	var st killSwitchState
-	_ = json.Unmarshal(data, &st)
-	if st.Iface == iface {
-		return nil // same tunnel, nothing to re-point
+	if st.Iface == "" {
+		return ModeProxy, true
 	}
-	gen := st.Gen + 1
-	if err := ksAddRules(iface, gen); err != nil {
-		// The previous set still stands, so the machine is not sealed in — but
-		// nothing allows the new tunnel, and it will not carry traffic until
-		// this succeeds. Say so loudly: this is the one failure here that costs
-		// the user their connection rather than their protection.
-		ksRemoveOldRules(st.Gen) // sweep whatever half of the new set got in
-		vlog("error", "kill-switch: could not allow the new tunnel (%v) — traffic stays blocked; disconnect to release it", err)
-		return err
-	}
-	ksRemoveOldRules(gen)
-	st.Gen = gen
-	st.Iface = iface
-	if out, err := json.MarshalIndent(st, "", "  "); err == nil {
-		_ = os.WriteFile(killSwitchMarker(), out, 0o600)
-	}
-	vlog("info", "kill-switch: block re-pointed at %s (traffic stayed blocked through the switch)", iface)
-	return nil
+	return ModeTUN, true
 }
 
-// releaseKillSwitch puts the firewall back. Safe to call when nothing is
+// releaseHint is the way out that works without the program's window: the
+// program itself with --release-block, or the script beside the marker when
+// the program is gone.
+func releaseHint() string {
+	exe, _ := os.Executable()
+	if serviceMode() {
+		// The service takes it down for whoever asks; the script stays the
+		// way out for when the program is gone, and that one does need rights.
+		return fmt.Sprintf("\"%s\" --release-block  (or, as administrator, powershell -ExecutionPolicy Bypass -File \"%s\")", exe, releaseScriptPath())
+	}
+	return fmt.Sprintf("\"%s\" --release-block  as administrator (or powershell -ExecutionPolicy Bypass -File \"%s\")", exe, releaseScriptPath())
+}
+
+// releaseKillSwitch takes the block down. Safe to call when nothing is
 // engaged, and safe to call from a different run of the program than the one
 // that engaged it — which is exactly the case it exists for.
+//
+// The marker is removed only when the block is really gone: a release that was
+// refused must leave the machine describable, with the chip still on the bar.
 func releaseKillSwitch() {
 	killSwitchMu.Lock()
 	defer killSwitchMu.Unlock()
-	data, err := os.ReadFile(killSwitchMarker())
-	if err != nil {
+	st, had := readKillSwitchState()
+	present, known := wfpBlockPresent()
+	if !had && !(known && present) {
+		return // nothing of ours to take down
+	}
+	if err := wfpRemoveBlock(); err != nil {
+		vlog("error", "kill-switch: the block could not be taken down (%v) — it is still standing; run  %s", err, releaseHint())
 		return
 	}
-	var st killSwitchState
-	_ = json.Unmarshal(data, &st)
+	if had && st.legacy() && !releaseLegacyBlockLocked(st) {
+		return
+	}
+	_ = os.Remove(killSwitchMarker())
+	removeReleaseScript()
+	vlog("info", "kill-switch: block released")
+}
 
+// releaseLegacyBlockLocked takes down a Windows Firewall block of the kind
+// builds before 2.7.0 put up: the default outbound action back to what the
+// marker recorded, the allow-rule group removed. Reports whether it managed.
+func releaseLegacyBlockLocked(st killSwitchState) bool {
 	ksRemoveRules()
 	// Restore per profile, falling back to Allow for anything the marker does
 	// not name: a machine with no way out is a worse failure than a firewall
 	// that is one setting more permissive than it was.
 	// Every profile, or none of it counts. "At least one worked" was the old
-	// test and it let a machine out of here with one profile still blocking —
-	// the marker deleted, the chip gone, and the block standing on whichever
-	// network the user happened to be on.
+	// test and it let a machine out of here with one profile still blocking.
 	restored := len(st.Previous) > 0
 	for profile, action := range st.Previous {
 		if action == "" {
@@ -211,16 +213,11 @@ func releaseKillSwitch() {
 	}
 	if !restored {
 		if err := ksSetAllOutbound("Allow"); err != nil {
-			// The marker stays. Deleting it here left the one machine that
-			// needs it most — blocked, with the restore refused — with nothing
-			// on disk that knows what to put back and no button that could do
-			// anything, because every path checks the marker first.
-			vlog("error", "kill-switch: the firewall could not be put back (%v) — the block is still standing; run  Set-NetFirewallProfile -All -DefaultOutboundAction Allow", err)
-			return
+			vlog("error", "kill-switch: the firewall could not be put back (%v) — the block is still standing; run  %s", err, releaseHint())
+			return false
 		}
 	}
-	_ = os.Remove(killSwitchMarker())
-	vlog("info", "kill-switch: firewall restored")
+	return true
 }
 
 // releaseStaleKillSwitch is called once at startup: a marker still on disk means
@@ -235,397 +232,250 @@ func releaseStaleKillSwitch() {
 	releaseKillSwitch()
 }
 
-// ─────────────────────────── the firewall itself ───────────────────────────
-
-// currentOutboundActions reads each profile's DefaultOutboundAction so the
-// release can put back what was there.
-func currentOutboundActions() (map[string]string, error) {
-	out, err := psOutput(`Get-NetFirewallProfile -All | ForEach-Object { $_.Name + "=" + $_.DefaultOutboundAction }`)
-	if err != nil {
-		return nil, fmt.Errorf("read firewall profiles: %w", err)
-	}
-	// Named profiles and named actions only. Anything else on this stream is
-	// noise, and noise written into the marker comes back as a command that
-	// cannot run — see the note in psOutput.
-	m := map[string]string{}
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		name, action, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
+// forceReleaseBlock is the button of last resort: put this machine back on its
+// network, whatever the marker says.
+//
+// Without administrator rights nothing below can run, and the person pressing
+// the button is exactly the person who cannot afford to be told to go and find
+// a terminal: their machine has no network. So Windows is asked for the rights
+// instead — one prompt, for one run of this program with --release-block — and
+// the program itself stays unelevated. It happens whenever we are not elevated,
+// not only on failure: trying first would spend seconds on calls certain to be
+// refused, and put "access is denied" in the log ahead of the prompt.
+func forceReleaseBlock() {
+	if !ksPrivileged() {
+		if unattendedExit.Load() {
+			// Windows is ending the session: a prompt now would hold the
+			// shutdown up with nobody there to answer it. The next start takes
+			// the block down — it is not the persistent one, or this would not
+			// be running.
+			vlog("warning", "kill-switch: the block needs administrator rights to come down and Windows is ending the session — the next start of Vair releases it")
+			return
 		}
-		name, action = strings.TrimSpace(name), strings.TrimSpace(action)
-		if !isFirewallProfileName(name) || !isOutboundAction(action) {
-			continue
+		ksElevate()
+		return
+	}
+	releaseKillSwitch()
+	if standing, _ := blockStandsNow(); !standing {
+		// Nothing is blocking, so nothing may go on claiming otherwise: a flag
+		// left set here put "traffic blocked" on the bar over a machine that
+		// was plainly online.
+		blockStandingNoMarker.Store(false)
+		legacyStray.Store(false)
+		return
+	}
+	// Still standing after a proper release: the marker was missing or wrong.
+	vlog("warning", "kill-switch: the block is still standing after the release — taking it down directly")
+	if err := openEverythingOfOurs(); err != nil {
+		vlog("error", "kill-switch: the block would not come down (%v) — run  %s", err, releaseHint())
+		return
+	}
+	_ = os.Remove(killSwitchMarker())
+	removeReleaseScript()
+	blockStandingNoMarker.Store(false)
+	legacyStray.Store(false)
+	vlog("info", "kill-switch: block released")
+}
+
+// openEverythingOfOurs takes down every block this program could have put up,
+// with or without a record of it: all our WFP filters, and — where there is
+// evidence it was ours — a Windows Firewall block from an earlier build.
+func openEverythingOfOurs() error {
+	killSwitchMu.Lock()
+	defer killSwitchMu.Unlock()
+	if err := wfpRemoveBlock(); err != nil {
+		return err
+	}
+	if legacyEvidence() {
+		ksRemoveRules()
+		if err := ksSetAllOutbound("Allow"); err != nil {
+			return err
 		}
-		m[name] = action
-	}
-	if len(m) == 0 {
-		return nil, fmt.Errorf("read firewall profiles: nothing to read")
-	}
-	return m, nil
-}
-
-// firewallEnabled reports whether Windows Firewall is on for any profile.
-// With it off, DefaultOutboundAction is a value nobody reads.
-func firewallEnabled() bool {
-	out, err := psOutput(`(Get-NetFirewallProfile -All | Where-Object { $_.Enabled -eq 'True' }).Count`)
-	if err != nil {
-		return true // cannot tell; do not stand in the way
-	}
-	return strings.TrimSpace(out) != "0" && strings.TrimSpace(out) != ""
-}
-
-func setOutboundAction(action string) error {
-	_, err := psOutput(fmt.Sprintf(`Set-NetFirewallProfile -All -DefaultOutboundAction %s`, action))
-	return err
-}
-
-func setOutboundActionFor(profile, action string) error {
-	_, err := psOutput(fmt.Sprintf(`Set-NetFirewallProfile -Name %s -DefaultOutboundAction %s`, profile, action))
-	return err
-}
-
-// addKillSwitchAllowRules opens exactly what has to keep moving. gen names the
-// set it belongs to — see genRuleName.
-func addKillSwitchAllowRules(iface string, gen int) error {
-	if _, err := psOutput(killSwitchAllowScript(iface, gen)); err != nil {
-		return fmt.Errorf("firewall allow rules: %w", err)
 	}
 	return nil
 }
 
-// genRuleName stamps a rule with the set it belongs to.
-//
-// Re-pointing the block at a new tunnel used to remove the whole allow list and
-// then build it again, which left a moment — a PowerShell round trip — with the
-// door shut and nothing allowed through it. Not a leak: a machine that goes
-// silent in the middle of a switch, including for the engine that is trying to
-// bring the new tunnel up. Windows Firewall offers no transaction to avoid
-// that, so the two sets are made able to coexist: the new one is installed
-// under its own generation, and the previous one comes down only once the new
-// one is standing.
-func genRuleName(name string, gen int) string { return fmt.Sprintf("%s #%d", name, gen) }
-
-// removeKillSwitchRulesOtherThan takes down every rule of the group that does
-// not belong to this generation. Best-effort, like the rest of the firewall
-// calls: a rule left behind is an exception too many, not a block too many.
-func removeKillSwitchRulesOtherThan(gen int) {
-	_, _ = psOutput(fmt.Sprintf(
-		`Get-NetFirewallRule -Group '%s' -ErrorAction SilentlyContinue | `+
-			`Where-Object { $_.DisplayName -notlike '*#%d' } | `+
-			`Remove-NetFirewallRule -ErrorAction SilentlyContinue`,
-		killSwitchRuleGroup, gen))
+// blockInstalled reports whether any block of ours is in place: a marker, or
+// our filters with or without one.
+func blockInstalled() bool {
+	if killSwitchHeld() {
+		return true
+	}
+	standing, _ := blockStandsNow()
+	return standing
 }
 
-// killSwitchAllowScript builds that list. Separate from running it so the shape
-// of the exceptions can be checked without touching a firewall.
-//
-// All of it or none of it. Windows Firewall has no transaction to put this in,
-// and a half-installed allow list is the worst of the three outcomes: the door
-// shuts behind it and the machine is inside a block missing the exception that
-// would have let it out. PowerShell reports a rule it could not create as a
-// non-terminating error and carries on to the next one by default, exiting 0 —
-// so the preference is raised to Stop, which makes the first failure end the
-// script with a non-zero code. The caller then removes the group and the
-// engage path never reaches the block.
-func killSwitchAllowScript(iface string, gen int) string {
-	exe, _ := os.Executable()
-	var b strings.Builder
-	b.WriteString("$ErrorActionPreference = 'Stop'\n")
-	rule := func(name, args string) {
-		fmt.Fprintf(&b, "New-NetFirewallRule -DisplayName '%s' -Group '%s' -Direction Outbound -Action Allow %s | Out-Null\n",
-			genRuleName(name, gen), killSwitchRuleGroup, args)
+// legacyStray remembers that the block found at start was a Windows Firewall
+// one with no marker: the only case where opening the firewall's default
+// action is ours to do without a record saying so.
+var legacyStray atomic.Bool
+
+// legacyEvidence says whether a Windows Firewall block standing now is ours:
+// a marker from an earlier build, our allow-rule group still in the
+// firewall, or the stray block found at start.
+func legacyEvidence() bool {
+	if st, had := readKillSwitchState(); had && st.legacy() {
+		return true
 	}
-	// The tunnel itself. Everything the user's applications send goes out here.
-	if iface != "" {
-		rule("Vair tunnel", fmt.Sprintf("-InterfaceAlias '%s'", psQuote(iface)))
+	if legacyStray.Load() {
+		return true
 	}
-	// The engines, so the tunnel can be built and rebuilt while the block holds.
-	state.mu.RLock()
-	xrayBin, singboxBin := state.xrayBin, state.singboxBin
-	state.mu.RUnlock()
-	for i, p := range []string{xrayBin, singboxBin, exe} {
-		if p == "" {
-			continue
-		}
-		rule(fmt.Sprintf("Vair program %d", i+1), fmt.Sprintf("-Program '%s'", psQuote(p)))
+	// Not while Windows is ending the session: this is a PowerShell launch,
+	// and the seconds it takes are the ones the rest of the teardown needs.
+	if unattendedExit.Load() {
+		return false
 	}
-	// No rule for loopback, deliberately.
-	//
-	// There used to be one — "-RemoteAddress 127.0.0.0/8,::1" — and Windows
-	// refused it every single time: the address of a firewall rule must be a
-	// real unicast/multicast/broadcast address, and the loopback range is none
-	// of those. For most of this program's life that refusal was a warning
-	// PowerShell walked past, so the block went up anyway and nobody noticed.
-	// Then the script was made to stop at the first failure — so that a
-	// half-installed allow list could never be shut behind a block — and this
-	// invalid rule started taking the whole thing down with it: no allow list,
-	// no block, a kill switch that silently did nothing and a machine that
-	// went on using its ordinary connection.
-	//
-	// Nothing is lost by dropping it. Windows Firewall does not filter loopback
-	// traffic at all: what a program sends to 127.0.0.1 or ::1 never reaches
-	// the filtering engine, so the local proxy ports, the web interface and
-	// everything else on this machine keep working under the block without a
-	// rule to permit them.
-	// The local network, unless the user asked for it to be blocked too.
-	settingsMu.RLock()
-	blockLAN := appSettings.BlockLAN
-	settingsMu.RUnlock()
-	if !blockLAN {
-		rule("Vair local network", "-RemoteAddress LocalSubnet")
-		// DHCP and DNS to the router, or the address itself goes stale.
-		rule("Vair dhcp", "-Protocol UDP -RemotePort 67,68")
-	}
-	return b.String()
+	present, _ := winsys.LegacyRulesPresent()
+	return present
 }
 
-func removeKillSwitchRules() {
-	_, _ = psOutput(fmt.Sprintf(
-		`Remove-NetFirewallRule -Group '%s' -ErrorAction SilentlyContinue`, killSwitchRuleGroup))
-}
-
-// psQuote escapes a value for a single-quoted PowerShell string.
-func psQuote(s string) string { return strings.ReplaceAll(s, "'", "''") }
-
-// psOutput runs a PowerShell snippet and returns its output. Errors carry the
-// output, because "the command failed" without what it said is not a report.
-// nlPS is the newline used when prefixing a script — PowerShell reads
-// carriage returns fine, but a bare \n keeps the encoded command shorter.
-const nlPS = "\n"
-
-func psOutput(script string) (string, error) {
-	// The progress stream is silenced for every script, and that is a bug fix
-	// rather than tidiness. PowerShell writes progress records — "Preparing
-	// modules for first use", the per-command bar — to a stream that a
-	// non-interactive host renders as CLIXML on stderr, and CombinedOutput
-	// hands them back mixed into the output we parse. One of those records was
-	// read as a firewall profile called `<Objs Version` and written into the
-	// marker; the release then tried to restore a profile by that name, the
-	// command failed, and a real profile was left blocking behind it — a
-	// machine whose disconnect left the firewall half shut.
-	cmd := runHidden("powershell.exe", "-NoProfile", "-NonInteractive",
-		"-ExecutionPolicy", "Bypass", "-EncodedCommand",
-		encodePS("$ProgressPreference = 'SilentlyContinue'"+nlPS+script))
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(out), fmt.Errorf("%v: %s", err, psErrorText(string(out)))
+// blockStandsNow says whether a block of ours is in force right now, and
+// whether that could be told at all. Our WFP filters are asked directly; a
+// Windows Firewall block counts only with evidence that it is ours.
+func blockStandsNow() (standing, known bool) {
+	present, known := wfpBlockPresent()
+	if known && present {
+		return true, true
 	}
-	return string(out), nil
-}
-
-// psErrorText pulls the readable part out of what PowerShell writes when its
-// error stream is redirected: a CLIXML document, several kilobytes of it, with
-// the actual message spread across <S S="Error"> fragments and the newlines
-// spelled out as _x000D__x000A_. Logged raw, one failed firewall rule filled the
-// screen and said nothing; this is the same failure in one line.
-func psErrorText(out string) string {
-	out = strings.TrimSpace(out)
-	if !strings.Contains(out, "#< CLIXML") {
-		return out
+	if legacyEvidence() {
+		return firewallBlocking()
 	}
-	var b strings.Builder
-	for _, part := range strings.Split(out, `<S S="Error">`)[1:] {
-		frag, _, ok := strings.Cut(part, "</S>")
-		if !ok {
-			continue
-		}
-		frag = strings.ReplaceAll(frag, "_x000D__x000A_", " ")
-		frag = strings.ReplaceAll(frag, "_x000D_", " ")
-		frag = strings.ReplaceAll(frag, "_x000A_", " ")
-		if frag = strings.TrimSpace(frag); frag != "" {
-			if b.Len() > 0 {
-				b.WriteString(" ")
-			}
-			b.WriteString(frag)
-		}
-	}
-	if b.Len() == 0 {
-		return out
-	}
-	// The tail is PowerShell describing its own stack; the first sentence is
-	// what went wrong.
-	msg := b.String()
-	if i := strings.Index(msg, "+ CategoryInfo"); i > 0 {
-		msg = strings.TrimSpace(msg[:i])
-	}
-	return msg
-}
-
-// forceReleaseBlock is the button of last resort: put this machine back on its
-// network, whatever the marker says.
-//
-// Everything else keys off the marker, which is right — it remembers what the
-// firewall looked like before, so a release restores exactly that. But it also
-// means a marker that is missing, unreadable, or written by a run whose restore
-// failed leaves a blocked machine with no way out from inside the program. The
-// user pressing the red button is not asking us to be careful; they are asking
-// for their network back.
-func forceReleaseBlock() {
-	// Without administrator rights none of the commands below can run, and the
-	// person pressing the button is exactly the person who cannot afford to be
-	// told to go and find a terminal: their machine has no network. Ask Windows
-	// for the rights instead — one prompt, for one command — and leave the
-	// program itself unelevated.
-	//
-	// It happens whenever we are not elevated, not only on failure: trying
-	// first would spend several seconds on commands that are certain to be
-	// refused, and put "access is denied" in the log ahead of the prompt.
-	if !isPrivileged() {
-		releaseBlockElevated()
-		return
-	}
-	releaseKillSwitch()
-	if !anyProfileBlocking() {
-		// Nothing is blocking, so nothing may go on claiming otherwise. This
-		// clear is the whole reason the chip stopped being a lie: a block found
-		// at startup without a marker set that flag, an ordinary disconnect then
-		// released the firewall without touching it, and the connection bar went
-		// on showing "traffic blocked" over a machine that was plainly online —
-		// pressing it just brought the chip back.
-		blockStandingNoMarker.Store(false)
-		return
-	}
-	// Still blocking after a proper release: the marker was missing or wrong.
-	vlog("warning", "kill-switch: the block is still standing after the release — opening the firewall directly")
-	killSwitchMu.Lock()
-	defer killSwitchMu.Unlock()
-	ksRemoveRules()
-	if err := ksSetAllOutbound("Allow"); err != nil {
-		vlog("error", "kill-switch: the firewall refused to open (%v) — run  Set-NetFirewallProfile -All -DefaultOutboundAction Allow  as administrator", err)
-		return
-	}
-	_ = os.Remove(killSwitchMarker())
-	blockStandingNoMarker.Store(false)
-	vlog("info", "kill-switch: firewall opened")
+	return false, known
 }
 
 // anyProfileBlocking reports whether any profile is still refusing outbound
 // traffic by default.
 func anyProfileBlocking() bool {
-	out, err := psOutput(firewallStateScript)
-	if err != nil {
-		return false
-	}
-	_, profiles := parseFirewallState(out)
-	for _, p := range profiles {
-		if strings.EqualFold(p.outbound, "Block") {
-			return true
-		}
-	}
-	return false
+	blocking, _ := winsys.AnyProfileBlocking()
+	return blocking
 }
 
 // noteStrayBlockAtStart looks for a block standing without a marker to describe
 // it, and remembers what it finds so the interface can offer to lift it.
 //
-// The question is whose block it is. A machine that blocks outbound traffic by
-// its own policy is not ours to open, and the chip must not appear on one. The
-// evidence used is the setting: "keep blocking after the tunnel is gone" is on,
-// nothing else here asked for a block, and the firewall is shut — that is our
-// doing, from a run that ended badly. With the setting off we look at nothing
-// and claim nothing.
+// Our WFP filters answer the question of whose block it is by themselves: they
+// carry our provider and our keys, so if they are there, they are ours. For a
+// Windows Firewall block from an earlier build the evidence is weaker, and the
+// old rule stands: "keep blocking after the tunnel is gone" is on, nothing
+// else here asked for a block, and the firewall is shut.
 func noteStrayBlockAtStart() {
-	if killSwitchHeld() || !persistentKillSwitchEnabled() {
+	if killSwitchHeld() {
 		return
 	}
-	if !anyProfileBlocking() {
+	if present, known := wfpBlockPresent(); known && present {
+		blockStandingNoMarker.Store(true)
+		vlog("warning", "kill-switch: traffic is blocked from an earlier run and there is no record of it — release it from the connection bar, or connect")
+		announceBlockState()
 		return
 	}
+	if !persistentKillSwitchEnabled() || !anyProfileBlocking() {
+		return
+	}
+	legacyStray.Store(true)
 	blockStandingNoMarker.Store(true)
 	vlog("warning", "kill-switch: traffic is blocked at the firewall from an earlier run and there is no record of what to put back — release it from the connection bar, or connect")
 	announceBlockState()
 }
 
-// isFirewallProfileName says whether a name is one of the three Windows
-// firewall profiles. Used to keep everything else out of the marker, and out of
-// the commands built from it.
-func isFirewallProfileName(s string) bool {
-	switch strings.ToLower(s) {
-	case "domain", "private", "public":
-		return true
-	}
-	return false
+// releaseBlockElevated takes the block down through a single UAC prompt: this
+// program again, elevated, with --release-block, which does the release and
+// exits. The alternative, relaunching the whole program as administrator, is
+// heavier than what the button says and restarts the window.
+//
+// The marker is removed only if the block is actually gone afterwards. A prompt
+// that was dismissed, or a release that failed inside the elevated process,
+// must leave the machine describable: the chip has to stay on the bar.
+// ksElevate is releaseBlockElevated, behind a variable for the tests.
+var ksElevate = releaseBlockElevated
+
+// ourFiltersPresent reports whether our block's filters are in the filtering
+// engine — answered only where it can be asked; without the rights to ask,
+// "no" is the answer, and the marker is what the caller goes by.
+func ourFiltersPresent() bool {
+	present, known := wfpBlockPresent()
+	return known && present
 }
 
-// isOutboundAction says the same for the value beside it.
-func isOutboundAction(s string) bool {
-	switch strings.ToLower(s) {
-	case "allow", "block", "notconfigured":
-		return true
-	}
-	return false
-}
-
-// releaseBlockElevated opens the firewall through a single UAC prompt.
-//
-// The alternative was relaunching the whole program as administrator, which is
-// what TUN mode does — but that is a heavier thing to ask for, it restarts the
-// window, and it is not what the button says. One command, one prompt, the
-// program stays as it was.
-//
-// The marker is removed only if the firewall is actually open afterwards. A
-// prompt that was dismissed, or a command that failed inside the elevated
-// process, must leave the machine describable: the block is still standing and
-// the chip has to stay on the bar.
 func releaseBlockElevated() {
-	vlog("info", "kill-switch: asking Windows for permission to open the firewall")
-	if _, err := psOutput(elevatedOpenScript()); err != nil {
-		vlog("error", "kill-switch: the firewall was not opened (%v) — allow the prompt, or run  Set-NetFirewallProfile -All -DefaultOutboundAction Allow  as administrator", err)
+	vlog("info", "kill-switch: asking Windows for permission to take the block down")
+	if _, err := psOutputFor(elevatedOpenScript(), 10*time.Minute); err != nil {
+		vlog("error", "kill-switch: the block was not taken down (%v) — allow the prompt, or run  %s", err, releaseHint())
 		return
 	}
-	if anyProfileBlocking() {
-		vlog("error", "kill-switch: the firewall is still blocking after the elevated attempt — run  Set-NetFirewallProfile -All -DefaultOutboundAction Allow  as administrator")
-		return
+	if standing, known := blockStandsNow(); standing || !known && killSwitchHeld() {
+		// !known here is an unelevated process unable to read the filters. The
+		// elevated run removes the marker when it succeeds, so the marker is
+		// the answer: still there means still standing.
+		if standing || killSwitchHeld() {
+			vlog("error", "kill-switch: the block is still standing after the elevated attempt — run  %s", releaseHint())
+			return
+		}
 	}
 	_ = os.Remove(killSwitchMarker())
 	blockStandingNoMarker.Store(false)
-	vlog("info", "kill-switch: firewall opened")
+	legacyStray.Store(false)
+	vlog("info", "kill-switch: block released")
 }
 
 // elevatedOpenScript is what that prompt runs. Separate from running it so its
-// shape can be tested without a firewall or a UAC dialog.
+// shape can be tested without a UAC dialog.
 func elevatedOpenScript() string {
-	inner := "Set-NetFirewallProfile -All -DefaultOutboundAction Allow; " +
-		"Get-NetFirewallRule -Group '" + killSwitchRuleGroup + "' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"
+	exe, _ := os.Executable()
 	// Start-Process is what raises the prompt; -Wait is what lets us check the
 	// result afterwards rather than reporting success at the moment we asked.
-	// The inner command is encoded, so no quoting of ours can be broken by the
-	// argument list in between.
 	return "$ErrorActionPreference = 'Stop'; " +
-		"Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -Wait " +
-		"-ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','" + encodePS(inner) + "'"
+		"Start-Process -FilePath '" + psQuote(exe) + "' -ArgumentList '--release-block' -Verb RunAs -WindowStyle Hidden -Wait"
 }
 
-// checkBlockAfterRestart reconciles the marker with the firewall at a start,
-// and tells the user when the machine has come up with no way out.
+// ReleaseBlockFromCommandLine is `Vair.exe --release-block`: take down every
+// block of ours and report. Run elevated — by the red button through a UAC
+// prompt, by the uninstaller, or by hand. Returns the process exit code.
+func ReleaseBlockFromCommandLine() int {
+	if !ksPrivileged() {
+		fmt.Fprintln(os.Stderr, "Vair --release-block: needs to run as administrator")
+		return 2
+	}
+	releaseKillSwitch()
+	if standing, _ := blockStandsNow(); standing {
+		if err := openEverythingOfOurs(); err != nil {
+			fmt.Fprintln(os.Stderr, "Vair --release-block:", err)
+			return 1
+		}
+	}
+	if standing, _ := blockStandsNow(); standing {
+		fmt.Fprintln(os.Stderr, "Vair --release-block: the block is still standing")
+		return 1
+	}
+	_ = os.Remove(killSwitchMarker())
+	removeReleaseScript()
+	return 0
+}
+
+// checkBlockAfterRestart reconciles the marker with what is actually in force
+// at a start, and tells the user when the machine has come up with no way out.
 //
 // The case that brings people here is a reboot for Windows updates with the
-// block standing. Everything it needs survives that — the outbound default and
-// our allow rules are both persistent policy — so the machine comes back
-// exactly as protected as it was, which is the point of the setting and also
-// the moment it is most surprising: no browser, no mail, no update service,
-// and Vair possibly not even started.
+// block standing. The filters are persistent, so the machine comes back exactly
+// as protected as it was, which is the point of the setting and also the moment
+// it is most surprising: no browser, no mail, no update service, and Vair
+// possibly not even started.
 //
 // Two things are worth doing about it. Say so where the user is looking, once,
 // unless the session is being restored anyway (the tunnel is on its way back
 // and a warning about a state that lasts three seconds is noise). And handle
-// the opposite mismatch: a firewall that is NOT blocking any more, which
-// happens when something resets it — an in-place Windows upgrade, a
-// "reset firewall to defaults", another security product. The marker would go
-// on claiming a block that is not there, the chip would sit on the connection
-// bar over a working connection, and the only way to clear it would be to press
-// a button that has nothing to do.
+// the opposite mismatch: a block that is NOT there any more — something removed
+// it — while the marker goes on claiming it, the chip sitting on the bar over a
+// working connection with a button that has nothing to do.
 func checkBlockAfterRestart() {
-	blocking, known := firewallBlocking()
+	blocking, known := blockStandsNow()
 	if !known {
 		return // could not read it; claim nothing
 	}
 	if !blocking {
 		_ = os.Remove(killSwitchMarker())
+		removeReleaseScript()
 		blockStandingNoMarker.Store(false)
-		vlog("warning", "kill-switch: the block is no longer in the firewall — something else opened it (a Windows upgrade or a firewall reset does this). The record of it has been dropped")
+		vlog("warning", "kill-switch: the block is no longer in place — something else removed it. The record of it has been dropped")
 		announceBlockState()
 		return
 	}
@@ -635,23 +485,36 @@ func checkBlockAfterRestart() {
 	desktopNotify("Vair", notifyBlockedAfterStart())
 }
 
-// firewallBlocking reads the firewall and says whether anything is blocking
-// outbound traffic by default — and whether it could be read at all. The
-// second half matters: "no" and "cannot tell" lead to opposite actions when
-// the question is whether to throw away the only record of a standing block.
+// firewallBlocking reads Windows Firewall and says whether anything is blocking
+// outbound traffic by default — and whether it could be read at all. Only a
+// block from a build before 2.7.0 lives there; the question matters because
+// "no" and "cannot tell" lead to opposite actions when it is whether to throw
+// away the only record of a standing block.
 func firewallBlocking() (blocking, known bool) {
-	out, err := psOutput(firewallStateScript)
-	if err != nil {
-		return false, false
-	}
-	_, profiles := parseFirewallState(out)
-	if len(profiles) == 0 {
-		return false, false
-	}
-	for _, p := range profiles {
-		if strings.EqualFold(p.outbound, "Block") {
-			return true, true
-		}
-	}
-	return false, true
+	return winsys.AnyProfileBlocking()
+}
+
+// ── the way out without the program ───────────────────────────────────────────
+
+// releaseScriptPath is where release-block.ps1 lives: beside the marker, in the
+// data folder, which outlives both an uninstall of the program and a deleted
+// Vair.exe.
+func releaseScriptPath() string { return filepath.Join(DataDir(), "release-block.ps1") }
+
+// writeReleaseScript leaves a way out that needs nothing of this program.
+//
+// WFP has no command of its own to remove a filter — no netsh verb, no
+// PowerShell cmdlet — so a block whose program has been deleted would have no
+// undo, on a machine that cannot download it again because the block is
+// standing. This script calls the filtering engine directly with the same keys
+// the program uses, generated from the same constants, and takes everything of
+// ours down in one transaction.
+func writeReleaseScript() {
+	_ = writeFileDurable(releaseScriptPath(), []byte(releaseScriptText()), 0o644)
+}
+
+func removeReleaseScript() { _ = os.Remove(releaseScriptPath()) }
+
+func releaseScriptText() string {
+	return wfp.ReleaseScript(releaseScriptPath(), killSwitchMarker())
 }

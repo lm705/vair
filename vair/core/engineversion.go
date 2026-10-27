@@ -2,10 +2,12 @@ package core
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -44,28 +46,22 @@ func parseSingboxVersion(out string) (major, minor int, ok bool) {
 	return major, minor, true
 }
 
-// detectSingboxVersion runs the binary once and remembers what it said. Called
-// off the hot path (from the shell, after the engines are registered) because
-// it spawns a process; everything that reads the answer takes what is known at
-// the time and falls back to "unknown", which is the conservative branch.
+// detectSingboxVersion asks the engine for its version and remembers the
+// answer. Called off the hot path (from the shell, after the engines are
+// registered) because it spawns a process; everything that reads the answer
+// takes what is known at the time and falls back to "unknown", which is the
+// conservative branch.
 func detectSingboxVersion() {
-	_, bin := engineBins()
-	if bin == "" {
+	if !singboxProbe.CompareAndSwap(false, true) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "version")
-	// Hidden, like every other process this program starts. A console engine
-	// launched without it flashes a black window over the desktop — and this one
-	// runs at startup, which is the most visible moment there is.
-	prepareProc(cmd)
-	out, err := cmd.Output()
+	defer singboxProbe.Store(false)
+	out, err := engineVersionOutput(func() string { _, b := engineBins(); return b })
 	if err != nil {
 		vlog("warn", "sing-box version could not be read (%v)", err)
 		return
 	}
-	major, minor, ok := parseSingboxVersion(string(out))
+	major, minor, ok := parseSingboxVersion(out)
 	if !ok {
 		return
 	}
@@ -73,6 +69,49 @@ func detectSingboxVersion() {
 	singboxVer.major, singboxVer.minor, singboxVer.known = major, minor, true
 	singboxVer.Unlock()
 	vlog("info", "sing-box %d.%d", major, minor)
+}
+
+// One probe per engine at a time. SetEngines runs twice at startup — once to
+// register the paths, once after extraction — and the session panel asks again
+// when the version is still unknown; without the guard those would stack up
+// behind the same slow first launch.
+var singboxProbe, xrayProbe atomic.Bool
+
+// versionProbeWaits are the pauses before each attempt. The first launch of a
+// freshly extracted engine after a cold boot is the slow one: the antivirus
+// scans the new file before it lets it run, and a single five-second attempt
+// gave up there and never asked again, so the session panel said "present"
+// for the rest of the run.
+var versionProbeWaits = []time.Duration{0, 5 * time.Second, 30 * time.Second}
+
+// versionProbeTimeout bounds one attempt.
+const versionProbeTimeout = 20 * time.Second
+
+// engineVersionOutput runs "<engine> version" until it answers or the attempts
+// run out. The path is read again before each attempt because the extraction
+// goroutine may register the final one in the meantime.
+func engineVersionOutput(bin func() string) (string, error) {
+	err := errors.New("engine not registered")
+	for _, wait := range versionProbeWaits {
+		time.Sleep(wait)
+		path := bin()
+		if path == "" {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), versionProbeTimeout)
+		cmd := exec.CommandContext(ctx, path, "version")
+		// Hidden, like every other process this program starts. A console engine
+		// launched without it flashes a black window over the desktop — and this
+		// one runs at startup, which is the most visible moment there is.
+		prepareProc(cmd)
+		out, e := cmd.Output()
+		cancel()
+		if e == nil {
+			return string(out), nil
+		}
+		err = e
+	}
+	return "", err
 }
 
 // singboxAtLeast reports whether the engine on disk is at least this version.
@@ -100,3 +139,40 @@ func singboxAtLeast(major, minor int) bool {
 // start. So it is written for the engines that need it and left out for the
 // ones that would refuse it, rather than being deleted on the calendar.
 func dnsIndependentCache() bool { return !singboxAtLeast(1, 14) }
+
+// xrayVer is the xray version on disk, for the session panel — which showed a
+// version for sing-box and only "present" for xray.
+var xrayVer struct {
+	sync.RWMutex
+	v string
+}
+
+// xrayVersionRe matches the engine's first line: "Xray 26.3.27 (Xray, …)".
+var xrayVersionRe = regexp.MustCompile(`Xray\s+v?(\d+\.\d+\.\d+)`)
+
+// detectXrayVersion asks xray for its version and remembers the answer; off
+// the startup path and retried, like detectSingboxVersion.
+func detectXrayVersion() {
+	if !xrayProbe.CompareAndSwap(false, true) {
+		return
+	}
+	defer xrayProbe.Store(false)
+	out, err := engineVersionOutput(func() string { b, _ := engineBins(); return b })
+	if err != nil {
+		vlog("warn", "xray version could not be read (%v)", err)
+		return
+	}
+	if m := xrayVersionRe.FindStringSubmatch(out); m != nil {
+		xrayVer.Lock()
+		xrayVer.v = m[1]
+		xrayVer.Unlock()
+		vlog("info", "xray %s", m[1])
+	}
+}
+
+// xrayVersionString is what detectXrayVersion learned, or "".
+func xrayVersionString() string {
+	xrayVer.RLock()
+	defer xrayVer.RUnlock()
+	return xrayVer.v
+}

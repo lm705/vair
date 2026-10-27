@@ -103,8 +103,8 @@ tasks:
   package:
     summary: Builds the Windows installer
     # Not the stock Wails NSIS/MSIX targets (still below, unused): those install
-    # one exe, and Vair installs a program plus the engines beside it. The script
-    # is build/windows/installer/vair.iss.
+    # one exe, and Vair installs a program, its helper service and the engines
+    # beside them. The script is build/windows/installer/vair.iss.
     cmds:
       - task: create:inno:installer
 
@@ -119,6 +119,20 @@ tasks:
           ARCH: '{{.ARCH}}'
           EXTRA_TAGS: 'portable{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}}'
 
+  build:helper:
+    summary: Builds the helper service the installer ships (vair-helper.exe)
+    # Beside the program in bin/packaged/, where the setup script takes both
+    # from. A plain console build: it runs as a service, and its flags
+    # (-install-service, -repair, ...) are run by the setup program hidden.
+    # CGO_ENABLED=0 as on Linux: it runs as SYSTEM and imports nothing of
+    # vair/core.
+    env:
+      GOOS: windows
+      CGO_ENABLED: 0
+      GOARCH: '{{.ARCH | default ARCH}}'
+    cmds:
+      - go build -trimpath -buildvcs=false -ldflags="-w -s" -o "{{.ROOT_DIR}}/bin/packaged/vair-helper.exe" ./helper/cmd/vair-helper
+
   create:inno:installer:
     summary: Compiles the Inno Setup installer
     dir: build/windows/installer
@@ -127,6 +141,7 @@ tasks:
         vars:
           # No `portable` tag: the installed build has no payload inside it.
           OUTPUT: '{{.ROOT_DIR}}/bin/packaged/Vair.exe'
+      - task: build:helper
     preconditions:
       # test -f, not -x: Task runs preconditions through its own shell, and on
       # Windows nothing has an execute bit for -x to find.

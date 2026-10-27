@@ -1,5 +1,12 @@
 package core
 
+import (
+	"net"
+	"strings"
+	"sync/atomic"
+	"time"
+)
+
 // Bringing a connection back after the program was closed.
 //
 // Two problems, and one answer to both.
@@ -77,37 +84,222 @@ func restoreLastSession() {
 	}
 	settingsMu.RLock()
 	raw, mode := appSettings.LastConnectedRaw, appSettings.LastConnectedMode
+	chain := append([]string(nil), appSettings.LastConnectedChain...)
 	settingsMu.RUnlock()
 
-	entry, tabID, ok := memEntryByRaw("", raw)
-	if !ok {
-		// Nothing to come back to. The block stays: it is protecting the
-		// machine from exactly the state it would otherwise be in. Said out
-		// loud, because a machine with no network needs a reason on screen.
-		if killSwitchHeld() {
-			vlog("error", "the configuration this session was using is no longer in any tab — the traffic block stays; release it from the connection bar or by connecting something")
+	entries, tabID, lost := restoreTargets(raw, chain)
+	if lost != "" {
+		// Nothing to come back to — or, for a chain, not all of it, and the
+		// part that is left is not the same connection: the exit alone, dialled
+		// directly, shows the network the one server the chain hid. The block
+		// stays: it is protecting the machine from exactly the state it would
+		// otherwise be in. Said out loud either way — on the connection bar and
+		// in a notification — because a restore that silently does nothing
+		// reads as the setting not working.
+		held := killSwitchHeld()
+		setConnError(state.conn, &ConfigEntry{Name: lost}, restoreLostMessage(len(chain) > 1, held))
+		if held {
 			desktopNotify("Vair", notifyRestoreFailed())
+		} else {
+			desktopNotify("Vair", notifyRestoreGone())
 		}
 		markSessionActive(false)
 		return
 	}
-	vlog("info", "restoring the connection to %s", autoLabel(entry))
-	go func() {
-		cm := state.conn
-		cm.actionMu.Lock()
-		defer cm.actionMu.Unlock()
-		if ConnMode(mode) == ModeTUN {
-			startTUNConnectionOnTab(entry, tabID)
-		} else {
-			startProxyConnectionOnTab(entry, tabID)
+	labels := make([]string, len(entries))
+	for i, e := range entries {
+		labels[i] = autoLabel(e)
+	}
+	vlog("info", "restoring the connection to %s", strings.Join(labels, " → "))
+	go restoreLoop(entries, tabID, ConnMode(mode), userConnGen.Load())
+}
+
+// restoreTargets finds the configurations to bring back: every hop of a chain,
+// entry first, or the one configuration. lost names what could not be found,
+// "" when everything was.
+func restoreTargets(raw string, chain []string) (entries []*ConfigEntry, tabID, lost string) {
+	if len(chain) < 2 {
+		e, tab, ok := memEntryByRaw("", raw)
+		if !ok {
+			return nil, "", rawLabel(raw)
 		}
-		// The connection did not come up and the block is still standing. It
-		// stays standing: the machine is without a network, which is the point
-		// — the alternative is a machine on the open network with its real
-		// address. Both halves are said out loud.
-		if state.conn.snap().Status != ConnConnected && killSwitchHeld() {
-			vlog("error", "the connection could not be restored — the traffic block stays; release it from the connection bar, or connect something else")
+		return []*ConfigEntry{e}, tab, ""
+	}
+	for i, r := range chain {
+		e, tab, ok := memEntryByRaw(tabID, r)
+		if !ok {
+			return nil, "", rawLabel(r)
+		}
+		if i == 0 {
+			tabID = tab
+		}
+		entries = append(entries, e)
+	}
+	return entries, tabID, ""
+}
+
+// rawLabel is a configuration's name from its link, for a message about a
+// configuration that is no longer in any tab.
+func rawLabel(raw string) string {
+	if n, err := parseNode(raw); err == nil && n.Name != "" {
+		return n.Name
+	}
+	return "the last configuration"
+}
+
+// restoreLostMessage is the connection bar's line when there is nothing to
+// restore. Fixed phrases: the window translates them.
+func restoreLostMessage(chain, held bool) string {
+	what := "not restored: the configuration is no longer in any tab"
+	if chain {
+		what = "not restored: a configuration of the chain is no longer in any tab"
+	}
+	if held {
+		return what + " — traffic stays blocked (kill-switch); disconnect to release it"
+	}
+	return what
+}
+
+// restoreBudget is how long a start keeps trying to bring the last session
+// back. A start at sign-in often comes before the network does — Wi-Fi still
+// associating, DHCP not yet answered — and the single attempt there used to
+// fail and leave the machine disconnected (or, under the persistent
+// kill-switch, offline) after the network came up seconds later.
+const restoreBudget = 2 * time.Minute
+
+// restoreRetry are the pauses after a failed attempt, one per retry.
+var restoreRetry = []time.Duration{3 * time.Second, 5 * time.Second, 10 * time.Second, 15 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second}
+
+// restoreNetPoll is how often a restore waiting for the network looks again.
+var restoreNetPoll = 2 * time.Second
+
+// restoreLoop makes the attempts. It stops at the first that connects, when
+// the user connects or disconnects anything themselves (gen moves), when the
+// setting is turned off or AUTO on, and when the budget is spent.
+func restoreLoop(entries []*ConfigEntry, tabID string, mode ConnMode, gen int64) {
+	// TUN that this start cannot run at all — on Windows, a copy started
+	// without administrator rights — is not a network that is late. One
+	// attempt says why on the connection bar; retrying for two minutes only
+	// repeated it.
+	if mode == ModeTUN && tunPreconditionError() != "" {
+		restoreOnce(entries, tabID, mode, gen)
+		vlog("error", "the connection could not be restored: TUN mode needs administrator rights, and this copy of Vair was started without them")
+		if killSwitchHeld() {
 			desktopNotify("Vair", notifyRestoreFailed())
+		} else {
+			desktopNotify("Vair", notifyRestoreNotConnected())
 		}
-	}()
+		return
+	}
+	deadline := time.Now().Add(restoreBudget)
+	takenOver := func() bool { return userConnGen.Load() != gen || !restoreStillWanted() }
+	waited := false
+	for attempt := 0; ; attempt++ {
+		// No network at all: wait for one rather than spend an attempt on it.
+		for !networkLooksUp() && time.Now().Before(deadline) {
+			if !waited {
+				vlog("info", "restoring the connection: waiting for the network")
+				waited = true
+			}
+			if takenOver() {
+				return
+			}
+			time.Sleep(restoreNetPoll)
+		}
+		if takenOver() {
+			return
+		}
+		if restoreOnce(entries, tabID, mode, gen) {
+			return
+		}
+		if takenOver() {
+			return
+		}
+		if attempt >= len(restoreRetry) || time.Now().Add(restoreRetry[attempt]).After(deadline) {
+			break
+		}
+		vlog("warning", "restoring the connection: attempt %d did not connect — trying again in %s", attempt+1, restoreRetry[attempt])
+		for until := time.Now().Add(restoreRetry[attempt]); time.Now().Before(until); time.Sleep(250 * time.Millisecond) {
+			if takenOver() {
+				return
+			}
+		}
+	}
+	// The connection did not come up. A block still standing stays standing:
+	// the machine is without a network, which is the point — the alternative
+	// is a machine on the open network with its real address. Both halves are
+	// said out loud; the reason itself is on the connection bar.
+	if killSwitchHeld() {
+		vlog("error", "the connection could not be restored — the traffic block stays; release it from the connection bar, or connect something else")
+		desktopNotify("Vair", notifyRestoreFailed())
+		return
+	}
+	vlog("error", "the connection could not be restored in %s — the reason is on the connection bar", restoreBudget)
+	desktopNotify("Vair", notifyRestoreNotConnected())
+}
+
+// restoreOnce makes one attempt, and reports whether it is connected. An
+// attempt the user overtook while it waited for the connection lock is not
+// made: theirs is the newer request.
+func restoreOnce(entries []*ConfigEntry, tabID string, mode ConnMode, gen int64) bool {
+	cm := state.conn
+	cm.actionMu.Lock()
+	defer cm.actionMu.Unlock()
+	if userConnGen.Load() != gen {
+		return true
+	}
+	switch {
+	case len(entries) > 1:
+		startChainOnTab(entries, tabID, mode)
+	case mode == ModeTUN:
+		startTUNConnectionOnTab(entries[0], tabID)
+	default:
+		startProxyConnectionOnTab(entries[0], tabID)
+	}
+	return cm.snap().Status == ConnConnected
+}
+
+// restoreStillWanted re-reads what restoreWanted read: a disconnect clears the
+// session mark, and the setting or AUTO may be switched while a restore waits.
+func restoreStillWanted() bool {
+	settingsMu.RLock()
+	defer settingsMu.RUnlock()
+	return appSettings.ReconnectOnStart && appSettings.LastSessionActive && !appSettings.AutoConnect
+}
+
+// userConnGen moves with every connect and disconnect the user asks for, so a
+// restore still trying can tell that it has been overtaken.
+var userConnGen atomic.Int64
+
+// noteUserConnAction is called by every user-initiated connect and disconnect.
+func noteUserConnAction() { userConnGen.Add(1) }
+
+// networkLooksUp reports whether the machine has a network to connect over:
+// an interface that is up, is not loopback or one of Vair's own tunnels, and
+// has an address that is not link-local. Read from the system's interface
+// table; nothing is sent. Virtual adapters (Hyper-V, VirtualBox) count as a
+// network here — the retries cover what this cannot tell.
+func networkLooksUp() bool {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return true // cannot tell: attempt, as before
+	}
+	for _, ifc := range ifs {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(ifc.Name), "vair") {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.IsGlobalUnicast() {
+				return true
+			}
+		}
+	}
+	return false
 }

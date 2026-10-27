@@ -23,6 +23,7 @@ package core
 // parse falls back to the old exact-body key.
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"sort"
@@ -60,6 +61,19 @@ var securityAliases = map[string]string{
 	"none": "none",
 	"tls":  "tls",
 	"xtls": "xtls",
+}
+
+// shownNetwork is the transport as the table shows, sorts and filters it, and
+// as the edit form reads it. Xray renamed TCP to "raw" and treats the two
+// spellings as one transport, so they are shown as one: a subscription that
+// writes type=raw no longer looks like a different transport from one that
+// writes type=tcp. The link itself is left as it was.
+func shownNetwork(s string) string {
+	s = strings.ToLower(s)
+	if s == "raw" {
+		return "tcp"
+	}
+	return s
 }
 
 func normNetwork(s string) string {
@@ -144,6 +158,13 @@ func dedupKey(raw string) string {
 	port := fmt.Sprint(n.Port)
 
 	switch {
+	case n.JSON != nil:
+		// The outbound itself, re-encoded with sorted keys and without its tag:
+		// the same object written in another order, or tagged differently, is
+		// the same config.
+		b, _ := json.Marshal(n.JSON.Outbound)
+		return f("json", string(b))
+
 	case n.Vless != nil:
 		p := n.Vless
 		net_ := normNetwork(p.Network)
@@ -155,7 +176,7 @@ func dedupKey(raw string) string {
 			strings.ToLower(strings.TrimSpace(p.Fingerprint)),
 			strings.TrimSpace(p.Flow), strings.TrimSpace(p.PublicKey),
 			strings.ToLower(strings.TrimSpace(p.ShortID)), strings.TrimSpace(p.SpiderX),
-			boolKey(p.AllowInsecure))
+			boolKey(p.AllowInsecure)) + certCheckKey(p.PinnedCertSHA256, p.VerifyCertName)
 
 	case n.Trojan != nil:
 		p := n.Trojan
@@ -167,7 +188,7 @@ func dedupKey(raw string) string {
 			strings.ToLower(strings.TrimSpace(p.SNI)), normALPN(p.ALPN),
 			strings.ToLower(strings.TrimSpace(p.Fingerprint)),
 			strings.TrimSpace(p.PublicKey), strings.ToLower(strings.TrimSpace(p.ShortID)),
-			strings.TrimSpace(p.SpiderX), boolKey(p.AllowInsecure))
+			strings.TrimSpace(p.SpiderX), boolKey(p.AllowInsecure)) + certCheckKey(p.PinnedCertSHA256, p.VerifyCertName)
 
 	case n.Vmess != nil:
 		p := n.Vmess
@@ -212,4 +233,16 @@ func dedupKey(raw string) string {
 	}
 	// Parsed, but no protocol payload we know how to canonicalise.
 	return "?\x00" + nodeBody(raw)
+}
+
+// certCheckKey is the certificate pin and the name to check, as part of the
+// identity — appended only when a link has them, so every key written before
+// they existed (the store keeps a hash of it) stays the same. The pin is
+// written one way: the same certificate as "AB:CD:…" and "abcd…" is one server.
+func certCheckKey(pin, name string) string {
+	if pin == "" && name == "" {
+		return ""
+	}
+	pin = strings.ToLower(strings.NewReplacer(":", "", " ", "").Replace(pin))
+	return "\x00pcs=" + pin + "\x00vcn=" + strings.ToLower(strings.TrimSpace(name))
 }

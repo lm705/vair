@@ -11,7 +11,7 @@ import (
 // appVersion is the running version. 1.10 kept this const in selfupdate.go;
 // relocated here (remove selfupdate.go's copy when it ports). Must stay a const
 // because subFetchUserAgent (fetch.go) concatenates it at compile time.
-const appVersion = "2.6.0"
+const appVersion = "2.7.0"
 
 // Engine timeouts (relocated from the 1.10 main.go const block; the others there
 // are already defined within the ported engine files).
@@ -47,12 +47,15 @@ func WebPort() int { return webPort }
 // checkExitHost is the fallback hostname for the "check IP" button when the
 // configured URL cannot be parsed. The service itself is a setting — see
 // currentCheckIPURL — and the routing follows it through checkIPHost().
-const checkExitHost = "ip-api.com"
+const checkExitHost = "ipwho.is"
 
 // checkIPURLDefault is the service the "check IP" button asks by default: free,
-// no key, and it answers over plain HTTP, which matters because this request has
-// to survive whatever the routing is doing.
-const checkIPURLDefault = "http://ip-api.com/json/?fields=status,message,country,countryCode,city,query,isp"
+// no key, and over HTTPS. The default used to be ip-api.com over plain HTTP,
+// whose answer — the address and the country the button reports — anyone on the
+// path after the VPN server could read or replace. The routing that sends this
+// host through the tunnel in the bypass modes works by name and does not care
+// which scheme carries it. ip-api.com stays in the list.
+const checkIPURLDefault = "https://ipwho.is/"
 
 // binDir holds the engine binaries (xray/sing-box) + the geo baselines shipped
 // beside them. The shell sets it via SetBinDir once the engines are on disk.
@@ -108,6 +111,7 @@ func SetEngines(xray, singbox string) {
 	// every DNS block we build — see dnsIndependentCache — and answers the
 	// first question of every bug report.
 	go detectSingboxVersion()
+	go detectXrayVersion()
 }
 
 // engineBins returns the two engine paths, or empty strings before they are
@@ -122,6 +126,14 @@ func engineBins() (xray, singbox string) {
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 	return state.xrayBin, state.singboxBin
+}
+
+// SingboxPath is where sing-box is on disk, or "" before it is registered: the
+// shell names it in the firewall rule for the LAN-shared proxy, which sing-box
+// serves in TUN mode.
+func SingboxPath() string {
+	_, singbox := engineBins()
+	return singbox
 }
 
 // proxyAuthUser/Pass are the credentials for Vair's local SOCKS/HTTP inbound,

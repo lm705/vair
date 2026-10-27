@@ -8,8 +8,8 @@ func AutoEnabled() bool {
 }
 
 // SetAuto flips the auto-connect master toggle. Enabling arms the supervisor to
-// connect to the fastest working config (and tests the candidate pool); disabling
-// disconnects any live connection. Mirrors the 1.10 handleSettings?auto=1 path.
+// connect to the fastest working config (and tests the candidate pool);
+// disabling stops the supervision and leaves the connection as it is.
 func SetAuto(enabled bool) {
 	settingsMu.Lock()
 	was := appSettings.AutoConnect
@@ -22,6 +22,7 @@ func SetAuto(enabled bool) {
 	withSpeed := rankModeUsesSpeed()
 
 	if enabled && !was {
+		autoAdminNoted.Store(false) // say it again if the rights are still missing
 		autoWant.Store(true)
 		if ecs := state.conn.snap(); ecs.Status == ConnConnected {
 			autoProbeNow.Store(true)
@@ -32,38 +33,46 @@ func SetAuto(enabled bool) {
 		go autoTestTabs(autoPool(), withSpeed)
 	}
 	if !enabled && was {
+		// The connection stays. Switching AUTO off used to disconnect whatever was
+		// up — a server connected by hand included — which neither the switch's
+		// description nor the wiki said. Off means no longer supervised; the
+		// connection is ended by Disconnect, as any other.
 		autoWant.Store(false)
-		cm := state.conn
-		cm.mu.Lock()
-		orig := cm.state.Status
-		if orig != ConnIdle && orig != ConnDisconnecting {
-			cm.state.Status = ConnDisconnecting
-		}
-		s := cm.state
-		cm.mu.Unlock()
-		if orig != ConnIdle && orig != ConnDisconnecting {
-			state.broadcast(SSEEvent{Type: "conn_update", Payload: s})
-			go stopConnection()
-		}
+		autoManaged.Store(false)
+		// Turning it on is announced above; turning it off has to be as well.
+		// The switch lives in the AUTO window, and without this the main
+		// window's AUTO button went on showing the mode as on.
+		broadcastAuto("off", "", "", "")
 	}
 	autoKick()
 	saveSettings()
 }
 
 // AutoSwitch forces an immediate failover/connect on the supervisor's next tick
-// (the panel's "Switch now"). No-op (returns false) when auto is off.
-func AutoSwitch() bool {
+// (the panel's "Switch now"). Returns why it cannot, or "": a request with
+// nothing to act on used to stay armed and fire whenever the pool next had
+// configs.
+func AutoSwitch() string {
 	settingsMu.RLock()
 	on := appSettings.AutoConnect
 	settingsMu.RUnlock()
 	if !on {
-		return false
+		return switchAutoOff
+	}
+	if !autoPoolHasEntries(autoPool()) {
+		return switchNoCandidates
 	}
 	autoWant.Store(true)
 	autoForce.Store(true)
 	autoKick()
-	return true
+	return ""
 }
+
+// Why "Switch now" did nothing, for the panel.
+const (
+	switchAutoOff      = "auto-connect is off"
+	switchNoCandidates = "there is nothing to switch to: the candidate tabs have no configurations"
+)
 
 // AutoCandDTO is one row of the AUTO panel's ranked candidate list.
 type AutoCandDTO struct {
@@ -102,13 +111,15 @@ func AutoCandidates() []AutoCandDTO {
 	out := []AutoCandDTO{}
 	for _, c := range autoCandidates(autoPool(), "", nil) {
 		es := c.entry.snap()
+		// Speed is the figure the ranking used: one older than six hours is not
+		// counted, and showing it ranked a 12 MB/s row below a 3 MB/s one.
 		out = append(out, AutoCandDTO{
 			Name:        autoLabel(c.entry),
 			Raw:         es.Raw,
 			Tab:         c.tabID,
 			Delay:       es.Delay,
 			Status:      es.PingStatus,
-			Speed:       es.SpeedMBps,
+			Speed:       c.speed,
 			Current:     connBody != "" && nodeBody(es.Raw) == connBody,
 			Stable:      c.stable,
 			CooldownSec: int(cooldownLeft(es.Raw).Seconds()),
@@ -145,6 +156,7 @@ func AutoConnectCand(raw, mode string) bool {
 	if mode != string(ModeProxy) && mode != string(ModeTUN) {
 		mode = string(autoEffectiveMode())
 	}
+	noteUserConnAction()
 	autoWant.Store(true)
 	autoManaged.Store(false)
 	autoLiveRtt.Store(0)
@@ -194,11 +206,23 @@ func StartBackground() {
 		autoWant.Store(true)
 	}
 	SetFileLogging(toFile) // re-open the log file if the user left it on
+	announceDBRecovery()   // a damaged database found at start: say so
 	go startAutoSupervisor()
 	go logFlushLoop()     // flush batched engine/app logs to the "log" event
 	go startAutoRefresh() // per-tab RefreshMin source refresh (1.10 routes.go)
-	// Refresh SOURCES at launch, but SILENTLY when it already has persisted
-	// configs (loaded from the store) — a background re-download shouldn't blank
-	// the list with a spinner. A first-ever launch (empty) shows the spinner.
-	go fetchAndInitSilent(memTabCount("main") > 0)
+	refreshSourcesAtStart()
+}
+
+// refreshSourcesAtStart: only an EMPTY SOURCES list is fetched at launch —
+// directly, since there is nothing to connect with otherwise, and with the
+// spinner. A list that has configurations keeps them, and the first session
+// refreshes it, silently, through the tunnel (afterSessionUp): the fetch at
+// every start went out before any tunnel, from the real address.
+func refreshSourcesAtStart() {
+	if memTabCount("main") > 0 {
+		sourcesDeferred.Store(true)
+		loadedSignal("main")
+		return
+	}
+	go fetchAndInitSilent(false)
 }

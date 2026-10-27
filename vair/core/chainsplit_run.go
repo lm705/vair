@@ -23,16 +23,10 @@ import (
 // the orphan reaper need no changes: whichever engine ends up in which slot,
 // both are killed together.
 func startSplitChainProxy(cm *connManager, entry *ConfigEntry, segs []chainSegment, name, connTab string, chain, chainRaws []string) {
-	httpPort, socksPort := currentProxyPorts()
-	if !portFree(httpPort) {
-		if pf, e := findFreePort(); e == nil {
-			httpPort = pf
-		}
-	}
-	if !portFree(socksPort) {
-		if pf, e := findFreePort(); e == nil {
-			socksPort = pf
-		}
+	httpPort, socksPort, perr := claimProxyPorts()
+	if perr != nil {
+		setConnError(cm, entry, perr.Error())
+		return
 	}
 	intHTTPPort, e1 := findFreePort()
 	intSOCKSPort, e2 := findFreePort()
@@ -129,6 +123,7 @@ func startChainHalf(engine string, cfg map[string]interface{}, label string, wai
 		os.Remove(path)
 		return nil, nil, "", err
 	}
+	tieToVair(cmd)
 	go pumpProcLog(engine, stderrPipe, nil)
 
 	exited := make(chan struct{})

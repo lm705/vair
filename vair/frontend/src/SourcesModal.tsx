@@ -4,11 +4,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { TabService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
-import { Hint } from './hints'
-import type { HintOpt } from './hints'
-import Select from './Select'
+import LangSelect from './langselect'
+import Group from './setgroup'
 import {
-  ExcludeFields,
+  ExcludeGroup,
+  RefreshGroup,
   SubInfoSection,
   emptyExInput,
   emptyExMap,
@@ -17,20 +17,21 @@ import {
   type ExInput,
   type ExMap,
 } from './tabshared'
+import CloseX from './closex'
+import { copyText } from './clipboard'
 
 export default function SourcesModal({
   onClose,
   onShowQR,
+  notify,
   lang,
 }: {
   onClose: () => void
   onShowQR: (text: string) => void
+  notify: (text: string) => void
   lang: string
 }) {
   const tt = (en: string) => t10(lang, en)
-  // The description under a setting: the paragraph while descriptions are
-  // on, the mark that opens the same text while they are off.
-  const hint = (en: string, opts?: HintOpt[]) => <Hint en={en} opts={opts} />
   const [tab, setTab] = useState<any>(null)
   const [srcUrls, setSrcUrls] = useState<string[] | null>(null) // null = loading
   const [refreshMin, setRefreshMin] = useState(0)
@@ -111,129 +112,82 @@ export default function SourcesModal({
         if (e.target === e.currentTarget) closeModal()
       }}
     >
-      <div className="modal-box" id="tab-modal-box">
-        <div className="modal-title">{tt('Sources Settings')}</div>
+      <div className="modal-box cardset" id="tab-modal-box">
+        <div className="modal-title set-title">
+          <span>{tt('Sources Settings')}</span>
+          <div className="set-title-controls">
+            <LangSelect lang={lang} />
+            <CloseX onClick={closeModal} title={tt('Close')} />
+          </div>
+        </div>
 
         <SubInfoSection subs={tab.subs} lang={lang} />
 
         {/* ── Built-in source URLs (read-only, copy/QR) ── */}
-        <div className="settings-section">
-          <div className="modal-label">{tt('Source URL (read-only)')}</div>
-          {srcUrls === null ? (
-            <div className="modal-hint" style={{ margin: 0 }}>
-              {tt('Loading…')}
-            </div>
-          ) : srcUrls.length === 0 ? (
-            <div className="modal-hint" style={{ margin: 0 }}>
-              {tt('No source URL.')}
-            </div>
-          ) : (
-            <div id="src-url-list">
-              {srcUrls.map((u) => (
-                <div key={u} className="src-url-row">
-                  <span className="src-url" title={u}>
-                    {u}
-                  </span>
-                  <button className="url-qr" onClick={() => navigator.clipboard.writeText(u).catch(() => {})}>
-                    {tt('copy')}
-                  </button>
-                  <button className="url-qr" onClick={() => onShowQR(u)}>
-                    {tt('QR')}
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* ── Auto-refresh ── */}
-        <div className="settings-section">
-          <div className="modal-row" style={{ marginBottom: 6 }}>
-            <span className="modal-label" style={{ margin: 0 }}>
-              {tt('Auto-refresh interval (minutes, 0 = off)')}
-            </span>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={!refreshDisabled}
-                onChange={(e) => {
-                  setRefreshDisabled(!e.target.checked)
-                  scheduleApply()
-                }}
-              />
-              <span className="toggle-track" />
-              <span className="toggle-thumb" />
-            </label>
+        <Group title={tt('Config sources')}>
+          <div className="modal-row" style={{ display: 'block' }}>
+            <span className="modal-row-label stack">{tt('Source URL (read-only)')}</span>
+            {srcUrls === null ? (
+              <div className="set-note" style={{ margin: 0 }}>
+                {tt('Loading…')}
+              </div>
+            ) : srcUrls.length === 0 ? (
+              <div className="set-note" style={{ margin: 0 }}>
+                {tt('No source URL.')}
+              </div>
+            ) : (
+              <div id="src-url-list">
+                {srcUrls.map((u) => (
+                  <div key={u} className="src-url-row">
+                    <span className="src-url" title={u}>
+                      {u}
+                    </span>
+                    {/* The shared copy, which falls back where the browser has no
+                        clipboard API (the web interface over plain HTTP); the
+                        button used to do nothing there, and say nothing here. */}
+                    <button
+                      className="url-qr"
+                      onClick={() => {
+                        copyText(u)
+                        notify(tt('Copied'))
+                      }}
+                    >
+                      {tt('copy')}
+                    </button>
+                    <button className="url-qr" title={tt('QR code')} onClick={() => onShowQR(u)}>
+                      {tt('QR')}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-          <input
-            className="modal-input"
-            type="number"
-            min={0}
-            value={refreshMin}
-            style={{ width: 80, opacity: refreshDisabled ? 0.45 : 1 }}
-            onChange={(e) => setRefreshMin(+e.target.value || 0)}
-            onBlur={scheduleApply}
-          />
-          {hint('On a set interval: tabs with a source/URL reload the latest config list; pasted-only tabs (no source) just clear stale ping/speed results so they get re-tested.')}
-          <div className="modal-row" style={{ marginTop: 8 }}>
-            <span className="modal-row-label">{tt('Test after auto-refresh')}</span>
-            <Select
-              className="modal-input num-input"
-              style={{ width: 'auto', marginBottom: 0 }}
-              value={refreshTest}
-              onChange={(e) => {
-                setRefreshTest(e.target.value)
-                scheduleApply()
-              }}
-            >
-              <option value="">{tt('off')}</option>
-              <option value="ping">{tt('Ping only')}</option>
-              <option value="speed">{tt('Speed test')}</option>
-            </Select>
-          </div>
-          {hint("After a scheduled auto-refresh (not a manual RELOAD), test the tab's configs in the background — ping only, or a full speed test.")}
-        </div>
+        </Group>
 
-        {/* ── Exclude filter ── */}
-        <div className="settings-section">
-          <div className="modal-row" style={{ marginBottom: 6 }}>
-            <span className="modal-label" style={{ margin: 0 }}>
-              {tt('Exclude filter')}
-            </span>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={!excludeDisabled}
-                onChange={(e) => {
-                  setExcludeDisabled(!e.target.checked)
-                  scheduleApply()
-                }}
-              />
-              <span className="toggle-track" />
-              <span className="toggle-thumb" />
-            </label>
-          </div>
-          <Hint
-            className="ef-hint"
-            en="Configs matching any of these are hidden. Type a value and press Enter to add it; matching is a case-insensitive substring. Leave a column empty to disable it."
-          />
-          <ExcludeFields
-            ef={ef}
-            efInput={efInput}
-            disabled={excludeDisabled}
-            setEf={setEf}
-            setEfInput={setEfInput}
-            onChanged={scheduleApply}
-          />
-        </div>
+        <RefreshGroup
+          lang={lang}
+          min={refreshMin}
+          off={refreshDisabled}
+          test={refreshTest}
+          setMin={setRefreshMin}
+          setOff={setRefreshDisabled}
+          setTest={setRefreshTest}
+          onChanged={scheduleApply}
+        />
 
-        <div className="modal-hint" style={{ marginBottom: 8 }}>
+        <ExcludeGroup
+          lang={lang}
+          off={excludeDisabled}
+          setOff={setExcludeDisabled}
+          ef={ef}
+          efInput={efInput}
+          setEf={setEf}
+          setEfInput={setEfInput}
+          onChanged={scheduleApply}
+        />
+
+        <div className="set-note" style={{ margin: '14px 0 0' }}>
           {tt('Changes apply automatically.')}
-        </div>
-        <div className="modal-btns">
-          <button className="btn ghost" onClick={closeModal}>
-            {tt('Close')}
-          </button>
         </div>
       </div>
     </div>

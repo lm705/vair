@@ -4,16 +4,14 @@
 // record laid out where it can be read. Every figure here is one the ranking
 // uses — nothing is measured to open this dialog.
 //
-// Two rules keep it honest, and they are why the numbers are grouped the way
-// they are:
-//
-//   - the tiles show what the ranking compares (typical delay and its spread,
-//     typical speed and its spread), and Detail shows the single number each
-//     one collapses to;
-//   - delay and speed are counted separately, because they are: a delay check
-//     is a ping, a speed measurement is a download, and a speed test produces
-//     one of each. The old dialog had a single "checks" and a single "last
-//     check" covering both, which answered neither question.
+// Two panels at the top, one per measurement — delay and speed — laid out the
+// same way: three figures in a row (the typical value with its spread, how far
+// it can be trusted, what the ranking makes of it), a line of facts under them
+// (how recent, how far back it counts), and a status mark in the panel's title
+// when the figures are not yet, or no longer, fit to rank on. The measurements
+// themselves are the lists below. Delay and speed are counted separately,
+// because they are: a delay check is a ping, a speed measurement is a
+// download, and a speed test produces one of each.
 //
 // Numbers, not a picture: the kept window is a list read at a glance, and there
 // is no longer series to draw — what survives for a month is a running mean per
@@ -23,6 +21,9 @@
 import { useEffect, useState } from 'react'
 import { ConfigService } from '../bindings/vair/internal/services'
 import { t10 } from './i18n'
+import CloseX from './closex'
+import { InfoDot, opt } from './hints'
+import type { HintOpt } from './hints'
 
 type History = {
   name: string
@@ -66,6 +67,34 @@ function ago(tt: (s: string) => string, sec: number): string {
   return Math.floor(h / 24) + ' ' + tt('days ago')
 }
 
+// What each figure of a panel is, for the panel's description mark: a name the
+// panel shows and the definition of it, in the pop-up the settings use (EN/RU).
+// opt() rather than bare pairs so the translation checker sees every string.
+const delayDefs: HintOpt[] = [
+  opt('Mean', 'Typical round-trip delay to the server: a running average in which every new check enters with a fixed weight, so recent checks count most. The spread is how far single checks typically deviate from it.'),
+  opt('Response rate', 'Share of delay checks the server answered, over the same running average. A speed test also counts as a delay check: it measures the delay before the download.'),
+  opt('Score', 'Mean plus spread plus a penalty for unanswered checks. AUTO ranks by this figure in the "Delay, steady (history)" mode. It appears once there are enough checks to judge.'),
+  opt('Averaging window', 'About how many of the latest checks determine the averages. Older checks are not discarded; they simply count for less, so a past failure stops mattering after a few new checks.'),
+]
+const speedDefs: HintOpt[] = [
+  opt('Mean', 'Typical download speed: a running average of the successful measurements. The spread is how far single measurements typically deviate from it.'),
+  opt('Samples', 'Number of successful speed measurements; failed tests are not counted, as they usually mean the test host refused. The "Speed, steady (history)" mode needs at least the minimum; with fewer it ranks on the latest measurement.'),
+  opt('Score', 'Mean less spread: the speed the server can be relied on to deliver. AUTO ranks by this figure in the "Speed, steady (history)" mode once there are enough measurements and the latest is recent enough.'),
+  opt('Counts for ranking', 'How long a speed measurement stays valid for the ranking. An older one is still shown here, but no longer used.'),
+]
+const defsDesc = (defs: HintOpt[]) => ({
+  render: (tt: (s: string) => string) => (
+    <div className="hint-opts">
+      {defs.map(([k, v]) => (
+        <div className="hint-opt" key={k}>
+          <span className="hint-opt-k">{tt(k)}</span>
+          <span className="hint-opt-v">{tt(v)}</span>
+        </div>
+      ))}
+    </div>
+  ),
+})
+
 // timedRuns groups kept measurements by when they were taken.
 //
 // Measurements arrive in bursts — a whole tab is tested at once, and every row
@@ -79,6 +108,11 @@ function ago(tt: (s: string) => string, sec: number): string {
 // about two different measurements, so they are read the same way: when on the
 // left, what was measured beside it, oldest at the top.
 type Run = { when: string; stale: boolean; vals: number[] }
+
+// mbps writes a speed figure. Below 10 MB/s with two decimals, as the list of
+// measurements does: with one, a spread of 0.05 read "±0.0" beside measurements
+// of 1.00 and 1.12.
+const mbps = (v: number) => (v < 10 ? v.toFixed(2) : v.toFixed(1))
 
 function timedRuns(values: number[], ages: number[], tt: (s: string) => string, staleSec = 0): Run[] {
   const runs: Run[] = []
@@ -119,12 +153,32 @@ export default function HistoryModal({
     p.then((r: any) => (r ? setH(r) : setMissing(true)))
   }, [idx, raw])
 
-  const row = (label: string, value: string, hint?: string) => (
-    <div className="hist-row">
-      <span className="hist-label">{label}</span>
-      <span className="hist-value">{value}</span>
-      {hint ? <span className="hist-hint">{hint}</span> : null}
+  // A figure: its name, the value with its unit, and one line that qualifies
+  // it — always present, empty or not, so the three in a row line up.
+  const metric = (o: {
+    label: string
+    value: string
+    unit?: string
+    caption?: string
+    poor?: boolean
+    off?: boolean
+    title?: string
+  }) => (
+    <div className="hm" title={o.title}>
+      <span className="hm-label">{o.label}</span>
+      <span className={'hm-value' + (o.poor ? ' poor' : '') + (o.off ? ' off' : '')}>
+        {o.value}
+        {o.unit ? <span className="hm-unit">{o.unit}</span> : null}
+      </span>
+      <span className="hm-cap">{o.caption || '\u00a0'}</span>
     </div>
+  )
+  // A fact under the figures: a name and its value, on one line.
+  const fact = (label: string, value: string, stale?: boolean) => (
+    <span className="hf">
+      <span className="hf-label">{label}</span>
+      <span className={'hf-value' + (stale ? ' stale' : '')}>{value}</span>
+    </span>
   )
 
   // Speed ages out of the ranking on a clock, and needs a few measurements
@@ -141,7 +195,10 @@ export default function HistoryModal({
       onMouseDown={(e) => e.target === e.currentTarget && onClose()}
     >
       <div className="modal-box hist-box">
-        <div className="modal-title">{tt('Measurement history')}</div>
+        <div className="modal-head">
+          <div className="modal-title">{tt('Measurement history')}</div>
+          <CloseX onClick={onClose} title={tt('Close')} />
+        </div>
         {h ? (
           <div className="hist-head">
             <span className="hist-name">{h.name || tt('This configuration')}</span>
@@ -159,41 +216,109 @@ export default function HistoryModal({
           </div>
         ) : (
           <>
-            <div className="hist-tiles">
-              <div className="hist-tile">
-                <span className="ht-label">{tt('Delay')}</span>
-                <span className="ht-value">
-                  {h.avg}
-                  <span className="ht-unit">ms</span>
+            <section className="hist-sec">
+              <div className="hist-sec-head">
+                <span className="hist-sec-title">
+                  {tt('Delay')}
+                  <InfoDot desc={defsDesc(delayDefs)} />
                 </span>
-                <span className="ht-note">±{h.jitter} ms {tt('spread')}</span>
+                {!h.trusted ? (
+                  <span
+                    className="hist-chip"
+                    title={tt('needs') + ' ' + h.min_samples + ' ' + tt('checks to judge')}
+                  >
+                    {tt('Too few checks')} · {h.samples}/{h.min_samples}
+                  </span>
+                ) : null}
               </div>
-              <div className="hist-tile">
-                <span className="ht-label">{tt('Answered')}</span>
-                <span className={'ht-value' + (h.percent >= 0 && h.percent < 80 ? ' poor' : '')}>
-                  {h.percent >= 0 ? h.percent : '—'}
-                  {h.percent >= 0 ? <span className="ht-unit">%</span> : null}
-                </span>
-                <span className="ht-note">
-                  {h.trusted
-                    ? h.samples + ' ' + tt('delay checks')
-                    : tt('needs') + ' ' + h.min_samples + ' ' + tt('checks to judge')}
-                </span>
+              <div className="hist-metrics">
+                {metric({
+                  label: tt('Mean'),
+                  value: String(h.avg),
+                  unit: 'ms',
+                  caption: tt('spread') + ' ±' + h.jitter + ' ms',
+                })}
+                {metric({
+                  label: tt('Response rate'),
+                  value: h.percent >= 0 ? String(h.percent) : '—',
+                  unit: h.percent >= 0 ? '%' : '',
+                  caption: tt('checks') + ': ' + h.samples,
+                  poor: h.percent >= 0 && h.percent < 80,
+                })}
+                {metric({
+                  label: tt('Score'),
+                  value: h.trusted ? String(Math.round(h.delay_score)) : '—',
+                  unit: h.trusted ? 'ms' : '',
+                  caption: h.trusted ? tt('used for AUTO ranking') : tt('too few checks'),
+                })}
               </div>
-              <div className="hist-tile">
-                <span className="ht-label">{tt('Speed')}</span>
-                <span className="ht-value">
-                  {h.speed_seen === 0 ? '—' : h.speed_mbps.toFixed(1)}
-                  {h.speed_seen === 0 ? null : <span className="ht-unit">MB/s</span>}
-                </span>
-                <span className={'ht-note' + (speedStale(h) ? ' stale' : '')}>
-                  {h.speed_seen === 0
-                    ? tt('never measured')
-                    : '±' + h.speed_spread.toFixed(1) + ' MB/s ' + tt('spread')}
-                </span>
+              <div className="hist-facts">
+                {fact(tt('Last check'), ago(tt, h.last_check_age_sec))}
+                {fact(tt('Averaging window'), '≈' + h.effective_window + ' ' + tt('checks'))}
               </div>
-            </div>
+            </section>
 
+            <section className="hist-sec">
+              <div className="hist-sec-head">
+                <span className="hist-sec-title">
+                  {tt('Speed')}
+                  <InfoDot desc={defsDesc(speedDefs)} />
+                </span>
+                {speedStale(h) ? (
+                  <span
+                    className="hist-chip"
+                    title={tt('older than') + ' ' + h.speed_hours + ' ' + tt('hours, so the ranking no longer uses it')}
+                  >
+                    {tt('Outdated')}
+                  </span>
+                ) : speedThin(h) ? (
+                  <span
+                    className="hist-chip muted"
+                    title={
+                      tt('the steady mode wants') +
+                      ' ' +
+                      h.min_samples +
+                      ' ' +
+                      tt('of them; below that it ranks on the last one')
+                    }
+                  >
+                    {tt('Too few measurements')} · {h.speed_seen}/{h.min_samples}
+                  </span>
+                ) : null}
+              </div>
+              {h.speed_seen === 0 ? (
+                <div className="hist-sec-empty">
+                  {tt('Not measured yet. Run SPEED on the row to measure it.')}
+                </div>
+              ) : (
+                <>
+                  <div className="hist-metrics">
+                    {metric({
+                      label: tt('Mean'),
+                      value: mbps(h.speed_mbps),
+                      unit: 'MB/s',
+                      caption: tt('spread') + ' ±' + mbps(h.speed_spread) + ' MB/s',
+                    })}
+                    {metric({
+                      label: tt('Samples'),
+                      value: String(h.speed_seen),
+                      caption: tt('minimum') + ': ' + h.min_samples,
+                    })}
+                    {metric({
+                      label: tt('Score'),
+                      value: mbps(h.speed_score),
+                      unit: 'MB/s',
+                      caption: speedStale(h) ? tt('not used') : tt('used for AUTO ranking'),
+                      off: speedStale(h),
+                    })}
+                  </div>
+                  <div className="hist-facts">
+                    {fact(tt('Last measurement'), ago(tt, h.speed_age_sec), speedStale(h))}
+                    {fact(tt('Counts for ranking'), h.speed_hours + ' ' + tt('hours'))}
+                  </div>
+                </>
+              )}
+            </section>
             <div className="hist-cap">{tt('Last delay checks')}</div>
             {(h.recent || []).length === 0 ? (
               <div className="hist-runs">
@@ -217,10 +342,10 @@ export default function HistoryModal({
               </div>
             )}
             <div className="hist-hint hist-para">
-              {tt('In milliseconds, oldest first — the last')} {h.recent_max}{' '}
-              {tt('checks, as they came, with when each round was taken. The figures above are worked out differently: every check folds into a running average at')}{' '}
-              {h.newest_weight_pct}%, {tt('so about')} {h.effective_window}{' '}
-              {tt('recent ones decide them — which is why the two need not agree.')}
+              {tt('In milliseconds, oldest first: the last')} {h.recent_max}{' '}
+              {tt('checks, each with the time it was taken. The figures above are calculated differently: each check enters a running average with a weight of')}{' '}
+              {h.newest_weight_pct}%, {tt('so they reflect roughly the last')} {h.effective_window}{' '}
+              {tt('checks. That is why the two can differ.')}
             </div>
 
             {(h.speed_recent || []).length > 0 ? (
@@ -248,69 +373,19 @@ export default function HistoryModal({
                 </div>
                 <div className="hist-hint hist-para">
                   {tt('The last')} {h.speed_recent_max}{' '}
-                  {tt('speed measurements, oldest first. A speed test is expensive, so these are rare and far apart — the ranking only uses ones under')}{' '}
+                  {tt('speed measurements, oldest first. Speed tests are costly, so there are few of them; the ranking uses only those less than')}{' '}
                   {h.speed_hours} {tt('hours old.')}
                 </div>
               </>
             ) : null}
 
-            <div className="hist-cap">{tt('Detail')}</div>
-            {row(
-              tt('Delay checks'),
-              String(h.samples),
-              tt('a speed test makes one of these too — it measures the delay before the download'),
-            )}
-            {row(tt('Last delay check'), ago(tt, h.last_check_age_sec))}
-            {row(
-              tt('History weight'),
-              '≈' + h.effective_window + ' ' + tt('checks'),
-              tt('nothing is dropped — each older check simply counts for less, so a server that was bad yesterday is forgiven within a few runs'),
-            )}
-            {h.trusted
-              ? row(
-                  tt('Ranked on'),
-                  Math.round(h.delay_score) + ' ms',
-                  tt('typical delay plus its spread and a charge for unanswered checks — this is what the steady modes compare'),
-                )
-              : null}
-            {row(
-              tt('Speed measurements'),
-              h.speed_seen === 0 ? tt('none') : String(h.speed_seen),
-              h.speed_seen === 0
-                ? tt('run SPEED on the row to measure it')
-                : speedThin(h)
-                  ? tt('the steady mode wants') + ' ' + h.min_samples + ' ' + tt('of them; below that it ranks on the last one')
-                  : undefined,
-            )}
-            {h.speed_seen > 0
-              ? row(
-                  tt('Last speed measurement'),
-                  ago(tt, h.speed_age_sec),
-                  speedStale(h)
-                    ? tt('older than') + ' ' + h.speed_hours + ' ' + tt('hours, so the ranking no longer uses it')
-                    : tt('a speed figure counts for') + ' ' + h.speed_hours + ' ' + tt('hours'),
-                )
-              : null}
-            {h.speed_seen > 0
-              ? row(
-                  tt('Ranked on'),
-                  h.speed_score.toFixed(1) + ' MB/s',
-                  tt('typical speed less its spread — what the server can be relied on to deliver'),
-                )
-              : null}
-
             <div className="hist-foot">
-              {tt('The history belongs to the server, not to the row: it survives a list refresh, and a configuration that appears in two tabs has one history. It is forgotten after')}{' '}
+              {tt('The history is tied to the server, not to the row: it is kept when the list is refreshed, and a configuration in two tabs shares one history. It is deleted after')}{' '}
               {h.kept_days} {tt('days without a check.')}
             </div>
           </>
         )}
 
-        <div className="modal-btns">
-          <button className="btn ghost" onClick={onClose}>
-            {tt('Close')}
-          </button>
-        </div>
       </div>
     </div>
   )

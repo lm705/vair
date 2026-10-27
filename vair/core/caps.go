@@ -19,6 +19,10 @@ type Capabilities struct {
 	TUN            bool   `json:"tun"`
 	TUNReady       bool   `json:"tun_ready"`
 	TUNBlockReason string `json:"tun_block_reason,omitempty"`
+	// HelperService is the Windows helper service's state: "running",
+	// "stopped" or "absent". Empty where there is none to speak of (Linux has
+	// its own helper flow, through TUNBlockReason).
+	HelperService string `json:"helper_service,omitempty"`
 
 	// SplitTunnel — per-application routing rules ("apps without VPN") are
 	// honoured. ProcessPicker — the running-process list that feeds them can be
@@ -87,6 +91,14 @@ type Capabilities struct {
 	// binary), "package" (hand a signed package to the package manager),
 	// "appimage", or "none" (check and link only).
 	SelfUpdate string `json:"self_update"`
+
+	// Portable is the single-file Windows build, which carries its engines
+	// inside the exe. Told by the build itself rather than guessed from where
+	// the exe sits: a portable exe in a folder it cannot write to reads as
+	// "installer" to SelfUpdate, and one an older setup left behind is
+	// portable in an installed folder. The Settings use it to say that the
+	// helper service comes with the setup version only.
+	Portable bool `json:"portable,omitempty"`
 }
 
 // currentCaps composes the platform's fixed capabilities with the facts that
@@ -115,6 +127,8 @@ func currentCaps() Capabilities {
 			c.TUNReady, c.TUNBlockReason = true, ""
 		}
 	}
+	c.HelperService = helperServiceCap()
+	c.Portable = portableBuild.Load()
 	return c
 }
 
@@ -125,3 +139,10 @@ var trayAvailable atomic.Bool
 
 // SetTrayAvailable records whether a tray icon will be shown on this system.
 func SetTrayAvailable(v bool) { trayAvailable.Store(v) }
+
+// portableBuild is set once at startup by main, which is the layer that knows
+// which build this is (the portable one has engines to unpack).
+var portableBuild atomic.Bool
+
+// SetPortableBuild records whether this is the portable build.
+func SetPortableBuild(v bool) { portableBuild.Store(v) }

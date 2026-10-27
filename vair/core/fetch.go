@@ -2,12 +2,14 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
+	neturl "net/url"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -22,25 +24,13 @@ import (
 // behaviour that only worked in TUN mode, where the system-wide tunnel already
 // carries everything). TUN needs nothing extra here for the same reason; an idle
 // or proxy-less state fetches directly.
+//
+// The dedicated source-fetch inbound is preferred: its traffic is PINNED to the
+// proxy outbound, so the refresh rides the tunnel in every routing mode
+// (through the regular port the RU modes can route a subscription host direct
+// — dead on a censored network). See ownHTTPClient.
 func sourceHTTPClient(timeout time.Duration) *http.Client {
-	tr := &http.Transport{}
-	cs := state.conn.snap()
-	if cs.Status == ConnConnected && cs.Mode == ModeProxy {
-		// Prefer the dedicated source-fetch inbound: its traffic is PINNED to the
-		// proxy outbound, so the refresh rides the tunnel in every routing mode
-		// (through the regular port the RU modes can route a subscription host
-		// direct — dead on a censored network). Fall back to the public port.
-		port := cs.SrcFetchPort
-		if port == 0 {
-			port = cs.HTTPPort
-		}
-		if port > 0 {
-			if pu, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", port)); err == nil {
-				tr.Proxy = http.ProxyURL(pu)
-			}
-		}
-	}
-	return &http.Client{Timeout: timeout, Transport: tr}
+	return ownHTTPClient(timeout)
 }
 
 // ─────────────────────────── config sources ─────────────────────
@@ -69,11 +59,49 @@ const (
 
 func fetchAndInit() { fetchAndInitSilent(false) }
 
-// fetchAndInitSilent (re)loads the SOURCES tab. When silent (a startup or
-// auto-refresh background refresh where main already shows its persisted
-// configs), it does NOT set the fetching flag or emit "loading" — so the
-// already-visible list isn't blanked by a spinner while it re-downloads.
+// sourcesFetch is who asked for a SOURCES refresh, which decides what it may do
+// to the list on screen.
+type sourcesFetch int
+
+const (
+	// sourcesFetchAsked: RELOAD, or an empty list at start. With the spinner;
+	// the results are cleared, on a failure too (see the failure branch).
+	sourcesFetchAsked sourcesFetch = iota
+	// sourcesFetchScheduled: the tab's own refresh interval. Silent, otherwise
+	// as asked.
+	sourcesFetchScheduled
+	// sourcesFetchDeferred: the refresh put off at start until the first
+	// session (afterSessionUp). Nobody asked for it, so it keeps what the user
+	// measured and fails without a word; see refreshSourcesDeferred.
+	sourcesFetchDeferred
+)
+
+// fetchAndInitSilent (re)loads the SOURCES tab. When silent (an auto-refresh
+// background refresh where main already shows its persisted configs), it does
+// NOT set the fetching flag or emit "loading" — so the already-visible list
+// isn't blanked by a spinner while it re-downloads.
 func fetchAndInitSilent(silent bool) {
+	if silent {
+		fetchSources(sourcesFetchScheduled)
+	} else {
+		fetchSources(sourcesFetchAsked)
+	}
+}
+
+// refreshSourcesDeferred is the SOURCES refresh that waited for the first
+// session, so that it goes through the tunnel. It is the program's own errand,
+// run because a connection came up, and it used to behave like RELOAD: every
+// ping and speed on the tab was cleared, AUTO (when on) tested the tab again,
+// and when the list could not be fetched — a server that does not reach GitHub
+// is enough — "Source unavailable" came up as well. Now:
+//   - a configuration that is still in the list keeps its results; only the new
+//     ones are untested, and the tab is tested again only when the list changed;
+//   - a failure changes nothing and shows nothing (a line in the log): the list
+//     and its results stay, and the next session tries again.
+func refreshSourcesDeferred() { fetchSources(sourcesFetchDeferred) }
+
+func fetchSources(kind sourcesFetch) {
+	silent := kind != sourcesFetchAsked
 	if !silent {
 		// Mark the Sources tab as fetching so a switch to it shows a spinner;
 		// cleared on every return path.
@@ -112,11 +140,12 @@ func fetchAndInitSilent(silent bool) {
 	// toast and the SOURCES settings modal read them), and previously they were
 	// dropped, leaving a bare "source unavailable" with no reason.
 	var failed []subMeta
+	prevSubs := tabSubs("main")
 	for _, src := range sourceDefs {
 		lines, meta, err := fetchURLMeta(src.URL)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "⚠  fetch %s: %v\n", src.URL, err)
-			failed = append(failed, subMeta{URL: src.URL, Error: shortErr(err.Error())})
+			fmt.Fprintf(os.Stderr, "⚠  fetch %s: %s\n", sourceForLog(src.URL), fetchErrText(err))
+			failed = append(failed, failedMeta(prevSubs, src.URL, shortErr(fetchErrText(err))))
 			continue
 		}
 		// Check if any line actually contains a recognised proxy URL.
@@ -133,22 +162,22 @@ func fetchAndInitSilent(silent bool) {
 			}
 		}
 		if !hasNode {
-			fmt.Fprintf(os.Stderr, "⚠  fetch %s: no proxy configs in response (%d lines)\n", src.URL, len(lines))
-			failed = append(failed, subMeta{URL: src.URL, Error: "no configs found"})
+			fmt.Fprintf(os.Stderr, "⚠  fetch %s: no proxy configs in response (%d lines)\n", sourceForLog(src.URL), len(lines))
+			failed = append(failed, failedMeta(prevSubs, src.URL, "no configs found"))
 			continue
 		}
 		if meta != nil { // metadata of the source we actually use (others are fallbacks)
 			subs = append(subs, *meta)
 		}
 		raws = append(raws, lines...)
-		fmt.Printf("ℹ  fetched %d lines from %s\n", len(lines), src.URL)
+		fmt.Printf("ℹ  fetched %d lines from %s\n", len(lines), sourceForLog(src.URL))
 		break
 	}
 
 	// Fetch from private GitHub repo via PAT
 	ghLines, err := fetchGitHubPAT()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "⚠  GitHub PAT fetch: %v\n", err)
+		fmt.Fprintf(os.Stderr, "⚠  GitHub PAT fetch: %s\n", fetchErrText(err))
 	} else {
 		raws = append(raws, ghLines...)
 		if len(ghLines) > 0 {
@@ -169,6 +198,12 @@ func fetchAndInitSilent(silent bool) {
 			if s.Error != "" {
 				errs = append(errs, s.Error)
 			}
+		}
+		if kind == sourcesFetchDeferred {
+			vlog("warn", "SOURCES: the refresh after connecting failed (%s) — configs and results kept, the next session tries again",
+				strings.Join(errs, "; "))
+			sourcesDeferred.Store(true)
+			return
 		}
 		vlog("warn", "SOURCES: source unreachable (%s) — configs kept, test results cleared",
 			strings.Join(errs, "; "))
@@ -224,7 +259,7 @@ func fetchAndInitSilent(silent bool) {
 		e := &ConfigEntry{Raw: raw, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
 		n, parseErr := parseNode(raw)
 		if parseErr != nil {
-			e.Name = raw[:minInt(40, len(raw))]
+			e.Name = brokenConfigName(raw)
 			// Label unparseable configs by their URL scheme so they don't fall
 			// back to the UI's "vless" default (e.g. a broken trojan:// link).
 			e.Protocol = internLow(schemeProtocol(raw))
@@ -258,6 +293,9 @@ func fetchAndInitSilent(silent bool) {
 		}
 	}
 	state.mu.Unlock()
+	if kind == sourcesFetchDeferred {
+		keepMeasured("main", entries)
+	}
 	addedN, removedN, addedIdx := reloadDelta("main", entries) // before storeReplace overwrites
 	storeReplace("main", entries)                              // persist to the store (outside the lock — DB write can be slow)
 	loadedSignal("main")                                       // client re-fetches its window from the store
@@ -266,8 +304,11 @@ func fetchAndInitSilent(silent bool) {
 	// A refresh rebuilds entries with no ping data. If this tab is part of the
 	// auto-connect pool, re-ping it so the supervisor can rank by real delay
 	// (covers auto-refresh, manual refresh and the startup load). No-ops when
-	// auto-connect is off.
-	go autoPingAfterRefresh("main")
+	// auto-connect is off. The deferred refresh kept the results, so the same
+	// list has nothing new to test.
+	if kind != sourcesFetchDeferred || addedN > 0 {
+		go autoPingAfterRefresh("main")
+	}
 	// Big subscription parses leave Go's heap allocated — nudge the runtime
 	// to release it back to the OS so memory usage doesn't appear to grow
 	// after every reload. See the matching call in fetchTabURLs.
@@ -292,6 +333,61 @@ type subMeta struct {
 	Count          int      `json:"count,omitempty"`
 	Info           string   `json:"info,omitempty"`
 	Notes          []string `json:"notes,omitempty"` // any other leading "#"-comment lines, verbatim
+}
+
+// sourceForLog is a source's address as it may be printed: scheme and host.
+// The rest of a subscription link — path and query — is usually the
+// credential itself, the panel's token for this user, and what is printed to
+// stderr does not stay on screen: on Linux a desktop session sends it to the
+// journal.
+func sourceForLog(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "(source)"
+	}
+	if (u.Path == "" || u.Path == "/") && u.RawQuery == "" {
+		return u.Scheme + "://" + u.Host
+	}
+	return u.Scheme + "://" + u.Host + "/…"
+}
+
+// fetchErrText is a fetch error without the address in it. Go's HTTP client
+// puts the whole URL into its errors — Get "https://…/sub/<token>": … — and this
+// text is shown in the tab's list of sources and in its notices, which people
+// copy into a bug report or a screenshot. What went wrong is the part after.
+func fetchErrText(err error) string {
+	var ue *neturl.Error
+	if errors.As(err, &ue) && ue.Err != nil {
+		return ue.Err.Error()
+	}
+	return err.Error()
+}
+
+// failedMeta is the record of a source that did not load this time. It keeps
+// what the source said about itself the last time it did — its title, traffic,
+// expiry — with the error added: the configurations from that fetch stay in
+// the tab, and the description above the table used to vanish while they were
+// still there.
+func failedMeta(prev []subMeta, url, errText string) subMeta {
+	for _, p := range prev {
+		if p.URL == url {
+			p.Error = errText
+			return p
+		}
+	}
+	return subMeta{URL: url, Error: errText}
+}
+
+// tabSubs is a copy of a tab's current source records.
+func tabSubs(tabID string) []subMeta {
+	state.mu.RLock()
+	defer state.mu.RUnlock()
+	for _, t := range state.tabs {
+		if t.ID == tabID {
+			return append([]subMeta(nil), t.Subs...)
+		}
+	}
+	return nil
 }
 
 func (m *subMeta) isEmpty() bool {
@@ -361,6 +457,11 @@ func fetchURLMeta(u string) ([]string, *subMeta, error) {
 			text = string(decoded)
 		}
 		// If all decoding attempts fail, fall through and try to parse as-is
+	}
+	// A JSON subscription — an array of xray or sing-box configurations, as
+	// some providers and v2rayNG hand out — has no link on any line.
+	if links, ok := jsonConfigsInText(text); ok {
+		text = strings.Join(links, "\n")
 	}
 
 	var lines []string
@@ -536,6 +637,18 @@ func fetchGitHubPAT() ([]string, error) {
 // maybeDecodeBase64Blob so a base64 *subscription* committed to the repo is
 // handled like any other base64 source. Used by the built-in source (above) and
 // by each user tab's own GitHub import (see fetchTabURLs).
+// githubContentsURL is the Contents API address of a file. Each part is
+// escaped: a space, "#" or "?" in a file name cut the request off there and
+// asked GitHub for something else.
+func githubContentsURL(owner, repo, file string) string {
+	parts := strings.Split(file, "/")
+	for i, p := range parts {
+		parts[i] = neturl.PathEscape(p)
+	}
+	return "https://api.github.com/repos/" + neturl.PathEscape(owner) + "/" + neturl.PathEscape(repo) +
+		"/contents/" + strings.Join(parts, "/")
+}
+
 func fetchGitHubPATContent(owner, repo, file, pat string) ([]string, error) {
 	owner = strings.TrimSpace(owner)
 	repo = strings.TrimSpace(repo)
@@ -544,7 +657,7 @@ func fetchGitHubPATContent(owner, repo, file, pat string) ([]string, error) {
 	if owner == "" || repo == "" || file == "" || pat == "" {
 		return nil, fmt.Errorf("incomplete GitHub config")
 	}
-	apiURL := "https://api.github.com/repos/" + owner + "/" + repo + "/contents/" + file
+	apiURL := githubContentsURL(owner, repo, file)
 	client := sourceHTTPClient(15 * time.Second) // via the proxy when connected
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
@@ -573,6 +686,9 @@ func fetchGitHubPATContent(owner, repo, file, pat string) ([]string, error) {
 		return nil, fmt.Errorf("base64: %w", err)
 	}
 	text := maybeDecodeBase64Blob(string(decoded))
+	if links, ok := jsonConfigsInText(text); ok {
+		text = strings.Join(links, "\n")
+	}
 	var lines []string
 	for _, l := range strings.Split(text, "\n") {
 		l = strings.TrimSpace(l)
@@ -618,11 +734,26 @@ func maybeDecodeBase64Blob(text string) string {
 	return text
 }
 
+// brokenConfigName is what a config that did not parse is called in the table:
+// the name it carries, when its link has one, and the start of the link when
+// not. A JSON config the checks refused is a long run of base64 otherwise.
+func brokenConfigName(raw string) string {
+	if _, name := splitFragment(raw); strings.TrimSpace(name) != "" {
+		return name
+	}
+	return raw[:minInt(40, len(raw))]
+}
+
 // parseConfigLines parses node URLs from a single in-memory text blob. Used for
 // URL responses and pasted text — kept around as a convenience wrapper over
 // parseConfigReader. A whole-blob base64 paste (a subscription body) is decoded
 // first.
 func parseConfigLines(text string) []*ConfigEntry {
+	// A JSON document — an outbound, a whole xray or sing-box configuration,
+	// or an array of them — becomes vair-json:// links first.
+	if links, ok := jsonConfigsInText(text); ok {
+		text = strings.Join(links, "\n")
+	}
 	return parseConfigReader(strings.NewReader(maybeDecodeBase64Blob(text)))
 }
 
@@ -637,7 +768,26 @@ func parseConfigFile(path string) ([]*ConfigEntry, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return parseConfigReader(f), nil
+	// A JSON file — an exported xray or sing-box configuration, or an array of
+	// them — is one document, not lines: it is read whole and handed to the
+	// same conversion a paste gets. JSON files that size are never large.
+	r := bufio.NewReader(f)
+	if head, _ := r.Peek(512); isJSONStart(head) {
+		data, err := io.ReadAll(io.LimitReader(r, 64<<20))
+		if err != nil {
+			return nil, err
+		}
+		return parseConfigLines(string(data)), nil
+	}
+	return parseConfigReader(r), nil
+}
+
+// isJSONStart reports whether a text begins, after whitespace and a byte-order
+// mark, with the start of a JSON object or array.
+func isJSONStart(b []byte) bool {
+	b = bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF})
+	b = bytes.TrimLeft(b, " \t\r\n")
+	return len(b) > 0 && (b[0] == '{' || b[0] == '[')
 }
 
 // parseConfigReader does the actual scanning. bufio.Scanner.Text() allocates
@@ -718,7 +868,7 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 			e := &ConfigEntry{Raw: cfg, PingStatus: StatusPending, Delay: -1, SpeedStatus: StatusPending}
 			n, parseErr := parseNode(cfg)
 			if parseErr != nil {
-				e.Name = cfg[:minInt(40, len(cfg))]
+				e.Name = brokenConfigName(cfg)
 				// Even when the body is unparseable, the scheme is known — label by
 				// it (e.g. a broken trojan:// link shows "trojan", not the UI's
 				// "vless" fallback for an empty protocol).
@@ -742,29 +892,54 @@ func parseConfigReader(r io.Reader) []*ConfigEntry {
 	return entries
 }
 
-// dedupByBody removes entries whose node body (everything before the
-// `#` fragment) already appeared at a smaller index. The first occurrence
-// in input order is kept. Used by tabs in DedupMode "delete" — the
-// reversible "hide" mode achieves the same visual result via a JS view
-// filter in matches(), without touching the underlying entries.
-func dedupByBody(entries []*ConfigEntry) []*ConfigEntry {
+// dedupByBody removes duplicates — entries with the same canonical identity
+// (dedupKey) — keeping one of each, in input order. The one kept is the first
+// copy the tab's exclude filter shows; only when every copy is hidden, the
+// first of them. Keeping the first in input order whatever the filter said
+// deleted the copy on screen whenever a hidden twin came before it: a server
+// the user could see vanished, and the one kept was one they could not.
+// Used by tabs in DedupMode "delete"; "hide" reaches the same set in the
+// windowed read, which applies the filter before it drops duplicates.
+func dedupByBody(entries []*ConfigEntry, exclude []string) []*ConfigEntry {
 	if len(entries) <= 1 {
 		return entries
 	}
-	seen := make(map[string]bool, len(entries))
-	out := make([]*ConfigEntry, 0, len(entries))
-	for _, e := range entries {
+	keys := make([]string, len(entries))
+	keep := make(map[string]*ConfigEntry, len(entries))
+	keptHidden := make(map[string]bool, len(entries))
+	for i, e := range entries {
 		if e == nil || strings.TrimSpace(e.Raw) == "" {
 			continue
 		}
 		key := dedupKey(e.Raw) // canonical identity, not the literal body
-		if seen[key] {
-			continue
+		keys[i] = key
+		if _, ok := keep[key]; !ok {
+			keep[key] = e
+			keptHidden[key] = hiddenByExclude(e, exclude)
+		} else if keptHidden[key] && !hiddenByExclude(e, exclude) {
+			keep[key] = e
+			keptHidden[key] = false
 		}
-		seen[key] = true
-		out = append(out, e)
+	}
+	out := make([]*ConfigEntry, 0, len(keep))
+	for i, e := range entries {
+		if keys[i] != "" && keep[keys[i]] == e {
+			out = append(out, e)
+		}
 	}
 	return out
+}
+
+// hiddenByExclude reports whether a tab's exclude rules hide this config — the
+// test the windowed read applies (memWindow).
+func hiddenByExclude(e *ConfigEntry, rules []string) bool {
+	if len(rules) == 0 {
+		return false
+	}
+	e.mu.Lock()
+	name, kind, host, network, security := e.Name, e.Protocol, e.Host, e.Network, e.Security
+	e.mu.Unlock()
+	return shouldSkip(name, kind, host, network, security, rules)
 }
 
 // applyDeleteDedupInPlace removes body-duplicates from the named tab's
@@ -813,6 +988,54 @@ func reloadDelta(tabID string, entries []*ConfigEntry) (added, removed int, adde
 
 const flashIdxCap = 20000
 
+// keepMeasured gives each freshly fetched entry the results of the entry it
+// replaces — the same server, by dedupKey, so a name the list renamed does not
+// lose them. Only finished results are carried: a test still running holds the
+// old entry and would never finish the new one, which would stay "testing".
+// Returns how many entries kept something.
+func keepMeasured(tabID string, entries []*ConfigEntry) int {
+	state.mu.RLock()
+	old := state.tabEntries[tabID]
+	state.mu.RUnlock()
+	if len(old) == 0 {
+		return 0
+	}
+	type measured struct {
+		pingSt  Status
+		delay   int64
+		pingErr string
+		speedSt Status
+		mbps    float64
+		speedEr string
+	}
+	byKey := make(map[string]measured, len(old))
+	for _, e := range old {
+		e.mu.Lock()
+		byKey[dedupKey(e.Raw)] = measured{e.PingStatus, e.Delay, e.PingErr, e.SpeedStatus, e.SpeedMBps, e.SpeedErr}
+		e.mu.Unlock()
+	}
+	n := 0
+	for _, e := range entries {
+		m, ok := byKey[dedupKey(e.Raw)]
+		if !ok {
+			continue
+		}
+		kept := false
+		if m.pingSt == StatusOK || m.pingSt == StatusFailed {
+			e.PingStatus, e.Delay, e.PingErr = m.pingSt, m.delay, m.pingErr
+			kept = true
+		}
+		if m.speedSt == StatusOK || m.speedSt == StatusFailed || m.speedSt == StatusSkipped {
+			e.SpeedStatus, e.SpeedMBps, e.SpeedErr = m.speedSt, m.mbps, m.speedEr
+			kept = true
+		}
+		if kept {
+			n++
+		}
+	}
+	return n
+}
+
 // broadcastReloadDelta fires the reload_delta event when a reload changed the set.
 func broadcastReloadDelta(tabID string, added, removed int, addedIdx []int) {
 	if added > 0 || removed > 0 {
@@ -826,20 +1049,38 @@ func applyDeleteDedupInPlace(tabID string) {
 		saveTabs()
 		return
 	}
-	deduped := dedupByBody(entries)
+	exclude := tabExcludeFilter(tabID)
+	deduped := dedupByBody(entries, exclude)
 	removed := len(entries) - len(deduped)
 	if removed == 0 {
 		saveTabs()
 		return
 	}
+	beforeIdx := entryIndices(entries)
 	for i, e := range deduped {
 		e.Index = i
 	}
 	storeReplace(tabID, deduped) // SQLite is the source of truth now
+	// Undoable like any delete from the table: on a tab of its own the removed
+	// copies exist nowhere else.
+	rememberDelete(tabID, entries, deduped, beforeIdx, entryIndices(deduped))
 	loadedSignal(tabID)
-	// Report how many duplicates were dropped (the "−N" toast) — otherwise a
-	// delete-dedup silently shrinks the list.
-	broadcastReloadDelta(tabID, 0, removed, nil)
+	// Report how many duplicates were dropped (the toast, with Undo) —
+	// otherwise a delete-dedup silently shrinks the list. The copies the
+	// exclude filter hides are counted apart: they leave nothing on screen,
+	// and counting them with the rest announced "25 removed" over a list
+	// that had lost one row.
+	kept := make(map[*ConfigEntry]bool, len(deduped))
+	for _, e := range deduped {
+		kept[e] = true
+	}
+	hidden := 0
+	for _, e := range entries {
+		if e != nil && !kept[e] && hiddenByExclude(e, exclude) {
+			hidden++
+		}
+	}
+	state.broadcast(SSEEvent{Type: "reload_delta", Payload: map[string]interface{}{"added": 0, "removed": removed - hidden, "hidden": hidden, "undo": true}, Tab: tabID})
 	saveTabs()
 }
 

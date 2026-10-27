@@ -3,58 +3,56 @@
 package shell
 
 import (
-	"fmt"
-	"os/exec"
-	"syscall"
+	"os"
+
+	"vair/core"
+	"vair/helper/winsys"
 )
 
-// Windows Firewall inbound rule for the LAN remote server. Without it, the
-// default firewall silently drops inbound TCP from OTHER hosts (the phone) even
-// though the server is listening — a loopback/local Test-NetConnection still
-// succeeds, which is why "it works from the PC but not the phone" is confusing.
-// We add a narrow allow rule (this one TCP port) when remote access is enabled
-// and remove it when disabled. Best-effort: adding a firewall rule needs admin,
-// so if Vair isn't elevated these no-op and the user adds the rule by hand.
+// Windows Firewall inbound rules for the LAN remote server and the LAN-shared
+// proxy. The rules themselves — names, scope, profiles — are in helper/winsys,
+// which the helper service runs too; these decide which programs they name.
+// With the helper service installed the service makes them, without the app
+// needing rights; without it this is best-effort: adding a firewall rule needs
+// admin, so if Vair isn't elevated these no-op and Windows asks or blocks.
 
-const fwRuleName = "Vair Remote Access"
-const fwProxyRuleName = "Vair LAN Proxy"
-
-// EnsureFirewallRule (re)creates the inbound allow rule for the given port.
+// EnsureFirewallRule (re)creates the inbound allow rule for the web interface
+// on port, for this program only.
 func EnsureFirewallRule(port int) {
-	// Delete any stale rule first so a port change doesn't leave the old one open.
-	RemoveFirewallRule()
-	netsh("advfirewall", "firewall", "add", "rule",
-		"name="+fwRuleName, "dir=in", "action=allow",
-		"protocol=TCP", fmt.Sprintf("localport=%d", port),
-		"profile=private,domain") // trusted networks only — not public Wi-Fi
+	if core.ServiceMode() {
+		core.ServiceFirewallRemote(port)
+		return
+	}
+	exe, _ := os.Executable()
+	winsys.EnsureRemoteRule(port, exe)
 }
 
-// RemoveFirewallRule deletes the rule (idempotent — ignores "no rule" errors).
+// RemoveFirewallRule deletes the rule (idempotent).
 func RemoveFirewallRule() {
-	netsh("advfirewall", "firewall", "delete", "rule", "name="+fwRuleName)
+	if core.ServiceMode() {
+		core.ServiceFirewallRemote(0)
+		return
+	}
+	winsys.RemoveRemoteRule()
 }
 
-// EnsureProxyFirewallRule (re)creates the inbound allow rule for the LAN-shared
-// proxy (TUN-mode proxy sharing) — one rule covering both the HTTP and SOCKS
-// ports. Same best-effort/admin caveat as the remote rule above. TUN mode already
-// runs elevated, so netsh actually applies when this feature is in use.
+// EnsureProxyFirewallRule (re)creates the rules for the LAN-shared proxy: TCP
+// on both ports, and UDP for Vair's own relay (proxy mode) and sing-box (TUN
+// mode).
 func EnsureProxyFirewallRule(httpPort, socksPort int) {
-	RemoveProxyFirewallRule()
-	netsh("advfirewall", "firewall", "add", "rule",
-		"name="+fwProxyRuleName, "dir=in", "action=allow",
-		"protocol=TCP", fmt.Sprintf("localport=%d,%d", httpPort, socksPort),
-		"profile=private,domain") // trusted networks only — not public Wi-Fi
+	if core.ServiceMode() {
+		core.ServiceFirewallLAN(httpPort, socksPort)
+		return
+	}
+	exe, _ := os.Executable()
+	winsys.EnsureLANProxyRule(httpPort, socksPort, core.SingboxPath(), exe)
 }
 
-// RemoveProxyFirewallRule deletes the LAN-proxy rule (idempotent).
+// RemoveProxyFirewallRule deletes them (idempotent).
 func RemoveProxyFirewallRule() {
-	netsh("advfirewall", "firewall", "delete", "rule", "name="+fwProxyRuleName)
-}
-
-// netsh runs a netsh command with no console window, ignoring failures (e.g. not
-// elevated). netsh itself is trusted; args are program-controlled constants.
-func netsh(args ...string) {
-	cmd := exec.Command("netsh", args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	_ = cmd.Run()
+	if core.ServiceMode() {
+		core.ServiceFirewallLAN(0, 0)
+		return
+	}
+	winsys.RemoveLANProxyRule()
 }

@@ -29,17 +29,28 @@ import { t10 } from './i18n'
 
 type TT = (s: string) => string
 
-// One choice of a multiple-choice setting: what it is called, and what it does.
-// Both are English source strings — the pop-up translates them. For a list of
-// examples rather than options (the table filter) the left side is code and is
-// left alone; `mono` says which.
-export type HintOpt = [string, string]
+// One state of a setting — a switch on or off, one choice of a list, the default
+// value of a field or any other — with what it does, and whether it is the
+// default. Name and text are English source strings, translated where they are
+// drawn. For a list of examples rather than states (the table filter) the left
+// side is code and is left alone; `mono` says which.
+//
+// Every description is written the same way: what the setting is, then each of
+// its states on a line of its own, the default one marked. Switches put Enabled
+// above Disabled whichever is the default, so the two read in the same order
+// from one setting to the next.
+export type HintOpt = [string, string, boolean?]
 
 // opt names one. A function rather than a bare array literal so the translation
 // checker can find the two strings: it looks for calls, and a pair inside an
 // array is invisible to it — which would mean the choices in these lists were
-// the one part of the interface nothing verified had Russian.
-export const opt = (name: string, desc: string): HintOpt => [name, desc]
+// the one part of the interface nothing verified had Russian. `def` marks the
+// default.
+export const opt = (name: string, desc: string, def?: boolean): HintOpt => [name, desc, def]
+
+// The two states of a switch, named the same way under every setting.
+export const whenOn = (desc: string, def?: boolean): HintOpt => ['Enabled', desc, def]
+export const whenOff = (desc: string, def?: boolean): HintOpt => ['Disabled', desc, def]
 
 // ex names an example instead. Same pair, different rule for the left half: it
 // is what you type, so it stays as written in both languages — and the checker
@@ -87,6 +98,28 @@ export function InfoDot({ desc, className }: { desc: Desc; className?: string })
   )
 }
 
+// States draws the states of a setting, one per line, the default one marked.
+// The same block goes under the setting and into the pop-up.
+function States({ opts, tt }: { opts?: HintOpt[]; tt: TT }) {
+  if (!opts || !opts.length) return null
+  return (
+    <div className="hint-states">
+      {/* A value that needs no words of its own — the default port, say —
+          is named and marked, with nothing after it. */}
+      {opts.map(([k, v, def]) => (
+        <div className="hint-st" key={k}>
+          <span className="hint-st-k">
+            {tt(k)}
+            {def ? ' ' + tt('(default)') : ''}
+            {v ? ':' : ''}
+          </span>
+          {v ? ' ' + tt(v) : null}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // Hint is a description under a setting: the paragraph while descriptions are
 // on, the mark while they are off.
 export function Hint({
@@ -106,11 +139,18 @@ export function Hint({
 }) {
   const { lang, hide } = useContext(HintCtx)
   const tt = (s: string) => t10(lang, s)
-  const body = children ? children(tt) : tt(en || '')
+  // The states are part of the description wherever it is shown: under the
+  // setting, in the pop-up, and in the hidden copy the settings search reads.
+  // A list of examples is the exception — it stays in the pop-up.
+  const body = (
+    <>
+      {children ? children(tt) : tt(en || '')}
+      {mono ? null : <States opts={opts} tt={tt} />}
+    </>
+  )
   // Given both, they are two different sentences on purpose: `children` is what
-  // the setting says under the control — which for a list of choices is the line
-  // for the chosen one — and `en` is what the pop-up opens with, above the list
-  // of all of them. Given one, it is both.
+  // the setting says under the control and `en` is what the pop-up opens with.
+  // Given one, it is both.
   const desc: Desc = { en, opts, mono, render: en ? undefined : children }
   if (!hide)
     return (
@@ -238,13 +278,25 @@ function ownerLabel(from: HTMLElement): HTMLElement | null {
           return first
         return null
       }
+      // A label of its own, above what it names: a list of rows (a tab's
+      // files) or a field with buttons beside it (the remote-access link).
+      if (p.classList.contains('modal-row-label') || p.classList.contains('modal-label')) return p as HTMLElement
+      if (p.classList.contains('set-group-head')) {
+        // A description that opens a block is about the block.
+        return p.querySelector<HTMLElement>('.set-group-title') || (p as HTMLElement)
+      }
       if (p.classList.contains('section-header') || p.classList.contains('auto-collapse-head')) {
         // The heading's last element is its text; a fold also carries an arrow
         // before it, and the mark belongs after the words, not after the arrow.
         return (p.lastElementChild as HTMLElement) || (p as HTMLElement)
       }
     }
-    if (node.classList.contains('settings-section') || node.classList.contains('modal-box')) return null
+    if (
+      node.classList.contains('settings-section') ||
+      node.classList.contains('set-group') ||
+      node.classList.contains('modal-box')
+    )
+      return null
   }
   return null
 }
@@ -358,37 +410,41 @@ function HintPopover({
       >
         <div className="hint-pop-head">
           <span className="hint-pop-title">{tt('Description')}</span>
-          <button
-            className={'hint-lang' + (cur === 'en' ? ' on' : '')}
-            onClick={() => setCur('en')}
-          >
-            EN
-          </button>
-          <button
-            className={'hint-lang' + (cur === 'ru' ? ' on' : '')}
-            onClick={() => setCur('ru')}
-          >
-            RU
-          </button>
+          <span className="bgroup">
+            <button
+              className={'hint-lang' + (cur === 'en' ? ' on' : '')}
+              onClick={() => setCur('en')}
+            >
+              EN
+            </button>
+            <button
+              className={'hint-lang' + (cur === 'ru' ? ' on' : '')}
+              onClick={() => setCur('ru')}
+            >
+              RU
+            </button>
+          </span>
           <button className="hint-pop-x" onClick={onClose} title={tt('Close')}>
             ×
           </button>
         </div>
         {body ? <div className="hint-pop-body">{body}</div> : null}
-        {desc.opts && desc.opts.length ? (
+        {desc.mono && desc.opts && desc.opts.length ? (
           <>
-            <div className="hint-pop-cap">{desc.mono ? tt('Examples') : tt('Options')}</div>
+            <div className="hint-pop-cap">{tt('Examples')}</div>
             <div className="hint-opts">
               {desc.opts.map(([k, v]) => (
                 <div className="hint-opt" key={k}>
-                  <span className={'hint-opt-k' + (desc.mono ? ' mono' : '')}>
-                    {desc.mono ? k : tt(k)}
-                  </span>
+                  <span className="hint-opt-k mono">{k}</span>
                   <span className="hint-opt-v">{tt(v)}</span>
                 </div>
               ))}
             </div>
           </>
+        ) : desc.opts && desc.opts.length ? (
+          <div className="hint-pop-body">
+            <States opts={desc.opts} tt={tt} />
+          </div>
         ) : null}
       </div>
     </>

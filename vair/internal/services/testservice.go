@@ -20,8 +20,9 @@ func (t *TestService) PingOne(idx int)  { core.PingOne(idx) }
 func (t *TestService) SpeedOne(idx int) { core.SpeedOne(idx) }
 
 // PingSelected / SpeedSelected test a chosen set (the row context menu).
-func (t *TestService) PingSelected(idxs []int)  { core.PingSelected(idxs) }
-func (t *TestService) SpeedSelected(idxs []int) { core.SpeedSelected(idxs) }
+// raws are the selected configurations, index for index (see core.PingSelected).
+func (t *TestService) PingSelected(idxs []int, raws []string)  { core.PingSelected(idxs, raws) }
+func (t *TestService) SpeedSelected(idxs []int, raws []string) { core.SpeedSelected(idxs, raws) }
 
 // PingConnected re-pings the currently connected config regardless of which
 // tab the UI is showing (the conn-bar ping chip).

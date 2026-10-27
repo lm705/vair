@@ -31,6 +31,14 @@ var (
 	memCacheTab string
 	memCacheSig string
 	memCacheOrd []*ConfigEntry // filtered + sorted pointers for (memCacheTab, memCacheSig)
+	// memCacheGen counts invalidations. An order is computed outside the lock
+	// from a copy of the tab's entries; if an invalidation lands meanwhile, the
+	// copy is from before the change and must not become the cached answer.
+	// It did: a move (or a delete, a paste) made while a sweep kept asking for
+	// stats had its invalidation overwritten by an order read a moment
+	// earlier, and the table went on showing the old order until another tab
+	// was opened.
+	memCacheGen uint64
 )
 
 // loadConfigsIntoMemory fills state.tabEntries from the durable SQLite store at
@@ -88,6 +96,7 @@ func resetTabResultsMem(tabID string) int {
 // (e.g. after a batch of test results that may have touched any tab).
 func memInvalidate(tabID string) {
 	memCacheMu.Lock()
+	memCacheGen++
 	if tabID == "" || memCacheTab == tabID {
 		memCacheSig = ""
 		memCacheOrd = nil
@@ -271,17 +280,43 @@ func parseFilterTerms(filter string) []filterTerm {
 	return out
 }
 
+// protoAliases are the short names the filter accepts for a protocol.
+var protoAliases = map[string]string{"hy2": "hysteria2", "wg": "wireguard"}
+
 // termHitKey reports whether a value matches the entry in the given column key.
+//
+// Type, transport and security are short codes that contain one another — "ss"
+// is in "vless" and "vmess", "http" in "httpupgrade" — so a code the filter
+// knows (classifyBare) is compared whole, through the same aliases the rest of
+// the program uses: hy2 and wg find Hysteria2 and WireGuard, h2 finds http. A
+// part of a word that is not a code ("vle") is still looked for inside.
 func termHitKey(k *sortKey, key, val string) bool {
+	known := classifyBare(val) == key
 	switch key {
 	case "name":
 		return strings.Contains(k.nameSearch, val)
 	case "host":
 		return strings.Contains(k.host, val)
 	case "type":
+		if known {
+			if a, ok := protoAliases[val]; ok {
+				val = a
+			}
+			return k.protocol == val || k.chip == val
+		}
 		return strings.Contains(k.protocol, val) || strings.Contains(k.chip, val)
 	case "transport":
+		if known {
+			return normNetwork(k.network) == normNetwork(val)
+		}
 		return strings.Contains(k.network, val)
+	case "security":
+		// It had no case of its own and fell through to "any column": tls found
+		// every server with "tls" in its name.
+		if known {
+			return normSecurity(k.security) == normSecurity(val)
+		}
+		return strings.Contains(k.security, val)
 	case "unlock":
 		// Not a column: the answer of the last service check. "unlock:chatgpt"
 		// means "servers that opened ChatGPT" — a config nobody checked is not a
@@ -322,6 +357,7 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 		memCacheMu.Unlock()
 		return ord
 	}
+	gen := memCacheGen
 	memCacheMu.Unlock()
 
 	// Fast path: the default view (idx order, no filter/proto/dedup/favorites) is
@@ -330,9 +366,7 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 		state.mu.RLock()
 		ord := append([]*ConfigEntry(nil), state.tabEntries[tabID]...)
 		state.mu.RUnlock()
-		memCacheMu.Lock()
-		memCacheTab, memCacheSig, memCacheOrd = tabID, sig, ord
-		memCacheMu.Unlock()
+		memCacheStore(gen, tabID, sig, ord)
 		return ord
 	}
 
@@ -370,7 +404,7 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 			e: e, idx: e.Index, delay: e.Delay, speed: e.SpeedMBps, stab: -1,
 			pStatus: e.PingStatus, sStatus: e.SpeedStatus,
 			name: nameLower, nameSearch: searchableName(nameLower), host: strings.ToLower(e.Host),
-			network: strings.ToLower(e.Network), security: strings.ToLower(e.Security),
+			network: shownNetwork(e.Network), security: strings.ToLower(e.Security),
 			protocol: strings.ToLower(e.Protocol),
 		}
 		raw := e.Raw
@@ -419,10 +453,19 @@ func memOrder(tabID string, q windowQuery, favorites []string) []*ConfigEntry {
 	for i := range keys {
 		out[i] = keys[i].e
 	}
-	memCacheMu.Lock()
-	memCacheTab, memCacheSig, memCacheOrd = tabID, sig, out
-	memCacheMu.Unlock()
+	memCacheStore(gen, tabID, sig, out)
 	return out
+}
+
+// memCacheStore caches an order computed from the entries as they were at
+// generation gen — unless the cache has been invalidated since, in which case
+// the order is already out of date and the next read computes it again.
+func memCacheStore(gen uint64, tabID, sig string, ord []*ConfigEntry) {
+	memCacheMu.Lock()
+	if memCacheGen == gen {
+		memCacheTab, memCacheSig, memCacheOrd = tabID, sig, ord
+	}
+	memCacheMu.Unlock()
 }
 
 func speedRank(k *sortKey) int {
