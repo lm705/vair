@@ -1,20 +1,24 @@
 {
-  "version": "2.6.0",
-  "url": "https://github.com/lm705/vair/releases/download/v2.6.0/Vair.exe",
-  "sha256": "82a1b38a7919a541425e2cd29f63e835b001fb5fff7956c0afe6634e8eed1828",
-  "notes": "Установщик Vair_Setup.exe рядом с портативной сборкой. Панель соединений: что идёт через туннель и что мимо. Колонка Stability и окно истории замеров, проверка доступа к семи сервисам, панель «Сессия». Выбор IPv6 и стека TCP/IP, списки резолверов DNS, четыре режима ранжирования AUTO, его пороги в настройках и проверка IP в его панели. Живость канала по счётчикам трафика, постоянная блокировка снимается только вручную, настройки по разделам с поиском и описаниями.",
+  "version": "2.7.0",
+  "url": "https://github.com/lm705/vair/releases/download/v2.7.0/Vair.exe",
+  "sha256": "15aac6646124905502c490d0471176b22415eae235daa9610c8a0549576b58dd",
+  "notes": "Служба-помощник на Windows: установщик ставит Vair для всех пользователей, а TUN и kill-switch работают без прав администратора. Kill-switch на фильтрах WFP блокирует весь трафик мимо туннеля, после подключения проверяются утечки. Собственные запросы Vair идут через туннель. JSON-конфигурации Xray и sing-box, закрепление сертификата pcs=, отмена удаления, работа с клавиатуры, единые описания настроек. Исправлены утечки DNS в режиме PROXY; сборка на Go 1.26.10.",
   "assets": {
     "linux/amd64/deb": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.6.0/vair_2.6.0-1_amd64.deb",
-      "sha256": "1f927a0833d7b885a1bacc71ed06d2744048aea82a74ef3af00fcfa15d56388b"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/vair_2.7.0-1_amd64.deb",
+      "sha256": "62d297cf494fac39b476e13a104655ebed2579634323287c20149406c36357b1"
     },
     "linux/amd64/rpm": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.6.0/vair-2.6.0-1.x86_64.rpm",
-      "sha256": "e60694052d35f2b4c4b238e65c31080ea7b2ec1258d4108f6002193a8d05f48c"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/vair-2.7.0-1.x86_64.rpm",
+      "sha256": "37438c4e27a12c903f7847baf7112bdd0143e41bcefa2847107b1ff42a433053"
     },
     "linux/amd64/archlinux": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.6.0/vair-2.6.0-1-x86_64.pkg.tar.zst",
-      "sha256": "36d88d56681c1bfd2e19fe183e60992299a3d99f45a308d1401e471f8bad7d34"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/vair-2.7.0-1-x86_64.pkg.tar.zst",
+      "sha256": "68b80cec193421a39e9a2ee4aed48ddf37026ee273d1920de0ee311d4e903811"
+    },
+    "windows/amd64/installer": {
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/Vair_2.7.0_setup.exe",
+      "sha256": "37bd3d6a56f5e0c9d23f888646eb2a0bbbb55c4804fdb25fabdbd514e30f4947"
     }
   }
 }
