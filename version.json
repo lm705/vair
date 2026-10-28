@@ -1,24 +1,24 @@
 {
-  "version": "2.7.0",
-  "url": "https://github.com/lm705/vair/releases/download/v2.7.0/Vair.exe",
-  "sha256": "15aac6646124905502c490d0471176b22415eae235daa9610c8a0549576b58dd",
-  "notes": "Служба-помощник на Windows: установщик ставит Vair для всех пользователей, а TUN и kill-switch работают без прав администратора. Kill-switch на фильтрах WFP блокирует весь трафик мимо туннеля, после подключения проверяются утечки. Собственные запросы Vair идут через туннель. JSON-конфигурации Xray и sing-box, закрепление сертификата pcs=, отмена удаления, работа с клавиатуры, единые описания настроек. Исправлены утечки DNS в режиме PROXY; сборка на Go 1.26.10.",
+  "version": "2.7.1",
+  "url": "https://github.com/lm705/vair/releases/download/v2.7.1/Vair.exe",
+  "sha256": "3955d03b7800cbb05ebfb142b2df20c2796ffa1120b8c1f7e3720b168c6182c4",
+  "notes": "Исправлено падение при переключении вкладок с конфигами на Linux. Переход между вкладками, добавленный в 2.7.0, на WebKitGTK (Ubuntu 24.04 и подобные) ронял окно программы; теперь на этом движке переход мгновенный, без анимации. На Windows и в веб-интерфейсе ничего не меняется. Остальное — как в 2.7.0.",
   "assets": {
     "linux/amd64/deb": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/vair_2.7.0-1_amd64.deb",
-      "sha256": "62d297cf494fac39b476e13a104655ebed2579634323287c20149406c36357b1"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/vair_2.7.1-1_amd64.deb",
+      "sha256": "85beabe9cb28b520d392b2306c38f736f27c31f227301fa9182576a4ea043247"
     },
     "linux/amd64/rpm": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/vair-2.7.0-1.x86_64.rpm",
-      "sha256": "37438c4e27a12c903f7847baf7112bdd0143e41bcefa2847107b1ff42a433053"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/vair-2.7.1-1.x86_64.rpm",
+      "sha256": "3fe3a4dc6107114e4b521431f1f8cc2cdb2a231a70cb6b8011e0de7876d98994"
     },
     "linux/amd64/archlinux": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/vair-2.7.0-1-x86_64.pkg.tar.zst",
-      "sha256": "68b80cec193421a39e9a2ee4aed48ddf37026ee273d1920de0ee311d4e903811"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/vair-2.7.1-1-x86_64.pkg.tar.zst",
+      "sha256": "847f20266ba1ac4553ebaf2e621efc9e9c6df695409d0ce3fd0a1f185e9dd284"
     },
     "windows/amd64/installer": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.0/Vair_2.7.0_setup.exe",
-      "sha256": "37bd3d6a56f5e0c9d23f888646eb2a0bbbb55c4804fdb25fabdbd514e30f4947"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/Vair_2.7.1_setup.exe",
+      "sha256": "e4d79ee6a27b5cc676ebc03cf21fe4effa87cda06bc298dab5fa9b838007ebf0"
     }
   }
 }
