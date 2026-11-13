@@ -10,15 +10,19 @@
 
 > ⚠️ This is an AI translation and may be inaccurate. The [Russian version](README.md) is the source of truth.
 
-A VPN client for testing and connecting to configurations of the **VLESS, VMess, Trojan, Shadowsocks (including SS2022), Hysteria2, TUIC, WireGuard** protocols, as well as ordinary **SOCKS5, HTTP and HTTPS** proxies. Built on top of [Xray-core](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box).
+Vair is a VPN client for Windows and Linux. It tests and connects configurations of the **VLESS, VMess, Trojan, Shadowsocks (including SS2022), Hysteria2, TUIC, WireGuard** protocols, as well as ordinary **SOCKS5, HTTP and HTTPS** proxies. It runs on the [Xray-core](https://github.com/XTLS/Xray-core) and [sing-box](https://github.com/SagerNet/sing-box) engines.
 
-**You can start without configurations of your own:** a list of free ones is already built in — it is refreshed every hour and checked automatically. In [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) mode the app tests the configurations itself, connects to the fastest working one and switches to another if it stops responding. A tab's auto-refresh then keeps the list itself current — fresh configurations arrive without you doing anything.
+**You can start without configurations of your own:** the **SOURCES** tab already holds a list of free ones that is refreshed regularly and checked automatically. In [**AUTO**](https://github.com/lm705/vair/wiki/Авто-подключение) mode the app tests the configurations itself, connects to the fastest working one and switches to another if it stops responding. The **RELOAD** button fetches the latest version of the list.
 
 > ℹ️ **Note:** that built-in list is collected and tested **inside Russia only**, so it may not work in your country. In that case add your own subscriptions and configurations — everything below works exactly the same with them.
 
-Your own configurations are just as welcome: **subscription links**, files and individual configurations sort into tabs and work with the same testing, routing and AUTO.
+You can add your own too: **subscription links**, files and individual configurations sort into tabs, and the same testing, routing and AUTO work for them.
 
-**Windows and Linux.** On Windows: the `Vair_<version>_setup.exe` installer, which installs the program for all users together with a small helper service, after which Vair runs without administrator rights, TUN mode and the kill-switch included; or the portable `Vair.exe` with the engines inside (no installation; TUN needs it run as administrator). On Linux: `.deb`, `.rpm` and Arch packages, with the engines installed and updated alongside.
+**Windows and Linux:**
+
+* **Windows, installer** `Vair_<version>_setup.exe` — installs the program for all users together with a small helper service. After that Vair runs without administrator rights, TUN mode and the kill-switch included.
+* **Windows, portable** `Vair.exe` — runs without installation, engines inside. For TUN mode it has to be run as administrator.
+* **Linux** — `.deb`, `.rpm` and Arch packages; the engines are installed and updated with the package.
 
 <a href="screenshots/main-window.png"><img src="screenshots/main-window.png" alt="Vair main window: the configuration table with test results" width="900"></a> <a href="screenshots/auto-panel.png"><img src="screenshots/auto-panel.png" alt="The AUTO panel: the connection, the candidates and the IP check" width="450"></a>
 
@@ -47,9 +51,10 @@ Your own configurations are just as welcome: **subscription links**, files and i
 
 ## Feedback
 
-* News, releases and test builds: the Telegram channel [**t.me/vair705**](https://t.me/vair705). *(in Russian)*
-* Please post suggestions, bugs and any feedback in [**Issues**](https://github.com/lm705/vair/issues). Feel free to write in whatever language is convenient for you.
-* To reach me directly: Telegram [**t.me/mial705**](https://t.me/mial705).
+* **News and releases** — the Telegram channel [**t.me/vair705**](https://t.me/vair705) *(in Russian)*. The 3.0.0 test builds will be published there too.
+* **Bugs and suggestions** — in [**Issues**](https://github.com/lm705/vair/issues), in any language.
+* **Write to me directly** — Telegram [**t.me/mial705**](https://t.me/mial705).
+* **Discussion** — the chat [**t.me/vair705chat**](https://t.me/vair705chat).
 
 ## Quick start
 
@@ -78,17 +83,17 @@ More in [Getting started](https://github.com/lm705/vair/wiki/Начало-раб
 
 ## Features
 
-* **Protocols** — VLESS / VMess / Trojan / Shadowsocks / SS2022 / Hysteria2 / TUIC / WireGuard, plus SOCKS5, HTTP and HTTPS proxies, with TLS and Reality.
-* **Two modes** — system proxy (HTTP/SOCKS) and TUN: all traffic through the tunnel.
-* [**Auto-connect (AUTO)**](https://github.com/lm705/vair/wiki/Авто-подключение) — connects to the fastest working configuration and switches over when it stops answering.
-* **Testing** — latency and speed per configuration, in bulk too; results persist between launches and build a history. Plus a check of which services open from which server.
-* **Routing** — five modes: everything through the VPN; everything except the sites of selected countries (🇷🇺 🇨🇳 🇮🇷 🇰🇿); only what is blocked in Russia; only what is blocked in China; only selected sites. Plus your own rules for domains, IPs and apps.
-* **Leak protection** — a kill-switch and DNS leak protection in TUN mode, on Windows and Linux alike; a block that outlives the program being closed (Windows); a leak check after every connection (Windows); a choice of what happens to IPv6.
-* **You can see what is in the tunnel** — the connections panel: program, destination, the rule that applied and the traffic, with a separate table for what goes around the VPN.
-* **Chains and DPI bypass** — connect through several nodes in a row; TLS handshake fragmentation and a browser TLS fingerprint (uTLS).
-* **Tabs and sources** — subscription links, files and a private GitHub repository, with auto-refresh and filters; lists of up to ~250,000 configurations stay smooth (SQLite).
-* **VPN on your phone** — share the proxy over the local network from TUN mode and [control the app from a phone](https://github.com/lm705/pc-vpn-to-phone).
-* **Conveniences** — QR codes, creating configurations by hand, raw Xray and sing-box JSON included, self-update, autostart, dark and light themes, Russian and English interface.
+* **Protocols.** VLESS, VMess, Trojan, Shadowsocks (including SS2022), Hysteria2, TUIC and WireGuard, as well as SOCKS5, HTTP and HTTPS proxies. TLS and REALITY are supported.
+* **Connection modes.** System proxy (HTTP/SOCKS) or TUN, which captures all system traffic.
+* [**Auto-connect (AUTO)**](https://github.com/lm705/vair/wiki/Авто-подключение). Picks the fastest working configuration and switches to another one when the server stops responding.
+* **Testing.** Latency and speed of each configuration, one at a time or in bulk. Results persist between launches and build up a measurement history. A separate check shows which services are reachable through each server.
+* **Routing.** Five modes: all traffic through the VPN; everything except the sites of selected countries (🇷🇺 🇨🇳 🇮🇷 🇰🇿); only resources blocked in Russia; only resources blocked in China; only selected sites. Custom rules for domains, IP addresses and applications on top.
+* **Leak protection.** A kill-switch and DNS protection in TUN mode and a leak check after every connection, on Windows and Linux. On Windows, also a block that stays in place after the program is closed. IPv6 handling is configured separately.
+* **Connection monitoring.** The connections panel shows the program, destination, applied rule and traffic volume; connections that bypass the VPN are listed in a separate table.
+* **Chains and DPI bypass.** Connections through several servers in sequence; TLS handshake fragmentation and a browser TLS fingerprint (uTLS).
+* **Configuration management.** Tabs, subscription links, files and private GitHub repositories, scheduled refresh and filters. Lists of up to ~250,000 configurations work without noticeable lag (stored in SQLite).
+* **Phone access.** Proxy sharing over the local network from TUN mode and [controlling the app from a phone](https://github.com/lm705/pc-vpn-to-phone).
+* **Other.** QR codes; manual configuration creation, including raw Xray and sing-box JSON; checking for and downloading updates; autostart; dark and light themes; Russian and English interface.
 
 ## Documentation
 
