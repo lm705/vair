@@ -2428,6 +2428,11 @@ func nodeUnsupportedReason(n *Node) string {
 	if pin := certPinOf(n); pin != "" && !validCertPins(pin) {
 		return "pcs= is not a certificate's SHA-256: expected 64 hexadecimal characters"
 	}
+	// Plaintext VLESS/Trojan goes to sing-box; on a transport sing-box lacks,
+	// xray would only stop with a line about its config parser.
+	if xrayRefusesPlaintext(n) && singboxOutboundForNode(n) == nil {
+		return plaintextUnsupported
+	}
 	return ""
 }
 
@@ -3261,6 +3266,11 @@ func engineForNode(n *Node) string {
 	// xray it could not connect at all. When sing-box cannot carry it (an
 	// xray-only transport), it stays on xray with the certificate checked.
 	if skipsCertCheck(n) && singboxOutboundForNode(n) != nil {
+		return "singbox"
+	}
+	// Likewise VLESS and Trojan without TLS to a public address, which xray
+	// refuses from 26.9 (plaintext.go).
+	if xrayRefusesPlaintext(n) && singboxOutboundForNode(n) != nil {
 		return "singbox"
 	}
 	if n.Kind == KindSS && n.SS != nil && n.SS.PluginName != "" &&

@@ -62,6 +62,13 @@ export function CheckRules(entries: string[] | null): $CancellablePromise<core$0
 }
 
 /**
+ * DismissStartupNotice records "Don't show again" on the 2.7.2 startup notice.
+ */
+export function DismissStartupNotice(): $CancellablePromise<void> {
+    return $Call.ByID(673956219);
+}
+
+/**
  * Export saves tabs + tab settings + app settings to a JSON file picked in the
  * native Save dialog. Returns "" on success, "cancelled", or an error text.
  * 

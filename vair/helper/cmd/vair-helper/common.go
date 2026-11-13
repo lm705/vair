@@ -14,7 +14,7 @@ import (
 
 // version is reported in the hello response. It is the protocol that decides
 // compatibility; this is for humans reading logs.
-const version = "2.7.0"
+const version = "2.7.2"
 
 // writeTimeout bounds every write to a client.
 //

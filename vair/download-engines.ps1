@@ -31,17 +31,17 @@ Set-Location $PSScriptRoot
 # The versions a release ships with, and the SHA-256 of each archive as GitHub
 # lists it for the asset. Update both together, after testing the new engine.
 #
-# Xray stays below 26.9: from 26.9.x it refuses to start a VLESS outbound with
-# no TLS and no VLESS encryption to a public address ("vless without TLS or
-# other encryption is prohibited"), and such configurations are common in
-# subscriptions. 26.7.28 carries the fix for GHSA-5wf9-h793-w73c (a pinned
-# certificate, pcs=, did not hold for gRPC and Hysteria2) and accepts every
-# configuration 26.3.27 did.
-$PinnedXray    = "v26.7.28"
-$PinnedSingbox = "v1.13.16"
+# From 26.9 xray refuses to start a VLESS outbound with no TLS and no VLESS
+# encryption, or a Trojan outbound without TLS, to a public address ("vless
+# without TLS or other encryption is prohibited"). Such configurations are
+# common in subscriptions; they run on sing-box (core/plaintext.go), so the
+# pin is no longer held below 26.9. 26.10.21 dropped root certificates whose
+# keys were broken, 26.10.31 turned MPTCP off by default.
+$PinnedXray    = "v26.11.9"
+$PinnedSingbox = "v1.14.4"
 $PinnedSha256 = @{
-    "XTLS/Xray-core/v26.7.28/Xray-windows-64.zip"                 = "c7172078fca4711bcd92a4774dcd1822544579c58816197575c47533317fd8d1"
-    "SagerNet/sing-box/v1.13.16/sing-box-1.13.16-windows-amd64.zip" = "6cbf90ec4ee87122ffce09b73928fb31e763bc1c75a119f79c61d24734c78807"
+    "XTLS/Xray-core/v26.11.9/Xray-windows-64.zip"                 = "1262522266337b824f07beb8e1375786b437683b3890105469088f8e17e0a69d"
+    "SagerNet/sing-box/v1.14.4/sing-box-1.14.4-windows-amd64.zip" = "99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df"
 }
 
 # GitHub's release CDN needs TLS 1.2+; Windows PowerShell 5.1 still negotiates

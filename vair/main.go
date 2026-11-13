@@ -79,7 +79,7 @@ func main() {
 
 	app := application.New(application.Options{
 		Name:        "Vair",
-		Description: "Vair 2.7.0",
+		Description: "Vair 2.7.2",
 		Services: []application.Service{
 			application.NewService(&services.ConfigService{}),
 			application.NewService(&services.TabService{}),

@@ -399,6 +399,7 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 	if err != nil {
 		entry.mu.Lock()
 		entry.SpeedStatus = StatusFailed
+		entry.SpeedMBps = 0
 		entry.SpeedErr = err.Error()
 		entry.mu.Unlock()
 		return
@@ -412,6 +413,7 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 		entry.Delay = -1
 		entry.PingErr = reason
 		entry.SpeedStatus = StatusFailed
+		entry.SpeedMBps = 0
 		entry.SpeedErr = reason
 		entry.SpeedLive = 0
 		entry.mu.Unlock()
@@ -438,6 +440,13 @@ func runSpeedForEntry(entry *ConfigEntry, tabID string, cancel <-chan struct{}) 
 			entry.PingErr = cleanPingErr(pingErr)
 			entry.SpeedStatus = StatusSkipped
 			entry.SpeedErr = "ping failed"
+			// The previous run's speed goes too. The row shows "—" for a skipped
+			// speed, but the speed sort ranks any speed above zero as measured:
+			// left in place, a server that is down now kept its old place among
+			// the fastest (an AUTO sweep, which does not clear rows before
+			// testing them, showed it as a row with no speed at the top).
+			entry.SpeedMBps = 0
+			entry.SpeedLive = 0
 			entry.mu.Unlock()
 			state.broadcast(SSEEvent{Type: "entry_update", Payload: entryPayload(entry.snap()), Tab: tabID})
 			return nil

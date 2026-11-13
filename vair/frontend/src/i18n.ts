@@ -70,6 +70,8 @@ export const RU: Record<string, string> = {
       "не восстановлено: одной из конфигураций цепочки больше нет ни в одной вкладке — трафик остаётся заблокированным (kill-switch); отключитесь, чтобы снять блокировку",
     "xray no longer allows turning off the certificate check (allowInsecure) — pin the certificate instead: pinnedPeerCertSha256 in the configuration":
       "xray больше не позволяет отключать проверку сертификата (allowInsecure) — закрепите сертификат: pinnedPeerCertSha256 в конфигурации",
+    "xray no longer connects to a public address without TLS, and sing-box does not run this transport":
+      "xray больше не подключается к публичному адресу без TLS, а sing-box не поддерживает этот транспорт",
     "Server certificate":
       "Сертификат сервера",
     "checked":
@@ -1373,6 +1375,23 @@ export const RU: Record<string, string> = {
     "finishes a large pool faster but makes each result less accurate, because the tests share one connection.": "большой пул проверяется быстрее, но каждый результат менее точен: тесты делят одно подключение.",
     "How many candidates are speed-tested at the same time; used only by the ranking modes that measure speed. Shared with Settings → Testing: a change here applies there too, including manual SPEED ALL runs.": "Сколько кандидатов проходит тест скорости одновременно; используется только в режимах ранжирования, которые измеряют скорость. Общая с «Настройки → Тестирование»: изменение здесь действует и там, в том числе для ручного SPEED ALL.",
     "parallel tests split your bandwidth, so each one measures only part of the server's real speed.": "параллельные тесты делят ваш канал, и каждый измеряет только часть настоящей скорости сервера.",
+
+    // Settings footer and the main window header (2.7.2)
+    "Telegram channel": "Telegram-канал",
+    "Like Vair? Give it a star on GitHub": "Нравится Vair? Поставьте звезду на GitHub",
+
+    // Startup notice (2.7.2 only — StartupNotice.tsx; leave out of 3.0.0)
+    "Vair has a Telegram channel": "У Vair появился Telegram-канал",
+    "News and new versions come out there. Version 3.0.0 is coming soon — with zapret (DPI bypass) and more.":
+      "Там выходят новости и новые версии. Скоро выйдет 3.0.0 — с zapret (обходом DPI) и не только.",
+    "3.0.0 needs testers. Its test build will be published in the channel: anyone will be able to download it and try it.":
+      "Для 3.0.0 нужны тестировщики. Тестовая сборка будет в канале: скачать и попробовать сможет любой.",
+    "If you can, write what works and what does not:":
+      "Если получится, напишите, что работает, а что нет:",
+    "in a private message": "в личные сообщения",
+    "in the discussion chat": "в чат обсуждения",
+    "Your system, provider and city help to find the cause of a problem, but they are optional — share only what you want to.":
+      "Система, провайдер и город помогают найти причину проблемы, но указывать их не обязательно — пишите только то, чем готовы поделиться.",
 }
 
 export function t10(lang: string, en: string): string {

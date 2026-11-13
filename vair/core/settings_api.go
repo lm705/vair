@@ -60,6 +60,7 @@ func keepProgramOwned(s *AppSettings, cur AppSettings) {
 	s.RemoteToken = cur.RemoteToken
 	s.UnlockServices = cur.UnlockServices
 	s.UpdateDismissedVersion = cur.UpdateDismissedVersion
+	s.StartupNoticeDismissed = cur.StartupNoticeDismissed
 	s.ConnTracking = cur.ConnTracking
 	s.SettingsRev = cur.SettingsRev
 }

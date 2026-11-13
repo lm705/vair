@@ -19,6 +19,9 @@ func (s *SettingsService) Get() core.AppSettings {
 // without sending a whole settings object back for it.
 func (s *SettingsService) SetSelectedMode(mode string) { core.SetSelectedMode(mode) }
 
+// DismissStartupNotice records "Don't show again" on the 2.7.2 startup notice.
+func (s *SettingsService) DismissStartupNotice() { core.DismissStartupNotice() }
+
 // Set applies a settings save and returns the applied settings.
 func (s *SettingsService) Set(ns core.AppSettings) core.AppSettings {
 	old := core.GetSettings()

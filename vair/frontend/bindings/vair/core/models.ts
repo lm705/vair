@@ -168,6 +168,13 @@ export interface AppSettings {
     "update_dismissed_version"?: string;
 
     /**
+     * StartupNoticeDismissed: the startup notice about the Telegram channel and
+     * the 3.0.0 test builds was closed with "Don't show again" (2.7.2 only, see
+     * startup_notice.go).
+     */
+    "startup_notice_dismissed"?: boolean;
+
+    /**
      * VerboseLogs raises the xray/sing-box log level from warning→info so the
      * Logs panel shows the detailed per-connection lines. Takes effect on the
      * next connection.

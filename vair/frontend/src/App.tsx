@@ -6,7 +6,7 @@ import { flushSync } from 'react-dom'
 import Check from './Check'
 import { Events, Window } from '@wailsio/runtime'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { IS_REMOTE } from './remote'
+import { IS_REMOTE, openLink } from './remote'
 import {
   ConfigService,
   ConnService,
@@ -29,6 +29,7 @@ import AutoModal from './AutoModal'
 import ConfigModal from './ConfigModal'
 import ConnectionsPanel from './ConnectionsPanel'
 import LinkConfirm from './LinkConfirm'
+import StartupNotice from './StartupNotice'
 import HistoryModal from './HistoryModal'
 import SessionModal from './SessionModal'
 import UnlockModal from './UnlockModal'
@@ -38,6 +39,19 @@ import { dialogOpen } from './dialogkeys'
 import { HintHost, InfoDot, ex } from './hints'
 import type { Desc } from './hints'
 import { endReasonText, chainErrText, srcErrText } from './reasons'
+
+// WebKitGTK — the WebView of the Linux build — segfaults in native code when a
+// View Transition is composited (seen on Ubuntu 24.04, WebKitGTK 2.52.6, opening
+// a config tab: the crossfade runs startViewTransition and the renderer crashes).
+// The API is present there, so the feature test alone let it through; the tab
+// crossfade is turned off here so it is never called. Its user agent is the
+// WebKitGTK shape — AppleWebKit on Linux, with no Chromium — which the web UI
+// (opened in a real browser) does not match, so the crossfade still runs there.
+const isWebKitGTK =
+  typeof navigator !== 'undefined' &&
+  /\bAppleWebKit\b/.test(navigator.userAgent) &&
+  /\bLinux\b/.test(navigator.userAgent) &&
+  !/\bChrom(e|ium)\b/.test(navigator.userAgent)
 
 type Row = NonNullable<Awaited<ReturnType<typeof ConfigService.Window>>>[number]
 // Sort is "idx" (original order) or "<column>" / "<column>:desc" — the table
@@ -544,6 +558,15 @@ export default function App() {
   const [sessionOpen, setSessionOpen] = useState(false)
   // A vair:// link waiting for the user's yes (see LinkConfirm).
   const [linkPending, setLinkPending] = useState<string | null>(null)
+  // The 2.7.2 startup notice, closed for this run (StartupNotice).
+  const [noticeClosed, setNoticeClosed] = useState(false)
+  // The "star it on GitHub" line in the header is shown only while the room
+  // between the figures and the buttons holds it whole. Measured rather than
+  // guessed from the window width: the room depends on which figures are shown,
+  // the language (the Russian line is longer) and the font size.
+  const starWrapRef = useRef<HTMLDivElement>(null)
+  const starRef = useRef<HTMLAnchorElement>(null)
+  const [starFits, setStarFits] = useState(false)
   const [winW, setWinW] = useState(0)
   // logs
   const [logsOpen, setLogsOpen] = useState(false)
@@ -633,7 +656,8 @@ export default function App() {
   const crossfadesRef = useRef(0)
   const crossfadeOK = () =>
     typeof (document as any).startViewTransition === 'function' &&
-    !window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    !window.matchMedia('(prefers-reduced-motion: reduce)').matches &&
+    !isWebKitGTK
   // The crossfade: the browser keeps a picture of the table, apply() switches
   // the tab, and once tabRowsReady the picture blends into the new table. Only
   // the table takes part (html.vt-tab in style.css names it, for the length of
@@ -755,8 +779,12 @@ export default function App() {
   // unchanged). When sorted by ping/speed, refetch the visible windows on a 1s
   // debounce so rows actually re-order as results arrive (the no-blank window
   // refetch keeps scroll + rows). idx sort never reorders on results → skipped.
+  // The field decides, not the direction: "speed:desc" (and stability, which a
+  // test adds to) depend on results just as much as "speed" does, and compared
+  // as whole strings they were left in the order the run started with.
   const scheduleResort = () => {
-    if (resortTimer.current || (sortRef.current !== 'ping' && sortRef.current !== 'speed')) return
+    const field = sortRef.current.split(':')[0]
+    if (resortTimer.current || (field !== 'ping' && field !== 'speed' && field !== 'stab')) return
     resortTimer.current = window.setTimeout(() => {
       resortTimer.current = 0
       setReloadKey((k) => k + 1)
@@ -865,6 +893,22 @@ export default function App() {
     bump((v) => v + 1)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sort, filter, protos, activeTab, reloadKey])
+
+  // Whether the star line fits its room (see starFits). Hidden by visibility,
+  // not removed, so it keeps its width and can be measured again: the room
+  // changes with the window and the figures, the line with the language and
+  // the font size, and the observer hears both.
+  useLayoutEffect(() => {
+    const wrap = starWrapRef.current
+    const star = starRef.current
+    if (!wrap || !star) return
+    const check = () => setStarFits(star.offsetWidth <= wrap.clientWidth)
+    check()
+    const ro = new ResizeObserver(check)
+    ro.observe(wrap)
+    ro.observe(star)
+    return () => ro.disconnect()
+  }, [])
 
   // A tab's remembered offset, put back on the first render tall enough for it:
   // a stashed tab gets its row count in the render after the switch, and setting
@@ -3627,7 +3671,22 @@ export default function App() {
             </div>
           )}
         </div>
-        <div className="spacer" />
+        {/* A quiet line in the free room between the figures and the buttons:
+            dim, and hidden whole rather than cut when the room is too narrow
+            (starFits). Unlike the rest of the header it follows the language
+            setting — it is a sentence, not a label. */}
+        <div className="spacer hdr-star-wrap" ref={starWrapRef}>
+          <a
+            ref={starRef}
+            className="hdr-star"
+            style={starFits ? undefined : { visibility: 'hidden' }}
+            aria-hidden={starFits ? undefined : true}
+            title="github.com/lm705/vair"
+            onClick={() => openLink('https://github.com/lm705/vair')}
+          >
+            {tt('Like Vair? Give it a star on GitHub')}
+          </a>
+        </div>
         <div className="ctrls">
           <button
             className={'btn ghost' + (auto ? ' on' : '') + (auto && autoLast?.state === 'switching' ? ' switching' : '')}
@@ -4816,6 +4875,19 @@ export default function App() {
         />
       )}
       {sessionOpen && <SessionModal onClose={() => setSessionOpen(false)} lang={lang} />}
+      {/* 2.7.2 only: the Telegram channel / 3.0.0 testers notice. Under any
+          other dialog that opens at start (a vair:// link asks first). */}
+      {stg && !stg.startup_notice_dismissed && !noticeClosed && !STANDALONE_AUTO && !IS_REMOTE && (
+        <StartupNotice
+          lang={lang}
+          onClose={() => setNoticeClosed(true)}
+          onDismiss={() => {
+            setNoticeClosed(true)
+            setStg((p: any) => (p ? { ...p, startup_notice_dismissed: true } : p))
+            SettingsService.DismissStartupNotice()
+          }}
+        />
+      )}
       {linkPending !== null && (
         <LinkConfirm
           payload={linkPending}

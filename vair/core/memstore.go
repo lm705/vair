@@ -473,8 +473,11 @@ func speedRank(k *sortKey) int {
 	// Requiring sStatus==OK (the 1.10 rule) dropped a config whose status went
 	// back to pending/testing (cancelled re-test, refresh) into the ping-only
 	// band, where speed-FAILED configs (tiny response, eof) could sit above an
-	// actual result. Failure paths zero SpeedMBps, so speed>0 ⇒ a valid result.
-	if k.speed > 0 {
+	// actual result. Failure paths zero SpeedMBps, so speed>0 ⇒ a valid result —
+	// except that a speed the table shows as failed or skipped is not one, even if
+	// a number was left behind: the row reads "—", so it must not rank with the
+	// measured ones (a test whose ping failed used to keep the old speed).
+	if k.speed > 0 && k.sStatus != StatusFailed && k.sStatus != StatusSkipped {
 		return 0
 	}
 	if k.pStatus == StatusOK && k.delay > 0 {

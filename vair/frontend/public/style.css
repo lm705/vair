@@ -214,6 +214,12 @@ header{
   .btn{transition:padding .16s ease,background .15s,color .15s,border-color .15s,box-shadow .15s}
 }
 .spacer{flex:1}
+/* The "star it on GitHub" line in the header's free room: a footnote, not a
+   control — dim, lit only under the pointer. Whether it fits is measured in
+   App.tsx (starFits); it is hidden whole, never cut. */
+.hdr-star-wrap{display:flex;justify-content:center;min-width:0;overflow:hidden}
+.hdr-star{font-size:calc(var(--app-fs-base) - 2px);color:var(--dim);opacity:.7;white-space:nowrap;cursor:pointer;text-decoration:none;transition:opacity .15s,color .15s}
+.hdr-star:hover{opacity:1;color:var(--accent)}
 /* nowrap + no shrink: the control buttons stay on the header's single row. */
 .ctrls{display:flex;gap:8px;align-items:center;flex-wrap:nowrap;flex-shrink:0}
 /* Buttons (2.7.0, the "segments" style). A frame; on hover the face fills, on
@@ -1065,6 +1071,17 @@ body.no-hints .hist-foot{display:none}
 .upd-bar{height:6px;background:var(--bg3);border:1px solid var(--border2);border-radius:3px;overflow:hidden;margin:2px 0 10px}
 .upd-fill{height:100%;width:0;background:var(--accent);transition:width .2s}
 /* A vair:// link waiting for a yes: what it holds, where it goes, the warning. */
+/* The 2.7.2 startup notice (StartupNotice.tsx; not in 3.0.0). */
+.startup-notice{width:min(520px,94vw)}
+.startup-notice .notice-body{color:var(--text);margin:0 0 14px}
+.startup-notice .notice-body p{margin:0 0 8px}
+.startup-notice .notice-channel{font-size:calc(var(--modal-fs-base) + 2px);font-weight:700}
+.startup-notice .notice-link{color:var(--accent);cursor:pointer;text-decoration:none;user-select:text}
+.startup-notice .notice-link:hover{text-decoration:underline}
+.startup-notice .notice-where{margin-bottom:4px}
+.startup-notice .notice-list{margin:0 0 10px;padding-left:18px}
+.startup-notice .notice-list li{margin:2px 0}
+.startup-notice .notice-optional{color:var(--dim);font-size:calc(var(--modal-fs-base) - 1px);margin-bottom:0}
 .link-confirm{width:min(520px,94vw)}
 .link-confirm .link-confirm-what{display:flex;flex-direction:column;gap:3px;margin:0 0 10px;color:var(--text)}
 .link-confirm .link-confirm-url{font-family:var(--mono,ui-monospace,Consolas,monospace);word-break:break-all;color:var(--dim);user-select:text}
@@ -1079,6 +1096,9 @@ body.no-hints .hist-foot{display:none}
 .upd-attrib{margin-top:12px;padding-top:8px;border-top:1px solid var(--border2);font-size:var(--modal-fs-base);color:var(--dim);text-align:center}
 .upd-attrib a{color:var(--accent);text-decoration:none;cursor:pointer}
 .upd-attrib a:hover{text-decoration:underline}
+.upd-attrib .upd-star{margin-top:3px;font-size:calc(var(--modal-fs-base) - 2px)}
+.upd-attrib .upd-star a{color:var(--dim);opacity:.75}
+.upd-attrib .upd-star a:hover{color:var(--accent);opacity:1;text-decoration:none}
 
 /* Compact numeric input used in Settings (concurrency, refresh interval) */
 .num-input{

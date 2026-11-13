@@ -7,7 +7,7 @@
 #   scripts/download-engines.sh                     # linux/amd64, the pinned engines
 #   scripts/download-engines.sh --os windows        # cross-fetch for a Windows build
 #   scripts/download-engines.sh --arch arm64
-#   scripts/download-engines.sh --xray v26.7.28 --singbox v1.13.16
+#   scripts/download-engines.sh --xray v26.11.9 --singbox v1.14.4
 #
 # The geo files are OS-independent, so they are fetched once regardless of --os.
 #
@@ -25,20 +25,20 @@ XRAY_VERSION=""
 SINGBOX_VERSION=""
 
 # The versions a release ships with. Update with the hashes below, after testing.
-# Xray stays below 26.9, which refuses VLESS without TLS or VLESS encryption to
-# a public address — see download-engines.ps1.
-PINNED_XRAY=v26.7.28
-PINNED_SINGBOX=v1.13.16
+# From 26.9 xray refuses VLESS/Trojan without TLS to a public address; those
+# configurations run on sing-box — see download-engines.ps1.
+PINNED_XRAY=v26.11.9
+PINNED_SINGBOX=v1.14.4
 
 # pinned_sha256 prints the SHA-256 GitHub lists for a pinned release asset.
 pinned_sha256() {
   case "$1" in
-    XTLS/Xray-core/v26.7.28/Xray-linux-64.zip)        echo 8195d909f1109b8f3d99eefe401a3c451d7bf4af71f24d3815420f77e5dd2a40 ;;
-    XTLS/Xray-core/v26.7.28/Xray-linux-arm64-v8a.zip) echo f5698bb218ada3b4022db26fafc39601c5f53b46b19eb76c9616325985807501 ;;
-    XTLS/Xray-core/v26.7.28/Xray-windows-64.zip)      echo c7172078fca4711bcd92a4774dcd1822544579c58816197575c47533317fd8d1 ;;
-    SagerNet/sing-box/v1.13.16/sing-box-1.13.16-linux-amd64.tar.gz) echo e37c312859dfa84cba148f41072ff6369f08361ae91d622dc1fd3aab49611a8d ;;
-    SagerNet/sing-box/v1.13.16/sing-box-1.13.16-linux-arm64.tar.gz) echo d587fb00bdc3c044227f35d15d154f271bc75108475091eda2542e4b82bb2949 ;;
-    SagerNet/sing-box/v1.13.16/sing-box-1.13.16-windows-amd64.zip)  echo 6cbf90ec4ee87122ffce09b73928fb31e763bc1c75a119f79c61d24734c78807 ;;
+    XTLS/Xray-core/v26.11.9/Xray-linux-64.zip)        echo b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82 ;;
+    XTLS/Xray-core/v26.11.9/Xray-linux-arm64-v8a.zip) echo 64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be ;;
+    XTLS/Xray-core/v26.11.9/Xray-windows-64.zip)      echo 1262522266337b824f07beb8e1375786b437683b3890105469088f8e17e0a69d ;;
+    SagerNet/sing-box/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz) echo 699a1b510aa4396b2176d32d1181920399ebf1e267835da6f3b598d0f7c24968 ;;
+    SagerNet/sing-box/v1.14.4/sing-box-1.14.4-linux-arm64.tar.gz) echo 436441f76ee2f7fe21b5b2d426d3cb261a480455a704865789ad533e4273ec26 ;;
+    SagerNet/sing-box/v1.14.4/sing-box-1.14.4-windows-amd64.zip)  echo 99185d75d314a07dbba4a130c8ad986cbeb629a07927975636b341ca61f991df ;;
   esac
 }
 

@@ -77,6 +77,9 @@ export function endReasonText(r: string, tt: (s: string) => string): string {
     'xray no longer allows turning off the certificate check (allowInsecure) — pin the certificate instead: pinnedPeerCertSha256 in the configuration': tt(
       'xray no longer allows turning off the certificate check (allowInsecure) — pin the certificate instead: pinnedPeerCertSha256 in the configuration',
     ),
+    'xray no longer connects to a public address without TLS, and sing-box does not run this transport': tt(
+      'xray no longer connects to a public address without TLS, and sing-box does not run this transport',
+    ),
   }
   return known[r] || r
 }

@@ -2940,10 +2940,19 @@ export default function SettingsModal({
           </div>
         </div>
 
-        {/* The credit, centred. The dialog closes from the ✕ in its title bar. */}
+        {/* The credit, centred, with the news channel beside it and a quiet
+            line under it. The dialog closes from the ✕ in its title bar. */}
         <div className="set-foot">
           <div className="upd-attrib">
-            Vair · by <a onClick={() => openLink('https://github.com/lm705/vair')}>lm705</a>
+            Vair · by <a onClick={() => openLink('https://github.com/lm705/vair')}>lm705</a> ·{' '}
+            <a title="t.me/vair705" onClick={() => openLink('https://t.me/vair705')}>
+              {tt('Telegram channel')}
+            </a>
+            <div className="upd-star">
+              <a onClick={() => openLink('https://github.com/lm705/vair')}>
+                {tt('Like Vair? Give it a star on GitHub')}
+              </a>
+            </div>
           </div>
         </div>
       </div>
