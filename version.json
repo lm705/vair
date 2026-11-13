@@ -1,24 +1,24 @@
 {
-  "version": "2.7.1",
-  "url": "https://github.com/lm705/vair/releases/download/v2.7.1/Vair.exe",
-  "sha256": "3955d03b7800cbb05ebfb142b2df20c2796ffa1120b8c1f7e3720b168c6182c4",
-  "notes": "Исправлено падение при переключении вкладок с конфигами на Linux. Переход между вкладками, добавленный в 2.7.0, на WebKitGTK (Ubuntu 24.04 и подобные) ронял окно программы; теперь на этом движке переход мгновенный, без анимации. На Windows и в веб-интерфейсе ничего не меняется. Остальное — как в 2.7.0.",
+  "version": "2.7.2",
+  "url": "https://github.com/lm705/vair/releases/download/v2.7.2/Vair.exe",
+  "sha256": "d116b029849bbc1e793c87cb1c70c300addbb30c9fdf92ec78313739f67baf3f",
+  "notes": "Telegram-канал t.me/vair705: новости и релизы, скоро там будет тестовая сборка 3.0.0 с zapret (обходом DPI); при запуске об этом рассказывает окно. Движки обновлены: xray 26.11.9, sing-box 1.14.4; VLESS и Trojan без TLS теперь работают через sing-box. Исправлена сортировка по скорости после нового теста: строки, у которых не прошёл пинг, больше не остаются среди самых быстрых.",
   "assets": {
     "linux/amd64/deb": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/vair_2.7.1-1_amd64.deb",
-      "sha256": "85beabe9cb28b520d392b2306c38f736f27c31f227301fa9182576a4ea043247"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.2/vair_2.7.2-1_amd64.deb",
+      "sha256": "e3e98d099bb1943e2c915ad27914627d0355c369e9a2355c8551d55a16443af0"
     },
     "linux/amd64/rpm": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/vair-2.7.1-1.x86_64.rpm",
-      "sha256": "3fe3a4dc6107114e4b521431f1f8cc2cdb2a231a70cb6b8011e0de7876d98994"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.2/vair-2.7.2-1.x86_64.rpm",
+      "sha256": "56be50a80ee727511e3e8360f6a801ea67f4f4f00d1bed115bd98775c6ef41a7"
     },
     "linux/amd64/archlinux": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/vair-2.7.1-1-x86_64.pkg.tar.zst",
-      "sha256": "847f20266ba1ac4553ebaf2e621efc9e9c6df695409d0ce3fd0a1f185e9dd284"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.2/vair-2.7.2-1-x86_64.pkg.tar.zst",
+      "sha256": "73785de78ff7d4276d9b1d7409c34e9de6f8811205e34d50148749ed32f175ce"
     },
     "windows/amd64/installer": {
-      "url": "https://github.com/lm705/vair/releases/download/v2.7.1/Vair_2.7.1_setup.exe",
-      "sha256": "e4d79ee6a27b5cc676ebc03cf21fe4effa87cda06bc298dab5fa9b838007ebf0"
+      "url": "https://github.com/lm705/vair/releases/download/v2.7.2/Vair_2.7.2_setup.exe",
+      "sha256": "cf0350a019eb6458ee7546a61892534181bb51ad70a8192e072b0609d755dc97"
     }
   }
 }
